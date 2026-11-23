@@ -1,0 +1,37 @@
+name: Unit Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  unit-tests-windows:
+    name: Windows Unit Tests (Node ${{ matrix.node }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22', '24']
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ matrix.node }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Verify Node.js version
+        shell: pwsh
+        run: node --version
+
+      - name: Validate shipped default configuration
+        shell: pwsh
+        run: node -e "import('./leaderteam/core/config.mjs').then(m => { const c = m.loadConfig('./config/leaderteam.config.json'); console.log('config ok, mode =', c.governance.mode, 'maxMembers =', c.team.maxMembersPerTeam); })"
+
+      - name: Run pure unit test suite (zero paid models, zero Desktop)
+        shell: pwsh
+        run: node --test "test/unit/*.test.mjs"

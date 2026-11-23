@@ -223,8 +223,11 @@ try {
     Assert-True ($installedContent -like "*magpie:*") "Contains magpie provider"
     Assert-True ($installedContent -like "*apiKeyEnv: LEADERTEAM_MAGPIE_KEY*") "Uses the official API-key environment reference"
     Assert-True ($installedContent -like "*baseURL: http://127.0.0.1:3425/v1*") "Contains baseURL: http://127.0.0.1:3425/v1"
-    Assert-True ($installedContent -like "*codex/gpt-6.1-sol*") "Contains model codex/gpt-6.1-sol"
-    Assert-True ($installedContent -like "*antigravity/gemini-4-argon*") "Contains model antigravity/gemini-4-argon"
+    $cfgModels = @(((Get-Content -LiteralPath (Join-Path $testRoot 'config\leaderteam.config.json') -Raw -Encoding UTF8 | ConvertFrom-Json).models.PSObject.Properties).Name)
+    $firstConfiguredModel = $cfgModels[0]
+    $lastConfiguredModel = $cfgModels[$cfgModels.Count - 1]
+    Assert-True ($installedContent -like "*$firstConfiguredModel*") "Contains first configured model $firstConfiguredModel"
+    Assert-True ($installedContent -like "*$lastConfiguredModel*") "Contains last configured model $lastConfiguredModel"
     
     # Check single occurrence of markers
     $beginCount = ([regex]::Matches($installedContent, '# >>> leaderteam')).Count

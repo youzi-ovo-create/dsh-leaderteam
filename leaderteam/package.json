@@ -1,6 +1,6 @@
 {
   "name": "dsh-leaderteam",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "private": true,
   "description": "LeaderTeam V2.1 for DeepSeek Harness Desktop: autonomous leader execution, direct execution model, async dual supervision, 4-stage independent arbitration, layered deterministic safety gate, and truncation auto-recovery.",
   "type": "module",

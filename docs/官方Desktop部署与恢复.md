@@ -1,6 +1,8 @@
 # 官方 Desktop 部署、恢复与日常维护
 
-本仓库适配官方 **DeepSeek Harness Desktop `0.2.2-rc.1`**。本机安装与数据目录统一由未入库的 `config/official-desktop.paths.json` 指定（首次使用时从 `config/official-desktop.paths.example.json` 复制并填写本机绝对路径），本机额度快照与全局参考目录由可选的 `config/leaderteam.local.json` 指定。
+本仓库适配官方 **DeepSeek Harness Desktop `0.2.2-rc.1`**。Node.js 运行要求：LeaderTeam 核心插件要求 `>= 22.15`；若需自行构建随仓 `extensions/dsh-context`，要求 `^22.19.0 || >= 24.0.0`（建议统一使用 Node.js `22.19+` 或 `24.x`）。
+
+本机安装与数据目录统一由未入库的 `config/official-desktop.paths.json` 指定（首次使用时从 `config/official-desktop.paths.example.json` 复制并填写本机绝对路径），本机模型路由、额度快照与全局参考目录由可选的 `config/leaderteam.local.json` 覆盖。**注意**：随仓 `config/leaderteam.config.json` 中的 `codex/`、`zcode/` 等模型路由为示例网关配置，部署后请通过 `leaderteam.local.json`、`scripts/configure-models.mjs` 或 DSH 侧栏 **LeaderTeam 控制台**修改为自己网关实际提供的模型路由。
 
 ## 部署顺序
 
