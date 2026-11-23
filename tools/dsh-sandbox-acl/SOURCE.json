@@ -1,0 +1,14 @@
+{
+  "sourcePackage": "@deepseek-ai/dsh-sandbox-windows-acl",
+  "runtime": "DSH Desktop 0.13.2 / core 0.2.2-alpha.2",
+  "files": [
+    {
+      "path": "SKILL.md",
+      "sha256": "9c616c78892daeaea864a9b2d6baaea91ff133cf83cde0b725c6caee2d4933cb"
+    },
+    {
+      "path": "scripts\\diagnose-windows-sandbox-acl.ps1",
+      "sha256": "adba89f3b10692302723d231d003cdf365311effaff996d32416f9531e3b63d9"
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "name": "@leaderteam/plugin-scheduler",
+  "version": "2.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Detachable LeaderTeam elastic concurrency & device-load scheduler plugin.",
+  "main": "./index.mjs",
+  "exports": {
+    ".": "./index.mjs",
+    "./package.json": "./package.json"
+  }
+}

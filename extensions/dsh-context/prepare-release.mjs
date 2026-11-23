@@ -1,0 +1,13 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+const root=path.dirname(fileURLToPath(import.meta.url));
+const target=path.join(root,'.tmp','release-'+new Date().toISOString().replace(/[:.]/g,'-'));
+fs.mkdirSync(target,{recursive:true});
+for(const file of ['lib','locale','icon.svg','LICENSE','README.md','cordis.patch.yml'])fs.cpSync(path.join(root,file),path.join(target,file),{recursive:true});
+fs.copyFileSync(path.join(root,'host-entry.mjs'),path.join(target,'lib/host-entry.mjs'));
+const pkg=JSON.parse(fs.readFileSync(path.join(root,'package.json'),'utf8'));
+pkg.version='0.82.1-leaderteam.1';pkg.main='lib/host-entry.mjs';pkg.exports['.'].default='./lib/host-entry.mjs';
+pkg.files.push('lib/host-entry.mjs');pkg.scripts={};
+fs.writeFileSync(path.join(target,'package.json'),JSON.stringify(pkg,null,2)+'\n');
+console.log(target);

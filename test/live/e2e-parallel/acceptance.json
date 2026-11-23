@@ -1,0 +1,10 @@
+{
+  "description": "Live LeaderTeam acceptance: autonomous model choice, two parallel writing members, gate on every controlled op, plan and delivery agreements, independently re-run tests.",
+  "minWritingMembers": 2,
+  "requireParallel": true,
+  "allowedChanges": ["textstats/**", "money/**", ".leaderteam/**"],
+  "modules": [
+    { "dir": "textstats", "files": ["textstats/textstats.py", "textstats/test_textstats.py"], "testArgs": ["-m", "unittest", "discover", "-s", "textstats", "-v"], "expectTests": 4 },
+    { "dir": "money", "files": ["money/money.py", "money/test_money.py"], "testArgs": ["-m", "unittest", "discover", "-s", "money", "-v"], "expectTests": 4 }
+  ]
+}

@@ -1,0 +1,3 @@
+- insert:
+    - id: lt-test-it21-fake-tool
+      name: "__LT_ROOT__/test/integration/fixtures/it21-fake-plugin.mjs"

@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-11-06T20:41:58+08:00",
+  "source": "magpie_local_cache",
+  "accounts": [
+    { "id": "codex-a", "provider": "codex", "plan": "team", "windows": [ { "name": "5 hours", "used": 0, "remaining": 100, "resetsAt": "2026-11-07T01:41:50+08:00" }, { "name": "7 days", "used": 100, "remaining": 0, "resetsAt": "2026-11-08T23:31:36+08:00" } ] },
+    { "id": "codex-b", "provider": "codex", "plan": "plus", "windows": [ { "name": "5 hours", "used": 6, "remaining": 94, "resetsAt": "2026-11-06T23:42:34+08:00" }, { "name": "7 days", "used": 61, "remaining": 39, "resetsAt": "2026-11-11T19:12:49+08:00" } ] },
+    { "id": "zcode-a", "provider": "zcode", "plan": "lite", "windows": [ { "name": "5 hours", "used": 0, "remaining": 100, "resetsAt": null }, { "name": "Weekly", "used": 90, "remaining": 10, "resetsAt": "2026-11-08T01:22:00+08:00" } ] },
+    { "id": "antigravity-a", "provider": "antigravity", "plan": "pro", "windows": [ { "name": "Gemini · 7 days", "used": 99, "remaining": 1, "resetsAt": "2026-11-09T22:04:00+08:00" }, { "name": "Gemini · 5 hours", "used": 0, "remaining": 100, "resetsAt": "2026-11-07T01:41:00+08:00" } ] },
+    { "id": "broken", "provider": "codex", "windows": [ { "name": "5 hours", "remaining": "n/a" } ] }
+  ],
+  "models": [
+    { "id": "gpt-6.1-sol", "provider": "codex", "model": "gpt-6.1-sol", "recorded_calls": 3165, "recent_by_effort": { "high": { "record_count": 63, "processed_tokens_p50": 307343, "processed_tokens_p90": 381629, "duration_ms_p50": 12192 } } }
+  ]
+}

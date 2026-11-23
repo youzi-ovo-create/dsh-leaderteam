@@ -1,0 +1,29 @@
+# Magpie provider for the headless runner. __MAGPIE_BASEURL__ = http://127.0.0.1:3425/v1 (or a mock),
+# __MAGPIE_KEY_ENV__ = name of the environment variable holding the Magpie key.
+# __LEADER_MODEL__ / __LEADER_EFFORT__ = roles.leader.route / roles.leader.effort from leaderteam.config.json.
+- id: agent-default-model
+  config:
+    provider: magpie
+    model: __LEADER_MODEL__
+    reasoningEffort: __LEADER_EFFORT__
+- id: llm-pi-ai
+  config:
+    providers:
+      magpie:
+        api: openai-completions
+        apiKeyEnv: __MAGPIE_KEY_ENV__
+        baseURL: __MAGPIE_BASEURL__
+        timeoutMs: 600000
+        streamIdleTimeoutMs: 300000
+        retryPolicy: {mode: normal, maxRetries: 2}
+        models:
+          - {id: codex/gpt-6.1-sol, input: [text, image], reasoningEfforts: {low: low, medium: medium, high: high, xhigh: xhigh, max: max}}
+          - {id: codex/gpt-6.1-terra, input: [text, image], reasoningEfforts: {low: low, medium: medium, high: high, xhigh: xhigh, max: max}}
+          - {id: codex/gpt-6-astra, input: [text, image], reasoningEfforts: {low: low, medium: medium, high: high, xhigh: xhigh, max: max}}
+          - {id: zcode/GLM-5.3, input: [text], reasoningEfforts: {low: low, high: high, max: max}}
+          - {id: zcode/GLM-5.3-Flash, input: [text, image], reasoningEfforts: {low: low, high: high, max: max}}
+          - {id: antigravity/claude-opus-5-5, input: [text, image], reasoningEfforts: {low: low, medium: medium, high: high}}
+- id: llm-deepseek
+  disabled: true
+- id: llm-deepseek-account
+  disabled: true

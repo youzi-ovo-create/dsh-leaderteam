@@ -1,0 +1,17 @@
+node_modules/
+test-work/
+test-tmp/
+runtime/
+home-headless/
+backups/
+scratch/
+reports/
+__pycache__/
+*.tmp
+.DS_Store
+Thumbs.db
+
+# Local machine overrides & workspace-private instructions
+AGENTS.md
+config/leaderteam.local.json
+config/official-desktop.paths.json

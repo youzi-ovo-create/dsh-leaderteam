@@ -1,0 +1,14 @@
+{
+  "quota": {
+    "stateFile": "D:/path/to/magpie-quota/state.json"
+  },
+  "paths": {
+    "globalRefRoots": [
+      "D:/path/to/shared-reference-docs"
+    ],
+    "leaderReadRoots": []
+  },
+  "team": {
+    "maxActiveMembers": 6
+  }
+}

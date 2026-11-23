@@ -1,0 +1,12 @@
+{
+  "name": "@leaderteam/plugin-lead",
+  "version": "2.1.0",
+  "private": true,
+  "type": "module",
+  "description": "LeaderTeam leader orchestration tools plugin (`team_models`, `team_dispatch`, `team_discuss`, `team_concurrency`, `team_plan_archive`, `team_note`, `team_status`).",
+  "main": "./index.mjs",
+  "exports": {
+    ".": "./index.mjs",
+    "./package.json": "./package.json"
+  }
+}

@@ -1,0 +1,10 @@
+dsh-leaderteam
+Copyright 2026 LeaderTeam Contributors
+Licensed under the Apache License, Version 2.0 (see ../LICENSE).
+
+This product includes code adapted from dsh-auto-review v0.15.0
+(community DeepSeek Harness plugin, licensed under the Apache License, Version 2.0):
+  - core/redact.mjs: sanitizeArguments, redactInlineSecrets, truncate (ported from src/review.ts)
+  - host/llm.mjs: inline tool-less reviewer call with timeout/cancel/failure classification (ported from runReviewInline)
+  - core/gate-policy.mjs: extractReviewerJson (ported)
+The full Apache License 2.0 text is distributed in ../LICENSE at the repository root.

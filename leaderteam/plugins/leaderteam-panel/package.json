@@ -1,0 +1,28 @@
+{
+  "name": "leaderteam-panel",
+  "version": "2.1.0",
+  "private": true,
+  "type": "module",
+  "description": "In-DSH LeaderTeam visual console: dynamic upstream model discovery & role/pool editor, detachable plugin switches, engineering timers, and external plan archive retrospective/cleanup.",
+  "main": "./index.mjs",
+  "exports": {
+    ".": "./index.mjs",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-sidebar-right"
+      ],
+      "platform": "web"
+    },
+    "compatibility": {
+      "dshReleases": {
+        "0.2.2-rc.1+": "compatible"
+      }
+    }
+  }
+}

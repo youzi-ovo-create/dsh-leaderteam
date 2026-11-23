@@ -1,0 +1,20 @@
+# Magpie model provider for DeepSeek Harness Desktop profile (managed by scripts/install-desktop.ps1).
+# Template only: the installer merges the existing config locally before adding
+# this final override. Raw Cordis patches replace config; they do not deep merge.
+- id: llm-pi-ai
+  config:
+    providers:
+      magpie:
+        api: openai-completions
+        apiKeyEnv: LEADERTEAM_MAGPIE_KEY
+        baseURL: __MAGPIE_BASEURL__
+        timeoutMs: 600000
+        streamIdleTimeoutMs: 300000
+        retryPolicy: {mode: normal, maxRetries: 2}
+        models:
+          - {id: codex/gpt-6.1-sol, input: [text, image], reasoningEfforts: {low: low, medium: medium, high: high, xhigh: xhigh, max: max}}
+          - {id: codex/gpt-6.1-terra, input: [text, image], reasoningEfforts: {low: low, medium: medium, high: high, xhigh: xhigh, max: max}}
+          - {id: codex/gpt-6-astra, input: [text, image], reasoningEfforts: {low: low, medium: medium, high: high, xhigh: xhigh, max: max}}
+          - {id: zcode/GLM-5.3, input: [text], reasoningEfforts: {low: low, high: high, max: max}}
+          - {id: zcode/GLM-5.3-Flash, input: [text, image], reasoningEfforts: {low: low, high: high, max: max}}
+          - {id: antigravity/claude-opus-5-5, input: [text, image], reasoningEfforts: {low: low, medium: medium, high: high}}

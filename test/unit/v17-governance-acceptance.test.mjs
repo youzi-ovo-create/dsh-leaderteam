@@ -1,0 +1,51 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { currentPlanFile, readCurrentPlan, writeCurrentPlan } from '../../leaderteam/core/current-plan.mjs';
+import { MEMBER_SYSTEM } from '../../leaderteam/core/agreement.mjs';
+import { normalizeReview } from '../../leaderteam/core/review-policy.mjs';
+import { rankCandidatePlans } from '../../leaderteam/core/plan-archive.mjs';
+import { summarizeTeamUsage } from '../../leaderteam/host/observability.mjs';
+
+test('current full plans survive optional plugin absence and stay scoped to team/task',t=>{
+  const root=fs.mkdtempSync(path.join(os.tmpdir(),'lt-current-plan-'));t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
+  writeCurrentPlan(root,'team-a',1,'architecture\nall phases');
+  assert.equal(readCurrentPlan(root,'team-a',1).content,'architecture\nall phases');
+  assert.equal(readCurrentPlan(root,'team-b',1),null);
+  assert.equal(readCurrentPlan(root,'team-a',2),null);
+  assert.throws(()=>currentPlanFile(root,'../escape',1));
+  assert.throws(()=>writeCurrentPlan(root,'team-a',1,''));
+});
+test('resolved revisions turn new ordinary objections into conditions while hard constraints still block',()=>{
+  const prior={id:'a',problem:'missing endpoint',evidence:'spec section 1',suggestion:'add endpoint',hard_blocker:false,category:'ordinary'};
+  const fresh={id:'b',problem:'rename variable',evidence:'style preference',suggestion:'rename to amount',hard_blocker:false,category:'ordinary'};
+  const opinion={stance:'revise',summary:'new detail',reasons:['style detail'],suggestions:['rename to amount'],requiredChanges:['rename variable'],changeItems:[fresh],resolutions:[{id:'a',status:'resolved',evidence:'endpoint exists in attached file'}]};
+  const got=normalizeReview(opinion,{previousItems:[prior]});assert.equal(got.stance,'approve');assert.equal(got.conditions.length,1);
+  const hard={...fresh,problem:'deletes user data',hard_blocker:true,category:'data_loss'};
+  const blocked=normalizeReview({...opinion,changeItems:[hard]},{previousItems:[prior]});assert.equal(blocked.stance,'revise');
+  assert.throws(()=>normalizeReview({...opinion,resolutions:[]},{previousItems:[prior]}),/reconcile/);
+  assert.throws(()=>normalizeReview({...opinion,changeItems:[{...hard,category:'style'}]}),/hard blockers/);
+  assert.match(MEMBER_SYSTEM,/"resolutions":\[\{"id"/);
+  const cleanApprove=normalizeReview({stance:'approve',summary:'all fixed',reasons:['C1 fixed in src/formatter.mjs L44'],requiredChanges:[],suggestions:[]},{previousItems:[prior,{...prior,id:'dup-hash'}]});
+  assert.equal(cleanApprove.stance,'approve');
+  assert.equal(cleanApprove.resolutions.length,2);
+  assert.equal(cleanApprove.resolutions.every(r=>r.status==='resolved'),true);
+  const plans=[{planId:'p',proposal:'src/app.js',outcome:{decision:'revise',changeItems:[hard],requiredChanges:['deletes user data']},rounds:[{A:{stance:'revise'},B:{stance:'revise'}}]}];
+  assert.equal(rankCandidatePlans(plans)[0].viableForFallback,false);
+});
+test('usage counts each native receipt once and keeps governance separate from execution',()=>{
+  const row={type:'assistant/message',seq:1,data:{message:{id:'m1',source:{model:'zcode/GLM-5.3'}},usage:{inputTokens:10,cacheReadTokens:100,outputTokens:3,totalTokens:113},stream:[{usage:{totalTokens:113}}]}};
+  const out=summarizeTeamUsage([{id:'leader',group:'leader',name:'leader',available:true,rows:[row,row]}, {id:'child',group:'execution',name:'dev',available:true,rows:[{...row,data:{...row.data,message:{id:'m2',source:{model:'zcode/GLM-5.3-Flash'}}}}]}],[{role:'gate',route:'zcode/GLM-5.3',usage:{totalTokens:7}}]);
+  assert.equal(out.groups.leader.tokens.totalTokens,113);assert.equal(out.groups.execution.tokens.totalTokens,113);assert.equal(out.groups.governance.tokens.totalTokens,7);assert.equal(out.total.totalTokens,233);
+  assert.equal(out.cost,null);
+  const waiting=summarizeTeamUsage([{id:'leader',group:'leader',available:true,rows:[{type:'request/header',data:{header:{config:{model:'zcode/GLM-5.3'}}}}]}],[]);
+  assert.equal(waiting.groups.leader.awaitingUsage,1);
+  assert.equal(waiting.groups.leader.receiptCount,0);
+  assert.equal(waiting.complete,false,'an in-flight first request is not complete zero usage');
+  const unmetered=summarizeTeamUsage([{id:'leader',group:'leader',available:true,rows:[{...row,data:{message:row.data.message,usage:{inputTokens:0,outputTokens:0,totalTokens:0}}},{type:'assistant/message',seq:2,data:{message:{id:'m3',source:{model:'other/model'}}}}]}],[]);
+  assert.equal(unmetered.groups.leader.receiptCount,2,'model responses remain real calls even without valid metering');
+  assert.equal(unmetered.groups.leader.missingUsage,2);
+  assert.equal(unmetered.complete,false,'zero-filled upstream metering is unknown consumption');
+});

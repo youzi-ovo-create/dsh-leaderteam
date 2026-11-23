@@ -1,0 +1,175 @@
+# LeaderTeam rows for the DeepSeek Harness Desktop profile (appended by scripts/install-desktop.ps1 into
+# ~/.dsh/profiles/desktop/cordis.patch.yml between marker comments).
+# Placeholders: __LT_ROOT_URL__ (file URL), __LT_CONFIG__.
+- id: tool-executor-native
+  disabled: true
+- insert:
+    - id: tool-executor-native
+      name: "__LT_ROOT_URL__/leaderteam/entry-native-executor.mjs"
+    - id: leaderteam-core
+      name: "__LT_ROOT_URL__/leaderteam/entry-core.mjs"
+      config:
+        configPath: "__LT_CONFIG__"
+        surface: desktop
+        modular: true
+    - id: leaderteam-scheduler
+      name: "__LT_ROOT_URL__/leaderteam/plugins/leaderteam-scheduler/index.mjs"
+    - id: leaderteam-timer-archive
+      name: "__LT_ROOT_URL__/leaderteam/plugins/leaderteam-timer-archive/index.mjs"
+    - id: leaderteam-consensus
+      name: "__LT_ROOT_URL__/leaderteam/plugins/leaderteam-consensus/index.mjs"
+    - id: leaderteam-panel
+      name: "__LT_ROOT_URL__/leaderteam/plugins/leaderteam-panel/index.mjs"
+    - id: preset-leaderteam
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: leaderteam
+        name: LeaderTeam
+        description: 可配置模型与档位的领队、独立安全门及对称讨论
+        order: 0
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: You are the LeaderTeam leader, powered by the {{model}} model.
+          - id: agent-instructions
+            name: '@deepseek-ai/dsh-agent-instructions'
+            config: {maxBytes: 65536}
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+            config: {write: false, edit: false}
+          - id: tool-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config: {sampleOverCapGlobResults: false}
+          - id: tool-todo
+            name: '@deepseek-ai/dsh-tool-todo'
+            config: {allowParallelInProgress: true}
+          - id: tool-subagent-control
+            name: '@deepseek-ai/dsh-tool-subagent-control'
+          - id: compaction
+            name: cordis:group
+            group: true
+            isolate: {compaction: true, toolResultPruner: true}
+            config:
+              - id: compaction-basic
+                name: '@deepseek-ai/dsh-compaction-basic'
+              - id: command-compact
+                name: '@deepseek-ai/dsh-command-compact'
+              - id: tool-result-pruner
+                name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+                config: {thresholdChars: 8192, headChars: 4096, tailChars: 1024}
+          - id: leaderteam-lead
+            name: "__LT_ROOT_URL__/leaderteam/entry-lead.mjs"
+    - id: preset-lt-member-readonly
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: lt-member-readonly
+        name: LeaderTeam 成员（只读）
+        order: 90
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: You are a LeaderTeam member, powered by the {{model}} model.
+          - id: agent-instructions
+            name: '@deepseek-ai/dsh-agent-instructions'
+            config: {maxBytes: 65536}
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+            config: {write: false, edit: false}
+          - id: tool-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config: {sampleOverCapGlobResults: false}
+          - id: tool-todo
+            name: '@deepseek-ai/dsh-tool-todo'
+            config: {allowParallelInProgress: true}
+          - id: compaction
+            name: cordis:group
+            group: true
+            isolate: {compaction: true, toolResultPruner: true}
+            config:
+              - id: compaction-basic
+                name: '@deepseek-ai/dsh-compaction-basic'
+              - id: tool-result-pruner
+                name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+                config: {thresholdChars: 8192, headChars: 4096, tailChars: 1024}
+    - id: preset-lt-member-code
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: lt-member-code
+        name: LeaderTeam 成员（代码）
+        order: 91
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: You are a LeaderTeam member, powered by the {{model}} model.
+          - id: agent-instructions
+            name: '@deepseek-ai/dsh-agent-instructions'
+            config: {maxBytes: 65536}
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+          - id: tool-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config: {sampleOverCapGlobResults: false}
+          - id: tool-todo
+            name: '@deepseek-ai/dsh-tool-todo'
+            config: {allowParallelInProgress: true}
+          - id: compaction
+            name: cordis:group
+            group: true
+            isolate: {compaction: true, toolResultPruner: true}
+            config:
+              - id: compaction-basic
+                name: '@deepseek-ai/dsh-compaction-basic'
+              - id: tool-result-pruner
+                name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+                config: {thresholdChars: 8192, headChars: 4096, tailChars: 1024}
+    - id: preset-lt-member-shell
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: lt-member-shell
+        name: LeaderTeam 成员（代码+命令行）
+        order: 92
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: You are a LeaderTeam member, powered by the {{model}} model.
+          - id: agent-instructions
+            name: '@deepseek-ai/dsh-agent-instructions'
+            config: {maxBytes: 65536}
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+          - id: tool-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config: {sampleOverCapGlobResults: false}
+          - id: tool-todo
+            name: '@deepseek-ai/dsh-tool-todo'
+            config: {allowParallelInProgress: true}
+          - id: tool-bash
+            name: '@deepseek-ai/dsh-tool-bash'
+            disabled: !!js process.platform === 'win32'
+          - id: tool-pwsh
+            name: '@deepseek-ai/dsh-tool-pwsh'
+            disabled: !!js process.platform !== 'win32'
+          - id: tool-jobs
+            name: '@deepseek-ai/dsh-tool-jobs'
+          - id: compaction
+            name: cordis:group
+            group: true
+            isolate: {compaction: true, toolResultPruner: true}
+            config:
+              - id: compaction-basic
+                name: '@deepseek-ai/dsh-compaction-basic'
+              - id: tool-result-pruner
+                name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+                config: {thresholdChars: 8192, headChars: 4096, tailChars: 1024}

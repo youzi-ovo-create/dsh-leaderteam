@@ -1,0 +1,6 @@
+# it17: the LeaderTeam session runs a model other than roles.leader.
+- id: agent-default-model
+  config:
+    provider: magpie
+    model: zcode/GLM-5.3
+    reasoningEffort: high

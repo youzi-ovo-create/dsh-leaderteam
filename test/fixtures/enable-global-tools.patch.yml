@@ -1,0 +1,4 @@
+# it18: re-enable a global tool that Desktop profiles carry (working_directory) to prove that team agents
+# see exactly their profile tools while the global stays available to other agents.
+- id: tool-working-directory
+  disabled: false

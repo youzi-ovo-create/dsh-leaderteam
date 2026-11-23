@@ -1,0 +1,23 @@
+# Detach leaderteam-consensus via Cordis row override and connect a brand-new DSH upstream provider (`custom_upstream`)
+# with a non-reasoning model (`qwen-fast-v1`) not hardcoded in leaderteam.config.json.
+- id: leaderteam-consensus
+  disabled: true
+- id: llm-pi-ai
+  config:
+    providers:
+      magpie:
+        api: openai-completions
+        apiKeyEnv: __MAGPIE_KEY_ENV__
+        baseURL: __MAGPIE_BASEURL__
+        timeoutMs: 600000
+        streamIdleTimeoutMs: 300000
+        retryPolicy: {mode: normal, maxRetries: 2}
+        models:
+          - {id: zcode/GLM-5.3, contextWindow: 131072, maxTokens: 16384, input: [text], reasoningEfforts: {low: low, high: high, max: max}}
+          - {id: codex/gpt-6.1-sol, contextWindow: 131072, maxTokens: 16384, input: [text], reasoningEfforts: {low: low, medium: medium, high: high}}
+      custom_upstream:
+        api: openai-completions
+        apiKeyEnv: __MAGPIE_KEY_ENV__
+        baseURL: __MAGPIE_BASEURL__
+        models:
+          - {id: qwen-fast-v1, contextWindow: 65536, maxTokens: 8192, input: [text]}

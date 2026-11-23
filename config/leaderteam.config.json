@@ -1,0 +1,354 @@
+{
+  "schemaVersion": 1,
+  "magpie": {
+    "provider": "magpie"
+  },
+  "models": {
+    "codex/gpt-6.1-sol": {
+      "family": "gpt",
+      "label": "GPT-6.1 Sol",
+      "vision": true,
+      "efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "defaultEffort": "medium",
+      "strengths": "复杂执行、多模块实现、疑难调试、规划与独立审阅"
+    },
+    "codex/gpt-6.1-terra": {
+      "family": "gpt",
+      "label": "GPT-6.1 Terra",
+      "vision": true,
+      "efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "defaultEffort": "low",
+      "strengths": "视觉材料、图纸与图像、清晰写作、跨软件成品"
+    },
+    "codex/gpt-6-astra": {
+      "family": "gpt",
+      "label": "GPT-6 Astra",
+      "vision": true,
+      "efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "defaultEffort": "low",
+      "strengths": "大工程全局规划、关键架构抉择、多轮后的总检查"
+    },
+    "zcode/GLM-5.3": {
+      "family": "glm",
+      "label": "GLM-5.3",
+      "efforts": [
+        "low",
+        "high",
+        "max"
+      ],
+      "defaultEffort": "high",
+      "strengths": "多模块实现、重构、复杂调试、较长工具流程；深层推理用 max",
+      "vision": false
+    },
+    "zcode/GLM-5.3-Flash": {
+      "family": "glm",
+      "label": "GLM-5.3 Flash",
+      "vision": true,
+      "efforts": [
+        "low",
+        "high",
+        "max"
+      ],
+      "defaultEffort": "high",
+      "strengths": "明确的代码修改、脚本、资料整理、图文材料与可验收的执行任务"
+    },
+    "antigravity/claude-opus-5-5": {
+      "family": "claude",
+      "label": "Claude Opus 5.5",
+      "vision": true,
+      "efforts": [
+        "low",
+        "medium",
+        "high"
+      ],
+      "defaultEffort": "high",
+      "strengths": "深层权衡、架构争议裁断与独立复核",
+      "quotaWindows": [
+        "Claude & GPT · 7 days",
+        "Claude & GPT · 5 hours"
+      ]
+    }
+  },
+  "roles": {
+    "leader": {
+      "route": "codex/gpt-6.1-sol",
+      "effort": "high"
+    },
+    "gate": {
+      "route": "codex/gpt-6.1-sol",
+      "effort": "high",
+      "maxTokens": 8000,
+      "timeoutMs": 120000,
+      "retries": 1,
+      "fallback": [
+        {
+          "route": "zcode/GLM-5.3",
+          "effort": "high",
+          "maxTokens": 2000,
+          "timeoutMs": 60000,
+          "retries": 1
+        }
+      ]
+    },
+    "discussA": {
+      "route": "zcode/GLM-5.3",
+      "effort": "high",
+      "maxTokens": 8000,
+      "timeoutMs": 300000,
+      "retries": 1
+    },
+    "discussB": {
+      "route": "codex/gpt-6.1-sol",
+      "effort": "max",
+      "maxTokens": 8000,
+      "timeoutMs": 300000,
+      "retries": 1
+    },
+    "arbiter": {
+      "route": "zcode/GLM-5.3",
+      "effort": "max",
+      "maxTokens": 16000,
+      "timeoutMs": 600000,
+      "retries": 1
+    },
+    "serialReviewer": {
+      "route": "zcode/GLM-5.3",
+      "effort": "low",
+      "maxTokens": 2400,
+      "timeoutMs": 120000,
+      "retries": 0,
+      "fallback": [{ "route": "zcode/GLM-5.3-Flash", "effort": "low", "retries": 0 }]
+    },
+    "directExec": {
+      "route": "codex/gpt-6.1-sol",
+      "effort": "medium",
+      "timeoutMs": 180000,
+      "retries": 1,
+      "fallback": [{ "route": "zcode/GLM-5.3-Flash", "effort": "low", "timeoutMs": 180000, "retries": 0 }]
+    }
+  },
+  "profiles": {
+    "leader": {
+      "preset": "leaderteam",
+      "tools": [
+        "read",
+        "read_image",
+        "glob",
+        "grep",
+        "todo_write",
+        "list_agents",
+        "send_message",
+        "interrupt_agent",
+        "team_models",
+        "team_plan",
+        "team_concurrency",
+        "team_dispatch",
+        "team_direct_exec",
+        "team_conference",
+        "team_discuss",
+        "team_plan_archive",
+        "team_note",
+        "team_status",
+        "team_tools",
+        "team_skills"
+      ]
+    },
+    "readonly": {
+      "preset": "lt-member-readonly",
+      "mutating": false,
+      "description": "只读：阅读、搜索、分析与报告",
+      "tools": [
+        "read",
+        "read_image",
+        "glob",
+        "grep",
+        "todo_write",
+        "team_tools",
+        "team_skills"
+      ]
+    },
+    "code": {
+      "preset": "lt-member-code",
+      "mutating": true,
+      "description": "代码：在写入范围内创建与修改文件",
+      "tools": [
+        "read",
+        "read_image",
+        "glob",
+        "grep",
+        "todo_write",
+        "write",
+        "edit",
+        "team_tools",
+        "team_skills"
+      ]
+    },
+    "shell": {
+      "preset": "lt-member-shell",
+      "mutating": true,
+      "description": "代码+命令行：可运行测试与构建命令",
+      "tools": [
+        "read",
+        "read_image",
+        "glob",
+        "grep",
+        "todo_write",
+        "write",
+        "edit",
+        "pwsh",
+        "bash",
+        "job_list",
+        "job_output",
+        "job_kill",
+        "team_tools",
+        "team_skills"
+      ]
+    }
+  },
+  "gate": {
+    "scope": "team",
+    "sandboxDirectAllow": true,
+    "enablePatternCache": true,
+    "ruleOnlyTools": [
+      "team_note",
+      "team_plan",
+      "team_conference"
+    ],
+    "maxReviewsPerMember": 400,
+    "maxReviewsPerTask": 2000,
+    "maxConsecutiveGateErrors": 5,
+    "gateErrorCooldownMs": 60000,
+    "uncontrolledTools": [
+      "read",
+      "read_image",
+      "glob",
+      "grep",
+      "todo_write",
+      "list_agents",
+      "send_message",
+      "interrupt_agent",
+      "team_models",
+      "team_concurrency",
+      "team_status",
+      "team_discuss",
+      "team_plan_archive",
+      "job_list",
+      "job_output",
+      "team_tools",
+      "team_skills"
+    ],
+    "pathArgs": {
+      "write": [
+        "file_path"
+      ],
+      "edit": [
+        "file_path"
+      ],
+      "team_note": [
+        "path"
+      ]
+    },
+    "shellTools": [
+      "pwsh",
+      "bash"
+    ],
+    "mutatingTools": [
+      "write",
+      "edit",
+      "pwsh",
+      "bash",
+      "job_kill"
+    ],
+    "requireReadBeforeWrite": true,
+    "maxArgChars": 12000,
+    "maxAuthorizationChars": 6000
+  },
+  "quota": {
+    "stateFile": null,
+    "maxSnapshotAgeSec": 300,
+    "exhaustedBelowPct": 3,
+    "lowBelowPct": 15,
+    "allowUnknown": true,
+    "allowUnknownGpt": false,
+    "gptReservePct": 3
+  },
+  "paths": {
+    "globalRefRoots": [],
+    "projectRefsDir": ".leaderteam/refs",
+    "protectedDirs": [
+      ".leaderteam",
+      ".git",
+      ".agents",
+      "AGENTS.md"
+    ],
+    "leaderReadRoots": []
+  },
+  "team": {
+    "executionPool": [
+      "codex/gpt-6.1-sol",
+      "codex/gpt-6.1-terra",
+      "codex/gpt-6-astra",
+      "zcode/GLM-5.3",
+      "zcode/GLM-5.3-Flash"
+    ],
+    "maxMembersPerTeam": 128,
+    "requirePlanAgreement": true,
+    "rollingPlanning": true,
+    "planExemptProfiles": [
+      "readonly"
+    ],
+    "maxPlanAgreements": 4,
+    "maxRefsPerMember": 20,
+    "leaderModelPolicy": "enforce",
+    "maxActiveMembers": 6,
+    "autoIncludeUpstreamModels": false,
+    "disabledFamilies": [
+      "gemini"
+    ]
+  },
+  "agreement": {
+    "maxRounds": 3,
+    "maxProposalChars": 40000,
+    "maxEvidenceChars": 300000,
+    "maxEvidenceFiles": 64,
+    "evidenceFileMaxBytes": 200000,
+    "maxArbiterAttempts": 2
+  },
+  "storage": {
+    "root": null
+  },
+  "toolPolicy": {
+    "additionalTools": []
+  },
+  "skills": {
+    "roots": []
+  },
+  "governance": {
+    "mode": "autonomous",
+    "caucusQuorumNumerator": 2,
+    "caucusQuorumDenominator": 3,
+    "maxInternalArbitrationRounds": 2,
+    "maxConferenceDialogueTurns": 2,
+    "autoSuperviseStages": true,
+    "autoSuperviseDispatches": true,
+    "directExecMaxSteps": 24
+  }
+}

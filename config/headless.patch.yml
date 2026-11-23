@@ -1,0 +1,90 @@
+# LeaderTeam composition for the official `dsh headless` runner (automated acceptance and scripted runs).
+# Placeholders replaced by the test runner / scripts: __LT_ROOT__ (forward slashes), __LT_CONFIG__.
+# The headless root agent cannot use presets, so the leader's tools are global here; members get
+# their tools from lt-member-* presets and the leader-only tools are masked for them at creation.
+- id: tool-executor-native
+  disabled: true
+- id: tool-fs
+  config: {write: false, edit: false}
+- id: tool-bash
+  disabled: true
+- id: tool-pwsh
+  disabled: true
+- id: tool-jobs
+  disabled: true
+- id: tool-goal
+  disabled: true
+- id: tool-skill
+  disabled: true
+- id: tool-subagent
+  disabled: true
+- id: tool-subagent-fork
+  disabled: true
+- id: tool-workflow
+  disabled: true
+- id: workflow-ptc
+  disabled: true
+- id: ptc-runtime
+  disabled: true
+- id: tool-working-directory
+  disabled: true
+- id: tool-web
+  disabled: true
+- id: session-title-llm
+  disabled: true
+- insert:
+    - id: tool-executor-native
+      name: "__LT_ROOT__/leaderteam/entry-native-executor.mjs"
+    - id: leaderteam-core
+      name: "__LT_ROOT__/leaderteam/entry-core.mjs"
+      config:
+        configPath: "__LT_CONFIG__"
+        surface: headless
+        modular: true
+    - id: leaderteam-scheduler
+      name: "__LT_ROOT__/leaderteam/plugins/leaderteam-scheduler/index.mjs"
+    - id: leaderteam-timer-archive
+      name: "__LT_ROOT__/leaderteam/plugins/leaderteam-timer-archive/index.mjs"
+    - id: leaderteam-consensus
+      name: "__LT_ROOT__/leaderteam/plugins/leaderteam-consensus/index.mjs"
+    - id: leaderteam-panel
+      name: "__LT_ROOT__/leaderteam/plugins/leaderteam-panel/index.mjs"
+    - id: leaderteam-lead
+      name: "__LT_ROOT__/leaderteam/entry-lead.mjs"
+    - id: agent-preset-registry
+      name: '@deepseek-ai/dsh-agent-preset-registry'
+      config:
+        default: lt-member-readonly
+    - id: preset-lt-member-readonly
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: lt-member-readonly
+        name: LeaderTeam member (readonly)
+        plugins:
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+            config: {write: false, edit: false}
+    - id: preset-lt-member-code
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: lt-member-code
+        name: LeaderTeam member (code)
+        plugins:
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+    - id: preset-lt-member-shell
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: lt-member-shell
+        name: LeaderTeam member (shell)
+        plugins:
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+          - id: tool-bash
+            name: '@deepseek-ai/dsh-tool-bash'
+            disabled: !!js process.platform === 'win32'
+          - id: tool-pwsh
+            name: '@deepseek-ai/dsh-tool-pwsh'
+            disabled: !!js process.platform !== 'win32'
+          - id: tool-jobs
+            name: '@deepseek-ai/dsh-tool-jobs'

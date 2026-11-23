@@ -1,0 +1,9 @@
+{
+  "at": "2026-11-08T08:04:18.159Z",
+  "upstreamCommit": "cc481fc070dff5fec57e9d8381f70698f546f59e",
+  "version": "0.82.1-leaderteam.1",
+  "artifact": "packages/dsh-context/dsh-context-0.82.1-leaderteam.1.tgz",
+  "sha256": "ed198b6d71ddb76ac21fef11f317b68a924b4183d8d1b081b5f9fba2d81bcdfb",
+  "hostLogicIdenticalToQualified": true,
+  "lastChange": "client CSS grid span only"
+}
