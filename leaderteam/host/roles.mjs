@@ -17,7 +17,7 @@ import { resolveModelTarget } from '../core/upstream-models.mjs';
 import { readCurrentPlan, currentPlanFile } from '../core/current-plan.mjs';
 import { frontierState, frontierView, frontierNeedsPlanning, frontierHasDispatchableWork } from '../core/frontier.mjs';
 import { formatFrontierContext } from './planning.mjs';
-import { hasAdmissibleFrontierWork, hasAdmissibleNonShellFrontierWork, hasUnfinishedNonShellPlanWork } from './activation.mjs';
+import { hasAdmissibleFrontierWork, hasAdmissibleNonShellFrontierWork, hasUnfinishedNonShellPlanWork, resolveSendMessageTargetId } from './activation.mjs';
 import { createAgentCircuitState, recordToolOutcomeInCircuit, recordTurnEndInCircuit } from '../core/circuit-breaker.mjs';
 import { runCircuitInvestigation } from './investigator.mjs';
 import { isAutonomousGovernance, replayGovernanceState } from '../core/governance-protocol.mjs';
@@ -1037,18 +1037,20 @@ export function onToolResult(exec, result) {
   const caller = exec?.agent && rt.actors.get(exec.agent.id);
   rt = runtimeForTeam(caller?.teamId);
   if (caller?.role === 'leader' && exec?.name === 'send_message' && !result?.isError) {
-    const targetId = exec.arguments?.agent_id;
-    if (typeof targetId === 'string' && caller.teamId && rt.storageRoot) {
+    if (caller.teamId && rt.storageRoot) {
       try {
         const store = teamStore(caller.teamId);
-        const rec = store.getMember(targetId);
-        const liveChild = rt.hostAgents?.get?.(targetId);
-        const childQueuedOrRunning = liveChild
-          ? (liveChild.status !== 'idle' || (liveChild.inbox?.nextTurn?.length ?? 0) > 0 || (liveChild.inbox?.nextStep?.length ?? 0) > 0)
-          : false;
-        if (rec && childQueuedOrRunning) {
-          if (rt.liveProcessMemberIds instanceof Set) rt.liveProcessMemberIds.add(targetId);
-          if (rec.status !== 'running') store.setMemberStatus(targetId, 'running');
+        const targetId = resolveSendMessageTargetId(store, exec.arguments);
+        if (typeof targetId === 'string') {
+          const rec = store.getMember(targetId);
+          const liveChild = rt.hostAgents?.get?.(targetId);
+          const childQueuedOrRunning = liveChild
+            ? (liveChild.status !== 'idle' || (liveChild.inbox?.nextTurn?.length ?? 0) > 0 || (liveChild.inbox?.nextStep?.length ?? 0) > 0)
+            : false;
+          if (rec && childQueuedOrRunning) {
+            if (rt.liveProcessMemberIds instanceof Set) rt.liveProcessMemberIds.add(targetId);
+            if (rec.status !== 'running') store.setMemberStatus(targetId, 'running');
+          }
         }
       } catch {}
     }

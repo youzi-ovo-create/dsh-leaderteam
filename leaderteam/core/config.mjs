@@ -10,6 +10,8 @@ import { DEFAULT_TIMER_CONFIG } from './timer.mjs';
 import { DEFAULT_PLAN_ARCHIVE_CONFIG } from './plan-archive.mjs';
 import { DEFAULT_CIRCUIT_BREAKER_CONFIG } from './circuit-breaker.mjs';
 import { DEFAULT_GOVERNANCE_CONFIG } from './governance-protocol.mjs';
+import { DEFAULT_POWER_MONITOR_CONFIG } from './power-monitor.mjs';
+import { DEFAULT_REQUEST_WINDOW_CONFIG } from './request-window.mjs';
 
 const ROLE_KEYS = ['leader', 'gate', 'discussA', 'discussB', 'arbiter', 'serialReviewer', 'directExec'];
 const FORBIDDEN_UNCONTROLLED = ['team_dispatch', 'team_note', 'team_plan', 'write', 'edit', 'bash', 'pwsh'];
@@ -70,7 +72,7 @@ export function validateConfig(raw) {
   const bool = (v, path) => { if (typeof v !== 'boolean') { p.push(`${path} must be a boolean`); return false; } return true; };
 
   if (!isObj(raw)) throw new LtError('BAD_CONFIG', 'config must be a JSON object');
-  onlyKeys(raw, ['schemaVersion', 'magpie', 'models', 'roles', 'toolPolicy', 'skills', 'profiles', 'gate', 'quota', 'paths', 'team', 'agreement', 'storage', 'scheduler', 'timer', 'planArchive', 'plugins', 'circuitBreaker', 'governance'], '');
+  onlyKeys(raw, ['schemaVersion', 'magpie', 'models', 'roles', 'toolPolicy', 'skills', 'profiles', 'gate', 'quota', 'paths', 'team', 'agreement', 'storage', 'scheduler', 'timer', 'planArchive', 'plugins', 'circuitBreaker', 'governance', 'powerMonitor', 'requestWindow'], '');
   if (raw.schemaVersion !== 1) p.push('schemaVersion must be 1');
   if (!isObj(raw.magpie)) p.push('magpie must be an object');
   else { onlyKeys(raw.magpie, ['provider'], 'magpie'); str(raw.magpie.provider, 'magpie.provider'); }
@@ -404,6 +406,45 @@ export function validateConfig(raw) {
     }
   }
 
+  if (raw.powerMonitor !== undefined) {
+    if (!isObj(raw.powerMonitor)) p.push('powerMonitor must be an object');
+    else {
+      const pm = raw.powerMonitor;
+      onlyKeys(pm, ['enabled', 'pollIntervalMs', 'lowBatteryPct', 'resetBatteryPct'], 'powerMonitor');
+      if (pm.enabled !== undefined) bool(pm.enabled, 'powerMonitor.enabled');
+      if (pm.pollIntervalMs !== undefined) int(pm.pollIntervalMs, 'powerMonitor.pollIntervalMs', 600000, 900000);
+      if (pm.lowBatteryPct !== undefined) int(pm.lowBatteryPct, 'powerMonitor.lowBatteryPct', 5, 50);
+      if (pm.resetBatteryPct !== undefined) int(pm.resetBatteryPct, 'powerMonitor.resetBatteryPct', 10, 90);
+      if (Number.isInteger(pm.lowBatteryPct) && Number.isInteger(pm.resetBatteryPct) && pm.resetBatteryPct <= pm.lowBatteryPct) {
+        p.push('powerMonitor.resetBatteryPct must be greater than powerMonitor.lowBatteryPct');
+      }
+    }
+  }
+
+  if (raw.requestWindow !== undefined) {
+    if (!isObj(raw.requestWindow)) p.push('requestWindow must be an object');
+    else {
+      const rw = raw.requestWindow;
+      onlyKeys(rw, ['enabled', 'windowMs', 'softThrottlePct', 'hardPausePct', 'windowsByProvider'], 'requestWindow');
+      if (rw.enabled !== undefined) bool(rw.enabled, 'requestWindow.enabled');
+      if (rw.windowMs !== undefined) int(rw.windowMs, 'requestWindow.windowMs', 60000, 86400000);
+      if (rw.softThrottlePct !== undefined) num(rw.softThrottlePct, 'requestWindow.softThrottlePct', 1, 80);
+      if (rw.hardPausePct !== undefined) num(rw.hardPausePct, 'requestWindow.hardPausePct', 0, 50);
+      if (rw.windowsByProvider !== undefined) {
+        if (!isObj(rw.windowsByProvider)) p.push('requestWindow.windowsByProvider must be an object');
+        else {
+          for (const [prov, w] of Object.entries(rw.windowsByProvider)) {
+            const wat = `requestWindow.windowsByProvider["${prov}"]`;
+            if (!isObj(w)) { p.push(`${wat} must be an object`); continue; }
+            onlyKeys(w, ['maxRequests', 'windowMs'], wat);
+            int(w.maxRequests, `${wat}.maxRequests`, 1, 1000000);
+            if (w.windowMs !== undefined) int(w.windowMs, `${wat}.windowMs`, 60000, 86400000);
+          }
+        }
+      }
+    }
+  }
+
   if (p.length) throw new LtError('BAD_CONFIG', `invalid leaderteam config:\n- ${p.join('\n- ')}`, { problems: p });
   const cfg = structuredClone(raw);
   cfg.roles.serialReviewer ??= {
@@ -425,6 +466,26 @@ export function validateConfig(raw) {
   cfg.planArchive = { ...DEFAULT_PLAN_ARCHIVE_CONFIG, ...(raw.planArchive ?? {}) };
   cfg.circuitBreaker = { ...DEFAULT_CIRCUIT_BREAKER_CONFIG, ...(raw.circuitBreaker ?? {}) };
   cfg.governance = { ...DEFAULT_GOVERNANCE_CONFIG, ...(raw.governance ?? {}) };
+  cfg.powerMonitor = {
+    enabled: DEFAULT_POWER_MONITOR_CONFIG.enabled,
+    pollIntervalMs: DEFAULT_POWER_MONITOR_CONFIG.pollIntervalMs,
+    lowBatteryPct: DEFAULT_POWER_MONITOR_CONFIG.lowBatteryPct,
+    resetBatteryPct: DEFAULT_POWER_MONITOR_CONFIG.resetBatteryPct,
+    ...(raw.powerMonitor ?? {}),
+  };
+  cfg.requestWindow = {
+    enabled: DEFAULT_REQUEST_WINDOW_CONFIG.enabled,
+    windowMs: DEFAULT_REQUEST_WINDOW_CONFIG.windowMs,
+    softThrottlePct: DEFAULT_REQUEST_WINDOW_CONFIG.softThrottlePct,
+    hardPausePct: DEFAULT_REQUEST_WINDOW_CONFIG.hardPausePct,
+    windowsByProvider: structuredClone(raw.requestWindow?.windowsByProvider ?? {}),
+    ...(raw.requestWindow ? {
+      ...(raw.requestWindow.enabled !== undefined ? { enabled: raw.requestWindow.enabled } : {}),
+      ...(raw.requestWindow.windowMs !== undefined ? { windowMs: raw.requestWindow.windowMs } : {}),
+      ...(raw.requestWindow.softThrottlePct !== undefined ? { softThrottlePct: raw.requestWindow.softThrottlePct } : {}),
+      ...(raw.requestWindow.hardPausePct !== undefined ? { hardPausePct: raw.requestWindow.hardPausePct } : {}),
+    } : {}),
+  };
   cfg.plugins = {
     scheduler: raw.plugins?.scheduler ?? true,
     consensus: raw.plugins?.consensus ?? true,

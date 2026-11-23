@@ -2,6 +2,22 @@
 
 本项目的所有重要版本变更均记录于此文件，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [2.2.0] - 2026-11-23
+
+跨平台一等公民支持、标准 `dsh.bundle` 分发、零网关 Solo-Key 起手与长工程韧性增强版（纯 Node.js ESM，Apache-2.0）：
+
+### Added
+- **标准 `dsh.bundle` 一行安装与零配置自举**：新增根级 [package.json](package.json)、[cordis.patch.yml](cordis.patch.yml)、`icon.svg` 与中英多语言元数据，支持通过 `dsh plugin --profile web|desktop add` 或 `.tgz` 离线包直接安装；未显式传入 `configPath` 时自动在 `<DSH_HOME>/leaderteam/config/` 初始化配置。
+- **Linux 与 Windows 双一等公民支持**：
+  - 重构 [leaderteam/host/host-imports.mjs](leaderteam/host/host-imports.mjs)，同时支持官方 Desktop（`app.asar`）与 Linux / WSL2 / macOS / Windows 下的 `@deepseek-ai/dsh` CLI、`dsh web` 及 `dsh headless` 宿主寻址；
+  - 增强 [leaderteam/core/scheduler.mjs](leaderteam/core/scheduler.mjs) 的 Linux `/proc/meminfo` 与 **`cgroup v2` / `cgroup v1`** 容器内存/CPU 限额识别，防止容器环境误判宿主机内存导致 OOM；
+  - 强化 [leaderteam/core/gate-policy.mjs](leaderteam/core/gate-policy.mjs) 对 Linux `bash` 命令替换、进程替换、符号链接逃逸、重定向、目录逃逸与后台守护进程的确定性前置拦截。
+- **电池感知式安全收尾（Battery-Aware Graceful Shutdown）**：新增纯状态机 `leaderteam/core/power-monitor.mjs` 与零依赖无窗适配层 `leaderteam/host/power-adapter.mjs`。默认每 12 分钟（10~15 分钟可配）静默检测一次电源状态（仅读取是否电池供电与电量百分比，支持 `powerMonitor.enabled: false` 随时关闭）；电池供电 `<= 20%` 时持久化通知领队有序保存检查点收尾（不强杀进程），插电或回升 `>= 25%` 仅重置触发器而不擅自自动恢复已暂停工程，VPS 无电池与 WSL2 未知状态安全静默跳过。
+- **Solo-Key 免网关极简起手（`leaderteam/core/solo-key.mjs`）**：自动识别 `DEEPSEEK_API_KEY`、`DASHSCOPE_API_KEY`、`ZHIPU_API_KEY`、`OPENAI_API_KEY` 等单通道环境变量，无需前置部署本地 Magpie 网关即可生成合规角色配置直跑。
+- **不削弱治理的 5 小时滚动请求窗口守卫（`leaderteam/core/request-window.mjs`）**：严格区分 `local-estimate`（本地估算）与 `provider-confirmed`（上游确认配额，未知保持 `unknown`）；按「抑制非必要探测 → 限制新派发并发 → 可审计检查点暂停」三级节流，**全程严禁静默跳过或削弱既定双审与安全门**。
+- **转化与排障三件套**：新增跨平台 `bin/lt-doctor.mjs`（含未验证宿主离线探测与 Windows `Win32 5` ACL 修复命令提示）、`bin/lt-bugreport.mjs`（严格剥离密钥/路径/用户名的脱敏诊断导出）、`examples/smoke-bugfix/` 微型冒烟示例仓与 `.github/ISSUE_TEMPLATE/`，完成 [README.md](README.md) 三屏重构。
+- **宿主兼容范围扩展**：经实测验证支持官方 DeepSeek Harness `0.2.2-rc.1` 至 `0.2.2-rc.5`（未验证版本严格维持 Fail-Closed 拒绝进入受保护生产运行）。
+
 ## [2.1.1] - 2026-11-23
 
 发布就绪（Release Readiness）文档、契约与 CI 修正（不改变核心治理行为）：

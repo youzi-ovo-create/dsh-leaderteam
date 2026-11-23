@@ -1,6 +1,6 @@
 {
   "name": "@leaderteam/plugin-core",
-  "version": "2.1.1",
+  "version": "2.2.0",
   "private": true,
   "type": "module",
   "description": "LeaderTeam core Cordis plugin: safety gate, actor isolation, capability surface, and modular runtime bus.",

@@ -57,9 +57,20 @@ async function runScenario(name, scenario) {
     calls.push({ ...c, reply });
     if (reply.httpStatus) { res.writeHead(reply.httpStatus, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: { message: 'scripted failure' } })); return; }
     const common = { id: `chatcmpl-${calls.length}`, object: 'chat.completion.chunk', created: 1, model: payload.model };
+    const adaptToolArgs = (toolName, rawArgs) => {
+      if (toolName === 'send_message' && rawArgs && typeof rawArgs === 'object' && 'agent_id' in rawArgs && !('agent' in rawArgs)) {
+        const smDef = (payload.tools ?? []).find(td => (td.function?.name ?? td.name) === 'send_message');
+        const props = smDef?.function?.parameters?.properties ?? smDef?.parameters?.properties;
+        if (props && 'agent' in props && !('agent_id' in props)) {
+          const { agent_id, ...rest } = rawArgs;
+          return { agent: agent_id, ...rest };
+        }
+      }
+      return rawArgs ?? {};
+    };
     const delta = { role: 'assistant' };
-    if (reply.tools) delta.tool_calls = reply.tools.map((tool, index) => ({ index, id: `call-${calls.length}-${index}`, type: 'function', function: { name: tool.tool, arguments: JSON.stringify(tool.args ?? {}) } }));
-    else if (reply.tool) delta.tool_calls = [{ index: 0, id: `call-${calls.length}`, type: 'function', function: { name: reply.tool, arguments: JSON.stringify(reply.args ?? {}) } }];
+    if (reply.tools) delta.tool_calls = reply.tools.map((tool, index) => ({ index, id: `call-${calls.length}-${index}`, type: 'function', function: { name: tool.tool, arguments: JSON.stringify(adaptToolArgs(tool.tool, tool.args)) } }));
+    else if (reply.tool) delta.tool_calls = [{ index: 0, id: `call-${calls.length}`, type: 'function', function: { name: reply.tool, arguments: JSON.stringify(adaptToolArgs(reply.tool, reply.args)) } }];
     else delta.content = typeof reply.content === 'string' ? reply.content : JSON.stringify(reply.json);
     res.writeHead(200, { 'content-type': 'text/event-stream' });
     res.write(`data: ${JSON.stringify({ ...common, choices: [{ index: 0, delta, finish_reason: null }] })}\n\n`);

@@ -1,135 +1,108 @@
-# LeaderTeam for DeepSeek Harness (V2.1)
+# LeaderTeam for DeepSeek Harness (V2.2)
 
-运行在官方 **DeepSeek Harness Desktop `0.2.2-rc.1`**（<https://deepseek.com/harness/>）内的多模型工程协作插件与预设体系。核心插件采用纯 JavaScript ESM 编写（零第三方运行时依赖），复用官方原生子代理机制，以**工程交付与任务可完成性**为首要目标。
+![Version](https://img.shields.io/badge/version-2.2.0-blue)
+![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows%20%7C%20macOS-success)
+![DSH Host](https://img.shields.io/badge/DeepSeek%20Harness-0.2.2--rc.1..rc.5-5b6ee1)
+![Node.js](https://img.shields.io/badge/node-%3E%3D22.15-339933)
+![License](https://img.shields.io/badge/license-Apache--2.0-orange)
 
-- **实跑基准与横向测评**：[V2.1 双项复杂工程实跑测评报告（自举编译器 & 存量生态账本插件）](docs/benchmarks/LeaderTeam_V2.1_双项工程实跑测评报告.md)
-- 日常使用与治理操作：[使用指南](docs/使用指南.md)
-- 配置契约与接口参考：[配置与接口](docs/01-配置与接口.md)
-- 部署、沙箱权限与卸载恢复：[官方 Desktop 部署与恢复](docs/官方Desktop部署与恢复.md)
-- 版本变更记录：[CHANGELOG.md](CHANGELOG.md)
-
----
-
-## 一、环境要求与快速安装
-
-### 1. 运行环境
-
-- **操作系统**：Windows 10/11 x64
-- **宿主客户端**：官方 **DeepSeek Harness Desktop `0.2.2-rc.1`**
-- **Node.js**：
-  - LeaderTeam 核心插件与脚本要求 **`>= 22.15`**（`leaderteam/package.json`）；
-  - 若需自行构建随仓 `extensions/dsh-context` 扩展，要求 **`^22.19.0 || >= 24.0.0`**；
-  - **推荐统一安装 Node.js `22.19+` 或 `24.x`**。
-- **模型网关**：本地回环运行的 OpenAI 兼容聚合网关（如 Magpie，默认 `http://127.0.0.1:3425/v1`）。
-
-### 2. 四步完成安装与首次配置
-
-1. **填写本机路径**（已加入 `.gitignore`，不会入库）：
-   将 `config/official-desktop.paths.example.json` 复制为 `config/official-desktop.paths.json`，填入本机 `app`、`home`、`userData` 与 `workspace` 四个绝对路径。
-2. **自定义模型路由（重要）**：
-   > **提示**：随仓 `config/leaderteam.config.json` 中的 `codex/*`、`zcode/*`、`antigravity/*` 等路由均为**示例网关配置**。请务必按自己的网关与可用模型修改，推荐将 `config/leaderteam.local.example.json` 复制为 `config/leaderteam.local.json` 覆盖，或安装后通过 `node scripts/configure-models.mjs` / DSH 侧栏 **LeaderTeam 控制台**一键探测并切换。
-3. **初始化并安装到 Desktop Profile**：
-   先运行一次 `scripts\start-official-desktop.ps1` 完成官方目录初始化并完全退出（含系统托盘），再执行幂等安装（自动备份原配置）：
-   ```powershell
-   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install-desktop.ps1 -DryRun
-   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install-desktop.ps1
-   ```
-   可选创建桌面快捷方式：
-   ```powershell
-   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\deployment\create-official-shortcut.ps1
-   ```
-4. **启动与一键卸载**：
-   - 日常运行 `scripts\start-official-desktop.ps1`（或桌面快捷方式），新建会话选择 **LeaderTeam** 预设即可工作；点击左侧栏 **LeaderTeam 控制台**图标可实时管理角色模型、执行池、并发上限、工程计时与外部历史计划库（内嵌控制台与 `dsh-context` 用量洞察说明见 [可视化与用量](docs/08-可视化与用量.md)）。
-   - 停用并恢复原生执行器（完全退出 Desktop 后执行）：
-     ```powershell
-     powershell -NoProfile -ExecutionPolicy Bypass -File scripts\uninstall-desktop.ps1
-     ```
+面向 **DeepSeek Harness（Linux & Windows）** 的**分权自治多 Agent 工程治理 + `0ms` 确定性宿主安全门 + `100%` 四桶物理 Token 账本**标准插件体系（纯 Node.js ESM，零第三方运行时依赖）。
 
 ---
 
-## 二、总体架构与权力划分（V2.1）
+## 第一屏：30 秒安装与单 Key 即刻启动（Quick Start）
 
-LeaderTeam V2.1 采用**「领队自主执行、双评审异步监督、独立裁断介入纠偏、安全门最高约束、人工处理最终争议」**的分权治理架构：
+### 1. 一行命令标准安装（`dsh.bundle`）
 
-| 角色 | 核心职责 | 权限定位 |
-|---|---|---|
-| **安全门（Safety Gate）** | 最终调度前安全检查、越界拦截、拒绝违规操作 | **最高安全权限**（任何治理决议不得绕过） |
-| **独立裁断（Arbiter）** | 争议事实核查、与领队正式会商、强制干预纠偏 | **最高自主治理裁决权** |
-| **领队（Leader）** | 滚动规划、技术决策、直接派发、组织施工与验收 | **日常执行指挥权**（无需等待评审审批即可派发） |
-| **双评审（Reviewers A/B）** | 后台异步监督、风险提示、发起裁断提请 | **监督权与提请权**（无直接阻断领队权） |
-| **直属执行模型（Direct Exec）** | 接受领队高频灵活调用，完成局部探测、验证与修复 | **高调用自由度、最低工作区沙箱执行权限** |
-| **普通执行成员（Members）** | 按阶段分工与授权范围独立完成模块研发与测试 | **授权范围内自主执行** |
-| **人工（User）** | 处理自治体系三次同案争议仍无法化解的分歧及外部授权 | **最终人工决策权** |
+要求 **Node.js `>= 22.15`**（若需从源码构建 `extensions/dsh-context` 推荐 `22.19+` 或 `24.x`）与 **DeepSeek Harness `0.2.2-rc.1`..`0.2.2-rc.5`**：
 
-> **核心治理铁律**：仅**安全门**与**独立裁断**拥有直接阻止领队执行或派发的权力；常规施工与后台监督完全并行，零审批阻塞。如需回退传统同步审批流程，可在配置中设置 `governance.mode: "approval"`。
+```bash
+# Linux / macOS / Web CLI Profile 一行安装
+dsh plugin --profile web add dsh-leaderteam
 
----
+# 官方 Desktop Profile 一行安装
+dsh plugin --profile desktop add dsh-leaderteam
 
-## 三、核心工程特性
-
-- **领队自主派发 + 直属执行模型（`team_direct_exec`）**：领队通过 `team_plan` 定义就绪阶段后即可直接调用 `team_dispatch` 派发成员施工，无需同步等待 `plan_id`；局部验证、环境探查或小范围修补可直接调用受沙箱硬锁约束的 `team_direct_exec`，免去繁琐建阶开销。
-- **四阶段异步争议治理与三次异议上调人工**：
-  1. **异步双评审监督**：后台并行审查阶段契约与产出，非一致异议作为顾问建议（`advisory`）无阻塞回注领队。
-  2. **三方内部预议（2/3 多数门槛）**：仅当双评审一致提出强制干预异议，且「双评审 + 独立裁断」达成至少 2/3 多数时才启动正式干预。
-  3. **正式二方会商与即时交接检查点**：会商开启前，在途执行成员先写下精确交接检查点并有序暂停（绑定 `conferenceId` 世代防竞态）；领队与裁断直接交涉，裁断可纠偏、采纳替代方案或推翻原异议，整改指令须经实质验证方可销账。
-  4. **事件-行为-争议链追踪**：按底层工程事件与实际决策行为累计争议次数；同一实质争议第 3 次触发一致异议时，自动暂停并上调人工裁决。
-- **分层确定性安全门与模式缓存**：挂载于 `ToolExecutionPipeline.dispatchToolBody` 最后一环。工作区沙箱内的合规读写与常规构建直接由确定性硬规则放行（`by: "sandbox"`，零大模型调用），跨边界或敏感命令才进入安全门模型复核并支持同类安全模式缓存。
-- **真实模型容量直通与无损截断续接**：自动同步上游模型真实 `contextWindow` 与 `maxTokens`（推理档位与可用输出空间独立管理，移除人为固定上限）；领队与成员单次输出触及 `max-tokens` 时自动保留完整上下文与已成功工具记录原位续接，不判失败、不重复执行已落盘操作。
-- **独立熔断调查员与双层阻塞区分**：仅在持续零进展空转或重复相同报错时触发独立调查 Agent 诊断恢复（区分正常长只读任务与真死循环）；严格区分**局部可解工程阻塞**（自主排障推进到底，减少打断人工）与**全局/边界级硬阻塞**（如会话根沙箱权限缺失、越界路径限制，在完成非受阻工作后确定性停机，二次停机分歧升级裁断并设硬上限，严禁跨目录拷工程等无意义绕行浪费额度）。
-- **资源感知弹性并发与内嵌可视化控制台**：结合用户实时并发上限、CPU/内存/提交空间与上游限流动态调节执行槽位；内置 `leaderteam-panel` 侧栏控制台与 `dsh-context` 扩展，直观展示编队状态、工程计时、历史计划库与真实模型 Token 账本。
-
----
-
-## 四、目录结构
-
-| 路径 | 说明 |
-|---|---|
-| `leaderteam/` | 核心插件源码（纯 Node ESM，零第三方运行时依赖）及 `leaderteam/plugins/*` 六个模块化 Cordis 子插件 |
-| `config/` | 默认示例配置 `leaderteam.config.json`、本机覆盖模板 `leaderteam.local.example.json`、Desktop/Headless YAML 补丁模板 |
-| `extensions/dsh-context/`、`packages/dsh-context/` | 适配团队编队档位徽章与辅助账本统计的 `dsh-context` 扩展源码及打包产物 |
-| `scripts/` | Desktop 安装/卸载、启动器、模型与角色配置 CLI、并发控制、外部计划归档管理与官方客户端更新复验脚本 |
-| `tools/dsh-sandbox-acl/` | Windows 工作区沙箱文件权限诊断与带回滚修复工具 |
-| `test/` | 38 个单元测试文件、安装/备份测试与 45 个官方运行时端到端集成测试场景 |
-| `docs/` | 使用指南、架构总览、配置与接口参考、验收清单、部署维护文档及 `docs/benchmarks/` 工程实跑测评报告 |
-
----
-
-## 五、安全与运行边界说明
-
-- **Fail-Closed 版本与完整性锁定**：启动时精确校验宿主 `@deepseek-ai/dsh-tools` 版本（`0.2.2-rc.1`）与 `dispatchToolBody` 特征；若官方客户端未经验收升级或关键配置损坏，受管环境会直接拒绝启动，绝不在缺失安全门的状态下降级运行（紧急恢复运行 `scripts\uninstall-desktop.ps1`）。
-- **命令行沙箱边界**：文件类工具（`read`/`write`/`edit`/`glob`/`grep`）受词法与 `realpath` 硬边界严格约束；`shell` 档位依赖官方 Windows `workspace-write` 沙箱与安全门审查，处理不可信外部代码时建议优先采用 `readonly` 或 `code` 档位。
-- **领队外部只读授权**：领队访问工作区与配置参考根之外的路径默认拦截，需用户在当前会话显式发送一行 `允许读取 <绝对路径>`（仅本会话对领队只读生效，成员不继承）。
-- **Windows 新目录沙箱权限**：若共享盘或新建目录缺少当前用户的 `WRITE_DAC`/`WRITE_OWNER` 权限导致 `pwsh` 报 `Win32 5`，详见 [官方 Desktop 部署与恢复](docs/官方Desktop部署与恢复.md) 使用 `tools/dsh-sandbox-acl` 一键诊断修复。
-
----
-
-## 六、常用测试与维护命令
-
-```powershell
-# 运行纯逻辑与治理状态机单元测试（零模型调用、不依赖 Desktop）
-node --test test/unit/*.test.mjs
-
-# 运行 Windows 完整测试套件（单元 + 备份 + 安装 + 配置合并 + 官方运行时集成场景）
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run-tests.ps1
-
-# 实时查看或调整执行成员最大并发上限（<= 500ms 热生效，无需重启）
-node scripts/dev/set-max-members.mjs --status
-node scripts/dev/set-max-members.mjs --max 6
-
-# 命令行或本地回环面板管理模型目录、执行池与治理角色
-node scripts/configure-models.mjs --status
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\open-model-config.ps1
-
-# 外部历史计划库检索、复盘与按期清理
-node scripts/plan-archive.mjs --status
-node scripts/plan-archive.mjs --clean --older-than-days 30 --dry-run
-
-# 官方客户端新安装包兼容性预检（独立沙盒副本运行，不改动当前环境）
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\verify-desktop-update.ps1 -Installer <官方安装包.exe>
+# 离线发布包 (.tgz) 安装
+dsh plugin --profile desktop add ./dsh-leaderteam-2.2.0.tgz
 ```
 
+> 仓库源码调试安装与旧版环境备份恢复脚本仍完整保留，详见《[官方 Desktop 部署与恢复](docs/官方Desktop部署与恢复.md)》。
+
+### 2. 单 Key 零网关即刻启动 vs 多网关异构编队
+
+- **Solo-Key 极速模式（零 Magpie、分钟级跑通）**：只需注入单个上游模型 API Key（支持 `DEEPSEEK_API_KEY`、`DASHSCOPE_API_KEY` / `BAILIAN_API_KEY`、`ZHIPU_API_KEY`、`OPENAI_API_KEY`），首次启动会自动在 `<DSH_HOME>/leaderteam/config/leaderteam.config.json` 生成匹配的 Solo-Key 初始配置，新建会话选择 **LeaderTeam** 预设即可开工：
+  ```bash
+  # Linux / macOS
+  export DEEPSEEK_API_KEY="sk-..."
+
+  # Windows PowerShell
+  $env:DEEPSEEK_API_KEY = "sk-..."
+  ```
+- **多网关异构编队模式（进阶生产）**：若您运行本地 OpenAI 兼容聚合网关（如 Magpie）或多厂商订阅路由，可通过 `config/leaderteam.local.json`、`node scripts/configure-models.mjs --serve --open` 或 DSH 侧栏 **LeaderTeam 控制台**为领队、执行池、双评审、独立裁断与安全门分别绑定最优异构模型。
+
 ---
 
-## 七、开源许可
+## 第二屏：诚实选型矩阵（何时用 / 何时不用 LeaderTeam）
 
-本项目采用 [Apache License 2.0](LICENSE) 开源许可，第三方组件署名与修改声明见 [leaderteam/NOTICE](leaderteam/NOTICE)。
+多 Agent 治理并非银弹。在引入 LeaderTeam 前，请按真实工程场景对照选型：
+
+| 对比维度 | 原生 Codex / Claude Code | 官方 `dsh-agent-team` / 轻量插件 | LeaderTeam V2.2 (`dsh-leaderteam`) |
+|---|---|---|---|
+| **最适核心场景** | 日常单仓交互式 CRUD、中小规模功能快速迭代、具备稳定低延迟海外旗舰直连通道 | 在 DSH 内进行轻量级子任务并行扇出，追求极简提示词开销，无需独立监督或强审计 | **异步 / 夜间无人值守的可验证后端与系统工程**，依托国内高性价比主力模型（Qwen / DeepSeek / GLM）攻坚复杂多模块交付 |
+| **协调开销与时效** | **最低**（零多代理协调税，紧凑单流最快；实测自举编译器仅 `24m43s` / `$1.33`） | 低（仅基础子代理派发与汇总） | 中（分权自治已剪除同步审批等待，治理仅占约 `0.39%` Token，但多阶段验收墙钟时间长于顶级单体） |
+| **执行安全边界** | 依赖宿主内置审批与系统沙箱 | 依赖宿主默认工具权限 | **`0ms` 确定性宿主安全门**：挂载于 `dispatchToolBody` 最后一环，沙箱内合规操作 `0ms` 直通，Linux `bash` 重定向/替换逃逸与越界读写硬阻断，失配 **Fail-Closed** |
+| **治理与防死循环** | 单模型自纠错 | 领队单点汇总 | **四阶段分权治理**：领队免审批直派 + `team_direct_exec`、后台异步双评审、2/3 预议 + 独立裁断检查点会商、三次同案争议上调人工 + 独立熔断调查员 |
+| **成本审计与长跑护栏** | 平台侧总量账单 | 会话级基础统计 | **`100%` 四桶物理 Token 账本**（`Input / Cache Read / Cache Write / Output` 去重对账，`null ≠ 0`）、Linux `cgroup v2` 容器弹性并发、**不降级治理的 5h 请求窗口三级节流**与笔记本低电量优雅收尾 |
+
+---
+
+## 第三屏：三阶验证阶梯、运维诊断与实跑基准
+
+推荐按**从零成本到生产分支**的三阶路径渐进验证，无需一上来投入长任务额度：
+
+### 阶梯 1：`¥0` 纯离线单元测试验证（零模型调用、不依赖 Desktop）
+
+克隆仓库后直接验证安全门硬规则、四阶段自治状态机、Linux `cgroup v2` 并发调度、5h 窗口节流与电量状态机：
+
+```bash
+node --test "test/unit/*.test.mjs"
+```
+
+### 阶梯 2：低成本微工程真机冒烟（[`examples/smoke-bugfix/`](examples/smoke-bugfix/README.md)）
+
+随仓附带约 80 行代码的双模块计费缺陷微工程（初始 `2 pass / 2 fail`）及有界配置 `examples/smoke-bugfix/leaderteam.smoke.json`（限制 `directExecMaxSteps: 8`、`maxMembersPerTeam: 4`、`maxActiveMembers: 2`），用于快速打通「领队拆解 → `0ms` 安全门放行 → 修复至 `4/4` 全绿 → 四桶物理账本审计」闭环。
+
+> **体验目标声明**：在 DeepSeek Flash / Chat 错峰时段下，该冒烟工程的**设计体验目标约为 `3–5 分钟`、`~¥0.5–¥1.5`**；实际耗时与费用随模型排队延迟、缓存命中率及服务商定价波动，**不构成固定时间或固定价格承诺**。
+
+### 阶梯 3：生产 Git 分支集成、预检诊断与隐私开关
+
+在生产仓库建议绑定独立 Git 工作分支或 `git worktree` 运行，并配合内置双 CLI 工具进行环境预检与零泄露问题反馈：
+
+```bash
+# 1. 环境与兼容性预检（Node 版本、DSH 0.2.2-rc.1..rc.5 与 pipeline 契约、Linux bash/cgroup v2、Windows Win32 5 沙箱权限、Solo-Key 状态）
+npx lt-doctor
+# 或针对未正式签发的候选客户端目录执行隔离探针（明确区分 VERIFIED / UNVERIFIED_COMPATIBLE_SHAPE / INCOMPATIBLE_PIPELINE）：
+node bin/lt-doctor.mjs --check-host <DSH安装目录或模块目录> --workspace <目标工作区>
+
+# 2. 生成严格脱敏的 GitHub Issue 诊断块（自动抹除全部 API Key、个人路径、主机名与任务原文，仅输出规则计数与四桶 Token 汇总）
+npx lt-bugreport
+node bin/lt-bugreport.mjs --out lt-bugreport.md
+```
+
+- **Windows 新建目录 `Win32 5` 沙箱权限一键排查**：若非系统盘新建工作区缺少当前用户显式 `(F)` / `WRITE_DAC` 权限导致 `pwsh` 报 `SetNamedSecurityInfoW (Win32 5)`，`lt-doctor` 会直接打印即拷即用的 `icacls` 与 [`tools/dsh-sandbox-acl`](tools/dsh-sandbox-acl/SKILL.md) 带备份修复命令。
+- **低电量优雅停机（Battery-Aware Graceful Shutdown）隐私说明与开关**：
+  - 默认开启（`powerMonitor.enabled: true`）：每 **12 分钟**（`720000ms`）以无弹窗静默方式采样一次，**仅读取 `(onBattery, batteryPct)` 两个布尔/数值字段**（绝不读取电池序列号、硬件型号或 OEM 标识；在 Linux VPS、WSL2 与台式机上自动静默跳过）。当电池供电且电量 `<= 20%` 时单次通知领队安全落盘检查点并暂停新派发；插电或恢复至 `>= 25%` 时仅重置检测器闩锁（`autoResumeAllowed: false`，绝不未经用户指令擅自恢复已暂停工程）。
+  - 如需关闭，在 `leaderteam.local.json` 或 `leaderteam.config.json` 中写入即可：
+    ```json
+    {
+      "powerMonitor": { "enabled": false }
+    }
+    ```
+
+### 架构文档与实跑基准报告
+
+- **实跑基准与横向对照**：[V2.1 双项复杂工程实跑测评报告（自举编译器 & 存量生态账本插件）](docs/benchmarks/LeaderTeam_V2.1_双项工程实跑测评报告.md)
+- **核心设计与接口契约**：[架构总览与设计决定](docs/00-总览.md) · [配置与接口参考](docs/01-配置与接口.md) · [按需工具与技能](docs/07-按需工具与技能.md) · [可视化与用量账本](docs/08-可视化与用量.md)
+- **日常操作与客户端维护**：[使用指南](docs/使用指南.md) · [官方 Desktop 部署与恢复](docs/官方Desktop部署与恢复.md) · [官方客户端更新复验](docs/官方Desktop更新复验.md) · [CHANGELOG.md](CHANGELOG.md)
+- **开源许可**：本项目采用 [Apache License 2.0](LICENSE) 许可发布，第三方组件声明见 [leaderteam/NOTICE](leaderteam/NOTICE)。

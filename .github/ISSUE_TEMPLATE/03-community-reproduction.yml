@@ -1,0 +1,50 @@
+name: 社区独立复现与 E1–E4 消融测评提交 (Community Reproduction & Benchmark)
+description: 提交独立工程实跑复现、跨框架横向对照或 E1–E4 治理消融实验数据（含四桶物理 Token 账本）
+title: "[Benchmark]: "
+labels: ["benchmark", "reproduction"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        欢迎提交独立实跑结果（无论是正向复现、性能退化还是失败案例均欢迎公开记录）！为保证统计口径可复核，请附上物理四桶 Token 账本与可验证测试结果。
+
+  - type: dropdown
+    id: experiment_type
+    attributes:
+      label: 测评类别 / 消融组别
+      options:
+        - "端到端复杂工程实跑（Greenfield / Brownfield）"
+        - "E1–E4 架构消融对照（E1 单体直跑 / E2 仅子代理 / E3 同步审批 / E4 V2.2 分权自治）"
+        - "跨框架同题对照（vs Native Codex / Claude Code / Official dsh-agent-team / Swarm）"
+        - "examples/smoke-bugfix 低成本冒烟实测反馈"
+    validations:
+      required: true
+
+  - type: input
+    id: model_matrix
+    attributes:
+      label: 编队角色与模型配置
+      description: 说明领队、执行池、双评审、裁断与安全门所用的模型路由及推理档位
+      placeholder: "例如：Leader=Qwen4-Max, Exec=DeepSeek-V4.1-Flash, Gate/Discuss/Arbiter=DeepSeek-Reasoner"
+    validations:
+      required: true
+
+  - type: textarea
+    id: ledger_and_timing
+    attributes:
+      label: 墙钟耗时与四桶物理 Token 账本
+      description: 粘贴 `npx lt-bugreport` / `node bin/lt-bugreport.mjs` 中的四桶账本（Input / Cache Read / Cache Write / Output）及墙钟/活跃耗时、计价时段说明
+      placeholder: |
+        - 墙钟耗时 / 团队净活跃耗时：
+        - 四桶 Token 汇总（Input / Cache Read / Cache Write / Output / Total）：
+        - 上游服务商与计价时段（官 Key 标准时段 / 错峰优惠 / 订阅计划）：
+    validations:
+      required: true
+
+  - type: textarea
+    id: verification_evidence
+    attributes:
+      label: 交付物验收命令与客观结果
+      description: 说明测试套件通过率、构建结果、主要成功点或暴露的缺陷，以及复现仓库/产物链接（如有）
+    validations:
+      required: true

@@ -34,7 +34,7 @@ import { callRoleJson } from './llm.mjs';
 import { roleRouteChain } from '../core/role-routes.mjs';
 import { runtime, teamStore, recordUsage, syncRuntimeConfig, runtimeForTeam, isPluginActive, refreshUpstreamCatalog, effectiveRuntimeConfig } from './runtime.mjs';
 import { resolveActor, leaderAllowedTools, userTaskText, userMessageTexts, currentTaskSeq, reconcileStaleMembers } from './roles.mjs';
-import { resumeAdmission, withMemberActivation, activationConfig } from './activation.mjs';
+import { resumeAdmission, withMemberActivation, activationConfig, resolveSendMessageTargetId } from './activation.mjs';
 
 const INSTALLED = Symbol.for('leaderteam.finalGate.installed.v1');
 const RECOVERABLE_PROTOCOL_NUDGES = new Set([
@@ -107,7 +107,8 @@ export function installFinalGate(supportedVersions) {
     if (actor.role === 'leader' && name === 'send_message') {
       const rt = runtimeForTeam(actor.teamId), store = teamStore(actor.teamId);
       reconcileStaleMembers(rt, store);
-      try { return await withMemberActivation(rt, store, rt.config, args.agent_id, currentTaskSeq(gate.ctx, actor.teamId), () => original.call(this, exec)); }
+      const targetId = resolveSendMessageTargetId(store, args);
+      try { return await withMemberActivation(rt, store, rt.config, targetId, currentTaskSeq(gate.ctx, actor.teamId), () => original.call(this, exec)); }
       catch (error) { return denied(name, { by: 'rule:member-activation', reason: error.message }); }
     }
     const isShell = Boolean(runtimeForTeam(actor.teamId).config?.gate?.shellTools?.includes(name));
@@ -147,7 +148,8 @@ export class Gate {
       try {
         const store = teamStore(actor.teamId);
         reconcileStaleMembers(rt, store);
-        resumeAdmission(store, activationConfig(rt, store, cfg), args.agent_id, currentTaskSeq(this.ctx, actor.teamId));
+        const targetId = resolveSendMessageTargetId(store, args);
+        resumeAdmission(store, activationConfig(rt, store, cfg), targetId, currentTaskSeq(this.ctx, actor.teamId));
       } catch (error) { return { rule: 'member-activation', reason: error.message }; }
     }
     return undefined;

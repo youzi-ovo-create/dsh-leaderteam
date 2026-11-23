@@ -1,6 +1,8 @@
 // DSH plugin row "leaderteam-core" (profile root): config, safety gate, team roles.
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { loadConfig } from './core/config.mjs';
+import { resolveOrBootstrapConfigPath } from './core/solo-key.mjs';
 import { isPluginActive, runtimeForTeam, runtime, bindRuntimeConfigFile, refreshUpstreamCatalog, effectiveRuntimeConfig } from './host/runtime.mjs';
 import { syncUpstreamModelsToDshSettings } from './core/upstream-models.mjs';
 import { onAgentCreated, onAgentPresetSelected, onAgentDisposed, onAgentStatus, onAgentError, onSessionEvent, onToolResult } from './host/roles.mjs';
@@ -40,13 +42,20 @@ export function apply(ctx, config) {
   if (hostError) throw new Error('leaderteam: host imports unavailable; refusing to start without the safety gate', { cause: hostError });
   const { installFinalGate, Gate, ClosedGate } = hostGate;
   const rt = runtime();
-  const configPath = config?.configPath ?? process.env.LEADERTEAM_CONFIG;
-  if (!configPath) throw new Error('leaderteam-core: config.configPath (or LEADERTEAM_CONFIG) is required');
+  const home = process.env.DSH_HOME ?? ctx.get('profileContext')?.home ?? null;
+  const bundledDefaultConfigPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'config', 'leaderteam.config.json');
+  const resolvedCfg = resolveOrBootstrapConfigPath({
+    explicitConfigPath: config?.configPath ?? null,
+    env: process.env,
+    dshHome: home,
+    bundledDefaultConfigPath,
+  });
+  const configPath = resolvedCfg.configPath;
   bindRuntimeConfigFile(rt, configPath, loadConfig(configPath));
+  rt.bootstrapMode = resolvedCfg.mode;
   rt.cordisCompositionMode = config?.modular === true;
   rt.plugins = { scheduler: null, consensus: null, timerArchive: null, panel: null };
   rt.surface = config?.surface === 'headless' ? 'headless' : 'desktop';
-  const home = process.env.DSH_HOME ?? ctx.get('profileContext')?.home;
   if (!rt.config.storage.root && !home) throw new Error('leaderteam-core: cannot locate DSH_HOME for team storage');
   rt.storageRoot = rt.config.storage.root ?? path.join(home, 'leaderteam');
   rt.llm = ctx.llm;

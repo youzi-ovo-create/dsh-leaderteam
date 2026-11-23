@@ -1,6 +1,6 @@
 {
   "name": "@leaderteam/plugin-consensus",
-  "version": "2.1.1",
+  "version": "2.2.0",
   "private": true,
   "type": "module",
   "description": "Detachable LeaderTeam accountable symmetric review (`discussA`/`discussB`) and arbiter ruling plugin.",

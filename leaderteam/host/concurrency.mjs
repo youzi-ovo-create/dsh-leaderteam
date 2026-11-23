@@ -4,6 +4,7 @@
 // - Synchronous dispatch slot reservations closing async TOCTOU windows
 // - Dynamic per-step systemPrompt.context for running leaders + idle-only followup wakeups when capacity expands
 import fs from 'node:fs';
+import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import * as dshLlm from '@deepseek-ai/dsh-llm';
 import {
@@ -17,6 +18,17 @@ import {
   writeTeamConcurrencyFile,
   resetAllTeamChatOverridesOnDisk,
 } from '../core/scheduler.mjs';
+import {
+  createPowerMonitorState,
+  evaluatePowerSample,
+  acknowledgePowerShutdownNotice,
+  serializePowerState,
+  hydratePowerState,
+} from '../core/power-monitor.mjs';
+import { assessRequestWindow } from '../core/request-window.mjs';
+import { readQuotaStateFile, routeQuota } from '../core/quota.mjs';
+import { routeProvider } from '../core/config.mjs';
+import { readSystemPowerSample } from './power-adapter.mjs';
 import { runtime, teamStore, syncRuntimeConfig, baseRuntime } from './runtime.mjs';
 import { userMessageTexts, currentTaskSeq, reconcileStaleMembers } from './roles.mjs';
 
@@ -208,11 +220,156 @@ export function syncTeamConcurrency(ctx, teamId, rt = runtime()) {
   return { sched, raised, changed: nextTeamMax !== prevTeamMax || ext.changed || Boolean(chatRes?.changed) };
 }
 
+export function evaluateTeamRequestWindow(rt = runtime(), teamId = null, nowMs = Date.now()) {
+  const baseRt = baseRuntime(rt);
+  const cfg = baseRt.config;
+  if (!cfg || !baseRt.storageRoot) return null;
+  const rwCfg = cfg.requestWindow;
+  const leaderRoute = cfg.roles?.leader?.route ?? '';
+  const provider = leaderRoute.includes('/') ? routeProvider(leaderRoute) : (cfg.magpie?.provider ?? null);
+
+  // Collect local call timestamps from `<storageRoot>/teams/*/usage.jsonl` + member creation timestamps
+  const timestampsMs = [];
+  const teamsDir = path.join(baseRt.storageRoot, 'teams');
+  try {
+    if (fs.existsSync(teamsDir)) {
+      for (const tid of fs.readdirSync(teamsDir)) {
+        try {
+          const st = teamStore(tid);
+          for (const u of st.usageRecords()) {
+            const t = typeof u?.at === 'string' ? Date.parse(u.at) : (typeof u?.atMs === 'number' ? u.atMs : NaN);
+            if (Number.isFinite(t)) timestampsMs.push(t);
+          }
+          for (const m of st.members().values()) {
+            const rawAt = m?.at ?? m?.createdAt;
+            const t = typeof rawAt === 'string' ? Date.parse(rawAt) : NaN;
+            if (Number.isFinite(t)) timestampsMs.push(t);
+          }
+        } catch {}
+      }
+    }
+  } catch {}
+
+  let confirmedQuota = null;
+  if (cfg.quota?.stateFile) {
+    const qr = readQuotaStateFile(cfg.quota.stateFile);
+    if (qr.ok && leaderRoute && cfg.models?.[leaderRoute]) {
+      const rq = routeQuota(qr.state, leaderRoute, cfg.models[leaderRoute], cfg.quota, new Date(nowMs));
+      if (rq.status !== 'unknown' && typeof rq.bestRemainingPct === 'number') {
+        confirmedQuota = { remainingPct: rq.bestRemainingPct, status: rq.status, nextResetAt: rq.nextResetAt };
+      }
+    }
+  }
+
+  const sched = baseRt.scheduler ?? null;
+  const recent429Count = Array.isArray(sched?.rateLimitEvents)
+    ? sched.rateLimitEvents.filter(t => nowMs - t <= 300000).length
+    : 0;
+
+  const result = assessRequestWindow({
+    localCallTimestampsMs: timestampsMs,
+    providerConfirmedQuota: confirmedQuota,
+    provider,
+    recent429Count,
+    config: rwCfg,
+    nowMs,
+  });
+
+  if (result.auditRecord && result.tier === 'checkpoint_pause') {
+    const auditFile = path.join(baseRt.storageRoot, 'request-window-audit.jsonl');
+    const lastKey = `${teamId ?? 'global'}:${result.tier}:${result.local_estimated_requests_5h}`;
+    if (baseRt.lastRequestWindowAuditKey !== lastKey) {
+      baseRt.lastRequestWindowAuditKey = lastKey;
+      try {
+        fs.mkdirSync(baseRt.storageRoot, { recursive: true });
+        fs.appendFileSync(auditFile, JSON.stringify({ teamId, ...result.auditRecord }) + '\n', 'utf8');
+      } catch {}
+    }
+  }
+  return result;
+}
+
+export function powerMonitorStatePath(storageRoot) {
+  return path.join(storageRoot, 'power-monitor-state.json');
+}
+
+export function loadPersistedPowerState(storageRoot) {
+  if (!storageRoot) return createPowerMonitorState();
+  const file = powerMonitorStatePath(storageRoot);
+  try {
+    if (!fs.existsSync(file)) return createPowerMonitorState();
+    return hydratePowerState(fs.readFileSync(file, 'utf8'));
+  } catch {
+    return createPowerMonitorState();
+  }
+}
+
+export function savePersistedPowerState(storageRoot, state) {
+  if (!storageRoot) return;
+  const file = powerMonitorStatePath(storageRoot);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = `${file}.tmp-${process.pid}-${Date.now()}`;
+  fs.writeFileSync(tmp, JSON.stringify(serializePowerState(state), null, 2) + '\n', 'utf8');
+  fs.renameSync(tmp, file);
+}
+
+export async function pollAndDeliverPowerMonitor(ctx, rt = runtime(), options = {}) {
+  const baseRt = baseRuntime(rt);
+  if (!baseRt.config || !baseRt.storageRoot) return null;
+  const pmCfg = baseRt.config.powerMonitor;
+  if (!baseRt.powerMonitorState) {
+    baseRt.powerMonitorState = loadPersistedPowerState(baseRt.storageRoot);
+  }
+  const sample = options.sample ?? await readSystemPowerSample({
+    hostPowerReader: options.hostPowerReader ?? baseRt.hostPowerReader,
+  });
+  const nowMs = options.nowMs ?? Date.now();
+  const outcome = evaluatePowerSample(baseRt.powerMonitorState, sample, pmCfg, nowMs);
+  baseRt.powerMonitorState = outcome.state;
+  try { savePersistedPowerState(baseRt.storageRoot, baseRt.powerMonitorState); } catch {}
+
+  if ((outcome.action === 'notify_graceful_shutdown' || outcome.action === 'retry_pending_notice') && outcome.notice) {
+    let anyDelivered = false;
+    for (const actor of baseRt.actors.values()) {
+      if (actor.role !== 'leader') continue;
+      const leaderAgent = actor.agent ?? ctx?.get?.('agents')?.get?.(actor.teamId);
+      if (deliverSchedulerNotice(leaderAgent, outcome.notice)) {
+        anyDelivered = true;
+      }
+    }
+    if (anyDelivered) {
+      acknowledgePowerShutdownNotice(baseRt.powerMonitorState, { ackedAtMs: nowMs, deliveredBy: 'scheduler-followup' });
+      try { savePersistedPowerState(baseRt.storageRoot, baseRt.powerMonitorState); } catch {}
+    }
+  }
+  // CRITICAL: when action === 'rearmed', we NEVER wake/auto-resume paused leaders!
+  return outcome;
+}
+
+function effectiveExternalDispatchCap(rt, teamId) {
+  const baseRt = baseRuntime(rt);
+  if (!baseRt.config || !baseRt.storageRoot) return undefined;
+  if (!baseRt.powerMonitorState) {
+    baseRt.powerMonitorState = loadPersistedPowerState(baseRt.storageRoot);
+  }
+  if (baseRt.config.powerMonitor?.enabled !== false && baseRt.powerMonitorState?.latched) {
+    return 0;
+  }
+  const rw = evaluateTeamRequestWindow(baseRt, teamId);
+  if (rw && typeof rw.maxNewDispatchCap === 'number') {
+    return rw.maxNewDispatchCap;
+  }
+  return undefined;
+}
+
 export function evaluateTeamConcurrency(ctx, teamId, options = {}) {
   const rt = runtime();
   const { sched } = syncTeamConcurrency(ctx, teamId, rt);
   const taskSeq = currentTaskSeq(ctx, teamId);
   const { activeMembers, otherActiveMembers } = collectTeamAndOtherActiveMembers(rt, teamId, sched);
+  const requestWindowMaxCap = options.requestWindowMaxCap !== undefined
+    ? options.requestWindowMaxCap
+    : effectiveExternalDispatchCap(rt, teamId);
   return sched.evaluate({
     teamId,
     taskSeq,
@@ -220,6 +377,7 @@ export function evaluateTeamConcurrency(ctx, teamId, options = {}) {
     otherActiveMembers,
     targetProfile: options.targetProfile ?? null,
     advanceSample: Boolean(options.advanceSample),
+    requestWindowMaxCap,
   });
 }
 
@@ -228,6 +386,7 @@ export function reserveTeamDispatch(ctx, teamId, { id, name, taskSeq, profile, a
   const rt = runtime();
   const { sched } = syncTeamConcurrency(ctx, teamId, rt);
   const { activeMembers, otherActiveMembers } = collectTeamAndOtherActiveMembers(rt, teamId, sched, providedOwnMembers);
+  const requestWindowMaxCap = effectiveExternalDispatchCap(rt, teamId);
   return sched.reserveDispatch({
     id,
     name,
@@ -236,6 +395,7 @@ export function reserveTeamDispatch(ctx, teamId, { id, name, taskSeq, profile, a
     activeMembers,
     otherActiveMembers,
     profile,
+    requestWindowMaxCap,
   });
 }
 
@@ -249,7 +409,26 @@ export function onLeaderTurnCompleted(ctx, teamId) {
   const leaderActor = rt.actors.get(teamId);
   const leaderAgent = leaderActor?.role === 'leader' ? leaderActor.agent : ctx?.get?.('agents')?.get?.(teamId);
   if (leaderAgent?.status === 'idle') {
-    maybeNotifyLeaderScaleUp(ctx, teamId, { userCapRaised: false });
+    const baseRt = baseRuntime(rt);
+    if (!baseRt.powerMonitorState) {
+      baseRt.powerMonitorState = loadPersistedPowerState(baseRt.storageRoot);
+    }
+    if (baseRt.config.powerMonitor?.enabled !== false && baseRt.powerMonitorState?.pendingNotice) {
+      const pct = baseRt.powerMonitorState.lastBatteryPct ?? baseRt.config.powerMonitor.lowBatteryPct;
+      const retryOutcome = evaluatePowerSample(
+        baseRt.powerMonitorState,
+        { status: 'ok', onBattery: true, batteryPct: pct },
+        baseRt.config.powerMonitor,
+      );
+      if (retryOutcome.notice && deliverSchedulerNotice(leaderAgent, retryOutcome.notice)) {
+        acknowledgePowerShutdownNotice(baseRt.powerMonitorState, { ackedAtMs: Date.now(), deliveredBy: 'turn-end-retry' });
+        try { savePersistedPowerState(baseRt.storageRoot, baseRt.powerMonitorState); } catch {}
+        return;
+      }
+    }
+    if (!baseRt.powerMonitorState?.latched) {
+      maybeNotifyLeaderScaleUp(ctx, teamId, { userCapRaised: false });
+    }
   }
 }
 
@@ -257,20 +436,32 @@ export function formatLeaderConcurrencyContext(ctx, teamId) {
   const rt = runtime();
   if (!rt.config || !rt.storageRoot || !teamId) return '';
   try {
+    const baseRt = baseRuntime(rt);
     const snap = evaluateTeamConcurrency(ctx, teamId);
+    const rw = evaluateTeamRequestWindow(baseRt, teamId);
     const c = snap.controls;
     const a = snap.active_execution_members;
     const d = snap.device;
     const p = snap.pipeline;
     const pipeText = p.bottlenecks.length ? `, bottlenecks=[${p.bottlenecks.join(',')}]` : '';
     const globalText = a.global_total > a.total ? `, env_active=${a.global_total}` : '';
-    return [
+    const lines = [
       `LeaderTeam elastic concurrency (execution subagents only; gate/discuss/arbiter excluded):`,
       `- Controls: user_max=${c.user_max_concurrent} (${c.user_max_source}), device_capacity=${c.device_capacity}, leader_max=${c.leader_max_parallel ?? 'auto'}, effective_cap=${c.effective_cap}, wave_available_now=${c.ramp_available_now}, state=${c.scale_state}`,
       `- Active execution members: ${a.total} (readonly=${a.by_profile.readonly}, code=${a.by_profile.code}, shell=${a.by_profile.shell})${globalText}${snap.backlog.pending_parallel_tasks > 0 ? `, registered_pending=${snap.backlog.pending_parallel_tasks}` : ''}`,
       `- Dispatch pressure: ${d.pressure}, hysteresis=${snap.hysteresis.mode}${pipeText}`,
-      `- Action: ${snap.guidance}`,
-    ].join('\n');
+    ];
+    if (rw && rw.enabled !== false) {
+      const confirmedLabel = rw.confirmedSource === 'provider-confirmed'
+        ? `${rw.confirmedRemainingPct !== null ? `${rw.confirmedRemainingPct}%` : 'confirmed'} (provider-confirmed)`
+        : 'unknown';
+      lines.push(`- 5h request window: local_estimated=${rw.local_estimated_requests_5h} (local-estimate), provider_confirmed=${confirmedLabel}, tier=${rw.tier} (governance reviews never skipped)`);
+    }
+    if (baseRt.config.powerMonitor?.enabled !== false && baseRt.powerMonitorState?.latched) {
+      lines.push(`- Battery-aware wind-down ACTIVE (${baseRt.powerMonitorState.lastBatteryPct ?? '<=20'}% on battery): stop new non-essential dispatches, let active members reach safe checkpoints, persist progress & resume entry.`);
+    }
+    lines.push(`- Action: ${snap.guidance}`);
+    return lines.join('\n');
   } catch {
     return '';
   }
@@ -349,8 +540,19 @@ export function startConcurrencyWatchers(ctx) {
   }, sampleMs));
   sampleTimer.unref?.();
 
+  const powerPollMs = Math.max(600000, Math.min(900000, rt.config?.powerMonitor?.pollIntervalMs ?? 720000));
+  let powerTimer = null;
+  if (rt.config?.powerMonitor?.enabled !== false) {
+    powerTimer = runDetached(() => setInterval(() => {
+      if (!rt.startupReady || rt.config?.powerMonitor?.enabled === false) return;
+      void pollAndDeliverPowerMonitor(ctx, rt).catch(() => {});
+    }, powerPollMs));
+    powerTimer.unref?.();
+  }
+
   return () => {
     clearInterval(controlTimer);
     clearInterval(sampleTimer);
+    if (powerTimer) clearInterval(powerTimer);
   };
 }

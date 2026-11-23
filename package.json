@@ -1,0 +1,79 @@
+{
+  "name": "dsh-leaderteam",
+  "version": "2.2.0",
+  "description": "Autonomous multi-agent governance, 0ms deterministic host safety gate, and 4-bucket physical token ledger for DeepSeek Harness (Linux & Windows).",
+  "license": "Apache-2.0",
+  "type": "module",
+  "icon": "icon.svg",
+  "engines": {
+    "node": ">=22.15",
+    "dsh": ">=0.2.2-rc.1 <=0.2.2-rc.5"
+  },
+  "bin": {
+    "lt-doctor": "./bin/lt-doctor.mjs",
+    "lt-bugreport": "./bin/lt-bugreport.mjs"
+  },
+  "main": "./leaderteam/plugins/leaderteam-panel/index.mjs",
+  "exports": {
+    ".": "./leaderteam/plugins/leaderteam-panel/index.mjs",
+    "./client": "./leaderteam/plugins/leaderteam-panel/client.js",
+    "./core": "./leaderteam/entry-core.mjs",
+    "./lead": "./leaderteam/entry-lead.mjs",
+    "./native-executor": "./leaderteam/entry-native-executor.mjs",
+    "./scheduler": "./leaderteam/plugins/leaderteam-scheduler/index.mjs",
+    "./timer-archive": "./leaderteam/plugins/leaderteam-timer-archive/index.mjs",
+    "./consensus": "./leaderteam/plugins/leaderteam-consensus/index.mjs",
+    "./panel": "./leaderteam/plugins/leaderteam-panel/index.mjs",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "files": [
+    "cordis.patch.yml",
+    "icon.svg",
+    "locale/*.json",
+    "bin/*.mjs",
+    "config/*.json",
+    "config/*.yml",
+    "leaderteam/**",
+    "scripts/configure-models.mjs",
+    "scripts/plan-archive.mjs",
+    "scripts/dsh-runtime.mjs",
+    "scripts/dev/set-max-members.mjs",
+    "tools/dsh-sandbox-acl/**",
+    "examples/smoke-bugfix/**",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-sidebar-right"
+      ],
+      "platform": "web"
+    }
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "cordis",
+    "multi-agent",
+    "safety-gate",
+    "token-ledger",
+    "autonomous-agents"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/youzi-ovo-create/dsh-leaderteam.git"
+  },
+  "homepage": "https://github.com/youzi-ovo-create/dsh-leaderteam",
+  "bugs": {
+    "url": "https://github.com/youzi-ovo-create/dsh-leaderteam/issues"
+  }
+}

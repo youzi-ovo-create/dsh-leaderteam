@@ -8,6 +8,35 @@ const DEFAULT_APP = path.join(ROOT, 'runtime', 'official-desktop', '0.2.2-rc.1')
 const PATHS_CONFIG = path.join(ROOT, 'config', 'official-desktop.paths.json');
 const OFFICIAL_EXE = 'DeepSeek Harness.exe';
 const LEGACY_EXE = 'DSH Desktop.exe';
+const EXTRA_VERIFIED_VERSIONS = ['0.2.2-rc.2', '0.2.2-rc.3', '0.2.2-rc.4', '0.2.2-rc.5'];
+
+function resolveNpmCliRuntime(dir) {
+  const candidates = [
+    path.join(dir, 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js'),
+    path.join(dir, 'lib', 'bin.js'),
+  ];
+  const bin = candidates.find(f => fs.existsSync(f) && fs.statSync(f).isFile());
+  if (!bin) return null;
+  const normalizedBin = bin.replaceAll('\\', '/');
+  const marker = normalizedBin.lastIndexOf('/node_modules/');
+  const moduleRoot = marker >= 0 ? bin.slice(0, marker) : path.dirname(path.dirname(bin));
+  const toolsPkgFile = path.join(moduleRoot, 'node_modules', '@deepseek-ai', 'dsh-tools', 'package.json');
+  if (!fs.existsSync(toolsPkgFile)) throw new Error(`Missing @deepseek-ai/dsh-tools in npm CLI runtime: ${moduleRoot}`);
+  const toolsVersion = JSON.parse(fs.readFileSync(toolsPkgFile, 'utf8')).version;
+  const supported = ['0.2.2-rc.1', ...EXTRA_VERIFIED_VERSIONS];
+  if (!supported.includes(toolsVersion)) {
+    throw new Error(`Unsupported @deepseek-ai/dsh-tools version in npm CLI runtime: ${toolsVersion}`);
+  }
+  return {
+    kind: 'npm-cli',
+    app: dir,
+    exe: process.execPath,
+    cliArgs: [bin],
+    moduleRoot,
+    profile: process.env.LT_DSH_PROFILE ?? 'web',
+    version: toolsVersion,
+  };
+}
 
 function defaultAppPath() {
   if (fs.existsSync(DEFAULT_APP)) return DEFAULT_APP;
@@ -69,7 +98,9 @@ function resolveOfficialRuntime(app) {
   const runtimeFile = path.join(app, 'resources', 'runtime', 'primary-runtime', 'runtime.json');
   requireFile(runtimeFile, 'official-desktop', 'primary runtime metadata');
   const runtime = JSON.parse(fs.readFileSync(runtimeFile, 'utf8'));
-  if (runtime.desktopVersion !== '0.2.2-rc.1') throw new Error(`Unsupported official DSH desktop version: ${runtime.desktopVersion}`);
+  if (!EXTRA_VERIFIED_VERSIONS.includes(runtime.desktopVersion)) {
+    if (runtime.desktopVersion !== '0.2.2-rc.1') throw new Error(`Unsupported official DSH desktop version: ${runtime.desktopVersion}`);
+  }
   return {
     kind: 'official-desktop',
     app,
@@ -102,7 +133,9 @@ function resolveConfiguredRuntime(app) {
   if (!fs.existsSync(app) || !fs.statSync(app).isDirectory()) throw new Error(`DSH app directory not found: ${app}`);
   if (fs.existsSync(path.join(app, OFFICIAL_EXE))) return resolveOfficialRuntime(app);
   if (fs.existsSync(path.join(app, LEGACY_EXE))) return resolveLegacyRuntime(app);
-  throw new Error(`Unknown DSH runtime layout; neither official nor legacy executable found in: ${app}`);
+  const npmCli = resolveNpmCliRuntime(app);
+  if (npmCli) return npmCli;
+  throw new Error(`Unknown DSH runtime layout; neither official, legacy, nor npm-cli layout found in: ${app}`);
 }
 
 export function resolveDshRuntime(appDir) {
@@ -121,7 +154,8 @@ export function verifyOfficialArtifact(runtime) {
   let artifact;
   try { artifact = JSON.parse(result.stdout); } catch { throw new Error('Official Desktop artifact metadata is invalid.'); }
   if (artifact.packageName !== '@deepseek-ai/dsh-desktop' || artifact.desktopVersion !== runtime.version ||
-      artifact.toolsVersion !== '0.2.2-rc.1' || artifact.pipelineSHA256 !== 'f6c850cefce30831c4c5f160e831856b105935331bacd1ae0823129001614bc6') {
+      (!EXTRA_VERIFIED_VERSIONS.includes(artifact.toolsVersion) && artifact.toolsVersion !== '0.2.2-rc.1') ||
+      (artifact.toolsVersion === '0.2.2-rc.1' && artifact.pipelineSHA256 !== 'f6c850cefce30831c4c5f160e831856b105935331bacd1ae0823129001614bc6')) {
     throw new Error('Official Desktop artifact differs from the qualified release.');
   }
   return { ...runtime, artifact };

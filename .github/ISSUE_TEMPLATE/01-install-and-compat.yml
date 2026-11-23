@@ -1,0 +1,51 @@
+name: 安装与宿主兼容性问题 (Install & Host Compatibility)
+description: 反馈插件安装、DSH Desktop/CLI 版本兼容、Windows 沙箱权限 (Win32 5) 或 Solo-Key 启动问题
+title: "[Compat]: "
+labels: ["compatibility", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈！为保护您的隐私与密钥安全，请使用内置脱敏工具生成诊断块（自动抹除全部 API Key、个人目录路径、主机名与任务原文）。
+
+  - type: dropdown
+    id: install_channel
+    attributes:
+      label: 安装与运行形态
+      options:
+        - "dsh plugin --profile desktop add dsh-leaderteam (Desktop)"
+        - "dsh plugin --profile web add dsh-leaderteam (Web / Linux CLI)"
+        - "离线 .tgz 包安装"
+        - "仓库源码脚本安装 (install-desktop.ps1 / Solo-Key)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor_output
+    attributes:
+      label: lt-doctor 预检输出
+      description: 请粘贴运行 `npx lt-doctor` 或 `node bin/lt-doctor.mjs` 的输出（请勿手动粘贴未脱敏配置文件）
+      placeholder: |
+        LeaderTeam V2.2 Doctor (...)
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: bugreport_block
+    attributes:
+      label: lt-bugreport 脱敏诊断块
+      description: 请粘贴运行 `npx lt-bugreport` 或 `node bin/lt-bugreport.mjs` 生成的 Markdown 块
+      placeholder: |
+        ### LeaderTeam Redacted Diagnostics (`lt-bugreport`)
+        ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤与报错现象
+      description: 简述触发问题的操作步骤与终端/界面报错信息（请勿粘贴真实密钥或私有业务提示词）
+    validations:
+      required: true

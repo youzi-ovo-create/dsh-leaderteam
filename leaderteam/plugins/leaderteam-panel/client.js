@@ -681,6 +681,8 @@
     globalThis.__LEADERTEAM_PANEL_CLIENT__ = descriptor;
   }
   if (typeof window !== 'undefined' && window && window.__ModuleLoader__ && typeof window.__ModuleLoader__.load === 'function') {
+    window.__ModuleLoader__.load({ id: 'dsh-leaderteam', factory: createLeaderTeamPanelClient });
+    window.__ModuleLoader__.load({ id: 'dsh-leaderteam/client', factory: createLeaderTeamPanelClient });
     window.__ModuleLoader__.load(descriptor);
   }
 })();

@@ -49,6 +49,51 @@ const json = { schema: { type: 'json' }, render: (_a, v) => [{ type: 'text', tex
 const jsonCompact = { schema: { type: 'json' }, render: (_a, v) => [{ type: 'text', text: JSON.stringify(v) }] };
 const strList = (description) => ({ type: 'array', items: { type: 'string' }, description });
 
+async function startSubagentCompat(subagents, {
+  provider,
+  childId,
+  name,
+  label,
+  delivery,
+  signal,
+  prompt,
+  parent,
+  agentPreset,
+  agentOptions,
+}) {
+  const isFlatSpec = typeof subagents?.resolveName === 'function' || typeof subagents?.waitForTreeWork === 'function';
+  if (!isFlatSpec) {
+    return subagents.startActivation({
+      provider,
+      childId,
+      label,
+      delivery,
+      signal,
+      request: { prompt, parent, agentPreset, agentOptions },
+    });
+  }
+  const validName = typeof name === 'string' && /^[a-z][a-z0-9-]{0,31}$/.test(name) && name !== 'lead' ? name : undefined;
+  const baseSpec = {
+    provider,
+    childId,
+    label,
+    delivery,
+    signal,
+    prompt,
+    parent,
+    agentPreset,
+    agentOptions,
+  };
+  if (validName && delivery === 'parent') {
+    try {
+      return await subagents.startActivation({ ...baseSpec, name: validName });
+    } catch (err) {
+      if (err?.code !== 'DUPLICATE_AGENT_NAME' && err?.code !== 'INVALID_AGENT_NAME') throw err;
+    }
+  }
+  return subagents.startActivation(baseSpec);
+}
+
 function compactConcurrency(snap) {
   return {
     user_max_concurrent: snap.controls.user_max_concurrent,
@@ -727,9 +772,17 @@ export function registerTeamTools(ctx) {
         store.addMember(member);
         addedToStore = true;
         const target = resolveModelTarget(cfg, modelRoute, args.effort);
-        const started = await ctx.subagents.startActivation({
-          provider: 'spawn', childId, label: args.name, delivery: 'parent', signal: exec.signal,
-          request: { prompt: [{ type: 'text', text: memberInitialPrompt(member, cfg.paths.protectedDirs) }], parent: exec.agent, agentPreset: profile.preset, agentOptions: target },
+        const started = await startSubagentCompat(ctx.subagents, {
+          provider: 'spawn',
+          childId,
+          name: args.name,
+          label: args.name,
+          delivery: 'parent',
+          signal: exec.signal,
+          prompt: [{ type: 'text', text: memberInitialPrompt(member, cfg.paths.protectedDirs) }],
+          parent: exec.agent,
+          agentPreset: profile.preset,
+          agentOptions: target,
         });
         if (store.getMember(childId)?.status === 'starting') store.setMemberStatus(childId, 'started');
         if (boundPlanId) {
@@ -894,18 +947,16 @@ export function registerTeamTools(ctx) {
       let started = null;
       try {
         const target = resolveModelTarget(cfg, chosen.route, chosenEffort);
-        started = await ctx.subagents.startActivation({
+        started = await startSubagentCompat(ctx.subagents, {
           provider: 'spawn',
           childId,
           label: directName,
           delivery: 'caller',
           signal: exec.signal,
-          request: {
-            prompt: [{ type: 'text', text: directExecInitialPrompt() }],
-            parent: exec.agent,
-            agentPreset: profile.preset,
-            agentOptions: target,
-          },
+          prompt: [{ type: 'text', text: directExecInitialPrompt() }],
+          parent: exec.agent,
+          agentPreset: profile.preset,
+          agentOptions: target,
         });
         if (store.getMember(childId)?.status === 'starting') store.setMemberStatus(childId, 'started');
         const settled = await started.result;

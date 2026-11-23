@@ -1,0 +1,194 @@
+{
+  "schemaVersion": 1,
+  "magpie": {
+    "provider": "deepseek"
+  },
+  "models": {
+    "deepseek/deepseek-reasoner": {
+      "provider": "deepseek",
+      "upstreamModel": "deepseek-reasoner",
+      "family": "deepseek",
+      "label": "DeepSeek Reasoner (Solo-Key Smoke)",
+      "vision": false,
+      "efforts": ["low", "medium", "high"],
+      "defaultEffort": "medium",
+      "strengths": "领队契约规划、安全门跨界复核与独立裁断"
+    },
+    "deepseek/deepseek-chat": {
+      "provider": "deepseek",
+      "upstreamModel": "deepseek-chat",
+      "family": "deepseek",
+      "label": "DeepSeek Chat / Flash (Solo-Key Smoke)",
+      "vision": false,
+      "efforts": ["none", "low", "medium"],
+      "defaultEffort": "none",
+      "strengths": "低成本快速探测、模块修复与单测验证"
+    }
+  },
+  "roles": {
+    "leader": {
+      "route": "deepseek/deepseek-reasoner",
+      "effort": "medium"
+    },
+    "gate": {
+      "route": "deepseek/deepseek-chat",
+      "effort": "none",
+      "maxTokens": 2048,
+      "timeoutMs": 60000,
+      "retries": 1
+    },
+    "discussA": {
+      "route": "deepseek/deepseek-chat",
+      "effort": "none",
+      "maxTokens": 4096,
+      "timeoutMs": 120000,
+      "retries": 1
+    },
+    "discussB": {
+      "route": "deepseek/deepseek-reasoner",
+      "effort": "low",
+      "maxTokens": 4096,
+      "timeoutMs": 120000,
+      "retries": 1
+    },
+    "arbiter": {
+      "route": "deepseek/deepseek-reasoner",
+      "effort": "medium",
+      "maxTokens": 8192,
+      "timeoutMs": 180000,
+      "retries": 1
+    },
+    "directExec": {
+      "route": "deepseek/deepseek-chat",
+      "effort": "none",
+      "timeoutMs": 90000,
+      "retries": 1
+    }
+  },
+  "profiles": {
+    "leader": {
+      "preset": "leaderteam",
+      "tools": [
+        "read",
+        "glob",
+        "grep",
+        "todo_write",
+        "list_agents",
+        "send_message",
+        "interrupt_agent",
+        "team_models",
+        "team_plan",
+        "team_concurrency",
+        "team_dispatch",
+        "team_direct_exec",
+        "team_conference",
+        "team_discuss",
+        "team_note",
+        "team_status",
+        "team_tools",
+        "team_skills"
+      ]
+    },
+    "readonly": {
+      "preset": "lt-member-readonly",
+      "mutating": false,
+      "description": "只读分析与验证报告",
+      "tools": ["read", "glob", "grep", "todo_write", "team_tools", "team_skills"]
+    },
+    "code": {
+      "preset": "lt-member-code",
+      "mutating": true,
+      "description": "授权范围内修改代码",
+      "tools": ["read", "glob", "grep", "todo_write", "write", "edit", "team_tools", "team_skills"]
+    },
+    "shell": {
+      "preset": "lt-member-shell",
+      "mutating": true,
+      "description": "代码修复与运行 node --test",
+      "tools": ["read", "glob", "grep", "todo_write", "write", "edit", "pwsh", "bash", "team_tools", "team_skills"]
+    }
+  },
+  "gate": {
+    "scope": "team",
+    "sandboxDirectAllow": true,
+    "enablePatternCache": true,
+    "ruleOnlyTools": ["team_note", "team_plan", "team_conference"],
+    "maxReviewsPerMember": 40,
+    "maxReviewsPerTask": 120,
+    "maxConsecutiveGateErrors": 3,
+    "gateErrorCooldownMs": 30000,
+    "uncontrolledTools": [
+      "read",
+      "glob",
+      "grep",
+      "todo_write",
+      "list_agents",
+      "send_message",
+      "interrupt_agent",
+      "team_models",
+      "team_concurrency",
+      "team_status",
+      "team_discuss",
+      "team_tools",
+      "team_skills"
+    ],
+    "pathArgs": {
+      "write": ["file_path"],
+      "edit": ["file_path"],
+      "team_note": ["path"]
+    },
+    "shellTools": ["pwsh", "bash"],
+    "mutatingTools": ["write", "edit", "pwsh", "bash"],
+    "requireReadBeforeWrite": true,
+    "maxArgChars": 12000,
+    "maxAuthorizationChars": 6000
+  },
+  "quota": {
+    "stateFile": null,
+    "maxSnapshotAgeSec": 300,
+    "exhaustedBelowPct": 3,
+    "lowBelowPct": 15,
+    "allowUnknown": true,
+    "allowUnknownGpt": true,
+    "gptReservePct": 0
+  },
+  "paths": {
+    "globalRefRoots": [],
+    "projectRefsDir": ".leaderteam/refs",
+    "protectedDirs": [".leaderteam", ".git", ".agents", "AGENTS.md"],
+    "leaderReadRoots": []
+  },
+  "team": {
+    "executionPool": ["deepseek/deepseek-chat", "deepseek/deepseek-reasoner"],
+    "maxMembersPerTeam": 4,
+    "maxActiveMembers": 2,
+    "requirePlanAgreement": true,
+    "rollingPlanning": true,
+    "planExemptProfiles": ["readonly"],
+    "maxPlanAgreements": 2,
+    "maxRefsPerMember": 8,
+    "leaderModelPolicy": "warn",
+    "autoIncludeUpstreamModels": true
+  },
+  "agreement": {
+    "maxRounds": 2,
+    "maxProposalChars": 20000,
+    "maxEvidenceChars": 100000,
+    "maxEvidenceFiles": 16,
+    "evidenceFileMaxBytes": 100000,
+    "maxArbiterAttempts": 1
+  },
+  "storage": {
+    "root": null
+  },
+  "governance": {
+    "mode": "autonomous",
+    "caucusQuorumNumerator": 2,
+    "caucusQuorumDenominator": 3,
+    "maxInternalArbitrationRounds": 1,
+    "maxConferenceDialogueTurns": 1,
+    "autoSuperviseStages": true,
+    "autoSuperviseDispatches": true,
+    "directExecMaxSteps": 8
+  }
+}

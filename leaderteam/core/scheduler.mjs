@@ -341,9 +341,368 @@ function readCpuTotals(cpus = os.cpus()) {
   return { count: Math.max(1, cpus?.length || 1), idle, total };
 }
 
+const CGROUP_UNLIMITED_SENTINEL = 1n << 52n; // 4 PiB: filters Linux PAGE_COUNTER_MAX (~9.22e18) sentinels
+
+function readTextSafe(fsImpl, filePath) {
+  try {
+    return String(fsImpl.readFileSync(filePath, 'utf8')).trim();
+  } catch {
+    return null;
+  }
+}
+
+function parseCgroupByteValue(raw, { allowUnlimited = true } = {}) {
+  if (raw === null || raw === '') return null;
+  const tok = raw.split(/\s+/)[0];
+  if (!tok) return null;
+  if (allowUnlimited && tok === 'max') return null;
+  if (!/^-?\d+$/.test(tok)) return null;
+  let big;
+  try { big = BigInt(tok); } catch { return null; }
+  if (big < 0n) return null;
+  if (allowUnlimited && (big === 0n || big >= CGROUP_UNLIMITED_SENTINEL)) return null;
+  return Number(big);
+}
+
+function readFirstAvailable(fsImpl, dirs, filename) {
+  for (const dir of dirs) {
+    if (!dir) continue;
+    const val = readTextSafe(fsImpl, path.join(dir, filename));
+    if (val !== null) return val;
+  }
+  return null;
+}
+
+function discoverSelfCgroupSubpaths(fsImpl) {
+  const raw = readTextSafe(fsImpl, '/proc/self/cgroup');
+  if (!raw) return { v2: null, v1Mem: null, v1Cpu: null };
+  let v2 = null, v1Mem = null, v1Cpu = null;
+  for (const line of raw.split(/\r?\n/)) {
+    const parts = line.split(':');
+    if (parts.length < 3) continue;
+    const controllers = parts[1];
+    const rel = parts.slice(2).join(':').replace(/^\/+/, '');
+    if (!rel) continue;
+    if (parts[0] === '0' && controllers === '') {
+      v2 = rel;
+    } else {
+      const list = controllers.split(',');
+      if (list.includes('memory')) v1Mem = rel;
+      if (list.includes('cpu')) v1Cpu = rel;
+    }
+  }
+  return { v2, v1Mem, v1Cpu };
+}
+
+/**
+ * Read Linux container limits supporting **cgroup v2** (`memory.max`, `memory.current`, `cpu.max`)
+ * and **cgroup v1 fallback** (`memory/memory.limit_in_bytes`, `memory/memory.usage_in_bytes`,
+ * `cpu/cpu.cfs_quota_us` + `cpu.cfs_period_us`). Zero subprocesses; never throws.
+ */
+export function readLinuxCgroupLimits(fsImpl = fs, cgroupRoot = '/sys/fs/cgroup') {
+  const empty = {
+    version: null,
+    memoryLimitBytes: null,
+    memoryUsageBytes: null,
+    memoryLimitMib: null,
+    memoryUsageMib: null,
+    memoryRemainingMib: null,
+    swapLimitMib: null,
+    swapUsageMib: null,
+    cpuQuotaCores: null,
+  };
+  if (!fsImpl || typeof cgroupRoot !== 'string' || !cgroupRoot) return empty;
+
+  const selfPaths = cgroupRoot === '/sys/fs/cgroup'
+    ? discoverSelfCgroupSubpaths(fsImpl)
+    : { v2: null, v1Mem: null, v1Cpu: null };
+
+  const v2Dirs = [
+    ...(selfPaths.v2 ? [path.join(cgroupRoot, selfPaths.v2)] : []),
+    cgroupRoot,
+  ];
+
+  const rawV2MemMax = readFirstAvailable(fsImpl, v2Dirs, 'memory.max');
+  const rawV2MemCur = readFirstAvailable(fsImpl, v2Dirs, 'memory.current');
+  const rawV2CpuMax = readFirstAvailable(fsImpl, v2Dirs, 'cpu.max');
+
+  const toMib = b => (b === null ? null : Math.max(0, Math.round(b / (1024 * 1024))));
+
+  if (rawV2MemMax !== null || rawV2MemCur !== null || rawV2CpuMax !== null) {
+    const memoryLimitBytes = parseCgroupByteValue(rawV2MemMax, { allowUnlimited: true });
+    const memoryUsageBytes = parseCgroupByteValue(rawV2MemCur, { allowUnlimited: false });
+    const rawSwapMax = readFirstAvailable(fsImpl, v2Dirs, 'memory.swap.max');
+    const rawSwapCur = readFirstAvailable(fsImpl, v2Dirs, 'memory.swap.current');
+    const swapLimitBytes = rawSwapMax === '0' ? 0 : parseCgroupByteValue(rawSwapMax, { allowUnlimited: true });
+    const swapUsageBytes = parseCgroupByteValue(rawSwapCur, { allowUnlimited: false });
+
+    let cpuQuotaCores = null;
+    if (rawV2CpuMax !== null) {
+      const [quotaTok, periodTok] = rawV2CpuMax.split(/\s+/);
+      if (quotaTok && quotaTok !== 'max') {
+        const quota = Number(quotaTok);
+        const period = Number(periodTok || 100000);
+        if (Number.isFinite(quota) && quota > 0 && Number.isFinite(period) && period > 0) {
+          cpuQuotaCores = Math.round((quota / period) * 1000) / 1000;
+        }
+      }
+    }
+
+    const memoryLimitMib = toMib(memoryLimitBytes);
+    const memoryUsageMib = toMib(memoryUsageBytes);
+    const memoryRemainingMib = memoryLimitBytes !== null
+      ? Math.max(0, Math.round((memoryLimitBytes - (memoryUsageBytes ?? 0)) / (1024 * 1024)))
+      : null;
+
+    return {
+      version: 2,
+      memoryLimitBytes,
+      memoryUsageBytes,
+      memoryLimitMib,
+      memoryUsageMib,
+      memoryRemainingMib,
+      swapLimitMib: toMib(swapLimitBytes),
+      swapUsageMib: toMib(swapUsageBytes),
+      cpuQuotaCores,
+    };
+  }
+
+  // cgroup v1 fallback
+  const v1MemDirs = [
+    ...(selfPaths.v1Mem ? [path.join(cgroupRoot, 'memory', selfPaths.v1Mem)] : []),
+    path.join(cgroupRoot, 'memory'),
+    cgroupRoot,
+  ];
+  const v1CpuDirs = [
+    ...(selfPaths.v1Cpu ? [path.join(cgroupRoot, 'cpu', selfPaths.v1Cpu)] : []),
+    path.join(cgroupRoot, 'cpu'),
+    path.join(cgroupRoot, 'cpu,cpuacct'),
+    cgroupRoot,
+  ];
+
+  const rawV1Lim = readFirstAvailable(fsImpl, v1MemDirs, 'memory.limit_in_bytes');
+  const rawV1Use = readFirstAvailable(fsImpl, v1MemDirs, 'memory.usage_in_bytes');
+  const rawV1Quota = readFirstAvailable(fsImpl, v1CpuDirs, 'cpu.cfs_quota_us');
+  const rawV1Period = readFirstAvailable(fsImpl, v1CpuDirs, 'cpu.cfs_period_us');
+
+  if (rawV1Lim === null && rawV1Use === null && rawV1Quota === null) {
+    return empty;
+  }
+
+  const memoryLimitBytes = parseCgroupByteValue(rawV1Lim, { allowUnlimited: true });
+  const memoryUsageBytes = parseCgroupByteValue(rawV1Use, { allowUnlimited: false });
+  let cpuQuotaCores = null;
+  if (rawV1Quota !== null) {
+    const quota = Number(rawV1Quota);
+    const period = Number(rawV1Period || 100000);
+    if (Number.isFinite(quota) && quota > 0 && Number.isFinite(period) && period > 0) {
+      cpuQuotaCores = Math.round((quota / period) * 1000) / 1000;
+    }
+  }
+
+  const memoryLimitMib = toMib(memoryLimitBytes);
+  const memoryUsageMib = toMib(memoryUsageBytes);
+  const memoryRemainingMib = memoryLimitBytes !== null
+    ? Math.max(0, Math.round((memoryLimitBytes - (memoryUsageBytes ?? 0)) / (1024 * 1024)))
+    : null;
+
+  return {
+    version: 1,
+    memoryLimitBytes,
+    memoryUsageBytes,
+    memoryLimitMib,
+    memoryUsageMib,
+    memoryRemainingMib,
+    swapLimitMib: null,
+    swapUsageMib: null,
+    cpuQuotaCores,
+  };
+}
+
+/**
+ * Parse Linux `/proc/meminfo` (`MemAvailable`, `MemTotal`, `CommitLimit`, `Committed_AS`, `SwapFree`).
+ * Zero subprocesses; returns `null` when unavailable.
+ */
+export function readLinuxProcMeminfo(fsImpl = fs, meminfoPath = '/proc/meminfo') {
+  if (!fsImpl || typeof meminfoPath !== 'string' || !meminfoPath) return null;
+  const text = readTextSafe(fsImpl, meminfoPath);
+  if (!text) return null;
+
+  const kibMap = new Map();
+  for (const line of text.split(/\r?\n/)) {
+    const m = /^([A-Za-z0-9_()]+):\s*(\d+)/.exec(line);
+    if (!m) continue;
+    const val = Number.parseInt(m[2], 10);
+    if (Number.isFinite(val) && val >= 0) kibMap.set(m[1], val);
+  }
+
+  const memTotalKib = kibMap.get('MemTotal') ?? null;
+  const memFreeKib = kibMap.get('MemFree') ?? null;
+  const buffersKib = kibMap.get('Buffers') ?? 0;
+  const cachedKib = kibMap.get('Cached') ?? 0;
+  const memAvailableKib = kibMap.get('MemAvailable')
+    ?? (memFreeKib !== null ? memFreeKib + buffersKib + cachedKib : null);
+  const commitLimitKib = kibMap.get('CommitLimit') ?? null;
+  const committedAsKib = kibMap.get('Committed_AS') ?? null;
+  const swapFreeKib = kibMap.get('SwapFree') ?? null;
+
+  if (memTotalKib === null && memAvailableKib === null) return null;
+
+  const kibToMib = k => (k === null ? null : Math.round(k / 1024));
+  const memTotalMib = kibToMib(memTotalKib);
+  const memAvailableMib = kibToMib(memAvailableKib);
+  const commitLimitMib = kibToMib(commitLimitKib);
+  const committedAsMib = kibToMib(committedAsKib);
+  const swapFreeMib = kibToMib(swapFreeKib);
+  const availCommitKib = (commitLimitKib !== null && committedAsKib !== null)
+    ? Math.max(0, commitLimitKib - committedAsKib)
+    : null;
+  const availCommitMib = kibToMib(availCommitKib);
+  const commitUsedPct = (commitLimitKib !== null && commitLimitKib > 0 && committedAsKib !== null)
+    ? Math.round((committedAsKib / commitLimitKib) * 1000) / 10
+    : null;
+
+  return {
+    MemTotal: memTotalKib,
+    MemAvailable: memAvailableKib,
+    CommitLimit: commitLimitKib,
+    Committed_AS: committedAsKib,
+    SwapFree: swapFreeKib,
+    memTotalMib,
+    memAvailableMib,
+    totalPhysMib: memTotalMib,
+    availPhysMib: memAvailableMib,
+    commitLimitMib,
+    committedAsMib,
+    swapFreeMib,
+    totalCommitMib: commitLimitMib,
+    availCommitMib,
+    commitUsedPct,
+  };
+}
+
+/**
+ * Sample host + container device resources across Windows, Linux (including cgroup v2/v1 containers), and macOS.
+ * On Linux, caps effective physical & commit headroom by cgroup limits so a 1GiB/2GiB container on a 64GiB host
+ * never mistakes host RAM for container-available RAM.
+ */
+export function sampleDeviceResources(options = {}) {
+  const ts = typeof options.nowMs === 'number' ? options.nowMs : (typeof options.now === 'function' ? options.now() : Date.now());
+  const platform = options.platform ?? process.platform;
+  const fsImpl = options.fs ?? fs;
+  const osImpl = options.os ?? os;
+  const mib = b => Math.round(b / (1024 * 1024));
+  const hostRssMib = typeof options.hostRssMib === 'number' ? options.hostRssMib : mib(process.memoryUsage().rss);
+  const hostLogicalCores = typeof options.logicalCores === 'number' && options.logicalCores >= 1
+    ? options.logicalCores
+    : Math.max(1, osImpl.cpus?.()?.length || 1);
+  const cpuBusyPct = typeof options.cpuBusyPct === 'number' ? Math.max(0, Math.min(100, options.cpuBusyPct)) : 0;
+  const cpuSmoothedPct = typeof options.cpuSmoothedPct === 'number'
+    ? Math.max(0, Math.min(100, options.cpuSmoothedPct))
+    : cpuBusyPct;
+
+  const useLinux = platform === 'linux'
+    || typeof options.linuxMeminfoReader === 'function'
+    || typeof options.linuxCgroupReader === 'function'
+    || options.cgroupRoot !== undefined
+    || options.meminfoPath !== undefined;
+
+  if (useLinux) {
+    const meminfo = typeof options.linuxMeminfoReader === 'function'
+      ? options.linuxMeminfoReader()
+      : readLinuxProcMeminfo(fsImpl, options.meminfoPath ?? '/proc/meminfo');
+    const cgroup = typeof options.linuxCgroupReader === 'function'
+      ? options.linuxCgroupReader()
+      : readLinuxCgroupLimits(fsImpl, options.cgroupRoot ?? '/sys/fs/cgroup');
+
+    const hostTotalPhysMib = meminfo?.totalPhysMib ?? mib(osImpl.totalmem());
+    const hostMemAvailableMib = meminfo?.availPhysMib ?? mib(osImpl.freemem());
+
+    const hasCgroupMemLimit = typeof cgroup?.memoryLimitMib === 'number' && Number.isFinite(cgroup.memoryLimitMib) && cgroup.memoryLimitMib > 0;
+    const cgroupRemainingMib = hasCgroupMemLimit
+      ? (typeof cgroup.memoryRemainingMib === 'number' ? cgroup.memoryRemainingMib : Math.max(0, cgroup.memoryLimitMib - hostRssMib))
+      : null;
+
+    const totalPhysMib = hasCgroupMemLimit
+      ? Math.min(hostTotalPhysMib, cgroup.memoryLimitMib)
+      : hostTotalPhysMib;
+    const availPhysMib = hasCgroupMemLimit
+      ? Math.min(hostMemAvailableMib, cgroupRemainingMib)
+      : hostMemAvailableMib;
+    const physUsedPct = totalPhysMib > 0
+      ? Math.round(((totalPhysMib - availPhysMib) / totalPhysMib) * 1000) / 10
+      : 0;
+
+    const hostTotalCommitMib = meminfo?.totalCommitMib ?? null;
+    const hostAvailCommitMib = meminfo?.availCommitMib ?? null;
+
+    let totalCommitMib = hostTotalCommitMib;
+    let availCommitMib = hostAvailCommitMib;
+    if (hasCgroupMemLimit) {
+      const swapLim = typeof cgroup.swapLimitMib === 'number' ? cgroup.swapLimitMib : 0;
+      const swapRem = typeof cgroup.swapLimitMib === 'number'
+        ? Math.max(0, cgroup.swapLimitMib - (cgroup.swapUsageMib ?? 0))
+        : 0;
+      const cgroupCommitTotal = cgroup.memoryLimitMib + swapLim;
+      const cgroupCommitAvail = cgroupRemainingMib + swapRem;
+      totalCommitMib = hostTotalCommitMib !== null ? Math.min(hostTotalCommitMib, cgroupCommitTotal) : cgroupCommitTotal;
+      availCommitMib = hostAvailCommitMib !== null ? Math.min(hostAvailCommitMib, cgroupCommitAvail) : cgroupCommitAvail;
+    }
+
+    const commitUsedPct = (totalCommitMib !== null && totalCommitMib > 0 && availCommitMib !== null)
+      ? Math.round(((totalCommitMib - availCommitMib) / totalCommitMib) * 1000) / 10
+      : (meminfo?.commitUsedPct ?? null);
+
+    const cgroupCpuQuotaCores = typeof cgroup?.cpuQuotaCores === 'number' && cgroup.cpuQuotaCores > 0
+      ? cgroup.cpuQuotaCores
+      : null;
+    const logicalCores = cgroupCpuQuotaCores !== null
+      ? Math.max(1, Math.min(hostLogicalCores, Math.ceil(cgroupCpuQuotaCores)))
+      : hostLogicalCores;
+
+    return {
+      sampledAtMs: ts,
+      logicalCores,
+      cgroupCpuQuotaCores,
+      cpuBusyPct: Math.round(cpuBusyPct * 10) / 10,
+      cpuSmoothedPct: Math.round(cpuSmoothedPct * 10) / 10,
+      totalPhysMib,
+      availPhysMib,
+      physUsedPct,
+      totalCommitMib,
+      availCommitMib,
+      commitUsedPct,
+      hostRssMib,
+      cgroupVersion: cgroup?.version ?? null,
+      cgroupMemoryLimitMib: hasCgroupMemLimit ? cgroup.memoryLimitMib : null,
+      cgroupMemoryRemainingMib: cgroupRemainingMib,
+    };
+  }
+
+  const winMem = (typeof options.win32MemReader === 'function' ? options.win32MemReader() : getWin32MemoryReader()?.()) ?? null;
+  const totalPhysMib = winMem?.totalPhysMib ?? mib(osImpl.totalmem());
+  const availPhysMib = winMem?.availPhysMib ?? mib(osImpl.freemem());
+  const physUsedPct = winMem?.osMemoryLoadPct
+    ?? (totalPhysMib > 0 ? Math.round(((totalPhysMib - availPhysMib) / totalPhysMib) * 1000) / 10 : 0);
+
+  return {
+    sampledAtMs: ts,
+    logicalCores: hostLogicalCores,
+    cpuBusyPct: Math.round(cpuBusyPct * 10) / 10,
+    cpuSmoothedPct: Math.round(cpuSmoothedPct * 10) / 10,
+    totalPhysMib,
+    availPhysMib,
+    physUsedPct,
+    totalCommitMib: winMem?.totalCommitMib ?? null,
+    availCommitMib: winMem?.availCommitMib ?? null,
+    commitUsedPct: winMem?.commitUsedPct ?? null,
+    hostRssMib,
+  };
+}
+
 /**
  * Zero-subprocess local hardware sampler. Uses libuv os.cpus() tick deltas, os.freemem()/totalmem(),
- * process RSS, and Win32 GlobalMemoryStatusEx (commit/pagefile) when running inside Official DSH.
+ * process RSS, Linux `/proc/meminfo` + cgroup v2/v1, and Win32 GlobalMemoryStatusEx when inside Official DSH.
  * Accepts an optional `probe()` override for deterministic tests.
  */
 export function createDeviceSampler(options = {}) {
@@ -365,6 +724,7 @@ export function createDeviceSampler(options = {}) {
         return {
           sampledAtMs: now(),
           logicalCores: raw.logicalCores ?? 8,
+          ...(raw.cgroupCpuQuotaCores != null ? { cgroupCpuQuotaCores: raw.cgroupCpuQuotaCores } : {}),
           cpuBusyPct: Math.round(busy * 10) / 10,
           cpuSmoothedPct: raw.cpuSmoothedPct ?? smoothed,
           totalPhysMib,
@@ -402,27 +762,13 @@ export function createDeviceSampler(options = {}) {
         smoothedBusyPct = 0;
       }
 
-      const winMem = getWin32MemoryReader()?.() ?? null;
-      const mib = b => Math.round(b / (1024 * 1024));
-      const totalPhysMib = winMem?.totalPhysMib ?? mib(os.totalmem());
-      const availPhysMib = winMem?.availPhysMib ?? mib(os.freemem());
-      const physUsedPct = winMem?.osMemoryLoadPct
-        ?? (totalPhysMib > 0 ? Math.round(((totalPhysMib - availPhysMib) / totalPhysMib) * 1000) / 10 : 0);
-      const hostRssMib = mib(process.memoryUsage().rss);
-
-      return {
-        sampledAtMs: ts,
+      return sampleDeviceResources({
+        ...options,
+        nowMs: ts,
         logicalCores: curCpu.count,
         cpuBusyPct: lastBusyPct,
         cpuSmoothedPct: smoothedBusyPct,
-        totalPhysMib,
-        availPhysMib,
-        physUsedPct,
-        totalCommitMib: winMem?.totalCommitMib ?? null,
-        availCommitMib: winMem?.availCommitMib ?? null,
-        commitUsedPct: winMem?.commitUsedPct ?? null,
-        hostRssMib,
-      };
+      });
     },
   };
 }
@@ -451,11 +797,12 @@ export class ElasticConcurrencyScheduler {
       },
     };
     this.now = options.now ?? (() => Date.now());
-    this.sampler = options.sampler ?? createDeviceSampler({ now: this.now, probe: options.deviceProbe });
+    this.sampler = options.sampler ?? createDeviceSampler({ ...options, now: this.now, probe: options.deviceProbe });
 
     this.baseUserMax = clampCap(config?.team?.maxActiveMembers ?? 8);
     this.userOverride = null; // global override: { maxActiveMembers, source, updatedAtMs }
     this.lastGlobalResetMs = 0;
+    this.requestWindowMaxCap = normalizeOptionalRequestWindowCap(options.requestWindowMaxCap);
 
     // Pipeline bottleneck counters (shared across process)
     this.inFlightShellCalls = 0;
@@ -760,12 +1107,18 @@ export class ElasticConcurrencyScheduler {
     return list;
   }
 
+  /** Set or clear process-level 5h request-window cap on new execution dispatches (`null` clears). */
+  setRequestWindowMaxCap(cap) {
+    this.requestWindowMaxCap = normalizeOptionalRequestWindowCap(cap);
+    return this.requestWindowMaxCap;
+  }
+
   /**
    * Synchronously check and reserve an execution dispatch slot before any `await` in `team_dispatch`.
    * Call `commit(postSnapshot)` once activation succeeds, or `cancel()` if validation/activation fails.
    */
-  reserveDispatch({ id = randomUUID(), name = '(starting)', teamId, taskSeq, activeMembers = [], otherActiveMembers = [], profile }) {
-    const check = this.checkDispatch({ teamId, taskSeq, activeMembers, otherActiveMembers, profile });
+  reserveDispatch({ id = randomUUID(), name = '(starting)', teamId, taskSeq, activeMembers = [], otherActiveMembers = [], profile, requestWindowMaxCap }) {
+    const check = this.checkDispatch({ teamId, taskSeq, activeMembers, otherActiveMembers, profile, requestWindowMaxCap });
     if (!check.allowed) return check;
     const waveUndo = this.#incrementWave(teamId, taskSeq);
     const entry = { id, name, teamId, taskSeq, profile, status: 'starting', reservedAtMs: this.now() };
@@ -784,6 +1137,7 @@ export class ElasticConcurrencyScheduler {
           taskSeq,
           activeMembers: [...activeMembers, { id, name, profile, status: 'started' }],
           otherActiveMembers,
+          requestWindowMaxCap,
         });
         this.#applyPendingAfterDispatch(teamId, taskSeq, snap);
       },
@@ -870,7 +1224,7 @@ export class ElasticConcurrencyScheduler {
    * Sample device + pipeline state across ALL active teams, advance hysteresis & progressive ramp windows,
    * and return the concurrency evaluation for `teamId`.
    */
-  evaluate({ teamId = 'default', taskSeq = 1, activeMembers = [], otherActiveMembers = [], targetProfile = null, advanceSample = false } = {}) {
+  evaluate({ teamId = 'default', taskSeq = 1, activeMembers = [], otherActiveMembers = [], targetProfile = null, advanceSample = false, requestWindowMaxCap } = {}) {
     const ts = this.now();
     this.#pruneEvents(ts);
     const dev = this.sampler.sample();
@@ -894,13 +1248,19 @@ export class ElasticConcurrencyScheduler {
 
     const { max: userMax, source: userMaxSource } = this.currentUserMaxForTeam(teamId);
     const globalPoolMax = this.currentGlobalPoolMax();
+    const rwCap = requestWindowMaxCap !== undefined
+      ? normalizeOptionalRequestWindowCap(requestWindowMaxCap)
+      : this.requestWindowMaxCap;
 
     if (!this.cfg.enabled) {
       const envShareCap = Math.max(0, globalPoolMax - otherActiveCount);
-      const hardCap = Math.min(userMax, envShareCap);
+      let hardCap = Math.min(userMax, envShareCap);
+      const preWindowHardCap = hardCap;
+      if (rwCap !== null) hardCap = Math.min(hardCap, rwCap);
       const effectiveCap = st.leaderMaxParallel !== null ? Math.min(hardCap, st.leaderMaxParallel) : hardCap;
       const availableNow = Math.max(0, effectiveCap - activeCount);
-      return this.#buildSnapshot({ ts, dev, execActive, activeCount, globalActiveCount, byProfile, userMax, userMaxSource, globalPoolMax, deviceCapacity: 200, hardCap, effectiveCap, availableNow, rampRemaining: 200, pressure: 'ok', bottlenecks: [], shellCapped: false, st });
+      const disabledBottlenecks = rwCap !== null && (rwCap < preWindowHardCap || activeCount >= rwCap) ? ['request_window_cap'] : [];
+      return this.#buildSnapshot({ ts, dev, execActive, activeCount, globalActiveCount, byProfile, userMax, userMaxSource, globalPoolMax, deviceCapacity: 200, hardCap, effectiveCap, availableNow, rampRemaining: 200, pressure: 'ok', bottlenecks: disabledBottlenecks, shellCapped: false, st, requestWindowMaxCap: rwCap });
     }
 
     // 1. Hardware carrying capacity (computed over globalActiveCount so multi-session never double-counts headroom)
@@ -909,10 +1269,19 @@ export class ElasticConcurrencyScheduler {
       ? this.cfg.memberMemoryMib[targetProfile]
       : Math.round((this.cfg.memberMemoryMib.code + this.cfg.memberMemoryMib.readonly) / 2);
 
+    // Scale commit watermarks proportionally when running inside a small cgroup container (totalCommitMib <= recoverFreeCommitMib)
+    const smallCommitContainer = dev.totalCommitMib !== null && dev.totalCommitMib <= this.cfg.recoverFreeCommitMib;
+    const effLowFreeCommitMib = smallCommitContainer
+      ? Math.min(this.cfg.lowFreeCommitMib, Math.max(128, Math.round(dev.totalCommitMib * (1 - this.cfg.highCommitUsedPct / 100))))
+      : this.cfg.lowFreeCommitMib;
+    const effRecoverFreeCommitMib = smallCommitContainer
+      ? Math.min(this.cfg.recoverFreeCommitMib, Math.max(effLowFreeCommitMib + 64, Math.round(dev.totalCommitMib * (1 - this.cfg.recoverCommitUsedPct / 100))))
+      : this.cfg.recoverFreeCommitMib;
+
     const physHeadroomMib = Math.max(0, dev.availPhysMib - this.cfg.lowFreePhysMib);
     let additionalMemSlots = Math.floor(physHeadroomMib / Math.max(16, profileMemCost));
     if (dev.availCommitMib !== null) {
-      const commitHeadroomMib = Math.max(0, dev.availCommitMib - this.cfg.lowFreeCommitMib);
+      const commitHeadroomMib = Math.max(0, dev.availCommitMib - effLowFreeCommitMib);
       const commitSlots = dev.commitUsedPct !== null && dev.commitUsedPct >= this.cfg.highCommitUsedPct
         ? 0
         : Math.floor(commitHeadroomMib / Math.max(32, profileMemCost * 2));
@@ -921,7 +1290,9 @@ export class ElasticConcurrencyScheduler {
 
     const perMemberCpuEst = targetProfile === 'shell' ? 16 : 5;
     const cpuHeadroomPct = Math.max(0, this.cfg.highCpuPct - cpuPct);
-    const coreScale = Math.max(1, dev.logicalCores / 8);
+    const coreScale = dev.cgroupCpuQuotaCores != null
+      ? Math.max(0.25, dev.cgroupCpuQuotaCores / 8)
+      : Math.max(1, dev.logicalCores / 8);
     const additionalCpuSlots = cpuPct >= this.cfg.highCpuPct
       ? 0
       : Math.floor((cpuHeadroomPct * coreScale) / perMemberCpuEst);
@@ -957,7 +1328,7 @@ export class ElasticConcurrencyScheduler {
     const tripReasons = [];
     if (cpuPct >= this.cfg.highCpuPct) tripReasons.push('cpu_high');
     if (dev.availPhysMib <= this.cfg.lowFreePhysMib) tripReasons.push('phys_mem_low');
-    if (dev.availCommitMib !== null && (dev.availCommitMib <= this.cfg.lowFreeCommitMib || (dev.commitUsedPct ?? 0) >= this.cfg.highCommitUsedPct)) {
+    if (dev.availCommitMib !== null && (dev.availCommitMib <= effLowFreeCommitMib || (dev.commitUsedPct ?? 0) >= this.cfg.highCommitUsedPct)) {
       tripReasons.push('commit_mem_high');
     }
     if (rateLimits > 0) tripReasons.push('model_rate_limit');
@@ -986,7 +1357,7 @@ export class ElasticConcurrencyScheduler {
       const recoveryMet =
         cpuPct <= this.cfg.recoverCpuPct &&
         dev.availPhysMib >= this.cfg.recoverFreePhysMib &&
-        (dev.availCommitMib === null || (dev.availCommitMib >= this.cfg.recoverFreeCommitMib && (dev.commitUsedPct ?? 0) <= this.cfg.recoverCommitUsedPct)) &&
+        (dev.availCommitMib === null || (dev.availCommitMib >= effRecoverFreeCommitMib && (dev.commitUsedPct ?? 0) <= this.cfg.recoverCommitUsedPct)) &&
         rateLimits === 0 &&
         this.inFlightGateReviews <= this.cfg.gateQueueRecoverWater;
 
@@ -1019,8 +1390,12 @@ export class ElasticConcurrencyScheduler {
 
     const globalHardCap = Math.min(globalPoolMax, deviceCapacity);
     const remainingGlobalForThisTeam = Math.max(0, globalHardCap - otherActiveCount);
-    const hardCap = Math.min(userMax, deviceCapacity, remainingGlobalForThisTeam);
+    const preWindowHardCap = Math.min(userMax, deviceCapacity, remainingGlobalForThisTeam);
+    const hardCap = rwCap !== null ? Math.min(preWindowHardCap, rwCap) : preWindowHardCap;
     const effectiveCap = st.leaderMaxParallel !== null ? Math.min(hardCap, st.leaderMaxParallel) : hardCap;
+    if (rwCap !== null && (rwCap < preWindowHardCap || activeCount >= rwCap) && !bottlenecks.includes('request_window_cap')) {
+      bottlenecks.push('request_window_cap');
+    }
 
     // 4. Progressive ramp-up wave budget
     if (st.waveStartMs > 0 && ts - st.waveStartMs >= this.cfg.rampObserveMs && this.hysteresis.mode === 'normal') {
@@ -1049,11 +1424,11 @@ export class ElasticConcurrencyScheduler {
 
     return this.#buildSnapshot({
       ts, dev, execActive, activeCount, globalActiveCount, byProfile, userMax, userMaxSource, globalPoolMax, deviceCapacity,
-      hardCap, effectiveCap, availableNow, rampRemaining, pressure, bottlenecks, shellCapped, st,
+      hardCap, effectiveCap, availableNow, rampRemaining, pressure, bottlenecks, shellCapped, st, requestWindowMaxCap: rwCap,
     });
   }
 
-  #buildSnapshot({ ts, dev, execActive, activeCount, globalActiveCount, byProfile, userMax, userMaxSource, globalPoolMax, deviceCapacity, hardCap, effectiveCap, availableNow, rampRemaining, pressure, bottlenecks, shellCapped, st }) {
+  #buildSnapshot({ ts, dev, execActive, activeCount, globalActiveCount, byProfile, userMax, userMaxSource, globalPoolMax, deviceCapacity, hardCap, effectiveCap, availableNow, rampRemaining, pressure, bottlenecks, shellCapped, st, requestWindowMaxCap = null }) {
     let scaleState = 'expandable';
     if (activeCount > effectiveCap) scaleState = 'draining_above_cap';
     else if (this.hysteresis.mode === 'throttled' && activeCount >= effectiveCap) scaleState = 'throttled_hold';
@@ -1071,6 +1446,7 @@ export class ElasticConcurrencyScheduler {
         user_max_source: userMaxSource,
         global_pool_max: globalPoolMax,
         device_capacity: deviceCapacity,
+        request_window_max_cap: requestWindowMaxCap,
         hard_cap: hardCap,
         leader_max_parallel: st.leaderMaxParallel,
         effective_cap: effectiveCap,
@@ -1091,6 +1467,8 @@ export class ElasticConcurrencyScheduler {
       },
       device: {
         logical_cores: dev.logicalCores,
+        ...(dev.cgroupCpuQuotaCores != null ? { cgroup_cpu_quota_cores: dev.cgroupCpuQuotaCores } : {}),
+        ...(dev.cgroupMemoryLimitMib != null ? { cgroup_memory_limit_mib: dev.cgroupMemoryLimitMib } : {}),
         cpu_busy_pct: dev.cpuBusyPct,
         cpu_smoothed_pct: dev.cpuSmoothedPct,
         phys_total_mib: dev.totalPhysMib,
@@ -1125,13 +1503,15 @@ export class ElasticConcurrencyScheduler {
    * Check whether an execution subagent dispatch may proceed right now.
    * Prefer `reserveDispatch(...)` in async callers so slots are reserved synchronously before any `await`.
    */
-  checkDispatch({ teamId, taskSeq, activeMembers = [], otherActiveMembers = [], profile }) {
-    const snapshot = this.evaluate({ teamId, taskSeq, activeMembers, otherActiveMembers, targetProfile: profile });
+  checkDispatch({ teamId, taskSeq, activeMembers = [], otherActiveMembers = [], profile, requestWindowMaxCap }) {
+    const snapshot = this.evaluate({ teamId, taskSeq, activeMembers, otherActiveMembers, targetProfile: profile, requestWindowMaxCap });
     const { active_execution_members: active, controls, pipeline } = snapshot;
     if (active.total >= controls.effective_cap) {
       this.markAwaitingSlots(teamId, taskSeq);
       const otherBusy = active.global_total - active.total;
-      const why = otherBusy > 0 && active.global_total >= Math.min(controls.global_pool_max, controls.device_capacity)
+      const why = controls.request_window_max_cap !== null && controls.effective_cap === controls.request_window_max_cap && controls.request_window_max_cap < Math.min(controls.user_max_concurrent, controls.device_capacity)
+        ? `request window cap=${controls.request_window_max_cap}`
+        : otherBusy > 0 && active.global_total >= Math.min(controls.global_pool_max, controls.device_capacity)
         ? `environment active=${active.global_total}/${Math.min(controls.global_pool_max, controls.device_capacity)} (${otherBusy} in other session(s))`
         : controls.user_max_concurrent <= controls.device_capacity
         ? `user max=${controls.user_max_concurrent}`
@@ -1162,6 +1542,7 @@ export class ElasticConcurrencyScheduler {
       taskSeq: input.taskSeq,
       activeMembers: [...(input.activeMembers ?? []), { status: 'starting', profile: input.profile, name: '(starting)' }],
       otherActiveMembers: input.otherActiveMembers ?? [],
+      requestWindowMaxCap: input.requestWindowMaxCap,
     });
     res.commit(after);
     return { allowed: true, snapshot: after };
@@ -1216,6 +1597,42 @@ function clampCap(v) {
   const n = Math.trunc(Number(v));
   if (!Number.isFinite(n)) return 8;
   return Math.max(1, Math.min(200, n));
+}
+
+function normalizeOptionalRequestWindowCap(v) {
+  if (v === null || v === undefined) return null;
+  const n = Math.trunc(Number(v));
+  if (!Number.isFinite(n)) return null;
+  return Math.max(0, Math.min(200, n));
+}
+
+/**
+ * Compute an execution concurrency snapshot, optionally applying `requestWindowMaxCap` (e.g. from Tier 2/3
+ * 5h request-window guard) to cap *new* execution member dispatches while keeping governance roles excluded.
+ */
+export function computeConcurrencySnapshot(schedulerOrOptions = {}, maybeOptions = {}) {
+  if (schedulerOrOptions instanceof ElasticConcurrencyScheduler) {
+    return schedulerOrOptions.evaluate(maybeOptions);
+  }
+  const opts = {
+    ...(schedulerOrOptions && typeof schedulerOrOptions === 'object' ? schedulerOrOptions : {}),
+    ...(maybeOptions && typeof maybeOptions === 'object' ? maybeOptions : {}),
+  };
+  const sched = opts.scheduler instanceof ElasticConcurrencyScheduler
+    ? opts.scheduler
+    : new ElasticConcurrencyScheduler(opts.config ?? {}, {
+        now: typeof opts.nowMs === 'number' ? () => opts.nowMs : opts.now,
+        sampler: opts.deviceSample ? { sample: () => opts.deviceSample } : opts.sampler,
+        deviceProbe: opts.deviceProbe,
+        platform: opts.platform,
+        fs: opts.fs,
+        cgroupRoot: opts.cgroupRoot,
+        meminfoPath: opts.meminfoPath,
+        linuxMeminfoReader: opts.linuxMeminfoReader,
+        linuxCgroupReader: opts.linuxCgroupReader,
+        requestWindowMaxCap: opts.requestWindowMaxCap,
+      });
+  return sched.evaluate(opts);
 }
 
 function buildLeaderGuidance({ activeCount, userMax, deviceCapacity, effectiveCap, availableNow, scaleState, pressure, bottlenecks, pending }) {

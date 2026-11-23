@@ -1,0 +1,61 @@
+name: 安全门规则误拦或漏拦反馈 (Safety Gate Feedback)
+description: 报告分层确定性安全门（0ms 本地规则 / 沙箱边界 / 模型复核）的误拦截 (False Positive) 或漏拦截 (False Negative)
+title: "[Safety-Gate]: "
+labels: ["safety-gate", "security"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        > **安全提示**：请仅提供脱敏后的命令结构或相对路径模式（例如 `bash -c "npm test"`、`<WORKSPACE>/dist/out.js`），切勿粘贴真实 API Key、Token 或含个人隐私的绝对路径。
+
+  - type: dropdown
+    id: feedback_kind
+    attributes:
+      label: 反馈类型
+      options:
+        - "误拦截 (False Positive — 合规工作区操作被拦截或误升级模型审查)"
+        - "漏拦截 (False Negative — 越界写入/命令逃逸未被本地硬规则阻断)"
+        - "规则提示文案不清晰"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: actor_and_shell
+    attributes:
+      label: 触发角色与工具环境
+      options:
+        - "member — bash (Linux / macOS / WSL2)"
+        - "member — pwsh (Windows)"
+        - "member — write / edit / read"
+        - "direct_exec (team_direct_exec)"
+        - "leader (team_dispatch / send_message / read)"
+    validations:
+      required: true
+
+  - type: input
+    id: rule_code
+    attributes:
+      label: 命中的规则代码 (`by` 字段)
+      description: 可从报错提示或 `node bin/lt-bugreport.mjs` 的 `Allow/Deny by Rule` 中查看
+      placeholder: "例如：rule:outside-workspace / sandbox / model / rule:bash-redirection-escape"
+    validations:
+      required: true
+
+  - type: textarea
+    id: anonymized_pattern
+    attributes:
+      label: 脱敏后的工具调用形态与预期行为
+      description: 说明调用的工具名、脱敏后的参数结构、当前工作区相对层级，以及您预期的放行/拦截结果
+      placeholder: |
+        工具: bash
+        命令模式: npm run build > ./dist/build.log 2>&1
+        实际结果: deny (rule:...)
+        预期结果: 工作区内相对路径重定向应允许放行
+    validations:
+      required: true
+
+  - type: textarea
+    id: bugreport_summary
+    attributes:
+      label: lt-bugreport 脱敏统计（可选）
+      description: 可选粘贴 `npx lt-bugreport` / `node bin/lt-bugreport.mjs` 输出以辅助定位规则分布

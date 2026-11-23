@@ -33,6 +33,21 @@ export function assertActivationAdmission(store, cfg, candidate, platform = proc
   if (conflict) throw new Error(`write_scope ${JSON.stringify(candidate.writeScope)} overlaps active running member "${conflict.name}" (child_id="${conflict.childId}", write_scope=${JSON.stringify(conflict.writeScope)}); wait for that member to finish or use disjoint write scopes`);
 }
 
+export function resolveSendMessageTargetId(store, args) {
+  if (args && typeof args === 'object' && args.agent_id === undefined && typeof args.agent === 'string') {
+    const ref = args.agent;
+    const direct = store.getMember(ref);
+    if (direct && direct.actorRole !== 'direct_exec') return direct.childId;
+    const byName = [...store.members().values()].findLast(
+      m => m.actorRole !== 'direct_exec' && m.name === ref && m.status !== 'failed' && m.status !== 'cancelled',
+    ) ?? [...store.members().values()].findLast(
+      m => m.actorRole !== 'direct_exec' && m.name === ref,
+    );
+    return byName ? byName.childId : ref;
+  }
+  return args?.agent_id;
+}
+
 export function resumeAdmission(store, cfg, targetId, taskSeq) {
   if (typeof targetId !== 'string') throw new Error('send_message requires a team member agent_id');
   const member = store.getMember(targetId);
