@@ -46,6 +46,7 @@ export function createPowerMonitorState() {
     pendingTeams: [],
     ackedTeams: [],
     pausedTeamsAwaitingUser: [],
+    userResumedTeamsDuringLatch: [],
     autoResumeAllowed: false,
     triggerCount: 0,
     lastTriggeredAtMs: null,
@@ -156,6 +157,7 @@ export function evaluatePowerSample(state, sample, cfg = DEFAULT_POWER_MONITOR_C
       target.pendingNotice = false;
       target.pendingTeams = [];
       target.ackedTeams = [];
+      target.userResumedTeamsDuringLatch = [];
       target.lastRearmedAtMs = ts;
       target.autoResumeAllowed = false;
       return {
@@ -191,6 +193,7 @@ export function evaluatePowerSample(state, sample, cfg = DEFAULT_POWER_MONITOR_C
     target.pendingNotice = true;
     target.pendingTeams = Array.isArray(target.pendingTeams) ? [...target.pendingTeams] : [];
     target.ackedTeams = [];
+    target.userResumedTeamsDuringLatch = [];
     target.pausedTeamsAwaitingUser = Array.isArray(target.pausedTeamsAwaitingUser) ? [...target.pausedTeamsAwaitingUser] : [];
     target.triggerCount = (Number.isInteger(target.triggerCount) ? target.triggerCount : 0) + 1;
     target.lastTriggeredAtMs = ts;
@@ -296,8 +299,10 @@ export function registerTeamsForPowerLatch(state, teamIds = []) {
   target.pendingTeams = Array.isArray(target.pendingTeams) ? [...target.pendingTeams] : [];
   target.ackedTeams = Array.isArray(target.ackedTeams) ? [...target.ackedTeams] : [];
   target.pausedTeamsAwaitingUser = Array.isArray(target.pausedTeamsAwaitingUser) ? [...target.pausedTeamsAwaitingUser] : [];
+  target.userResumedTeamsDuringLatch = Array.isArray(target.userResumedTeamsDuringLatch) ? [...target.userResumedTeamsDuringLatch] : [];
   for (const tid of teamIds) {
     if (typeof tid !== 'string' || !tid) continue;
+    if (target.userResumedTeamsDuringLatch.includes(tid)) continue;
     if (!target.pausedTeamsAwaitingUser.includes(tid)) {
       target.pausedTeamsAwaitingUser.push(tid);
     }
@@ -314,10 +319,17 @@ export function registerTeamsForPowerLatch(state, teamIds = []) {
 /** Clear a team's post-low-battery pause hold ONLY when the user explicitly sends a new message. */
 export function clearTeamPowerPauseOnUserTurn(state, teamId) {
   const target = ensureMutableTarget(state);
-  if (!teamId || !Array.isArray(target.pausedTeamsAwaitingUser)) return { changed: false, state: target };
+  if (!teamId) return { changed: false, state: target };
+  target.pausedTeamsAwaitingUser = Array.isArray(target.pausedTeamsAwaitingUser) ? [...target.pausedTeamsAwaitingUser] : [];
+  target.userResumedTeamsDuringLatch = Array.isArray(target.userResumedTeamsDuringLatch) ? [...target.userResumedTeamsDuringLatch] : [];
   const prevLen = target.pausedTeamsAwaitingUser.length;
   target.pausedTeamsAwaitingUser = target.pausedTeamsAwaitingUser.filter(id => id !== teamId);
-  return { changed: target.pausedTeamsAwaitingUser.length !== prevLen, state: target };
+  let latchOverrideChanged = false;
+  if (target.latched && !target.userResumedTeamsDuringLatch.includes(teamId)) {
+    target.userResumedTeamsDuringLatch.push(teamId);
+    latchOverrideChanged = true;
+  }
+  return { changed: target.pausedTeamsAwaitingUser.length !== prevLen || latchOverrideChanged, state: target };
 }
 
 /** Build a fresh low-battery notice from current latched state (for per-team retry delivery). */
@@ -341,6 +353,7 @@ export function serializePowerState(state) {
     pendingTeams,
     ackedTeams: cleanIds(s.ackedTeams),
     pausedTeamsAwaitingUser: cleanIds(s.pausedTeamsAwaitingUser),
+    userResumedTeamsDuringLatch: cleanIds(s.userResumedTeamsDuringLatch),
     autoResumeAllowed: false,
     triggerCount: Number.isInteger(s.triggerCount) && s.triggerCount >= 0 ? s.triggerCount : 0,
     lastTriggeredAtMs: typeof s.lastTriggeredAtMs === 'number' && Number.isFinite(s.lastTriggeredAtMs) ? s.lastTriggeredAtMs : null,

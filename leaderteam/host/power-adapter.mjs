@@ -46,25 +46,64 @@ function parseLinuxSysfsPower(fsImpl, sysfsDir, isWsl, sampledAt) {
   const batteryCandidates = [];
   let sawBatteryDevice = false;
 
+  const isMainsSupply = (devType, name) => (
+    /^(?:Mains|USB|USB_PD|USB_PD_DRP|USB_C|USB_ACA|USB_CDP|USB_DCP)$/i.test(devType)
+    || /^(?:AC|ADP|ACAD)/i.test(name)
+  );
+
+  // Pass 1: Discover all online AC / USB-PD mains supplies first so `readdirSync` entry order
+  // never drops a battery whose `status` is "Unknown" while resting at a charge threshold.
   for (const rawEntry of entries) {
     const name = typeof rawEntry === 'string' ? rawEntry : rawEntry?.name;
     if (!name) continue;
     const devDir = path.join(sysfsDir, name);
-    // Privacy rule: strictly read ONLY `type`, `online`, `capacity`, and `status`.
+    const scope = readTrimmedSafe(fsImpl, path.join(devDir, 'scope')) ?? '';
+    if (/^Device$/i.test(scope)) continue;
     const devType = readTrimmedSafe(fsImpl, path.join(devDir, 'type')) ?? '';
-    const isMains = /^Mains$/i.test(devType) || /^(?:AC|ADP|ACAD)/i.test(name);
-    if (isMains) {
+    if (isMainsSupply(devType, name)) {
       const online = readTrimmedSafe(fsImpl, path.join(devDir, 'online'));
       if (online === '1') anyMainsOnline = true;
     }
+  }
 
+  // Pass 2: Evaluate system batteries only (strictly excluding peripheral `scope=Device` HID batteries
+  // such as wireless mice/keyboards/headsets and absent `present=0` bays; never reads serial/model/OEM).
+  for (const rawEntry of entries) {
+    const name = typeof rawEntry === 'string' ? rawEntry : rawEntry?.name;
+    if (!name) continue;
+    const devDir = path.join(sysfsDir, name);
+    const scope = readTrimmedSafe(fsImpl, path.join(devDir, 'scope')) ?? '';
+    if (/^Device$/i.test(scope)) continue;
+    const present = readTrimmedSafe(fsImpl, path.join(devDir, 'present'));
+    if (present === '0') continue;
+
+    const devType = readTrimmedSafe(fsImpl, path.join(devDir, 'type')) ?? '';
     const isBattery = /^Battery$/i.test(devType) || /^BAT/i.test(name);
     if (!isBattery) continue;
     sawBatteryDevice = true;
 
     const rawCap = readTrimmedSafe(fsImpl, path.join(devDir, 'capacity'));
+    let capNum = rawCap !== null && rawCap !== '' ? Number(rawCap) : Number.NaN;
+    const rawEnergyFull = readTrimmedSafe(fsImpl, path.join(devDir, 'energy_full'));
+    const energyFull = rawEnergyFull !== null && rawEnergyFull !== '' ? Number(rawEnergyFull) : Number.NaN;
+
+    if (!Number.isFinite(capNum)) {
+      const rawEnergyNow = readTrimmedSafe(fsImpl, path.join(devDir, 'energy_now'));
+      const energyNow = rawEnergyNow !== null && rawEnergyNow !== '' ? Number(rawEnergyNow) : Number.NaN;
+      if (Number.isFinite(energyNow) && Number.isFinite(energyFull) && energyFull > 0) {
+        capNum = (energyNow / energyFull) * 100;
+      } else {
+        const rawChargeNow = readTrimmedSafe(fsImpl, path.join(devDir, 'charge_now'));
+        const rawChargeFull = readTrimmedSafe(fsImpl, path.join(devDir, 'charge_full'));
+        const chargeNow = rawChargeNow !== null && rawChargeNow !== '' ? Number(rawChargeNow) : Number.NaN;
+        const chargeFull = rawChargeFull !== null && rawChargeFull !== '' ? Number(rawChargeFull) : Number.NaN;
+        if (Number.isFinite(chargeNow) && Number.isFinite(chargeFull) && chargeFull > 0) {
+          capNum = (chargeNow / chargeFull) * 100;
+        }
+      }
+    }
+
     const rawStatus = readTrimmedSafe(fsImpl, path.join(devDir, 'status'));
-    const capNum = rawCap !== null && rawCap !== '' ? Number(rawCap) : Number.NaN;
     if (!Number.isFinite(capNum) || capNum < 0 || capNum > 100) continue;
     if (!rawStatus) continue;
 
@@ -78,7 +117,12 @@ function parseLinuxSysfsPower(fsImpl, sysfsDir, isWsl, sampledAt) {
     }
 
     if (devOnBattery !== null) {
-      batteryCandidates.push({ capacity: Math.round(capNum), onBattery: devOnBattery });
+      const weight = Number.isFinite(energyFull) && energyFull > 0 ? energyFull : null;
+      batteryCandidates.push({
+        capacity: Math.max(0, Math.min(100, Math.round(capNum))),
+        onBattery: devOnBattery,
+        weight,
+      });
     }
   }
 
@@ -92,9 +136,13 @@ function parseLinuxSysfsPower(fsImpl, sysfsDir, isWsl, sampledAt) {
     return { status: 'unknown', onBattery: null, batteryPct: null, source: 'linux-sysfs', sampledAt };
   }
 
-  const avgPct = Math.round(
-    batteryCandidates.reduce((acc, b) => acc + b.capacity, 0) / batteryCandidates.length,
-  );
+  const allWeighted = batteryCandidates.every(b => b.weight !== null);
+  const totalWeight = allWeighted
+    ? batteryCandidates.reduce((acc, b) => acc + b.weight, 0)
+    : batteryCandidates.length;
+  const avgPct = allWeighted && totalWeight > 0
+    ? Math.round(batteryCandidates.reduce((acc, b) => acc + b.capacity * b.weight, 0) / totalWeight)
+    : Math.round(batteryCandidates.reduce((acc, b) => acc + b.capacity, 0) / batteryCandidates.length);
   const onBattery = anyMainsOnline
     ? false
     : batteryCandidates.some(b => b.onBattery === true);

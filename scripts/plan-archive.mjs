@@ -7,6 +7,7 @@
 //   node scripts/plan-archive.mjs --retrospect <planId> [--notes "..."] [--json]
 //   node scripts/plan-archive.mjs --clean [--workspace <dir> | --project <key> | --category <cat> | --older-than-days <N> | --all] [--dry-run | --confirm] [--json]
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadConfig } from '../leaderteam/core/config.mjs';
@@ -50,7 +51,8 @@ function resolveStorageRoot(cfg, opts) {
   if (cfg.storage?.root) return path.resolve(cfg.storage.root);
   const home = resolveDefaultDshHome({ projectRoot: ROOT });
   if (home) return path.join(home, 'leaderteam');
-  return path.join(ROOT, 'home-headless', 'leaderteam');
+  if (os.homedir()) return path.join(os.homedir(), '.dsh', 'leaderteam');
+  return path.join(os.tmpdir(), 'leaderteam-storage');
 }
 
 function emit(opts, value) {

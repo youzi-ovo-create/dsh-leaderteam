@@ -21,7 +21,15 @@ if (!opt('workspace') || !opt('out')) { console.error('usage: --workspace <dir> 
 const allowGpt = a.includes('--allow-gpt');
 const ws = path.resolve(opt('workspace')), out = path.resolve(opt('out'));
 const localAppPy = process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Programs', 'Python', 'Python312', 'python.exe') : '';
-const python = opt('python') ?? process.env.LT_PYTHON ?? (localAppPy && fs.existsSync(localAppPy) ? localAppPy : 'python');
+function detectDefaultPython() {
+  if (localAppPy && fs.existsSync(localAppPy)) return localAppPy;
+  if (process.platform !== 'win32') {
+    const p3 = spawnSync('python3', ['--version'], { encoding: 'utf8' });
+    if (p3.status === 0) return 'python3';
+  }
+  return 'python';
+}
+const python = opt('python') ?? process.env.LT_PYTHON ?? detectDefaultPython();
 const fail = m => { console.error(m); process.exit(2); };
 if (!fs.existsSync(ws) || !fs.statSync(ws).isDirectory()) fail(`workspace not found: ${ws}`);
 for (const x of ['LT-E2E-SPEC.md', 'textstats', 'money']) if (fs.existsSync(path.join(ws, x))) fail(`workspace already contains ${x}: move it away first (a fresh acceptance needs a clean slate)`);
@@ -37,7 +45,8 @@ fs.mkdirSync(out, { recursive: true });
 let cfgFile = baseCfgFile;
 if (!allowGpt) { cfgFile = path.join(out, 'leaderteam.test.config.json'); fs.writeFileSync(cfgFile, JSON.stringify(withoutGptPool(baseCfg), null, 1)); }
 const home = path.join(out, 'home');
-fs.writeFileSync(path.join(ws, 'LT-E2E-SPEC.md'), fs.readFileSync(path.join(FIX, 'LT-E2E-SPEC.md'), 'utf8').replaceAll('__PYTHON__', python.replace(/\\/g, '/')));
+const pyCmdForSpec = /\s/.test(python) ? `"${python.replace(/\\/g, '/')}"` : python.replace(/\\/g, '/');
+fs.writeFileSync(path.join(ws, 'LT-E2E-SPEC.md'), fs.readFileSync(path.join(FIX, 'LT-E2E-SPEC.md'), 'utf8').replaceAll('__PYTHON__', pyCmdForSpec));
 const taskFile = path.join(out, 'task.md');
 fs.copyFileSync(path.join(FIX, 'task.md'), taskFile);
 const preFile = path.join(out, 'pre-manifest.json');

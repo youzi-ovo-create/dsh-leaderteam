@@ -395,7 +395,12 @@ export function isTeamAwaitingUserAfterPowerPause(rt = runtime(), teamId = null)
   }
   const st = baseRt.powerMonitorState;
   if (!st) return false;
-  if (st.latched) return true;
+  if (st.latched) {
+    if (teamId && Array.isArray(st.userResumedTeamsDuringLatch) && st.userResumedTeamsDuringLatch.includes(teamId)) {
+      return false;
+    }
+    return true;
+  }
   if (teamId && Array.isArray(st.pausedTeamsAwaitingUser) && st.pausedTeamsAwaitingUser.includes(teamId)) {
     return true;
   }

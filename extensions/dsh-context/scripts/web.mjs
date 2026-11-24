@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process'
 import { findPids, supervise, terminatePids } from './proc.mjs'
 
-const pattern = process.platform === 'win32' ? 'dsh web|@deepseek-ai[\\\\/]dsh[\\\\/].* web' : 'dsh web'
+const pattern = 'dsh web|@deepseek-ai[\\\\/]dsh[\\\\/].* web'
 
 let pids = []
 try {

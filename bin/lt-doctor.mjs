@@ -7,7 +7,7 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
-import { loadRawConfig, validateConfig } from '../leaderteam/core/config.mjs';
+import { loadRawConfig, validateConfig, deepMergePlain } from '../leaderteam/core/config.mjs';
 import { detectLegacyProfilePatchConflicts, cleanLegacyProfilePatches } from '../leaderteam/core/legacy-patch-guard.mjs';
 
 const THIS_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -531,17 +531,61 @@ export function checkPlatformEnvironment({
     let cgroupV2Present = false;
     let cgroupMemoryMaxRaw = null;
     let cgroupMemoryMaxMib = null;
-    const cgroupMemMaxFile = path.posix.join(cgroupRoot.replaceAll('\\', '/'), 'memory.max');
+    const normCgRoot = cgroupRoot.replaceAll('\\', '/');
     try {
-      if (fsImpl.existsSync(cgroupMemMaxFile)) {
+      // On systemd cgroup v2 hosts (Ubuntu 22.04+, Debian 12+, Fedora), `memory.max` lives in slice/scope subdirs
+      // discovered via `/proc/self/cgroup` while root `/sys/fs/cgroup` exposes `cgroup.controllers`.
+      const candidateCgDirs = [];
+      if (normCgRoot === '/sys/fs/cgroup') {
+        try {
+          const selfCg = fsImpl.readFileSync('/proc/self/cgroup', 'utf8');
+          for (const line of selfCg.split(/\r?\n/)) {
+            const parts = line.split(':');
+            if (parts.length >= 3 && parts[0] === '0' && parts[1] === '') {
+              const rel = parts.slice(2).join(':').replace(/^\/+|\/+$/g, '');
+              if (rel) {
+                const segs = rel.split('/').filter(Boolean);
+                for (let len = segs.length; len >= 1; len--) {
+                  candidateCgDirs.push(path.posix.join(normCgRoot, ...segs.slice(0, len)));
+                }
+              }
+            }
+          }
+        } catch {}
+      }
+      candidateCgDirs.push(normCgRoot);
+
+      if (fsImpl.existsSync(path.posix.join(normCgRoot, 'cgroup.controllers'))) {
         cgroupV2Present = true;
-        cgroupMemoryMaxRaw = fsImpl.readFileSync(cgroupMemMaxFile, 'utf8').trim();
-        if (cgroupMemoryMaxRaw !== 'max' && /^\d+$/.test(cgroupMemoryMaxRaw)) {
-          const bytes = Number(cgroupMemoryMaxRaw);
+      }
+      for (const cgDir of candidateCgDirs) {
+        const memMaxFile = path.posix.join(cgDir, 'memory.max');
+        if (!fsImpl.existsSync(memMaxFile)) continue;
+        cgroupV2Present = true;
+        const raw = fsImpl.readFileSync(memMaxFile, 'utf8').trim();
+        if (cgroupMemoryMaxRaw === null) cgroupMemoryMaxRaw = raw;
+        if (raw !== 'max' && /^\d+$/.test(raw)) {
+          const bytes = Number(raw);
           if (Number.isFinite(bytes) && bytes > 0 && bytes < Number.MAX_SAFE_INTEGER) {
-            cgroupMemoryMaxMib = Math.round(bytes / (1024 * 1024));
+            const mib = Math.round(bytes / (1024 * 1024));
+            if (cgroupMemoryMaxMib === null || mib < cgroupMemoryMaxMib) {
+              cgroupMemoryMaxMib = mib;
+              cgroupMemoryMaxRaw = raw;
+            }
           }
         }
+      }
+      if (cgroupV2Present && cgroupMemoryMaxRaw === null) {
+        cgroupMemoryMaxRaw = 'max';
+      }
+    } catch {}
+
+    let bwrapAvailable = false;
+    let apparmorRestrictUserns = null;
+    try {
+      bwrapAvailable = fsImpl.existsSync('/usr/bin/bwrap') || fsImpl.existsSync('/bin/bwrap');
+      if (fsImpl.existsSync('/proc/sys/kernel/apparmor_restrict_unprivileged_userns')) {
+        apparmorRestrictUserns = fsImpl.readFileSync('/proc/sys/kernel/apparmor_restrict_unprivileged_userns', 'utf8').trim() === '1';
       }
     } catch {}
 
@@ -558,19 +602,24 @@ export function checkPlatformEnvironment({
     const cgroupDesc = cgroupV2Present
       ? (cgroupMemoryMaxMib !== null ? `cgroup v2 memory.max=${cgroupMemoryMaxMib} MiB` : 'cgroup v2 memory.max=max (unrestricted)')
       : 'cgroup v2 memory.max not present';
+    const bwrapDesc = bwrapAvailable
+      ? `, bwrap=present${apparmorRestrictUserns ? ' (apparmor_userns=1)' : ''}`
+      : '';
     return {
       status,
       platform: 'linux',
       linuxVariant,
       bashAvailable,
       bashVersion,
+      bwrapAvailable,
+      apparmorRestrictUserns,
       meminfoReadable,
       memTotalMib,
       memAvailableMib,
       cgroupV2Present,
       cgroupMemoryMaxRaw,
       cgroupMemoryMaxMib,
-      summary: `Linux (${linuxVariant}): bash=${bashAvailable ? 'ok' : 'MISSING'}, /proc/meminfo=${meminfoReadable ? `ok (${memAvailableMib ?? '?'} MiB avail)` : 'unreadable'}, ${cgroupDesc}.`,
+      summary: `Linux (${linuxVariant}): bash=${bashAvailable ? 'ok' : 'MISSING'}, /proc/meminfo=${meminfoReadable ? `ok (${memAvailableMib ?? '?'} MiB avail)` : 'unreadable'}, ${cgroupDesc}${bwrapDesc}.`,
     };
   }
 
@@ -720,7 +769,7 @@ export function checkConfigurationAndSoloKey({
         const localOverride = path.join(path.dirname(selectedConfig), 'leaderteam.local.json');
         if (fsImpl.existsSync(localOverride)) {
           const over = JSON.parse(fsImpl.readFileSync(localOverride, 'utf8').replace(/^\uFEFF/, ''));
-          raw = { ...raw, ...over };
+          raw = deepMergePlain(raw, over);
         }
       }
     }
@@ -923,7 +972,19 @@ function printUsage() {
   ].join('\n'));
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+function isMainCliModule(metaUrl, argv1 = process.argv[1]) {
+  if (!argv1) return false;
+  const selfPath = fileURLToPath(metaUrl);
+  const resolvedArgv = path.resolve(argv1);
+  if (resolvedArgv === selfPath) return true;
+  try {
+    return fs.realpathSync(resolvedArgv) === fs.realpathSync(selfPath);
+  } catch {
+    return false;
+  }
+}
+
+if (isMainCliModule(import.meta.url)) {
   try {
     const cli = parseCliArgs(process.argv.slice(2));
     if (cli.help) {

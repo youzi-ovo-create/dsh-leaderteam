@@ -7,6 +7,7 @@ import { TeamStore } from '../../core/store.mjs';
 import { computeTimerSnapshot, resolveNowMs } from '../../core/timer.mjs';
 import { resolvePlanArchiveRoot, PlanArchiveStore } from '../../core/plan-archive.mjs';
 import { inspectModelConfiguration, applyModelConfigChanges } from '../../core/model-config-writer.mjs';
+import { buildSoloProviderSettingsTemplates } from '../../core/solo-key.mjs';
 import { syncUpstreamModelsToDshSettings } from '../../core/upstream-models.mjs';
 import { recentTeamObservability } from '../../host/observability.mjs';
 import {
@@ -253,6 +254,7 @@ export function createPanelHandlers(ctx, rt = runtime()) {
             ctx,
             toSync,
             rt.config.magpie?.provider ?? 'magpie',
+            { providerTemplates: buildSoloProviderSettingsTemplates(process.env) },
           );
           await refreshUpstreamCatalog(ctx, rt, { force: true });
         }

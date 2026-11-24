@@ -57,41 +57,45 @@ export function redactDiagnosticText(input, options = {}) {
   text = text.replace(/\bAIza[0-9A-Za-z_-]{20,}\b/g, '[REDACTED_KEY]');
 
   // 4. Quoted Windows / UNC / POSIX paths (preserving surrounding quotes, capturing spaces inside paths)
-  text = text.replace(/(["'`])(?:[A-Za-z]:(?:\\\\|\\|\/)Users(?:\\\\|\\|\/)|\/(?:home|Users|root)\/)[^"'`\r\n]*\1/gi, '$1<USER_HOME>/<REDACTED>$1');
-  text = text.replace(/(["'`])(?:[A-Za-z]:(?:\\\\|\\|\/)|(?:\\\\\\\\|\\\\)[A-Za-z0-9._$-]+(?:\\\\|\\)|\/\/[A-Za-z0-9._$-]+\/|file:\/\/\/)[^"'`\r\n]*\1/gi, '$1<LOCAL_PATH>/<REDACTED>$1');
+  text = text.replace(/(["'`])(?:[A-Za-z]:(?:\\\\|\\|\/)Users(?:\\\\|\\|\/)|\/(?:home|Users|root)\/|\/mnt\/[a-zA-Z]\/Users\/)[^"'`\r\n]*\1/gi, '$1<USER_HOME>/<REDACTED>$1');
+  text = text.replace(/(["'`])(?:[A-Za-z]:(?:\\\\|\\|\/)|(?:\\\\\\\\|\\\\)[A-Za-z0-9._$-]+(?:\\\\|\\)|\/\/[A-Za-z0-9._$-]+\/|\/(?:opt|srv|var|tmp|etc|mnt|media|run|data)\/|file:\/\/\/?)[^"'`\r\n]*\1/gi, '$1<LOCAL_PATH>/<REDACTED>$1');
 
   // 5. Unquoted Windows UNC & POSIX UNC paths (including directory/file segments containing spaces)
   text = text.replace(
-    /(?:\\\\\\\\|\\\\)[A-Za-z0-9._$-]+(?:\\\\|\\)(?:[^\r\n"'`<>|),;:]*?(?:\\\\|\\))*[^\s"'`<>|),;:\r\n]+(?:\s+[^\s"'`<>|),;:\r\n]+\.[A-Za-z0-9]{1,10})?/g,
+    /(?:\\\\\\\\|\\\\)[A-Za-z0-9._$-]+(?:\\\\|\\)(?:[^\r\n"'`<>|),;:]*?(?:\\\\|\\))*[^\s"'`<>|),;:\r\n]+(?:[ \t]+(?!(?:failed|error|denied|blocked|at|in|on|with|to|from)\b)[A-Za-z0-9._$-]+)*(?:\.[A-Za-z0-9]{1,10})?/g,
     '<LOCAL_PATH>/<REDACTED>',
   );
   text = text.replace(
-    /(?:^|(?<=[\s"'`(=:]))\/\/[A-Za-z0-9._$-]+\/(?:[^\r\n"'`<>|),;:]*?\/)*[^\s"'`<>|),;:\r\n]+(?:\s+[^\s"'`<>|),;:\r\n]+\.[A-Za-z0-9]{1,10})?/g,
+    /(?:^|(?<=[\s"'`(=:]))\/\/[A-Za-z0-9._$-]+\/(?:[^\r\n"'`<>|),;:]*?\/)*[^\s"'`<>|),;:\r\n]+(?:[ \t]+(?!(?:failed|error|denied|blocked|at|in|on|with|to|from)\b)[A-Za-z0-9._$-]+)*(?:\.[A-Za-z0-9]{1,10})?/g,
     '<LOCAL_PATH>/<REDACTED>',
   );
 
-  // 6. Unquoted Windows & POSIX personal home paths (supports spaces across path segments and filenames)
+  // 6. Unquoted Windows, WSL2 (/mnt/c/Users/...), & POSIX personal home paths (supports multi-word spaced directories & filenames)
   text = text.replace(
-    /[A-Za-z]:(?:\\\\|\\|\/)Users(?:\\\\|\\|\/)(?:[^\r\n"'`<>|),;:]*?(?:\\\\|\\|\/))*[^\s"'`<>|),;:\r\n]+(?:\s+[^\s"'`<>|),;:\r\n]+\.[A-Za-z0-9]{1,10})?/gi,
+    /[A-Za-z]:(?:\\\\|\\|\/)Users(?:\\\\|\\|\/)(?:[^\r\n"'`<>|),;:]*?(?:\\\\|\\|\/))*[^\s"'`<>|),;:\r\n]+(?:[ \t]+(?!(?:failed|error|denied|blocked|at|in|on|with|to|from)\b)[A-Za-z0-9._$-]+)*(?:\.[A-Za-z0-9]{1,10})?/gi,
     '<USER_HOME>/<REDACTED>',
   );
   text = text.replace(
-    /(?:^|(?<=[\s"'`(=:]))\/(?:home|Users|root)\/(?:[^\r\n"'`<>|),;:]*?\/)*[^\s"'`<>|),;:\r\n]+(?:\s+[^\s"'`<>|),;:\r\n]+\.[A-Za-z0-9]{1,10})?/g,
+    /(?:^|(?<=[\s"'`(=:]))(?:\/(?:home|Users|root)|\/mnt\/[a-zA-Z]\/Users)\/(?:[^\r\n"'`<>|),;:]*?\/)*[^\s"'`<>|),;:\r\n]+(?:[ \t]+(?!(?:failed|error|denied|blocked|at|in|on|with|to|from)\b)[A-Za-z0-9._$-]+)*(?:\.[A-Za-z0-9]{1,10})?/g,
     '<USER_HOME>/<REDACTED>',
   );
 
-  // 7. Arbitrary Windows drive paths & file:// URLs (supports spaces across path segments and filenames)
+  // 7. Arbitrary Windows drive paths, POSIX local mount/system paths, & file:// URLs (supports multi-word spaced segments)
   text = text.replace(
-    /[A-Za-z]:(?:\\\\|\\|\/)(?:[^\r\n"'`<>|),;:]*?(?:\\\\|\\|\/))*[^\s"'`<>|),;:\r\n]+(?:\s+[^\s"'`<>|),;:\r\n]+\.[A-Za-z0-9]{1,10})?/g,
+    /[A-Za-z]:(?:\\\\|\\|\/)(?:[^\r\n"'`<>|),;:]*?(?:\\\\|\\|\/))*[^\s"'`<>|),;:\r\n]+(?:[ \t]+(?!(?:failed|error|denied|blocked|at|in|on|with|to|from)\b)[A-Za-z0-9._$-]+)*(?:\.[A-Za-z0-9]{1,10})?/g,
     '<LOCAL_PATH>/<REDACTED>',
   );
-  text = text.replace(/\bfile:\/\/\/[^\r\n"'`<>|),;]+/gi, '<LOCAL_PATH>/<REDACTED>');
+  text = text.replace(
+    /(?:^|(?<=[\s"'`(=:]))\/(?:opt|srv|var|tmp|mnt|media|data)\/(?:[^\r\n"'`<>|),;:]*?\/)*[^\s"'`<>|),;:\r\n]+(?:[ \t]+(?!(?:failed|error|denied|blocked|at|in|on|with|to|from)\b)[A-Za-z0-9._$-]+)*(?:\.[A-Za-z0-9]{1,10})?/g,
+    '<LOCAL_PATH>/<REDACTED>',
+  );
+  text = text.replace(/\bfile:\/\/[^\r\n"'`<>|),;]+/gi, '<LOCAL_PATH>/<REDACTED>');
 
-  // 6. Long hex (>=32 chars) and high-entropy base64 secrets (>=32 chars with mixed case + digits)
+  // 8. Long hex (>=32 chars) and high-entropy base64 secrets (>=32 chars with mixed case + digits)
   text = text.replace(/\b[0-9a-fA-F]{32,}\b/g, '[REDACTED_SECRET]');
   text = text.replace(/\b(?=[A-Za-z0-9+/]*[A-Z])(?=[A-Za-z0-9+/]*[a-z])(?=[A-Za-z0-9+/]*\d)[A-Za-z0-9+/]{32,}={0,2}\b/g, '[REDACTED_SECRET]');
 
-  // 7. Scrub current OS hostname and username
+  // 9. Scrub current OS hostname and username
   const sensitiveIdentities = new Set();
   try {
     const hn = options.hostname ?? os.hostname();
@@ -111,7 +115,13 @@ export function redactDiagnosticText(input, options = {}) {
   ]);
   for (const ident of sensitiveIdentities) {
     if (SAFE_SYSTEM_WORDS.has(ident.toLowerCase())) continue;
-    text = text.replace(new RegExp(escapeRegExp(ident), 'gi'), '<REDACTED_IDENTITY>');
+    const escIdent = escapeRegExp(ident);
+    // Short 2-3 char usernames (e.g. `dev`, `app`, `ops`) avoid matching inside English words (`device`, `mode`)
+    // while still scrubbing standalone, hyphenated (`dev-worker`), path (`/dev`), and URL (`dev:pass`) occurrences.
+    const identRe = ident.length <= 3
+      ? new RegExp(`(?<![A-Za-z])${escIdent}(?![A-Za-z])`, 'gi')
+      : new RegExp(escIdent, 'gi');
+    text = text.replace(identRe, '<REDACTED_IDENTITY>');
   }
 
   return text;
@@ -688,7 +698,19 @@ function printUsage() {
   ].join('\n'));
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+function isMainCliModule(metaUrl, argv1 = process.argv[1]) {
+  if (!argv1) return false;
+  const selfPath = fileURLToPath(metaUrl);
+  const resolvedArgv = path.resolve(argv1);
+  if (resolvedArgv === selfPath) return true;
+  try {
+    return fs.realpathSync(resolvedArgv) === fs.realpathSync(selfPath);
+  } catch {
+    return false;
+  }
+}
+
+if (isMainCliModule(import.meta.url)) {
   try {
     const cli = parseCliArgs(process.argv.slice(2));
     if (cli.help) {

@@ -2,6 +2,7 @@
 // Validates both standalone base config and merged (base + local) config before atomic writes,
 // keeps Magpie YAML patch templates synchronized, and inspects Desktop cordis.patch.yml drift.
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { LtError, FAMILIES, MODEL_ROUTE_RE, EFFORT_ID_RE, DSH_EFFORTS } from './constants.mjs';
@@ -151,6 +152,8 @@ export function resolveDefaultDshHome({ dshHome, configFile, projectRoot } = {})
       } catch {}
     }
   }
+  const homeDotDsh = os.homedir() ? path.join(os.homedir(), '.dsh') : null;
+  if (homeDotDsh && fs.existsSync(homeDotDsh)) return homeDotDsh;
   return null;
 }
 
@@ -302,6 +305,7 @@ function defaultPatchTargets(configFile) {
 
 export function inspectPatchTemplateSync(baseCfg, configFile, patchFiles = defaultPatchTargets(configFile)) {
   const rows = renderMagpieModelRows(baseCfg);
+  if (!rows.trim()) return { patchFiles, inSync: true, drifted: [] };
   const drifted = [];
   for (const file of patchFiles) {
     const current = fs.readFileSync(file, 'utf8');
@@ -798,11 +802,13 @@ export function applyModelConfigChanges(changes = {}, options = {}) {
   if (target === 'base' && options.syncPatches !== false) {
     const patchFiles = options.patchFiles ?? defaultPatchTargets(configFile);
     const rows = renderMagpieModelRows(validatedBase);
-    for (const pf of patchFiles) {
-      const curYaml = fs.readFileSync(pf, 'utf8');
-      const nextYaml = rewriteModelsBlock(curYaml, rows);
-      if (curYaml.replace(/\r\n/g, '\n') !== nextYaml.replace(/\r\n/g, '\n')) {
-        patchWrites.push({ file: pf, content: nextYaml });
+    if (rows.trim()) {
+      for (const pf of patchFiles) {
+        const curYaml = fs.readFileSync(pf, 'utf8');
+        const nextYaml = rewriteModelsBlock(curYaml, rows);
+        if (curYaml.replace(/\r\n/g, '\n') !== nextYaml.replace(/\r\n/g, '\n')) {
+          patchWrites.push({ file: pf, content: nextYaml });
+        }
       }
     }
   }

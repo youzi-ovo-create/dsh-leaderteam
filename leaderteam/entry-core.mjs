@@ -1,4 +1,5 @@
 // DSH plugin row "leaderteam-core" (profile root): config, safety gate, team roles.
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadConfig } from './core/config.mjs';
@@ -42,7 +43,7 @@ export function apply(ctx, config) {
   if (hostError) throw new Error('leaderteam: host imports unavailable; refusing to start without the safety gate', { cause: hostError });
   const { installFinalGate, Gate, ClosedGate } = hostGate;
   const rt = runtime();
-  const home = process.env.DSH_HOME ?? ctx.get('profileContext')?.home ?? null;
+  const home = process.env.DSH_HOME ?? ctx.get('profileContext')?.home ?? (os.homedir() ? path.join(os.homedir(), '.dsh') : null);
   const bundledDefaultConfigPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'config', 'leaderteam.config.json');
   const resolvedCfg = resolveOrBootstrapConfigPath({
     explicitConfigPath: config?.configPath ?? null,

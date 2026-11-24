@@ -7,6 +7,8 @@
 //   node scripts/configure-models.mjs --upsert-model zcode/GLM-5.3-Flash --efforts low,high --default-effort high
 //   node scripts/configure-models.mjs --set-role gate=codex/gpt-6.1-sol:high
 //   node scripts/configure-models.mjs --serve --open
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -309,17 +311,38 @@ export function parseCliArgs(argv) {
 
 function openBrowserUrl(url) {
   if (!/^http:\/\/127\.0\.0\.1:\d+\/$/.test(url)) return;
-  if (process.platform === 'win32') {
-    spawn('rundll32.exe', ['url.dll,FileProtocolHandler', url], {
-      windowsHide: true,
-      detached: true,
-      stdio: 'ignore',
-    }).unref();
-  } else if (process.platform === 'darwin') {
-    spawn('open', [url], { detached: true, stdio: 'ignore' }).unref();
-  } else {
-    spawn('xdg-open', [url], { detached: true, stdio: 'ignore' }).unref();
+  let child;
+  try {
+    if (process.platform === 'win32') {
+      child = spawn('rundll32.exe', ['url.dll,FileProtocolHandler', url], {
+        windowsHide: true,
+        detached: true,
+        stdio: 'ignore',
+      });
+    } else if (process.platform === 'darwin') {
+      child = spawn('open', [url], { detached: true, stdio: 'ignore' });
+    } else {
+      child = spawn('xdg-open', [url], { detached: true, stdio: 'ignore' });
+    }
+    child.on('error', () => {
+      // Headless Linux / WSL2 / container without xdg-open: keep loopback server alive silently.
+    });
+    child.unref();
+  } catch {}
+}
+
+function resolveDefaultConfigFile(opts) {
+  if (opts.configFile) return path.resolve(opts.configFile);
+  if (process.env.LEADERTEAM_CONFIG) return path.resolve(process.env.LEADERTEAM_CONFIG);
+  const inNodeModules = ROOT.replaceAll('\\', '/').includes('/node_modules/');
+  if (inNodeModules) {
+    const dshHome = opts.dshHome ?? process.env.LT_DSH_HOME ?? process.env.DSH_HOME ?? (os.homedir() ? path.join(os.homedir(), '.dsh') : null);
+    if (dshHome) {
+      const managed = path.join(path.resolve(dshHome), 'leaderteam', 'config', 'leaderteam.config.json');
+      if (fs.existsSync(managed)) return managed;
+    }
   }
+  return path.join(ROOT, 'config', 'leaderteam.config.json');
 }
 
 async function main() {
@@ -329,7 +352,7 @@ async function main() {
     return;
   }
 
-  const configFile = path.resolve(opts.configFile ?? process.env.LEADERTEAM_CONFIG ?? path.join(ROOT, 'config', 'leaderteam.config.json'));
+  const configFile = resolveDefaultConfigFile(opts);
   const commonOpts = {
     configFile,
     localFile: opts.localFile,
@@ -419,7 +442,19 @@ async function main() {
   }, null, 2));
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+function isMainCliModule(metaUrl, argv1 = process.argv[1]) {
+  if (!argv1) return false;
+  const selfPath = fileURLToPath(metaUrl);
+  const resolvedArgv = path.resolve(argv1);
+  if (resolvedArgv === selfPath) return true;
+  try {
+    return fs.realpathSync(resolvedArgv) === fs.realpathSync(selfPath);
+  } catch {
+    return false;
+  }
+}
+
+if (isMainCliModule(import.meta.url)) {
   main().catch(err => {
     console.error(err instanceof Error ? err.message : String(err));
     process.exit(1);

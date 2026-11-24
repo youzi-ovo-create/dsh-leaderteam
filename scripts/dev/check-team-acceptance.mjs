@@ -26,7 +26,7 @@ const acc = JSON.parse(fs.readFileSync(opt('acceptance'), 'utf8'));
 const task = fs.readFileSync(opt('task-file'), 'utf8');
 const finalText = fs.readFileSync(opt('final-file'), 'utf8');
 const exitCode = Number(opt('exit-code'));
-const python = opt('python') ?? 'python';
+const python = opt('python') ?? (process.platform !== 'win32' && spawnSync('python3', ['--version'], { encoding: 'utf8' }).status === 0 ? 'python3' : 'python');
 
 const checks = [];
 const check = (id, title, pass, detail) => { checks.push({ id, title, pass: Boolean(pass), detail }); };

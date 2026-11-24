@@ -7,9 +7,38 @@ import { spawnSync } from 'node:child_process';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const DEFAULT_APP = path.join(ROOT, 'runtime', 'official-desktop', '0.2.2-rc.1');
 const PATHS_CONFIG = path.join(ROOT, 'config', 'official-desktop.paths.json');
-const OFFICIAL_EXE = 'DeepSeek Harness.exe';
+const OFFICIAL_EXE_WIN = 'DeepSeek Harness.exe';
+const OFFICIAL_EXE_LINUX_CANDIDATES = ['deepseek-harness', 'DeepSeek Harness'];
 const LEGACY_EXE = 'DSH Desktop.exe';
 const EXTRA_VERIFIED_VERSIONS = ['0.2.2-rc.5'];
+
+function splitShellArgs(raw) {
+  const out = [];
+  const src = String(raw ?? '');
+  let i = 0;
+  while (i < src.length) {
+    while (i < src.length && /\s/.test(src[i])) i++;
+    if (i >= src.length) break;
+    let tok = '';
+    while (i < src.length && !/\s/.test(src[i])) {
+      if (src[i] === '"' || src[i] === "'") {
+        const q = src[i++];
+        while (i < src.length && src[i] !== q) {
+          if (q === '"' && src[i] === '\\' && i + 1 < src.length) { tok += src[i + 1]; i += 2; continue; }
+          tok += src[i++];
+        }
+        if (i < src.length) i++;
+      } else if (src[i] === '\\' && i + 1 < src.length) {
+        tok += src[i + 1];
+        i += 2;
+      } else {
+        tok += src[i++];
+      }
+    }
+    if (tok) out.push(tok);
+  }
+  return out;
+}
 
 function resolveToolsPkgFromDshBin(bin, moduleRoot) {
   const direct = path.join(moduleRoot, 'node_modules', '@deepseek-ai', 'dsh-tools', 'package.json');
@@ -66,8 +95,34 @@ function defaultAppPath() {
       if (typeof parsed?.app === 'string' && parsed.app.trim() && fs.existsSync(parsed.app)) return parsed.app;
     }
   } catch {}
-  const localPrograms = process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Programs', 'DeepSeek Harness') : null;
-  if (localPrograms && fs.existsSync(localPrograms)) return localPrograms;
+  if (process.platform === 'win32') {
+    const localPrograms = process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Programs', 'DeepSeek Harness') : null;
+    if (localPrograms && fs.existsSync(localPrograms)) return localPrograms;
+  } else {
+    const unixCandidates = [
+      '/opt/DeepSeek Harness',
+      '/opt/deepseek-harness',
+      '/Applications/DeepSeek Harness.app/Contents',
+      '/usr/local/lib/node_modules/@deepseek-ai/dsh',
+      '/usr/lib/node_modules/@deepseek-ai/dsh',
+      '/opt/homebrew/lib/node_modules/@deepseek-ai/dsh',
+    ];
+    for (const cand of unixCandidates) {
+      if (fs.existsSync(cand)) return cand;
+    }
+    const pathSep = ':';
+    for (const binDir of String(process.env.PATH ?? '').split(pathSep).filter(Boolean)) {
+      const dshBin = path.join(binDir, 'dsh');
+      if (!fs.existsSync(dshBin)) continue;
+      try {
+        const real = fs.realpathSync(dshBin);
+        const norm = real.replaceAll('\\', '/');
+        const nmIdx = norm.lastIndexOf('/node_modules/');
+        if (nmIdx > 0) return real.slice(0, nmIdx);
+        return path.dirname(path.dirname(real));
+      } catch {}
+    }
+  }
   return DEFAULT_APP;
 }
 
@@ -95,7 +150,7 @@ function resolveLabRuntime() {
   if (marker < 0) throw new Error('LT_DSH_BIN must point inside a DSH node_modules tree');
   const moduleRoot = bin.slice(0, marker);
   const official = normalizedBin.slice(0, marker).endsWith('/resources/app.asar/dsh');
-  const cliArgs = [...(process.env.LT_DSH_EXEC_ARGS ?? '').split(' ').filter(Boolean), entry, bin];
+  const cliArgs = [...splitShellArgs(process.env.LT_DSH_EXEC_ARGS ?? ''), entry, bin];
   return {
     kind: 'lab',
     app: process.env.LT_DSH_APP ?? appFromModuleRoot(moduleRoot),
@@ -107,14 +162,29 @@ function resolveLabRuntime() {
   };
 }
 
+function findOfficialDesktopExecutable(app) {
+  for (const name of [OFFICIAL_EXE_WIN, ...OFFICIAL_EXE_LINUX_CANDIDATES]) {
+    const full = path.join(app, name);
+    if (fs.existsSync(full) && fs.statSync(full).isFile()) return full;
+  }
+  return null;
+}
+
 function resolveOfficialRuntime(app) {
-  requireFile(path.join(app, OFFICIAL_EXE), 'official-desktop', 'DeepSeek Harness.exe');
+  const exePath = findOfficialDesktopExecutable(app);
+  if (!exePath) {
+    requireFile(path.join(app, OFFICIAL_EXE_WIN), 'official-desktop', 'DeepSeek Harness executable');
+  }
   const asarFile = path.join(app, 'resources', 'app.asar');
   const asarPackage = path.join(asarFile, 'dsh', 'package.json');
   if (!((fs.existsSync(asarFile) && fs.statSync(asarFile).isFile()) || fs.existsSync(asarPackage))) {
     throw new Error(`Unknown DSH runtime layout (official-desktop); missing resources/app.asar: ${asarFile}`);
   }
-  requireFile(path.join(app, 'resources', 'runtime', 'cli', 'bin', 'dsh.cmd'), 'official-desktop', 'official dsh.cmd');
+  const winCli = path.join(app, 'resources', 'runtime', 'cli', 'bin', 'dsh.cmd');
+  const unixCli = path.join(app, 'resources', 'runtime', 'cli', 'bin', 'dsh');
+  if (!(fs.existsSync(winCli) && fs.statSync(winCli).isFile()) && !(fs.existsSync(unixCli) && fs.statSync(unixCli).isFile())) {
+    requireFile(winCli, 'official-desktop', 'official dsh CLI');
+  }
   const runtimeFile = path.join(app, 'resources', 'runtime', 'primary-runtime', 'runtime.json');
   requireFile(runtimeFile, 'official-desktop', 'primary runtime metadata');
   const runtime = JSON.parse(fs.readFileSync(runtimeFile, 'utf8'));
@@ -124,7 +194,7 @@ function resolveOfficialRuntime(app) {
   return {
     kind: 'official-desktop',
     app,
-    exe: path.join(app, OFFICIAL_EXE),
+    exe: exePath,
     cliArgs: ['--expose-internals', path.join(app, 'resources', 'app.asar', 'dsh', 'node_modules', '@deepseek-ai', 'dsh-desktop-host', 'lib', 'cli.js')],
     moduleRoot: path.join(app, 'resources', 'app.asar', 'dsh'),
     profile: 'desktop',
@@ -151,7 +221,7 @@ function resolveLegacyRuntime(app) {
 
 function resolveConfiguredRuntime(app) {
   if (!fs.existsSync(app) || !fs.statSync(app).isDirectory()) throw new Error(`DSH app directory not found: ${app}`);
-  if (fs.existsSync(path.join(app, OFFICIAL_EXE))) return resolveOfficialRuntime(app);
+  if (findOfficialDesktopExecutable(app)) return resolveOfficialRuntime(app);
   if (fs.existsSync(path.join(app, LEGACY_EXE))) return resolveLegacyRuntime(app);
   const npmCli = resolveNpmCliRuntime(app);
   if (npmCli) return npmCli;
@@ -181,7 +251,19 @@ export function verifyOfficialArtifact(runtime) {
   return { ...runtime, artifact };
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+function isMainCliModule(metaUrl, argv1 = process.argv[1]) {
+  if (!argv1) return false;
+  const selfPath = fileURLToPath(metaUrl);
+  const resolvedArgv = path.resolve(argv1);
+  if (resolvedArgv === selfPath) return true;
+  try {
+    return fs.realpathSync(resolvedArgv) === fs.realpathSync(selfPath);
+  } catch {
+    return false;
+  }
+}
+
+if (isMainCliModule(import.meta.url)) {
   const args = process.argv.slice(2);
   if (args[0] !== '--json' || (args.length !== 1 && !(args.length === 3 && args[1] === '--app' && args[2]))) {
     console.error('Usage: node scripts/dsh-runtime.mjs --json [--app <app directory>]');

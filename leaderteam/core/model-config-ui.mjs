@@ -60,7 +60,10 @@ function sendJson(res, status, payload) {
 
 export function runDesktopSync({ projectRoot, dshHome, profile = 'desktop', dryRun = false }) {
   if (process.platform !== 'win32') {
-    return { ok: false, error: 'Desktop installer sync requires Windows PowerShell (install-desktop.ps1).' };
+    return {
+      ok: false,
+      error: 'On Linux/macOS, dsh.bundle syncs configured models automatically to DSH settings at startup and via the in-DSH LeaderTeam Panel (Windows-only scripts/install-desktop.ps1 is not required).',
+    };
   }
   const script = path.join(projectRoot, 'scripts', 'install-desktop.ps1');
   const psArgs = ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script, '-Profile', profile];

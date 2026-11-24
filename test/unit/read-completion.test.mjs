@@ -4,10 +4,9 @@ import { onAgentDisposed, onToolResult } from '../../leaderteam/host/roles.mjs';
 import { runtime } from '../../leaderteam/host/runtime.mjs';
 import { pathKey, resolvePath } from '../../leaderteam/core/paths.mjs';
 
-// These cases use Windows paths, as on the production host; they are skipped elsewhere.
-const wtest = (name, fn) => test(name, { skip: process.platform !== 'win32' && 'uses Windows paths' }, fn);
-const CWD = 'D:\\leaderteam-read-test';
-const FILE = resolvePath('spec.md', CWD, 'win32');
+const PLAT = process.platform;
+const CWD = PLAT === 'win32' ? 'D:\\leaderteam-read-test' : '/tmp/leaderteam-read-test';
+const FILE = resolvePath('spec.md', CWD, PLAT);
 
 function member(id = 'member-1') {
   const actor = { id, role: 'member', cwd: CWD, refs: [FILE] };
@@ -24,14 +23,14 @@ function read(memberActor, args, result) {
 }
 
 function assertUnread(memberActor) {
-  assert.equal(Boolean(runtime().reads.get(memberActor.id)?.has(pathKey(FILE, 'win32'))), false);
+  assert.equal(Boolean(runtime().reads.get(memberActor.id)?.has(pathKey(FILE, PLAT))), false);
 }
 
 function assertRead(memberActor) {
-  assert.equal(runtime().reads.get(memberActor.id)?.has(pathKey(FILE, 'win32')), true);
+  assert.equal(runtime().reads.get(memberActor.id)?.has(pathKey(FILE, PLAT)), true);
 }
 
-wtest('a successful partial read does not mark a reference complete', () => {
+test('a successful partial read does not mark a reference complete', () => {
   const actor = member('partial');
   runtime().actors.set(actor.id, actor);
   read(actor, { file_path: 'spec.md' }, readResult({
@@ -42,11 +41,11 @@ wtest('a successful partial read does not mark a reference complete', () => {
   assertUnread(actor);
 });
 
-wtest('invalid or untrusted read metadata does not mark a reference complete', () => {
+test('invalid or untrusted read metadata does not mark a reference complete', () => {
   const cases = [
     { meta: undefined },
     readResult({ includePath: false, offset: 1, lines: [{ number: 1, text: 'only' }], totalLines: 1 }),
-    readResult({ path: resolvePath('other.md', CWD, 'win32'), offset: 1, lines: [{ number: 1, text: 'only' }], totalLines: 1 }),
+    readResult({ path: resolvePath('other.md', CWD, PLAT), offset: 1, lines: [{ number: 1, text: 'only' }], totalLines: 1 }),
     readResult({ offset: 1, lines: [{ number: 3, text: 'third' }], totalLines: 3 }),
     readResult({ offset: 1, lines: [{ number: 1, text: 'a' }, { number: 3, text: 'c' }], totalLines: 3 }),
     readResult({ offset: 1, lines: [{ number: 1, text: 'a' }, { number: 1, text: 'a' }], totalLines: 2 }),
@@ -62,7 +61,7 @@ wtest('invalid or untrusted read metadata does not mark a reference complete', (
   }
 });
 
-wtest('empty files and complete windows are marked read', () => {
+test('empty files and complete windows are marked read', () => {
   const empty = member('empty');
   runtime().actors.set(empty.id, empty);
   read(empty, { file_path: 'spec.md' }, readResult({ offset: 1, lines: [], totalLines: 0 }));
@@ -78,7 +77,7 @@ wtest('empty files and complete windows are marked read', () => {
   assertRead(complete);
 });
 
-wtest('disjoint pages accumulate until every line is covered', () => {
+test('disjoint pages accumulate until every line is covered', () => {
   const actor = member('pages');
   runtime().actors.set(actor.id, actor);
   read(actor, { file_path: 'spec.md' }, readResult({
@@ -95,7 +94,7 @@ wtest('disjoint pages accumulate until every line is covered', () => {
   assertRead(actor);
 });
 
-wtest('overlapping reads merge and errors never register progress', () => {
+test('overlapping reads merge and errors never register progress', () => {
   const actor = member('overlap');
   runtime().actors.set(actor.id, actor);
   read(actor, { file_path: 'spec.md' }, readResult({
@@ -118,7 +117,7 @@ wtest('overlapping reads merge and errors never register progress', () => {
   assertRead(actor);
 });
 
-wtest('disposing an agent removes its read completion progress', () => {
+test('disposing an agent removes its read completion progress', () => {
   const actor = member('dispose');
   runtime().actors.set(actor.id, actor);
   read(actor, { file_path: 'spec.md' }, readResult({

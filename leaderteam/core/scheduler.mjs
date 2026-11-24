@@ -394,10 +394,62 @@ function discoverSelfCgroupSubpaths(fsImpl) {
   return { v2, v1Mem, v1Cpu };
 }
 
+function buildCgroupAncestorChain(cgroupRoot, relSubpath) {
+  const dirs = [];
+  if (relSubpath) {
+    const cleanRel = relSubpath.replace(/^\/+|\/+$/g, '');
+    if (cleanRel) {
+      const segs = cleanRel.split('/').filter(Boolean);
+      for (let len = segs.length; len >= 1; len--) {
+        dirs.push(path.join(cgroupRoot, ...segs.slice(0, len)));
+      }
+    }
+  }
+  dirs.push(cgroupRoot);
+  return [...new Set(dirs)];
+}
+
+function readMinFiniteByteLimit(fsImpl, dirs, filenames) {
+  let minBytes = null;
+  let sawAnyFile = false;
+  for (const dir of dirs) {
+    if (!dir) continue;
+    for (const filename of filenames) {
+      const raw = readTextSafe(fsImpl, path.join(dir, filename));
+      if (raw === null) continue;
+      sawAnyFile = true;
+      const parsed = parseCgroupByteValue(raw, { allowUnlimited: true });
+      if (parsed !== null && (minBytes === null || parsed < minBytes)) {
+        minBytes = parsed;
+      }
+    }
+  }
+  return { minBytes, sawAnyFile };
+}
+
+function readReclaimablePageCacheBytes(fsImpl, dirs, keyNames) {
+  for (const dir of dirs) {
+    if (!dir) continue;
+    const raw = readTextSafe(fsImpl, path.join(dir, 'memory.stat'));
+    if (!raw) continue;
+    const map = new Map();
+    for (const line of raw.split(/\r?\n/)) {
+      const m = /^([A-Za-z0-9_]+)\s+(\d+)/.exec(line.trim());
+      if (m) map.set(m[1], Number(m[2]));
+    }
+    for (const k of keyNames) {
+      const v = map.get(k);
+      if (typeof v === 'number' && Number.isFinite(v) && v >= 0) return v;
+    }
+  }
+  return 0;
+}
+
 /**
- * Read Linux container limits supporting **cgroup v2** (`memory.max`, `memory.current`, `cpu.max`)
- * and **cgroup v1 fallback** (`memory/memory.limit_in_bytes`, `memory/memory.usage_in_bytes`,
- * `cpu/cpu.cfs_quota_us` + `cpu.cfs_period_us`). Zero subprocesses; never throws.
+ * Read Linux container limits supporting **cgroup v2** (`memory.max`, `memory.high`, `memory.current`,
+ * `memory.stat`, `cpu.max` across full ancestor slice hierarchy) and **cgroup v1 fallback**
+ * (`memory/memory.limit_in_bytes`, `memory/memory.usage_in_bytes`, `cpu/cpu.cfs_quota_us` + `cpu.cfs_period_us`),
+ * including hybrid cgroup v1+v2 hosts. Zero subprocesses; never throws.
  */
 export function readLinuxCgroupLimits(fsImpl = fs, cgroupRoot = '/sys/fs/cgroup') {
   const empty = {
@@ -417,36 +469,80 @@ export function readLinuxCgroupLimits(fsImpl = fs, cgroupRoot = '/sys/fs/cgroup'
     ? discoverSelfCgroupSubpaths(fsImpl)
     : { v2: null, v1Mem: null, v1Cpu: null };
 
-  const v2Dirs = [
-    ...(selfPaths.v2 ? [path.join(cgroupRoot, selfPaths.v2)] : []),
+  const v2Dirs = buildCgroupAncestorChain(cgroupRoot, selfPaths.v2);
+
+  const v2MemMax = readMinFiniteByteLimit(fsImpl, v2Dirs, ['memory.max']);
+  const v2MemHigh = v2MemMax.minBytes === null ? readMinFiniteByteLimit(fsImpl, v2Dirs, ['memory.high']) : { minBytes: null, sawAnyFile: false };
+  const rawV2MemCur = readFirstAvailable(fsImpl, v2Dirs, 'memory.current');
+  const rawV2Controllers = readTextSafe(fsImpl, path.join(cgroupRoot, 'cgroup.controllers'));
+
+  let v2CpuQuotaCores = null;
+  let sawV2CpuFile = false;
+  for (const dir of v2Dirs) {
+    const rawCpuMax = readTextSafe(fsImpl, path.join(dir, 'cpu.max'));
+    if (rawCpuMax === null) continue;
+    sawV2CpuFile = true;
+    const [quotaTok, periodTok] = rawCpuMax.split(/\s+/);
+    if (quotaTok && quotaTok !== 'max') {
+      const quota = Number(quotaTok);
+      const period = Number(periodTok || 100000);
+      if (Number.isFinite(quota) && quota > 0 && Number.isFinite(period) && period > 0) {
+        const cores = Math.round((quota / period) * 1000) / 1000;
+        if (v2CpuQuotaCores === null || cores < v2CpuQuotaCores) v2CpuQuotaCores = cores;
+      }
+    }
+  }
+
+  const toMib = b => (b === null ? null : Math.max(0, Math.round(b / (1024 * 1024))));
+  const hasAnyV2Signal = v2MemMax.sawAnyFile || v2MemHigh.sawAnyFile || rawV2MemCur !== null || sawV2CpuFile || rawV2Controllers !== null;
+
+  // Also inspect cgroup v1 in case this is a pure v1 or hybrid v1+v2 host where limits live on v1 controllers
+  const v1MemDirs = [
+    ...buildCgroupAncestorChain(path.join(cgroupRoot, 'memory'), selfPaths.v1Mem),
+    cgroupRoot,
+  ];
+  const v1CpuDirs = [
+    ...buildCgroupAncestorChain(path.join(cgroupRoot, 'cpu'), selfPaths.v1Cpu),
+    ...buildCgroupAncestorChain(path.join(cgroupRoot, 'cpu,cpuacct'), selfPaths.v1Cpu),
     cgroupRoot,
   ];
 
-  const rawV2MemMax = readFirstAvailable(fsImpl, v2Dirs, 'memory.max');
-  const rawV2MemCur = readFirstAvailable(fsImpl, v2Dirs, 'memory.current');
-  const rawV2CpuMax = readFirstAvailable(fsImpl, v2Dirs, 'cpu.max');
-
-  const toMib = b => (b === null ? null : Math.max(0, Math.round(b / (1024 * 1024))));
-
-  if (rawV2MemMax !== null || rawV2MemCur !== null || rawV2CpuMax !== null) {
-    const memoryLimitBytes = parseCgroupByteValue(rawV2MemMax, { allowUnlimited: true });
-    const memoryUsageBytes = parseCgroupByteValue(rawV2MemCur, { allowUnlimited: false });
-    const rawSwapMax = readFirstAvailable(fsImpl, v2Dirs, 'memory.swap.max');
-    const rawSwapCur = readFirstAvailable(fsImpl, v2Dirs, 'memory.swap.current');
-    const swapLimitBytes = rawSwapMax === '0' ? 0 : parseCgroupByteValue(rawSwapMax, { allowUnlimited: true });
-    const swapUsageBytes = parseCgroupByteValue(rawSwapCur, { allowUnlimited: false });
-
-    let cpuQuotaCores = null;
-    if (rawV2CpuMax !== null) {
-      const [quotaTok, periodTok] = rawV2CpuMax.split(/\s+/);
-      if (quotaTok && quotaTok !== 'max') {
-        const quota = Number(quotaTok);
-        const period = Number(periodTok || 100000);
-        if (Number.isFinite(quota) && quota > 0 && Number.isFinite(period) && period > 0) {
-          cpuQuotaCores = Math.round((quota / period) * 1000) / 1000;
-        }
-      }
+  const v1MemLim = readMinFiniteByteLimit(fsImpl, v1MemDirs, ['memory.limit_in_bytes']);
+  const rawV1Use = readFirstAvailable(fsImpl, v1MemDirs, 'memory.usage_in_bytes');
+  let v1CpuQuotaCores = null;
+  let sawV1CpuFile = false;
+  for (const dir of v1CpuDirs) {
+    const rawQuota = readTextSafe(fsImpl, path.join(dir, 'cpu.cfs_quota_us'));
+    if (rawQuota === null) continue;
+    sawV1CpuFile = true;
+    const quota = Number(rawQuota);
+    const period = Number(readTextSafe(fsImpl, path.join(dir, 'cpu.cfs_period_us')) || 100000);
+    if (Number.isFinite(quota) && quota > 0 && Number.isFinite(period) && period > 0) {
+      const cores = Math.round((quota / period) * 1000) / 1000;
+      if (v1CpuQuotaCores === null || cores < v1CpuQuotaCores) v1CpuQuotaCores = cores;
     }
+  }
+  const hasAnyV1Signal = v1MemLim.sawAnyFile || rawV1Use !== null || sawV1CpuFile;
+
+  if (hasAnyV2Signal && (v2MemMax.minBytes !== null || v2MemHigh.minBytes !== null || v2CpuQuotaCores !== null || (v1MemLim.minBytes === null && v1CpuQuotaCores === null))) {
+    const memoryLimitBytes = v2MemMax.minBytes ?? v2MemHigh.minBytes ?? null;
+    const rawMemoryUsageBytes = parseCgroupByteValue(rawV2MemCur, { allowUnlimited: false });
+    const reclaimableCacheBytes = rawMemoryUsageBytes !== null
+      ? readReclaimablePageCacheBytes(fsImpl, v2Dirs, ['inactive_file'])
+      : 0;
+    const memoryUsageBytes = rawMemoryUsageBytes !== null
+      ? Math.max(0, rawMemoryUsageBytes - reclaimableCacheBytes)
+      : null;
+
+    let swapLimitBytes = null;
+    for (const dir of v2Dirs) {
+      const rawSwapMax = readTextSafe(fsImpl, path.join(dir, 'memory.swap.max'));
+      if (rawSwapMax === null) continue;
+      const parsed = rawSwapMax === '0' ? 0 : parseCgroupByteValue(rawSwapMax, { allowUnlimited: true });
+      if (parsed !== null && (swapLimitBytes === null || parsed < swapLimitBytes)) swapLimitBytes = parsed;
+    }
+    const rawSwapCur = readFirstAvailable(fsImpl, v2Dirs, 'memory.swap.current');
+    const swapUsageBytes = parseCgroupByteValue(rawSwapCur, { allowUnlimited: false });
 
     const memoryLimitMib = toMib(memoryLimitBytes);
     const memoryUsageMib = toMib(memoryUsageBytes);
@@ -463,42 +559,22 @@ export function readLinuxCgroupLimits(fsImpl = fs, cgroupRoot = '/sys/fs/cgroup'
       memoryRemainingMib,
       swapLimitMib: toMib(swapLimitBytes),
       swapUsageMib: toMib(swapUsageBytes),
-      cpuQuotaCores,
+      cpuQuotaCores: v2CpuQuotaCores,
     };
   }
 
-  // cgroup v1 fallback
-  const v1MemDirs = [
-    ...(selfPaths.v1Mem ? [path.join(cgroupRoot, 'memory', selfPaths.v1Mem)] : []),
-    path.join(cgroupRoot, 'memory'),
-    cgroupRoot,
-  ];
-  const v1CpuDirs = [
-    ...(selfPaths.v1Cpu ? [path.join(cgroupRoot, 'cpu', selfPaths.v1Cpu)] : []),
-    path.join(cgroupRoot, 'cpu'),
-    path.join(cgroupRoot, 'cpu,cpuacct'),
-    cgroupRoot,
-  ];
-
-  const rawV1Lim = readFirstAvailable(fsImpl, v1MemDirs, 'memory.limit_in_bytes');
-  const rawV1Use = readFirstAvailable(fsImpl, v1MemDirs, 'memory.usage_in_bytes');
-  const rawV1Quota = readFirstAvailable(fsImpl, v1CpuDirs, 'cpu.cfs_quota_us');
-  const rawV1Period = readFirstAvailable(fsImpl, v1CpuDirs, 'cpu.cfs_period_us');
-
-  if (rawV1Lim === null && rawV1Use === null && rawV1Quota === null) {
+  if (!hasAnyV1Signal) {
     return empty;
   }
 
-  const memoryLimitBytes = parseCgroupByteValue(rawV1Lim, { allowUnlimited: true });
-  const memoryUsageBytes = parseCgroupByteValue(rawV1Use, { allowUnlimited: false });
-  let cpuQuotaCores = null;
-  if (rawV1Quota !== null) {
-    const quota = Number(rawV1Quota);
-    const period = Number(rawV1Period || 100000);
-    if (Number.isFinite(quota) && quota > 0 && Number.isFinite(period) && period > 0) {
-      cpuQuotaCores = Math.round((quota / period) * 1000) / 1000;
-    }
-  }
+  const memoryLimitBytes = v1MemLim.minBytes;
+  const rawMemoryUsageBytes = parseCgroupByteValue(rawV1Use, { allowUnlimited: false });
+  const reclaimableV1CacheBytes = rawMemoryUsageBytes !== null
+    ? readReclaimablePageCacheBytes(fsImpl, v1MemDirs, ['total_inactive_file', 'inactive_file'])
+    : 0;
+  const memoryUsageBytes = rawMemoryUsageBytes !== null
+    ? Math.max(0, rawMemoryUsageBytes - reclaimableV1CacheBytes)
+    : null;
 
   const memoryLimitMib = toMib(memoryLimitBytes);
   const memoryUsageMib = toMib(memoryUsageBytes);
@@ -515,7 +591,7 @@ export function readLinuxCgroupLimits(fsImpl = fs, cgroupRoot = '/sys/fs/cgroup'
     memoryRemainingMib,
     swapLimitMib: null,
     swapUsageMib: null,
-    cpuQuotaCores,
+    cpuQuotaCores: v1CpuQuotaCores,
   };
 }
 
@@ -544,9 +620,25 @@ export function readLinuxProcMeminfo(fsImpl = fs, meminfoPath = '/proc/meminfo')
     ?? (memFreeKib !== null ? memFreeKib + buffersKib + cachedKib : null);
   const commitLimitKib = kibMap.get('CommitLimit') ?? null;
   const committedAsKib = kibMap.get('Committed_AS') ?? null;
+  const swapTotalKib = kibMap.get('SwapTotal') ?? 0;
   const swapFreeKib = kibMap.get('SwapFree') ?? null;
 
   if (memTotalKib === null && memAvailableKib === null) return null;
+
+  // On Linux, `/proc/meminfo` `CommitLimit` defaults to `SwapTotal + 50% * MemTotal` and is ONLY enforced when
+  // `/proc/sys/vm/overcommit_memory === 2` (strict mode). Under default heuristic overcommit (`0`) or `1`,
+  // virtual reservations (V8/Wasm/Electron pointer cages) routinely exceed `50% * MemTotal` even with abundant free RAM;
+  // use `Math.max(CommitLimit, MemTotal + SwapTotal)` unless strict `overcommit_memory === 2` is active.
+  const rawOvercommitMode = meminfoPath === '/proc/meminfo'
+    ? readTextSafe(fsImpl, '/proc/sys/vm/overcommit_memory')
+    : null;
+  const strictOvercommit = rawOvercommitMode === '2';
+  const backingTotalKib = memTotalKib !== null ? memTotalKib + swapTotalKib : null;
+  const effectiveCommitTotalKib = strictOvercommit
+    ? commitLimitKib
+    : (commitLimitKib !== null && backingTotalKib !== null
+      ? Math.max(commitLimitKib, backingTotalKib)
+      : (commitLimitKib ?? backingTotalKib));
 
   const kibToMib = k => (k === null ? null : Math.round(k / 1024));
   const memTotalMib = kibToMib(memTotalKib);
@@ -554,12 +646,13 @@ export function readLinuxProcMeminfo(fsImpl = fs, meminfoPath = '/proc/meminfo')
   const commitLimitMib = kibToMib(commitLimitKib);
   const committedAsMib = kibToMib(committedAsKib);
   const swapFreeMib = kibToMib(swapFreeKib);
-  const availCommitKib = (commitLimitKib !== null && committedAsKib !== null)
-    ? Math.max(0, commitLimitKib - committedAsKib)
-    : null;
+  const totalCommitMib = kibToMib(effectiveCommitTotalKib);
+  const availCommitKib = (effectiveCommitTotalKib !== null && committedAsKib !== null)
+    ? Math.max(0, effectiveCommitTotalKib - committedAsKib)
+    : (memAvailableKib !== null ? memAvailableKib + (swapFreeKib ?? 0) : null);
   const availCommitMib = kibToMib(availCommitKib);
-  const commitUsedPct = (commitLimitKib !== null && commitLimitKib > 0 && committedAsKib !== null)
-    ? Math.round((committedAsKib / commitLimitKib) * 1000) / 10
+  const commitUsedPct = (effectiveCommitTotalKib !== null && effectiveCommitTotalKib > 0 && availCommitKib !== null)
+    ? Math.round(((effectiveCommitTotalKib - availCommitKib) / effectiveCommitTotalKib) * 1000) / 10
     : null;
 
   return {
@@ -575,7 +668,7 @@ export function readLinuxProcMeminfo(fsImpl = fs, meminfoPath = '/proc/meminfo')
     commitLimitMib,
     committedAsMib,
     swapFreeMib,
-    totalCommitMib: commitLimitMib,
+    totalCommitMib,
     availCommitMib,
     commitUsedPct,
   };

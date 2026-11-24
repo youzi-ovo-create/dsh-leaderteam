@@ -416,7 +416,11 @@ export function registerTeamTools(ctx) {
         const available = new Set(definitions.map(d => d.name));
         const unavailable = args.tools.filter(n => !available.has(n));
         if (unavailable.length) throw new Error(`stage tools are unavailable: ${unavailable.join(', ')}; choose exact names from team_tools(action="list", profile="${args.profile ?? 'code'}")`);
-        if (args.profile === 'shell' && !cfg.gate.shellTools.some(n => available.has(n) && grant.allowedTools.includes(n))) throw new Error('shell stage must select an actual host shell tool such as pwsh; "shell" is a profile, not a tool name');
+        if (args.profile === 'shell' && !cfg.gate.shellTools.some(n => available.has(n) && grant.allowedTools.includes(n))) {
+          const availShells = cfg.gate.shellTools.filter(n => available.has(n));
+          const shellExample = availShells.length > 0 ? availShells.join(' or ') : (process.platform === 'win32' ? 'pwsh' : 'bash');
+          throw new Error(`shell stage must select an actual host shell tool such as ${shellExample}; "shell" is a profile, not a tool name`);
+        }
         if (profile.mutating && !grant.allowedTools.some(n => !cfg.gate.uncontrolledTools.includes(n))) throw new Error('writing stage must select edit/write or an actual shell tool');
       }
       const result = args.action === 'overview' ? recordOverview(store, taskSeq, args) : args.action === 'stage' ? recordStage(store, taskSeq, args) : (() => { throw new Error('invalid team_plan action'); })();
@@ -1514,11 +1518,12 @@ export function registerTeamTools(ctx) {
                 return {...summarize(id,state),...context,status:'waiting_user',escalation,next_step_hint:'Ask the user to choose disclosed delivery, assistance, or stop. Do not loop or claim approval.'};
               }
             }
+            const hostShellTool = process.platform === 'win32' ? 'pwsh' : 'bash';
             const nextHint = state.outcome?.decision === 'revise'
               ? (input.kind === 'delivery'
                 ? (activePlanId !== null
-                  ? `Delivery review returned "revise": do NOT end your turn or output "DELIVERY: not approved". Dispatch member(s) using active plan_id="${activePlanId}" (for profile="shell", include "read", "glob", "grep", "pwsh" and "read_image" in tools, plus "edit"/"write" if modifying files) to resolve every item in outcome.required_changes and collect real execution/browser verification evidence, then call team_discuss with kind="delivery" and revises="${id}".`
-                  : `Delivery review returned "revise": do NOT end your turn or output "DELIVERY: not approved". Because active_approved_plan_id is null for current task_seq=${state.taskSeq ?? 1}, first update .leaderteam/refs/plan.md and call team_discuss(kind="plan") to obtain an approved plan_id, then dispatch member(s) under that plan_id (for profile="shell", include "read", "glob", "grep", "pwsh" and "read_image" in tools, plus "edit"/"write" if modifying files) to resolve every item in outcome.required_changes, and call team_discuss with kind="delivery" and revises="${id}".`)
+                  ? `Delivery review returned "revise": do NOT end your turn or output "DELIVERY: not approved". Dispatch member(s) using active plan_id="${activePlanId}" (for profile="shell", include "read", "glob", "grep", "${hostShellTool}" and "read_image" in tools, plus "edit"/"write" if modifying files) to resolve every item in outcome.required_changes and collect real execution/browser verification evidence, then call team_discuss with kind="delivery" and revises="${id}".`
+                  : `Delivery review returned "revise": do NOT end your turn or output "DELIVERY: not approved". Because active_approved_plan_id is null for current task_seq=${state.taskSeq ?? 1}, first update .leaderteam/refs/plan.md and call team_discuss(kind="plan") to obtain an approved plan_id, then dispatch member(s) under that plan_id (for profile="shell", include "read", "glob", "grep", "${hostShellTool}" and "read_image" in tools, plus "edit"/"write" if modifying files) to resolve every item in outcome.required_changes, and call team_discuss with kind="delivery" and revises="${id}".`)
                 : planQuota && planQuota.remaining === 0
                 ? (activePlanId !== null
                   ? `Plan agreement limit (${planQuota.settled}/${planQuota.limit}) reached for task_seq=${state.taskSeq ?? 1}, but earlier approved plan "${activePlanId}" remains active and valid: proceed with team_dispatch using plan_id="${activePlanId}" (incorporating reviewer feedback into member tasks/notes) instead of calling team_discuss(kind="plan") again.`

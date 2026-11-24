@@ -12,7 +12,19 @@ export { renderMagpieModelRows, rewriteModelsBlock };
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+function isMainCliModule(metaUrl, argv1 = process.argv[1]) {
+  if (!argv1) return false;
+  const selfPath = fileURLToPath(metaUrl);
+  const resolvedArgv = path.resolve(argv1);
+  if (resolvedArgv === selfPath) return true;
+  try {
+    return fs.realpathSync(resolvedArgv) === fs.realpathSync(selfPath);
+  } catch {
+    return false;
+  }
+}
+
+if (isMainCliModule(import.meta.url)) {
   const checkOnly = process.argv.includes('--check');
   const cfg = loadConfig(path.join(ROOT, 'config', 'leaderteam.config.json'), { includeLocal: false });
   const rows = renderMagpieModelRows(cfg);

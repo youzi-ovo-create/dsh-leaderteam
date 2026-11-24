@@ -250,7 +250,9 @@ export function watchLeaderteamUsageRoute(ctx: Context): () => void {
       const own = harnessEntriesOf(Array.isArray(records) ? records.slice(0, 100000) : [], {
         getSession: id => sessions.get(id), snapshotOf: session => projections.snapshot(session, keys), cachedOf: header => cache.cachedSnapshot(header, keys),
       })
-      const ledger = await readLedgerUsage(process.env.DSH_HOME)
+      const profileHome = (c.get('profileContext') as { home?: string } | undefined)?.home
+      const defaultHome = process.env.DSH_HOME ?? profileHome ?? (process.env.HOME ? join(process.env.HOME, '.dsh') : undefined)
+      const ledger = await readLedgerUsage(defaultHome)
       const capped = Array.isArray(records) && records.length > 100000
       return { entries: [...own.entries, ...ledger.entries], coverage: {
         sessions: own.sessions, pendingSessions: own.pendingSessions, ledgerFiles: ledger.ledgerFiles,

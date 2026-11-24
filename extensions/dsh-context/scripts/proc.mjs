@@ -62,6 +62,13 @@ function terminate(pid) {
     return
   }
   try {
+    execFileSync('pkill', ['-TERM', '-P', String(pid)], { stdio: 'ignore' })
+  } catch {}
+  try {
+    process.kill(-pid, 'SIGTERM')
+    return
+  } catch {}
+  try {
     process.kill(pid, 'SIGTERM')
   } catch {}
 }

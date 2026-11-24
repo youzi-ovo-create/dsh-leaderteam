@@ -17,13 +17,21 @@ export function inspectPatchTextForLegacyLeaderTeam(patchText, currentBundleRoot
   const corruptedBlock = beginIdx >= 0 && endIdx < 0;
 
   // Also detect manual/unmarked file-path rows overriding `entry-core.mjs` / `entry-native-executor.mjs` / `entry-lead.mjs`
-  const entryRegex = /([^\s"'`]+leaderteam\/(?:entry-core|entry-native-executor|entry-lead)\.mjs)/g;
+  // Supports quoted paths containing spaces (e.g. "/home/dev/workspace/Leader Team/...") and both POSIX `file:///home/...`
+  // and Windows `file:///C:/...` URLs without stripping the POSIX leading `/`.
+  const entryRegex = /(?:(["'`])([^"'`\r\n]*?leaderteam\/(?:entry-core|entry-native-executor|entry-lead)\.mjs)\1|([^\s"'`]+leaderteam\/(?:entry-core|entry-native-executor|entry-lead)\.mjs))/g;
   let hasExternalCoreOverride = false;
   const normRoot = currentBundleRoot
     ? currentBundleRoot.replaceAll('\\', '/').replace(/\/+$/, '').toLowerCase()
     : null;
   for (const m of patchText.matchAll(entryRegex)) {
-    const rawRef = m[1].replace(/^file:\/\/\/?/i, '').replaceAll('\\', '/');
+    let rawRef = (m[2] ?? m[3] ?? '').replaceAll('\\', '/');
+    if (/^file:\/\//i.test(rawRef)) {
+      // `file:///C:/foo` -> `C:/foo`, whereas POSIX `file:///home/foo` MUST preserve leading `/home/foo`
+      rawRef = /^file:\/\/\/[A-Za-z]:\//i.test(rawRef)
+        ? rawRef.replace(/^file:\/\/\//i, '')
+        : rawRef.replace(/^file:\/\//i, '');
+    }
     const decodedRef = (() => { try { return decodeURIComponent(rawRef); } catch { return rawRef; } })();
     if (!normRoot || !decodedRef.toLowerCase().includes(normRoot)) {
       hasExternalCoreOverride = true;

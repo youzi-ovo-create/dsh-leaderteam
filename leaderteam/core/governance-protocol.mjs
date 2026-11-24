@@ -721,17 +721,18 @@ export function checkGovernanceExecutionGate(govState, actor, tool, args = {}, s
     }
     if (tool === 'team_dispatch' && govState.activeDirectives?.length > 0) {
       const candidateScopes = (stage?.contract?.write_scope ?? args?.write_scope ?? []).map(g => {
-        try { return normalizeGlob(g); } catch { return String(g); }
-      });
+        try { return normalizeGlob(g, platform); } catch { return null; }
+      }).filter(Boolean);
       const candidateStageId = stage?.id ?? args?.stage_id ?? null;
       for (const dir of govState.activeDirectives) {
         if (!dir.blockedTargets?.length) continue;
         const stageBlocked = candidateStageId && dir.blockedTargets.includes(candidateStageId);
-        const globBlocked = candidateScopes.length > 0 && anyGlobOverlaps(
-          candidateScopes,
-          dir.blockedTargets.map(g => { try { return normalizeGlob(g); } catch { return String(g); } }),
-          platform,
-        );
+        const validBlockedGlobs = dir.blockedTargets
+          .map(g => { try { return normalizeGlob(g, platform); } catch { return null; } })
+          .filter(Boolean);
+        const globBlocked = candidateScopes.length > 0
+          && validBlockedGlobs.length > 0
+          && anyGlobOverlaps(candidateScopes, validBlockedGlobs, platform);
         if (!stageBlocked && !globBlocked) continue;
 
         // Block re-dispatching the UNCHANGED stage contract (or identical unamended stageId);

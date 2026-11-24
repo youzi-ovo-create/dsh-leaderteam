@@ -54,7 +54,7 @@ const mat = name => {
 };
 const patches = [mat('magpie-models.patch.yml'), mat('headless.patch.yml'), ...(args['extra-patch'] ? [path.resolve(args['extra-patch'])] : [])];
 const argv = [...runtime.cliArgs, 'headless', ...patches.flatMap(p => ['--patch', p]), '--json', ...(args.session ? ['--session-id', args.session] : []), '-'];
-const child = spawn(runtime.exe, argv, { cwd: ws, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, ELECTRON_RUN_AS_NODE: '1', DSH_HOME: home, DSH_TELEMETRY_DISABLED: '1', LEADERTEAM_HEADLESS_LEADER: '1', LEADERTEAM_MAGPIE_KEY: process.env.LEADERTEAM_MAGPIE_KEY ?? 'magpie-local' } });
+const child = spawn(runtime.exe, argv, { cwd: ws, detached: process.platform !== 'win32', windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, ELECTRON_RUN_AS_NODE: '1', DSH_HOME: home, DSH_TELEMETRY_DISABLED: '1', LEADERTEAM_HEADLESS_LEADER: '1', LEADERTEAM_MAGPIE_KEY: process.env.LEADERTEAM_MAGPIE_KEY ?? 'magpie-local' } });
 const events = fs.createWriteStream(path.join(runDir, 'events.jsonl')); const errlog = fs.createWriteStream(path.join(runDir, 'stderr.log'));
 let buf = '', final, sessionId;
 child.stdout.on('data', d => {
@@ -72,7 +72,13 @@ child.stdout.on('data', d => {
 });
 child.stderr.on('data', d => errlog.write(d));
 child.stdin.end(task);
-const timer = setTimeout(() => { console.error('timeout: stopping DSH'); child.kill(); }, Number(args['timeout-min'] ?? 120) * 60000);
+const timer = setTimeout(() => {
+  console.error('timeout: stopping DSH');
+  if (process.platform !== 'win32' && child.pid) {
+    try { process.kill(-child.pid, 'SIGTERM'); return; } catch {}
+  }
+  child.kill();
+}, Number(args['timeout-min'] ?? 120) * 60000);
 child.on('close', code => {
   clearTimeout(timer); events.end(); errlog.end();
   fs.writeFileSync(path.join(runDir, 'summary.json'), JSON.stringify({ code, sessionId, final }, null, 2));

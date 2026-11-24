@@ -437,7 +437,18 @@ function parseArgs(argv) {
   return parsed;
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+function isMainCliModule(metaUrl, argv1 = process.argv[1]) {
+  if (!argv1) return false;
+  const selfPath = fileURLToPath(metaUrl);
+  if (path.resolve(argv1) === selfPath) return true;
+  try {
+    return fs.realpathSync(argv1) === fs.realpathSync(selfPath);
+  } catch {
+    return false;
+  }
+}
+
+if (isMainCliModule(import.meta.url)) {
   try {
     const args = parseArgs(process.argv);
     for (const required of ['candidate-app', 'work-dir', 'candidate-source']) {

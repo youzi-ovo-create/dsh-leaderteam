@@ -784,6 +784,7 @@ async function maybeAutoContinueLeader(ctx, rt, actor, agent) {
       ? leaderTurnCompletedTools.join(', ')
       : '(none completed in the truncated turn — issue the next concrete tool call directly without repeating long prose)';
 
+    const hostShellTool = process.platform === 'win32' ? 'pwsh' : 'bash';
     const continuationText = reviewedContinue
       ? `[LeaderTeam stop review] This checkpoint should continue within the current authorization: ${reviewedContinue}`
       : truncatedStop
@@ -791,9 +792,9 @@ async function maybeAutoContinueLeader(ctx, rt, actor, agent) {
       : !declaration && streak === 1 && !invalidDeliveryClaim
       ? '[LeaderTeam workflow state] Before stopping, call team_status with stop_state delivered, waiting_members, waiting_user (with the actual question), or blocked (with the concrete reason). Continue routine implementation and verification autonomously; the host will check the stated stop reason.'
       : invalidDeliveryClaim
-      ? `[LeaderTeam workflow check] Your previous turn emitted "DELIVERY: approved${citedId ? ` (${citedId})` : ''}", which is invalid: ${citedId && activePlanIds.includes(citedId) ? `"${citedId}" is a kind="plan" agreement, NOT a kind="delivery" agreement` : `no approved kind="delivery" agreement exists for task_seq=${taskSeq} (approved_delivery_ids=${JSON.stringify(approvedDeliveryIds)})`}. Active approved plan_id="${activePlanId ?? 'none'}"; ${deliveryHint}. First ${planGuidance} (for profile="shell", include "read", "glob", "grep", "pwsh" and "read_image" in tools, plus "edit"/"write" if modifying files), then call team_discuss with kind="delivery" (attaching changed files and real verification output) and only emit "DELIVERY: approved (<delivery_agreement_id>)" in the user's language once kind="delivery" settles as "approve".`
+      ? `[LeaderTeam workflow check] Your previous turn emitted "DELIVERY: approved${citedId ? ` (${citedId})` : ''}", which is invalid: ${citedId && activePlanIds.includes(citedId) ? `"${citedId}" is a kind="plan" agreement, NOT a kind="delivery" agreement` : `no approved kind="delivery" agreement exists for task_seq=${taskSeq} (approved_delivery_ids=${JSON.stringify(approvedDeliveryIds)})`}. Active approved plan_id="${activePlanId ?? 'none'}"; ${deliveryHint}. First ${planGuidance} (for profile="shell", include "read", "glob", "grep", "${hostShellTool}" and "read_image" in tools, plus "edit"/"write" if modifying files), then call team_discuss with kind="delivery" (attaching changed files and real verification output) and only emit "DELIVERY: approved (<delivery_agreement_id>)" in the user's language once kind="delivery" settles as "approve".`
       : prematureNotApproved
-      ? `[LeaderTeam workflow check] Your previous turn emitted "DELIVERY: not approved" prematurely after a non-terminal review (${deliveryHint}). An outcome of "revise" requires resolving every item in required_changes through team members and re-submitting with revises, NOT stopping. Immediately ${planGuidance} (for profile="shell", include "read", "glob", "grep", "pwsh" and "read_image" in tools, plus "edit"/"write" if modifying files, and a workspace-relative write_scope), run real execution/browser verification and any needed fixes, and call team_discuss(kind="delivery"${latestDelivery?.id ? `, revises="${latestDelivery.id}"` : ''}) before answering in the user's language.`
+      ? `[LeaderTeam workflow check] Your previous turn emitted "DELIVERY: not approved" prematurely after a non-terminal review (${deliveryHint}). An outcome of "revise" requires resolving every item in required_changes through team members and re-submitting with revises, NOT stopping. Immediately ${planGuidance} (for profile="shell", include "read", "glob", "grep", "${hostShellTool}" and "read_image" in tools, plus "edit"/"write" if modifying files, and a workspace-relative write_scope), run real execution/browser verification and any needed fixes, and call team_discuss(kind="delivery"${latestDelivery?.id ? `, revises="${latestDelivery.id}"` : ''}) before answering in the user's language.`
       : `[LeaderTeam workflow continuation] Your turn ended while multi-step workflow work remains incomplete for task_seq=${taskSeq} (active_approved_plan_id="${activePlanId ?? 'none'}", running_members=${activeMembers.length}, ${deliveryHint}). Do not stop between waves: immediately ${planGuidance}, or once all acceptance criteria and real execution checks pass, call team_discuss with kind="delivery" and deliver in the user's language.`;
 
     agent.followup(buildContinuationMessage(rt, continuationText));
@@ -1158,7 +1159,9 @@ export function onToolResult(exec, result) {
       }
     } catch {}
   }
-  if ((caller?.role === 'member' || caller?.role === 'direct_exec') && result?.isError && rt.config?.gate?.shellTools?.includes(exec.name) && /SetNamedSecurityInfoW failed.*grantWrite\(/s.test(errorText)) {
+  const isOsSandboxStartupFailure = /SetNamedSecurityInfoW failed.*grantWrite\(/s.test(errorText)
+    || /\bbwrap:\s*(?:Creating new namespace failed|setting up uid map|No permissions to creating new namespace|loopback:\s*Failed)/i.test(errorText);
+  if ((caller?.role === 'member' || caller?.role === 'direct_exec') && result?.isError && rt.config?.gate?.shellTools?.includes(exec.name) && isOsSandboxStartupFailure) {
     caller.shellFailure = errorText.slice(0, 1200);
     caller.loadedTools = (caller.loadedTools ?? caller.allowedTools).filter(n => !rt.config.gate.shellTools.includes(n));
     rt.workspaceShellFailures ??= new Map();
@@ -1187,7 +1190,7 @@ export function onToolResult(exec, result) {
   const meta = readWindowMeta(result.meta);
   if (!meta) return;
   const p = resolvePath(meta.path, actor.cwd, process.platform);
-  const requested = resolvePath(exec.arguments?.file_path, actor.cwd, process.platform);
+  const requested = resolvePath(exec.arguments?.file_path ?? exec.arguments?.path, actor.cwd, process.platform);
   if (p === null || requested === null || pathKey(p, process.platform) !== pathKey(requested, process.platform)) return;
   const key = pathKey(p, process.platform);
   const intervals = mergeIntervals(rt.readProgress?.get(exec.agent.id)?.get(key) ?? [], meta.lines.map(({ number }) => [number, number]));

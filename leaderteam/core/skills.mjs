@@ -317,9 +317,18 @@ export function discoverSkills({
   for (const rootObj of validRoots) {
     if (discovered.length >= effectiveMax) break;
 
-    // Check if root itself directly contains SKILL.md
-    const directSkillMd = nodePath.join(rootObj.resolved, 'SKILL.md');
-    if (fs.existsSync(directSkillMd)) {
+    // Check if root itself directly contains SKILL.md (case-insensitive on Linux ext4, matching depth > 0)
+    let directSkillMd = null;
+    try {
+      const rootEntries = fs.readdirSync(rootObj.resolved, { withFileTypes: true });
+      rootEntries.sort((a, b) => a.name.localeCompare(b.name, 'en'));
+      const hit = rootEntries.find(e => e.name.toLowerCase() === 'skill.md');
+      if (hit) directSkillMd = nodePath.join(rootObj.resolved, hit.name);
+    } catch {
+      const fallback = nodePath.join(rootObj.resolved, 'SKILL.md');
+      if (fs.existsSync(fallback)) directSkillMd = fallback;
+    }
+    if (directSkillMd) {
       if (tryAddSkill(directSkillMd, rootObj)) break;
       continue;
     }
