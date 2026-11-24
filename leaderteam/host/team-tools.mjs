@@ -937,28 +937,29 @@ export function registerTeamTools(ctx) {
       }
 
       reconcileStaleMembers(rt, store);
-      const childId = randomUUID();
+      const primaryChildId = randomUUID();
       const seqNum = [...store.members().values()].filter(m => m.actorRole === 'direct_exec').length + 1;
       const directName = `direct-exec-${seqNum}`;
-      assertActivationAdmission(store, cfg, { childId, actorRole: 'direct_exec', name: directName, taskSeq, writeScope }, platform);
 
       const now = new Date();
       const q = quotaState(rt);
       const chain = roleRouteChain(cfg, 'directExec', currentSelection(exec.agent) ?? null);
-      const chosen = chain.find(t => quotaGate(cfg, q, t.route, now).allowed && !evaluateTeamRequestWindow(rt, actor.teamId, now.getTime(), { targetRoute: t.route, skipAuditWrite: true })?.triggerCheckpointPause)
-        ?? chain.find(t => quotaGate(cfg, q, t.route, now).allowed)
-        ?? chain[0];
-      if (!chosen) throw new Error('no configured route available for roles.directExec');
-      const qCheck = quotaGate(cfg, q, chosen.route, now);
-      if (!qCheck.allowed) throw new Error(qCheck.error);
-      const rwDirect = evaluateTeamRequestWindow(rt, actor.teamId, now.getTime(), { targetRoute: chosen.route });
+      const windowEligible = chain.filter(
+        t => quotaGate(cfg, q, t.route, now).allowed
+          && !evaluateTeamRequestWindow(rt, actor.teamId, now.getTime(), { targetRoute: t.route, skipAuditWrite: true })?.triggerCheckpointPause,
+      );
+      const quotaEligible = chain.filter(t => quotaGate(cfg, q, t.route, now).allowed);
+      const candidates = windowEligible.length > 0
+        ? windowEligible
+        : (quotaEligible.length > 0 ? quotaEligible : (chain[0] ? [chain[0]] : []));
+      const firstCand = candidates[0];
+      if (!firstCand) throw new Error('no configured route available for roles.directExec');
+      const firstQCheck = quotaGate(cfg, q, firstCand.route, now);
+      if (!firstQCheck.allowed) throw new Error(firstQCheck.error);
+      const rwDirect = evaluateTeamRequestWindow(rt, actor.teamId, now.getTime(), { targetRoute: firstCand.route });
       if (rwDirect?.triggerCheckpointPause) {
-        throw new Error(`5-hour request window entered checkpoint_pause for route "${chosen.route}" (${rwDirect.reason}): team_direct_exec is paused to protect quota while governance reviews stay active. Save your progress checkpoint via team_note and declare team_status(stop_state="blocked", reason=...).`);
+        throw new Error(`5-hour request window entered checkpoint_pause for route "${firstCand.route}" (${rwDirect.reason}): team_direct_exec is paused to protect quota while governance reviews stay active. Save your progress checkpoint via team_note and declare team_status(stop_state="blocked", reason=...).`);
       }
-      const modelSpec = cfg.models[chosen.route];
-      const chosenEffort = (typeof args.effort === 'string' && modelSpec?.efforts?.includes(args.effort))
-        ? args.effort
-        : chosen.effort;
 
       const shellBlocked = rt.workspaceShellFailures?.has(pathKey(actor.cwd));
       const wantShell = args.allow_shell !== false && !shellBlocked;
@@ -981,82 +982,115 @@ export function registerTeamTools(ctx) {
       const effectiveAcceptance = acceptance.length > 0
         ? acceptance.slice(0, 12)
         : ['Complete the assigned local task strictly inside the workspace Sandbox and report concise factual results.'];
+      const capturedUserTask = userTaskText(ctx, actor.teamId, cfg.gate.maxAuthorizationChars);
 
-      const directRecord = {
-        childId,
-        name: directName,
-        actorRole: 'direct_exec',
-        taskSeq,
-        planId: null,
-        profile: profileKey,
-        preset: profile.preset,
-        model: chosen.route,
-        effort: chosenEffort,
-        allowedTools: grantedTools,
-        loadedTools: grantedTools,
-        deferredTools: [],
-        skills: [],
-        writeScope,
-        refs: [],
-        task: taskText,
-        acceptance: effectiveAcceptance,
-        cwd: actor.cwd,
-        userTask: userTaskText(ctx, actor.teamId, cfg.gate.maxAuthorizationChars),
-        quotaAtDispatch: qCheck.quota.status,
-      };
-
-      if (rt.liveProcessMemberIds instanceof Set) rt.liveProcessMemberIds.add(childId);
-      store.addMember(directRecord);
-      let started = null;
-      try {
-        const target = resolveModelTarget(cfg, chosen.route, chosenEffort);
-        started = await startSubagentCompat(ctx.subagents, {
-          provider: 'spawn',
-          childId,
-          label: directName,
-          delivery: 'caller',
-          signal: exec.signal,
-          prompt: [{ type: 'text', text: directExecInitialPrompt() }],
-          parent: exec.agent,
-          agentPreset: profile.preset,
-          agentOptions: target,
-        });
-        if (store.getMember(childId)?.status === 'starting') store.setMemberStatus(childId, 'started');
-        const settled = await started.result;
-        const outputText = (settled?.output ?? []).filter(b => b?.type === 'text').map(b => b.text).join('\n');
-        const stopKind = settled?.stopReason?.kind ?? 'completed';
-        const curRec = store.getMember(childId);
-        const wasPausedForConf = curRec?.status === 'paused' || /^\s*STATUS:\s*paused\b/im.test(outputText);
-        if (curRec && ACTIVE_MEMBER_STATUSES.has(curRec.status)) {
-          store.setMemberStatus(childId, wasPausedForConf ? 'paused' : (stopKind === 'error' ? 'failed' : 'done'));
+      for (let candIdx = 0; candIdx < candidates.length; candIdx++) {
+        const chosen = candidates[candIdx];
+        const candQCheck = quotaGate(cfg, q, chosen.route, now);
+        if (!candQCheck.allowed) {
+          if (candIdx + 1 < candidates.length) continue;
+          throw new Error(candQCheck.error);
         }
-        const childReceipts = store.gateReceipts().filter(r => r.agentId === childId);
-        return {
-          direct_exec_id: childId,
-          name: directName,
+        const modelSpec = cfg.models[chosen.route];
+        const chosenEffort = (typeof args.effort === 'string' && modelSpec?.efforts?.includes(args.effort))
+          ? args.effort
+          : chosen.effort;
+
+        const childId = candIdx === 0 ? primaryChildId : randomUUID();
+        const attemptName = candIdx === 0 ? directName : `${directName}-fb${candIdx}`;
+        assertActivationAdmission(store, cfg, { childId, actorRole: 'direct_exec', name: attemptName, taskSeq, writeScope }, platform);
+
+        const directRecord = {
+          childId,
+          name: attemptName,
+          actorRole: 'direct_exec',
+          taskSeq,
+          planId: null,
+          profile: profileKey,
+          preset: profile.preset,
           model: chosen.route,
           effort: chosenEffort,
-          tools: grantedTools,
-          write_scope: writeScope,
-          stop_reason: wasPausedForConf ? 'paused_for_conference' : stopKind,
-          safety_gate: {
-            total_checked: childReceipts.length,
-            allowed: childReceipts.filter(r => r.decision === 'allow').length,
-            denied: childReceipts.filter(r => r.decision === 'deny').length,
-            model_calls: childReceipts.filter(r => r.by === 'model').length,
-          },
-          output: truncate(outputText, 16000),
+          allowedTools: grantedTools,
+          loadedTools: grantedTools,
+          deferredTools: [],
+          skills: [],
+          writeScope,
+          refs: [],
+          task: taskText,
+          acceptance: effectiveAcceptance,
+          cwd: actor.cwd,
+          userTask: capturedUserTask,
+          quotaAtDispatch: candQCheck.quota.status,
         };
-      } catch (err) {
-        const curRec = store.getMember(childId);
-        if (curRec && ACTIVE_MEMBER_STATUSES.has(curRec.status)) {
-          store.setMemberStatus(childId, 'failed', err instanceof Error ? err.message : String(err));
+
+        if (rt.liveProcessMemberIds instanceof Set) rt.liveProcessMemberIds.add(childId);
+        store.addMember(directRecord);
+        let started = null;
+        try {
+          const target = resolveModelTarget(cfg, chosen.route, chosenEffort);
+          started = await startSubagentCompat(ctx.subagents, {
+            provider: 'spawn',
+            childId,
+            label: attemptName,
+            delivery: 'caller',
+            signal: exec.signal,
+            prompt: [{ type: 'text', text: directExecInitialPrompt() }],
+            parent: exec.agent,
+            agentPreset: profile.preset,
+            agentOptions: target,
+          });
+          if (store.getMember(childId)?.status === 'starting') store.setMemberStatus(childId, 'started');
+          const settled = await started.result;
+          const outputText = (settled?.output ?? []).filter(b => b?.type === 'text').map(b => b.text).join('\n');
+          const stopKind = settled?.stopReason?.kind ?? 'completed';
+          const curRec = store.getMember(childId);
+          const wasPausedForConf = curRec?.status === 'paused' || /^\s*STATUS:\s*paused\b/im.test(outputText);
+          if (curRec && ACTIVE_MEMBER_STATUSES.has(curRec.status)) {
+            store.setMemberStatus(childId, wasPausedForConf ? 'paused' : (stopKind === 'error' ? 'failed' : 'done'));
+          }
+          const childReceipts = store.gateReceipts().filter(r => r.agentId === childId);
+          const allowedOps = childReceipts.filter(r => r.decision === 'allow').length;
+
+          // If the model failed before executing ANY workspace tool (e.g. retired model / 404 / 429 / 503 / timeout),
+          // automatically fall back to the next configured route in `roles.directExec`!
+          if (stopKind === 'error' && !wasPausedForConf && allowedOps === 0 && !exec.signal?.aborted && candIdx + 1 < candidates.length) {
+            continue;
+          }
+
+          const degraded = degradedNote('directExec', chosen);
+          return {
+            direct_exec_id: childId,
+            name: attemptName,
+            model: chosen.route,
+            effort: chosenEffort,
+            ...(degraded ? { degraded_role: degraded } : {}),
+            tools: grantedTools,
+            write_scope: writeScope,
+            stop_reason: wasPausedForConf ? 'paused_for_conference' : stopKind,
+            safety_gate: {
+              total_checked: childReceipts.length,
+              allowed: allowedOps,
+              denied: childReceipts.filter(r => r.decision === 'deny').length,
+              model_calls: childReceipts.filter(r => r.by === 'model').length,
+            },
+            output: truncate(outputText, 16000),
+          };
+        } catch (err) {
+          const curRec = store.getMember(childId);
+          if (curRec && ACTIVE_MEMBER_STATUSES.has(curRec.status)) {
+            store.setMemberStatus(childId, 'failed', err instanceof Error ? err.message : String(err));
+          }
+          const allowedOps = store.gateReceipts().filter(r => r.agentId === childId && r.decision === 'allow').length;
+          if (allowedOps === 0 && !exec.signal?.aborted && candIdx + 1 < candidates.length) {
+            continue;
+          }
+          throw err;
+        } finally {
+          if (rt.liveProcessMemberIds instanceof Set) rt.liveProcessMemberIds.delete(childId);
+          await started?.dispose?.().catch(() => {});
         }
-        throw err;
-      } finally {
-        if (rt.liveProcessMemberIds instanceof Set) rt.liveProcessMemberIds.delete(childId);
-        await started?.dispose?.().catch(() => {});
       }
+      throw new Error('no usable route succeeded for roles.directExec');
     },
   });
 

@@ -101,12 +101,13 @@ test('P0: queueAsyncSupervision defers when one or both reviewers fail, preserve
     const { queueAsyncSupervision, retryDeferredSupervisions } = await import('../../leaderteam/host/governance.mjs');
 
     fs.writeFileSync(path.join(tmpWs, 'app.js'), 'export const x = 1;\n', 'utf8');
-    // Distinct models for discussA (`deepseek/deepseek-reasoner`) and discussB (`deepseek/deepseek-chat`) with zero fallbacks so we control each reviewer cleanly
+    // Distinct models for discussA (`deepseek/deepseek-v4-pro`) and discussB (`deepseek/deepseek-flash`) with zero fallbacks so we control each reviewer cleanly
     const customRaw = buildSoloKeyStarterConfig(BASE_RAW_CFG, { preset: SOLO_PROVIDER_PRESETS[0] });
     customRaw.roles.discussA.fallback = [];
     customRaw.roles.discussA.retries = 0;
     customRaw.roles.discussB.fallback = [];
     customRaw.roles.discussB.retries = 0;
+    customRaw.team.leaderModelAsLastResort = false;
     const cfg = validateConfig(customRaw);
 
     let mode = 'both_fail';
@@ -114,7 +115,7 @@ test('P0: queueAsyncSupervision defers when one or both reviewers fail, preserve
     let callsB = 0;
     const mockLlm = {
       async *stream(req) {
-        const isA = req.model === 'deepseek-reasoner';
+        const isA = req.model === 'deepseek-v4-pro';
         if (isA) callsA++;
         else callsB++;
         if (mode === 'both_fail') {
@@ -425,8 +426,9 @@ test('P1-4: Solo-Key DEEPSEEK_API_KEY auto-provisions providers.deepseek with co
   assert.equal(savedNs, 'llm-pi-ai');
   assert.ok(savedData?.providers?.deepseek, 'providers.deepseek must be created when absent');
   assert.equal(savedData.providers.deepseek.apiKeyEnv, 'DEEPSEEK_API_KEY');
-  const reasoner = savedData.providers.deepseek.models.find(m => m.id === 'deepseek-reasoner');
-  const chat = savedData.providers.deepseek.models.find(m => m.id === 'deepseek-chat');
+  assert.equal(savedData.providers.deepseek.baseURL, 'https://api.deepseek.com');
+  const reasoner = savedData.providers.deepseek.models.find(m => m.id === 'deepseek-v4-pro');
+  const chat = savedData.providers.deepseek.models.find(m => m.id === 'deepseek-flash');
   assert.ok(reasoner && chat);
   assert.equal(reasoner.compat?.thinkingFormat, 'deepseek');
   assert.equal(reasoner.compat?.requiresReasoningContentOnAssistantMessages, true);

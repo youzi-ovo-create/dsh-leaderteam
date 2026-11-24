@@ -4,65 +4,82 @@
     "provider": "deepseek"
   },
   "models": {
-    "deepseek/deepseek-reasoner": {
+    "deepseek/deepseek-v4-pro": {
       "provider": "deepseek",
-      "upstreamModel": "deepseek-reasoner",
+      "upstreamModel": "deepseek-v4-pro",
       "family": "deepseek",
-      "label": "DeepSeek Reasoner (Solo-Key Smoke)",
+      "label": "DeepSeek V4 Pro (Solo-Key Smoke)",
       "vision": false,
-      "efforts": ["low", "medium", "high"],
+      "contextWindow": 1000000,
+      "maxTokens": 65536,
+      "efforts": ["none", "low", "medium", "high", "max"],
       "defaultEffort": "medium",
       "strengths": "领队契约规划、安全门跨界复核与独立裁断"
     },
-    "deepseek/deepseek-chat": {
+    "deepseek/deepseek-flash": {
       "provider": "deepseek",
-      "upstreamModel": "deepseek-chat",
+      "upstreamModel": "deepseek-flash",
       "family": "deepseek",
-      "label": "DeepSeek Chat / Flash (Solo-Key Smoke)",
-      "vision": false,
-      "efforts": ["none", "low", "medium"],
+      "label": "DeepSeek Flash (Solo-Key Smoke)",
+      "vision": true,
+      "contextWindow": 1000000,
+      "maxTokens": 65536,
+      "efforts": ["none", "low", "medium", "high"],
       "defaultEffort": "none",
       "strengths": "低成本快速探测、模块修复与单测验证"
     }
   },
   "roles": {
     "leader": {
-      "route": "deepseek/deepseek-reasoner",
+      "route": "deepseek/deepseek-v4-pro",
       "effort": "medium"
     },
     "gate": {
-      "route": "deepseek/deepseek-chat",
+      "route": "deepseek/deepseek-flash",
       "effort": "none",
       "maxTokens": 2048,
       "timeoutMs": 60000,
-      "retries": 1
+      "retries": 1,
+      "fallback": [{ "route": "deepseek/deepseek-v4-pro", "effort": "low", "timeoutMs": 120000, "retries": 1 }]
     },
     "discussA": {
-      "route": "deepseek/deepseek-chat",
+      "route": "deepseek/deepseek-flash",
       "effort": "none",
       "maxTokens": 4096,
       "timeoutMs": 120000,
-      "retries": 1
+      "retries": 1,
+      "fallback": [{ "route": "deepseek/deepseek-v4-pro", "effort": "low", "timeoutMs": 120000, "retries": 1 }]
     },
     "discussB": {
-      "route": "deepseek/deepseek-reasoner",
+      "route": "deepseek/deepseek-v4-pro",
       "effort": "low",
       "maxTokens": 4096,
       "timeoutMs": 120000,
-      "retries": 1
+      "retries": 1,
+      "fallback": [{ "route": "deepseek/deepseek-flash", "effort": "none", "timeoutMs": 120000, "retries": 1 }]
     },
     "arbiter": {
-      "route": "deepseek/deepseek-reasoner",
+      "route": "deepseek/deepseek-v4-pro",
       "effort": "medium",
       "maxTokens": 8192,
       "timeoutMs": 180000,
-      "retries": 1
+      "retries": 1,
+      "fallback": [{ "route": "deepseek/deepseek-flash", "effort": "none", "timeoutMs": 120000, "retries": 1 }]
+    },
+    "serialReviewer": {
+      "route": "deepseek/deepseek-flash",
+      "effort": "none",
+      "maxTokens": 2400,
+      "timeoutMs": 90000,
+      "retries": 1,
+      "fallback": [{ "route": "deepseek/deepseek-v4-pro", "effort": "low", "timeoutMs": 120000, "retries": 1 }]
     },
     "directExec": {
-      "route": "deepseek/deepseek-chat",
+      "route": "deepseek/deepseek-flash",
       "effort": "none",
       "timeoutMs": 90000,
-      "retries": 1
+      "retries": 1,
+      "fallback": [{ "route": "deepseek/deepseek-v4-pro", "effort": "low", "timeoutMs": 120000, "retries": 1 }]
     }
   },
   "profiles": {
@@ -159,7 +176,7 @@
     "leaderReadRoots": []
   },
   "team": {
-    "executionPool": ["deepseek/deepseek-chat", "deepseek/deepseek-reasoner"],
+    "executionPool": ["deepseek/deepseek-flash", "deepseek/deepseek-v4-pro"],
     "maxMembersPerTeam": 4,
     "maxActiveMembers": 2,
     "requirePlanAgreement": true,

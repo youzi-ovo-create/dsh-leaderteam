@@ -12,6 +12,7 @@ import {
   buildSoloKeyStarterConfig,
   resolveOrBootstrapConfigPath,
 } from '../../leaderteam/core/solo-key.mjs';
+import { roleRouteChain } from '../../leaderteam/core/role-routes.mjs';
 import { locateHostAnchor } from '../../leaderteam/host/host-imports.mjs';
 
 registerHooks({
@@ -81,7 +82,13 @@ test('root package.json and cordis.patch.yml conform to official DSH bundle rule
   assert.ok(fs.existsSync(path.join(ROOT, 'locale/zh-CN.json')));
 });
 
-test('Solo-Key starter presets produce strictly valid frozen configs and zero-config bootstrap writes atomically', () => {
+test('Solo-Key starter presets produce strictly valid frozen configs with active non-retired models and full role fallbacks', () => {
+  const RETIRED_MODELS = new Set([
+    'deepseek-reasoner',
+    'deepseek-chat',
+    'qwen-coder-plus',
+    'qwen3-coder-plus',
+  ]);
   const baseRaw = JSON.parse(fs.readFileSync(path.join(ROOT, 'config/leaderteam.config.json'), 'utf8'));
   for (const preset of SOLO_PROVIDER_PRESETS) {
     const raw = buildSoloKeyStarterConfig(baseRaw, { preset });
@@ -92,7 +99,33 @@ test('Solo-Key starter presets produce strictly valid frozen configs and zero-co
     assert.equal(validated.governance.mode, 'autonomous');
     assert.equal(validated.powerMonitor.enabled, true);
     assert.equal(validated.powerMonitor.pollIntervalMs, 720000);
+    for (const [route, spec] of Object.entries(validated.models)) {
+      const up = spec.upstreamModel ?? route;
+      assert.equal(RETIRED_MODELS.has(up), false, `Solo-Key preset "${preset.id}" must not use retired model "${up}"`);
+    }
+    if (preset.chatRoute !== preset.reasoningRoute) {
+      assert.ok(validated.roles.serialReviewer.fallback?.length >= 1, `${preset.id} serialReviewer must configure fallback route`);
+      assert.ok(validated.roles.directExec.fallback?.length >= 1, `${preset.id} directExec must configure fallback route`);
+    }
   }
+
+  // Verify smoke-bugfix config also uses active DeepSeek V4 models (zero retired model IDs)
+  const smokeCfg = loadConfig(path.join(ROOT, 'examples/smoke-bugfix/leaderteam.smoke.json'));
+  for (const [route, spec] of Object.entries(smokeCfg.models)) {
+    assert.equal(RETIRED_MODELS.has(spec.upstreamModel ?? route), false, `smoke config must not use retired model "${route}"`);
+  }
+  assert.equal(smokeCfg.roles.leader.route, 'deepseek/deepseek-v4-pro');
+  assert.equal(smokeCfg.roles.directExec.route, 'deepseek/deepseek-flash');
+
+  // Verify DashScope preset uses active `qwen-max` + `qwen-plus` AND `roleRouteChain` resolves prefixed leaderModel fallback
+  const dashPreset = SOLO_PROVIDER_PRESETS.find(p => p.id === 'dashscope');
+  assert.equal(dashPreset?.reasoningRoute, 'dashscope/qwen-max');
+  assert.equal(dashPreset?.chatRoute, 'dashscope/qwen-plus');
+  const dashNoExplicitFb = buildSoloKeyStarterConfig(baseRaw, { preset: dashPreset });
+  delete dashNoExplicitFb.roles.serialReviewer.fallback;
+  const dashValidated = validateConfig(dashNoExplicitFb);
+  const srChain = roleRouteChain(dashValidated, 'serialReviewer', { provider: 'dashscope', model: 'qwen-max', reasoningEffort: 'high' });
+  assert.deepEqual(srChain.map(c => c.route), ['dashscope/qwen-plus', 'dashscope/qwen-max']);
 
   assert.equal(detectSoloKeyPreset({ env: { DEEPSEEK_API_KEY: 'sk-test-123' } })?.preset.id, 'deepseek');
   assert.equal(detectSoloKeyPreset({ env: { ZHIPU_API_KEY: 'zp-test-123' } })?.preset.id, 'zhipu');
@@ -109,7 +142,7 @@ test('Solo-Key starter presets produce strictly valid frozen configs and zero-co
     assert.equal(res1.bootstrapped, true);
     assert.equal(res1.mode, 'solo-deepseek');
     const loaded = loadConfig(res1.configPath);
-    assert.equal(loaded.roles.leader.route, 'deepseek/deepseek-reasoner');
+    assert.equal(loaded.roles.leader.route, 'deepseek/deepseek-v4-pro');
 
     // Second call reuses existing managed config idempotently
     const res2 = resolveOrBootstrapConfigPath({
@@ -252,7 +285,7 @@ test('host concurrency wires Battery-Aware Graceful Shutdown and 5h Request Wind
     const nowMs = Date.now();
     const st = teamStore(teamId);
     for (let i = 0; i < 19; i++) {
-      st.appendUsage({ at: new Date(nowMs - i * 1000).toISOString(), role: 'gate', route: 'deepseek/deepseek-chat', ok: true });
+      st.appendUsage({ at: new Date(nowMs - i * 1000).toISOString(), role: 'gate', route: 'deepseek/deepseek-flash', ok: true });
     }
     const rw = evaluateTeamRequestWindow(rt, teamId, nowMs);
     assert.equal(rw.tier, 'checkpoint_pause');

@@ -191,14 +191,20 @@ function makeAutonomousEnv(t, cfg, llmGenerateFn, opts = {}) {
       runtime().hostAgents.set(actOpts.childId, childAgent);
       resolveActor(ctx, childAgent);
       if (actOpts.delivery === 'caller') {
-        const directOut = typeof opts.directExecHook === 'function'
+        const hookRes = typeof opts.directExecHook === 'function'
           ? await opts.directExecHook(childAgent, actOpts)
-          : [{ type: 'text', text: 'Direct execution verification completed cleanly.\nSTATUS: done' }];
+          : null;
+        const customStopReason = hookRes && !Array.isArray(hookRes) && typeof hookRes === 'object' && hookRes.stopReason
+          ? hookRes.stopReason
+          : { kind: 'completed' };
+        const directOut = Array.isArray(hookRes)
+          ? hookRes
+          : (hookRes?.output ?? [{ type: 'text', text: 'Direct execution verification completed cleanly.\nSTATUS: done' }]);
         childAgent.status = 'idle';
         return {
           childId: actOpts.childId,
           messageId: 'm-direct',
-          result: Promise.resolve({ output: directOut, stopReason: { kind: 'completed' } }),
+          result: Promise.resolve({ output: directOut, stopReason: customStopReason }),
           dispose: async () => {},
         };
       }
@@ -1123,4 +1129,50 @@ test('[Stop-Review Hardening & Anti-Detour] Rehydrated shell ACL failure stops d
   assert.equal(r3.action, 'stop', '3rd stop declaration hits hard cap and yields directly to user');
   assert.equal(r3.capped, true);
   assert.equal(calledSystems.length, 2, 'zero additional LLM calls once MAX_STOP_REVIEW_CONTINUES (2) is reached');
+});
+
+test('team_direct_exec automatically falls back to roles.directExec.fallback when primary model call fails before any workspace tool runs', async t => {
+  const cfg = autonomousConfig({
+    roles: {
+      directExec: {
+        route: 'zcode/GLM-5.3-Flash',
+        effort: 'low',
+        timeoutMs: 60000,
+        retries: 1,
+        fallback: [{ route: 'zcode/GLM-5.3', effort: 'low', timeoutMs: 60000, retries: 1 }],
+      },
+    },
+  });
+
+  const attemptedModels = [];
+  const env = makeAutonomousEnv(
+    t,
+    cfg,
+    async () => JSON.stringify({ stance: 'endorse', intervene: false, summary: 'ok', concerns: [], suggestions: [], target_paths: [] }),
+    {
+      directExecHook: async (_childAgent, actOpts) => {
+        const modelId = actOpts.agentOptions?.model ?? actOpts.request?.agentOptions?.model ?? 'unknown';
+        attemptedModels.push(modelId);
+        if (attemptedModels.length === 1) {
+          return {
+            output: [{ type: 'text', text: 'Upstream model unavailable (HTTP 404 model retired)' }],
+            stopReason: { kind: 'error' },
+          };
+        }
+        return {
+          output: [{ type: 'text', text: 'Recovered on fallback route.\nSTATUS: done' }],
+          stopReason: { kind: 'completed' },
+        };
+      },
+    },
+  );
+
+  const res = await env.tools.get('team_direct_exec').execute(
+    { task: 'Inspect src/engine.js version export', allow_shell: false },
+    { agent: env.leaderAgent },
+  );
+  assert.equal(attemptedModels.length, 2, 'must retry on fallback route after primary model failure');
+  assert.equal(res.model, 'zcode/GLM-5.3');
+  assert.equal(res.stop_reason, 'completed');
+  assert.match(res.degraded_role ?? '', /fallback route zcode\/GLM-5\.3/);
 });

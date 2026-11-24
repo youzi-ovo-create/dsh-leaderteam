@@ -988,7 +988,7 @@ test('[Linux Fix 6] Headless SIGINT group cancellation, pre-first-start npm conf
       path.join(fakePkgRoot, 'scripts', 'configure-models.mjs'),
       '--local',
       '--set-role',
-      'leader=deepseek/deepseek-chat:none',
+      'leader=deepseek/deepseek-flash:none',
     ],
     {
       cwd: tmp,
@@ -1016,7 +1016,7 @@ test('[Linux Fix 6] Headless SIGINT group cancellation, pre-first-start npm conf
     bundledDefaultConfigPath: path.join(fakePkgRoot, 'config', 'leaderteam.config.json'),
   });
   const effectiveAfterHostStart = loadConfig(hostBoot.configPath);
-  assert.equal(effectiveAfterHostStart.roles.leader.route, 'deepseek/deepseek-chat');
+  assert.equal(effectiveAfterHostStart.roles.leader.route, 'deepseek/deepseek-flash');
   assert.equal(effectiveAfterHostStart.roles.leader.effort, 'none');
 
   // Make `fakePkgRoot` read-only on POSIX and test Web UI `POST /api/apply` (no `backupRoot` passed -> must NOT fail with EACCES!)

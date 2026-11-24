@@ -467,7 +467,7 @@
             h('strong', null, '手动登记新上游模型'),
             h('div', { style: { display: 'flex', gap: '6px', flexWrap: 'wrap', marginTop: '8px' } },
               h('input', { style: { ...inputStyle, width: '110px' }, placeholder: 'provider (如 deepseek)', value: newModelProvider, onChange: e => setNewModelProvider(e.target.value) }),
-              h('input', { style: { ...inputStyle, flex: 1, minWidth: '160px' }, placeholder: '路由 <prefix>/<model> (如 deepseek/deepseek-chat)', value: newModelRoute, onChange: e => setNewModelRoute(e.target.value) }),
+              h('input', { style: { ...inputStyle, flex: 1, minWidth: '160px' }, placeholder: '路由 <prefix>/<model> (如 deepseek/deepseek-flash)', value: newModelRoute, onChange: e => setNewModelRoute(e.target.value) }),
               h('input', { style: { ...inputStyle, width: '140px' }, placeholder: '档位 (如 none 或 low,high)', value: newModelEfforts, onChange: e => setNewModelEfforts(e.target.value) }),
               h('button', { style: btnStyle(false), onClick: onAddCustomModel, disabled: loading }, '添加模型')
             )

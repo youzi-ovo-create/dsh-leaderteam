@@ -20,11 +20,23 @@ export function roleRouteChain(config, roleKey, leaderModel = null) {
     });
   }
   if (config.team?.leaderModelAsLastResort !== false && leaderModel && typeof leaderModel.model === 'string') {
-    const m = config.models?.[leaderModel.model];
+    let leaderRoute = Object.hasOwn(config.models ?? {}, leaderModel.model) ? leaderModel.model : null;
+    if (!leaderRoute) {
+      for (const [rKey, spec] of Object.entries(config.models ?? {})) {
+        const specProv = spec?.provider ?? provider;
+        const specModel = spec?.upstreamModel ?? rKey;
+        if ((leaderModel.provider === undefined || leaderModel.provider === specProv) && specModel === leaderModel.model) {
+          leaderRoute = rKey;
+          break;
+        }
+      }
+    }
+    const m = leaderRoute ? config.models?.[leaderRoute] : null;
+    const mProv = m?.provider ?? provider;
     // Only a model this configuration knows can stand in: its efforts are validated and its quota is tracked.
-    if (m && (leaderModel.provider === undefined || leaderModel.provider === provider)) {
+    if (m && (leaderModel.provider === undefined || leaderModel.provider === mProv || leaderModel.provider === provider)) {
       const effort = Array.isArray(m.efforts) && m.efforts.includes(leaderModel.reasoningEffort) ? leaderModel.reasoningEffort : m.defaultEffort;
-      if (typeof effort === 'string') chain.push({ provider, route: leaderModel.model, effort, ...limits, via: 'leader', degraded: true });
+      if (typeof effort === 'string') chain.push({ provider: mProv, route: leaderRoute, effort, ...limits, via: 'leader', degraded: true });
     }
   }
   const seen = new Set();
