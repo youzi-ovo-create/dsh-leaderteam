@@ -1,4 +1,5 @@
 // Safety-gate policy: tool classification, deterministic hard rules, reviewer request and verdict parsing. Pure.
+import fs from 'node:fs';
 import os from 'node:os';
 import { resolvePath, isInside, relativeInside, matchesAnyGlob, anyGlobOverlaps, normalizeGlob, hasGlobWildcard, realpathBestEffort, pathKey, api } from './paths.mjs';
 import { sanitizeArguments, boundJson, truncate, inlineSecretMatches } from './redact.mjs';
@@ -1020,7 +1021,7 @@ function extractCandidatePathStrings(val) {
   return out;
 }
 
-function inspectShellSandboxConfinement(args, workspace, realWorkspace, config, platform, realOf, tool = 'pwsh') {
+function inspectShellSandboxConfinement(args, workspace, realWorkspace, config, platform, realOf, tool = 'pwsh', fsImpl = null) {
   if (!args || typeof args !== 'object') return { confined: false, reason: 'missing shell arguments' };
   if (args.sandbox_permissions !== undefined || args.escalate === true) {
     return { confined: false, reason: `shell requests sandbox_permissions="${args.sandbox_permissions ?? 'escalated'}"` };
@@ -1114,8 +1115,84 @@ function inspectShellSandboxConfinement(args, workspace, realWorkspace, config, 
   const effPlat = (platform === 'win32' && tool !== 'bash') ? 'win32' : (platform === 'win32' ? 'win32' : platform);
   const posixCheckPlat = platform !== 'win32' ? platform : 'linux';
 
-  // Walk parsed command segments so quoted paths with spaces (e.g. "/home/dev/workspace/Leader Team/src/a.mjs"),
-  // mid-token `..` ("src/../../../tmp/pwn"), multi-`..` arguments, and symlinks inside workspace are evaluated accurately.
+  const checkWordTokenAtWd = (wTok, baseWd, isCmdExecutable, strippedCmdVal) => {
+    for (const candStr of extractCandidatePathStrings(wTok.value)) {
+      if (isSafeNullSink(candStr)) continue;
+
+      if (checkWin32Drive && /^[A-Za-z]:[\\/]/.test(candStr)) {
+        const candidate = resolvePath(candStr, baseWd, 'win32');
+        const wsWin = resolvePath(workspace, undefined, 'win32');
+        if (!candidate || !wsWin || !isInside(candidate, wsWin, 'win32')) {
+          return { confined: false, reason: `shell command references external path ${candStr}` };
+        }
+        continue;
+      }
+
+      // Check ANY `..` segment (at start OR mid-token like `src/../../../tmp/pwn`) against `baseWd` BEFORE applying `cd`
+      if (/(?:^|[\\/])\.\.(?:$|[\\/])/.test(candStr)) {
+        const { resolved: resolvedRel, forceOutside } = resolveShellPathForPlatform(candStr, baseWd, workspace, platform, tool);
+        if (forceOutside || !resolvedRel || !isInside(resolvedRel, workspace, effPlat) || !isInside(realOf(resolvedRel), realWorkspace, effPlat)) {
+          return { confined: false, reason: `shell command parent traversal "${candStr}" escapes workspace` };
+        }
+        continue;
+      }
+
+      // POSIX absolute path tokens (preserving spaces inside quotes, allowing system binary in command position, ignoring regex literals)
+      if (candStr.startsWith('/') && !candStr.startsWith('//')) {
+        if (isCmdExecutable && platform !== 'win32' && SAFE_POSIX_CMD_BIN_RE.test(candStr)) {
+          continue;
+        }
+        // Ignore awk/sed/JS regex literals like `/ERROR/ {print $0}` or `/abc/.test(...)`
+        if (/^\/[^/\s]+\/[gimsuy]*(?:\s|\.|;|,|\)|$)/.test(candStr)) {
+          continue;
+        }
+        const isSystemRootPrefix = POSIX_SYSTEM_ROOT_PREFIX_RE.test(candStr);
+        if (platform !== 'win32' || isSystemRootPrefix) {
+          const { resolved: candidate, forceOutside } = resolveShellPathForPlatform(candStr, baseWd, workspace, platform, tool);
+          const checkPlat = (platform === 'win32' && tool !== 'bash') ? 'linux' : (platform === 'win32' ? 'win32' : posixCheckPlat);
+          const wsCheck = resolvePath(workspace, undefined, checkPlat);
+          const candCheck = forceOutside ? null : (candidate ?? resolvePath(candStr, baseWd, checkPlat));
+          if (!candCheck || !wsCheck || !isInside(candCheck, wsCheck, checkPlat)) {
+            // On POSIX, ignore synthetic URL routes / CLI option values (e.g. `--base=/app`, `"/api/v1/users"`)
+            // ONLY when neither the path nor its top-level mount/directory actually exists on disk!
+            if (!isSystemRootPrefix && platform !== 'win32' && (wTok.value.startsWith('-') || wTok.quoted)) {
+              const topSeg = '/' + candStr.slice(1).split('/')[0];
+              const targetOrTopExists = inputFsExists(candCheck ?? candStr, fsImpl, realOf)
+                || inputFsExists(topSeg, fsImpl, realOf);
+              if (!targetOrTopExists) continue;
+            }
+            return { confined: false, reason: `shell command references external path ${candStr}` };
+          }
+          if (platform !== 'win32' && !isInside(realOf(candCheck), realWorkspace, platform)) {
+            return { confined: false, reason: `shell command path resolves via symlink outside workspace: ${candStr}` };
+          }
+        }
+        continue;
+      }
+
+      // Relative path inside workspace (including non-ASCII / Chinese filenames & symlinks!):
+      // verify pre-existing symlinks (`src/alias-ext/secret.txt`, `外部软链/secret.txt`) do NOT escape `realWorkspace`.
+      if (
+        platform !== 'win32'
+        && !candStr.startsWith('-')
+        && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(candStr)
+        && !/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(candStr)
+        && (candStr.includes('/') || candStr !== strippedCmdVal || !SAFE_POSIX_BARE_CMD_RE.test(candStr))
+      ) {
+        const relCand = resolvePath(candStr, baseWd, platform);
+        if (relCand && isInside(relCand, workspace, platform)) {
+          const realRelCand = realOf(relCand);
+          if (!isInside(realRelCand, realWorkspace, platform)) {
+            return { confined: false, reason: `shell command accesses symlink resolving outside workspace: ${candStr}` };
+          }
+        }
+      }
+    }
+    return null;
+  };
+
+  // Walk parsed command segments so quoted paths with spaces, mid-token `..`, `cd ..` within workspace,
+  // and Unicode/ASCII symlinks inside workspace are evaluated accurately in execution order.
   let curWd = effectiveWorkdir;
   let tIdx = 0;
   while (tIdx < scanned.tokens.length) {
@@ -1129,87 +1206,44 @@ function inspectShellSandboxConfinement(args, workspace, realWorkspace, config, 
       tIdx++;
     }
     const { words: strippedSeg, envChdirTokens } = stripLeadingEnvAssignmentsAndPrefixes(segWords);
+    const envChdirSet = new Set(envChdirTokens);
     for (const chdirTok of envChdirTokens) {
+      const envHit = checkWordTokenAtWd(chdirTok, curWd, false, strippedSeg[0]?.value ?? '');
+      if (envHit) return envHit;
       const { resolved: nextEnvWd } = resolveShellPathForPlatform(chdirTok.value, curWd, workspace, platform, tool);
       if (nextEnvWd) curWd = nextEnvWd;
     }
+
+    let cBase = '';
     if (strippedSeg.length > 0) {
       const cName = strippedSeg[0].value;
-      const cBase = cName.includes('/') ? cName.slice(cName.lastIndexOf('/') + 1) : cName;
+      cBase = cName.includes('/') ? cName.slice(cName.lastIndexOf('/') + 1) : cName;
       if (SUBSHELL_WRAPPER_CMDS.has(cBase) && segHeredocs.length > 0) {
         return { confined: false, reason: `shell sub-interpreter "${cBase}" with heredoc requires safety gate review` };
       }
-      if ((cBase === 'cd' || cBase === 'pushd') && strippedSeg[1]) {
-        const { resolved: nextWd } = resolveShellPathForPlatform(strippedSeg[1].value, curWd, workspace, platform, tool);
-        if (nextWd) curWd = nextWd;
-      }
     }
 
+    const cmdExecWd = curWd;
     for (let wPos = 0; wPos < segWords.length; wPos++) {
       const wTok = segWords[wPos];
+      if (envChdirSet.has(wTok)) continue;
       const isCmdExecutable = strippedSeg.length > 0 && wTok === strippedSeg[0];
-      for (const candStr of extractCandidatePathStrings(wTok.value)) {
-        if (isSafeNullSink(candStr)) continue;
+      const wordHit = checkWordTokenAtWd(wTok, cmdExecWd, isCmdExecutable, strippedSeg[0]?.value ?? '');
+      if (wordHit) return wordHit;
+    }
 
-        if (checkWin32Drive && /^[A-Za-z]:[\\/]/.test(candStr)) {
-          const candidate = resolvePath(candStr, curWd, 'win32');
-          const wsWin = resolvePath(workspace, undefined, 'win32');
-          if (!candidate || !wsWin || !isInside(candidate, wsWin, 'win32')) {
-            return { confined: false, reason: `shell command references external path ${candStr}` };
-          }
-          continue;
-        }
-
-        // Check ANY `..` segment (at start OR mid-token like `src/../../../tmp/pwn`) across ALL arguments
-        if (/(?:^|[\\/])\.\.(?:$|[\\/])/.test(candStr)) {
-          const { resolved: resolvedRel, forceOutside } = resolveShellPathForPlatform(candStr, curWd, workspace, platform, tool);
-          if (forceOutside || !resolvedRel || !isInside(resolvedRel, workspace, effPlat) || !isInside(realOf(resolvedRel), realWorkspace, effPlat)) {
-            return { confined: false, reason: `shell command parent traversal "${candStr}" escapes workspace` };
-          }
-          continue;
-        }
-
-        // POSIX absolute path tokens (preserving spaces inside quotes, allowing system binary in command position, ignoring regex literals)
-        if (candStr.startsWith('/') && !candStr.startsWith('//')) {
-          if (isCmdExecutable && platform !== 'win32' && SAFE_POSIX_CMD_BIN_RE.test(candStr)) {
-            continue;
-          }
-          // Ignore awk/sed/JS regex literals like `/ERROR/ {print $0}` or `/abc/.test(...)`
-          if (/^\/[^/\s]+\/[gimsuy]*(?:\s|\.|;|,|\)|$)/.test(candStr)) {
-            continue;
-          }
-          const isSystemRootPrefix = POSIX_SYSTEM_ROOT_PREFIX_RE.test(candStr);
-          if (platform !== 'win32' || isSystemRootPrefix) {
-            const { resolved: candidate, forceOutside } = resolveShellPathForPlatform(candStr, curWd, workspace, platform, tool);
-            const checkPlat = (platform === 'win32' && tool !== 'bash') ? 'linux' : (platform === 'win32' ? 'win32' : posixCheckPlat);
-            const wsCheck = resolvePath(workspace, undefined, checkPlat);
-            const candCheck = forceOutside ? null : (candidate ?? resolvePath(candStr, curWd, checkPlat));
-            if (!candCheck || !wsCheck || !isInside(candCheck, wsCheck, checkPlat)) {
-              // On POSIX, ignore synthetic URL routes / CLI option values (e.g. `--base=/app`, `"/api/v1/users"`) unless unquoted root dir or real host path
-              if (!isSystemRootPrefix && platform !== 'win32' && (wTok.value.startsWith('-') || wTok.quoted)) {
-                const topSeg = '/' + candStr.slice(1).split('/')[0];
-                const topExists = inputFsExists(topSeg, realOf, workspace, platform);
-                if (!topExists) continue;
-              }
-              return { confined: false, reason: `shell command references external path ${candStr}` };
-            }
-            if (platform !== 'win32' && !isInside(realOf(candCheck), realWorkspace, platform)) {
-              return { confined: false, reason: `shell command path resolves via symlink outside workspace: ${candStr}` };
-            }
-          }
-          continue;
-        }
-
-        // Relative path inside workspace: verify pre-existing symlinks (`src/alias-ext/secret.txt`) do NOT escape `realWorkspace`
-        if (platform !== 'win32' && !candStr.startsWith('-') && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(candStr) && /^[A-Za-z0-9._][A-Za-z0-9._/ -]*$/.test(candStr) && (candStr.includes('/') || candStr !== strippedSeg[0]?.value)) {
-          const relCand = resolvePath(candStr, curWd, platform);
-          if (relCand && isInside(relCand, workspace, platform)) {
-            const realRelCand = realOf(relCand);
-            if (!isInside(realRelCand, realWorkspace, platform)) {
-              return { confined: false, reason: `shell command accesses symlink resolving outside workspace: ${candStr}` };
-            }
-          }
-        }
+    if ((cBase === 'cd' || cBase === 'pushd') && strippedSeg.length > 1) {
+      let destArg = null;
+      for (let a = 1; a < strippedSeg.length; a++) {
+        const av = strippedSeg[a].value;
+        if (av === '--') { destArg = strippedSeg[a + 1]?.value ?? null; break; }
+        if (av === '-L' || av === '-P' || av === '-e') continue;
+        destArg = av;
+        break;
+      }
+      if (destArg && destArg !== '-') {
+        const { resolved: nextWd } = resolveShellPathForPlatform(destArg, cmdExecWd, workspace, platform, tool);
+        if (nextWd) curWd = nextWd;
       }
     }
   }
@@ -1217,11 +1251,23 @@ function inspectShellSandboxConfinement(args, workspace, realWorkspace, config, 
   return { confined: true, reason: 'in-sandbox workspace command without external boundary effect' };
 }
 
-function inputFsExists(absPath, realOf, workspace, platform) {
-  // Best-effort check: standard host roots are already caught by POSIX_SYSTEM_ROOT_PREFIX_RE;
-  // for custom top-level dirs (e.g. `/outside`), check if `realOf` or host fs sees it.
+const SAFE_POSIX_BARE_CMD_RE = /^[A-Za-z0-9._+-]+$/;
+
+function inputFsExists(absPath, fsImpl, realOf) {
+  if (!absPath || typeof absPath !== 'string') return false;
+  if (fsImpl) {
+    if (typeof fsImpl.existsSync === 'function') {
+      try { if (fsImpl.existsSync(absPath)) return true; } catch {}
+    }
+    if (typeof fsImpl.lstatSync === 'function') {
+      try { fsImpl.lstatSync(absPath); return true; } catch {}
+    }
+    if (typeof fsImpl.statSync === 'function') {
+      try { fsImpl.statSync(absPath); return true; } catch {}
+    }
+  }
   try {
-    if (realOf(absPath) !== absPath) return true;
+    if (typeof realOf === 'function' && realOf(absPath) !== absPath) return true;
   } catch {}
   return false;
 }
@@ -1236,7 +1282,8 @@ export function classifySandboxBoundary(input, config) {
   const platform = input.platform ?? process.platform;
   const workspace = resolvePath(cwd, undefined, platform);
   if (workspace === null) return { confined: false, reason: 'missing workspace' };
-  const realOf = p => (platform === process.platform || input.fs) ? realpathBestEffort(p, platform, input.fs) : p;
+  const fsImpl = input.fs ?? (platform === process.platform ? fs : null);
+  const realOf = p => fsImpl ? realpathBestEffort(p, platform, fsImpl) : p;
   const realWorkspace = realOf(workspace);
 
   if (tool === 'write' || tool === 'edit') {
@@ -1251,7 +1298,7 @@ export function classifySandboxBoundary(input, config) {
     return { confined: true, reason: 'session-scoped sandbox background job termination' };
   }
   if (config.gate.shellTools.includes(tool)) {
-    const res = inspectShellSandboxConfinement(args, workspace, realWorkspace, config, platform, realOf, tool);
+    const res = inspectShellSandboxConfinement(args, workspace, realWorkspace, config, platform, realOf, tool, fsImpl);
     if (res.confined && typeof args?.command === 'string' && SHELL_INLINE_INTERPRETER_RE.test(args.command)) {
       return { confined: false, reason: 'shell command runs inline script interpreter or find -exec requiring safety gate review' };
     }
@@ -1279,7 +1326,8 @@ export function evaluateDirectExecSafetyGate(input, config) {
   const platform = input.platform ?? process.platform;
   const workspace = resolvePath(cwd, undefined, platform);
   if (workspace === null) return { decision: 'deny', by: 'rule:no-workspace', risk: 'high', reason: 'missing workspace' };
-  const realOf = p => (platform === process.platform || input.fs) ? realpathBestEffort(p, platform, input.fs) : p;
+  const fsImpl = input.fs ?? (platform === process.platform ? fs : null);
+  const realOf = p => fsImpl ? realpathBestEffort(p, platform, fsImpl) : p;
   const realWorkspace = realOf(workspace);
   const protectedDirs = config.paths.protectedDirs.map(d => resolvePath(d, workspace, platform)).filter(Boolean);
   const realProtectedDirs = protectedDirs.map(realOf);
@@ -1348,7 +1396,7 @@ export function evaluateDirectExecSafetyGate(input, config) {
     if (directEscape) {
       return { decision: 'deny', by: 'rule:direct-exec-sandbox-lock', risk: 'high', reason: directEscape.reason };
     }
-    const directConfinement = inspectShellSandboxConfinement(args, workspace, realWorkspace, config, platform, realOf, tool);
+    const directConfinement = inspectShellSandboxConfinement(args, workspace, realWorkspace, config, platform, realOf, tool, fsImpl);
     if (!directConfinement.confined && !DIRECT_EXEC_AMBIGUOUS_SHELL_RE.test(command) && scannedDirect.substitutions.length === 0) {
       return { decision: 'deny', by: 'rule:direct-exec-sandbox-lock', risk: 'high', reason: directConfinement.reason };
     }
@@ -1417,7 +1465,8 @@ export function evaluateHardRules(input, config) {
   if (Array.isArray(actor.loadedTools) && !actor.loadedTools.includes(tool)) return { rule: 'tool-not-loaded', reason: `load the authorized tool "${tool}" with team_tools before using it in a later step` };
   const workspace = resolvePath(cwd, undefined, platform);
   if (workspace === null) return { rule: 'no-workspace', reason: 'the session has no absolute working directory' };
-  const realOf = p => (platform === process.platform || input.fs) ? realpathBestEffort(p, platform, input.fs) : p;
+  const fsImpl = input.fs ?? (platform === process.platform ? fs : null);
+  const realOf = p => fsImpl ? realpathBestEffort(p, platform, fsImpl) : p;
   const realWorkspace = realOf(workspace);
   const globals = config.paths.globalRefRoots.map(r => resolvePath(r, undefined, platform)).filter(Boolean);
   const realGlobals = globals.map(realOf);

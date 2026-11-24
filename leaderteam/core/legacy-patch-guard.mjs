@@ -22,7 +22,7 @@ export function inspectPatchTextForLegacyLeaderTeam(patchText, currentBundleRoot
   const entryRegex = /(?:(["'`])([^"'`\r\n]*?leaderteam\/(?:entry-core|entry-native-executor|entry-lead)\.mjs)\1|([^\s"'`]+leaderteam\/(?:entry-core|entry-native-executor|entry-lead)\.mjs))/g;
   let hasExternalCoreOverride = false;
   const normRoot = currentBundleRoot
-    ? currentBundleRoot.replaceAll('\\', '/').replace(/\/+$/, '').toLowerCase()
+    ? path.posix.normalize(currentBundleRoot.replaceAll('\\', '/')).replace(/\/+$/, '').toLowerCase()
     : null;
   for (const m of patchText.matchAll(entryRegex)) {
     let rawRef = (m[2] ?? m[3] ?? '').replaceAll('\\', '/');
@@ -33,7 +33,11 @@ export function inspectPatchTextForLegacyLeaderTeam(patchText, currentBundleRoot
         : rawRef.replace(/^file:\/\//i, '');
     }
     const decodedRef = (() => { try { return decodeURIComponent(rawRef); } catch { return rawRef; } })();
-    if (!normRoot || !decodedRef.toLowerCase().includes(normRoot)) {
+    const normRef = path.posix.normalize(decodedRef.replaceAll('\\', '/')).toLowerCase();
+    const isInsideCurrentBundle = Boolean(
+      normRoot && (normRef === normRoot || normRef.startsWith(`${normRoot}/`)),
+    );
+    if (!isInsideCurrentBundle) {
       hasExternalCoreOverride = true;
       break;
     }

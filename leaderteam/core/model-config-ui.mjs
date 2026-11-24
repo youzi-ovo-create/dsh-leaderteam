@@ -5,7 +5,7 @@ import http from 'node:http';
 import crypto from 'node:crypto';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { inspectModelConfiguration, applyModelConfigChanges, resolveDefaultDshHome } from './model-config-writer.mjs';
+import { inspectModelConfiguration, applyModelConfigChanges, resolveDefaultDshHome, resolveWritableBackupRoot } from './model-config-writer.mjs';
 
 const MAX_BODY_BYTES = 256 * 1024;
 
@@ -686,15 +686,22 @@ export async function startModelConfigServer(options = {}) {
       if (req.method === 'POST' && url.pathname === '/api/apply') {
         const body = await readJsonBody(req);
         const stamp = new Date().toISOString().replace(/[-:.TZ]/g, '').slice(0, 14);
+        const targetMode = body.target === 'local' ? 'local' : 'base';
+        const effectiveBackupRoot = resolveWritableBackupRoot({
+          explicitBackupRoot: options.backupRoot ?? null,
+          configFile,
+          localFile: options.localFile,
+          target: targetMode,
+          dshHome: options.dshHome,
+          projectRoot,
+        });
         const backupDir = body.dryRun
           ? null
-          : (options.backupRoot
-            ? path.join(path.resolve(options.backupRoot), `model-config-${stamp}`)
-            : path.join(projectRoot, 'backups', 'model-config', `ui-${stamp}`));
+          : path.join(effectiveBackupRoot, `ui-${stamp}`);
         const result = applyModelConfigChanges(body.changes ?? {}, {
           configFile,
           localFile: options.localFile,
-          target: body.target === 'local' ? 'local' : 'base',
+          target: targetMode,
           dryRun: Boolean(body.dryRun),
           backupDir,
           dshHome: options.dshHome,

@@ -307,7 +307,23 @@ export function parseConferenceOpening(raw) {
   };
 }
 
-export function parseConferenceDeliberation(raw, { forceConclude = false } = {}) {
+function isValidBlockedTargetEntry(entry, validStageIds = null, platform = process.platform) {
+  if (typeof entry !== 'string' || !entry.trim()) return false;
+  if (Array.isArray(validStageIds) && validStageIds.includes(entry)) return true;
+  try {
+    normalizeGlob(entry, platform);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function parseConferenceDeliberation(raw, {
+  forceConclude = false,
+  validStageIds = null,
+  fallbackTargets = [],
+  platform = process.platform,
+} = {}) {
   const jsonText = extractJsonObjectText(raw);
   if (!jsonText) return { ok: false, error: 'response must be a single JSON object' };
   let obj;
@@ -344,7 +360,18 @@ export function parseConferenceDeliberation(raw, { forceConclude = false } = {})
   if (decision !== 'overturn_objection' && bindingDirectives.length === 0) {
     return { ok: false, error: 'binding_directives must be non-empty when decision is adopt_alternative or enforce_correction' };
   }
-  const blockedTargets = decision === 'enforce_correction' ? cleanStrList(obj.blocked_targets, 12, 200) : [];
+  const rawBlockedTargets = decision === 'enforce_correction' ? cleanStrList(obj.blocked_targets, 12, 200) : [];
+  let blockedTargets = rawBlockedTargets.filter(t => isValidBlockedTargetEntry(t, validStageIds, platform));
+  if (decision === 'enforce_correction' && rawBlockedTargets.length > 0 && blockedTargets.length === 0) {
+    if (!forceConclude) {
+      return {
+        ok: false,
+        error: 'blocked_targets entries must be valid workspace-relative globs or stage IDs (no leading "/" or "..")',
+      };
+    }
+    blockedTargets = cleanStrList(fallbackTargets, 12, 200)
+      .filter(t => isValidBlockedTargetEntry(t, validStageIds, platform));
+  }
   const resumePolicy = obj.member_resume_policy === 'adjust_disputed_resume_others'
     ? 'adjust_disputed_resume_others'
     : 'resume_all';
@@ -726,20 +753,37 @@ export function checkGovernanceExecutionGate(govState, actor, tool, args = {}, s
       const candidateStageId = stage?.id ?? args?.stage_id ?? null;
       for (const dir of govState.activeDirectives) {
         if (!dir.blockedTargets?.length) continue;
-        const stageBlocked = candidateStageId && dir.blockedTargets.includes(candidateStageId);
+        const stageBlocked = Boolean(candidateStageId && dir.blockedTargets.includes(candidateStageId));
         const validBlockedGlobs = dir.blockedTargets
           .map(g => { try { return normalizeGlob(g, platform); } catch { return null; } })
           .filter(Boolean);
         const globBlocked = candidateScopes.length > 0
           && validBlockedGlobs.length > 0
           && anyGlobOverlaps(candidateScopes, validBlockedGlobs, platform);
-        if (!stageBlocked && !globBlocked) continue;
+
+        // If `blockedTargets` was non-empty on the directive yet every entry failed resolution (`!stageBlocked && validBlockedGlobs.length === 0`),
+        // NEVER silently drop the hold — fall back to the conference's disputed `stageId` / `targets`, or fail-closed on unamended stages!
+        let fallbackBlocked = false;
+        if (!stageBlocked && validBlockedGlobs.length === 0) {
+          const fallbackStageHit = Boolean(candidateStageId && dir.stageId && candidateStageId === dir.stageId);
+          const fallbackTargetGlobs = (dir.targets ?? [])
+            .map(g => { try { return normalizeGlob(g, platform); } catch { return null; } })
+            .filter(Boolean);
+          const fallbackGlobHit = candidateScopes.length > 0
+            && fallbackTargetGlobs.length > 0
+            && anyGlobOverlaps(candidateScopes, fallbackTargetGlobs, platform);
+          fallbackBlocked = fallbackStageHit
+            || fallbackGlobHit
+            || (!dir.stageId && fallbackTargetGlobs.length === 0);
+        }
+
+        if (!stageBlocked && !globBlocked && !fallbackBlocked) continue;
 
         // Block re-dispatching the UNCHANGED stage contract (or identical unamended stageId);
         // once the Leader amends the stage contract (`stage.hash !== dir.stageHashAtRuling`) or dispatches a new remediation stage,
         // allow the remediation member to run while keeping `dir` active until remediation is verified!
         const unamendedBlockedStage = stage
-          ? (dir.stageHashAtRuling ? stage.hash === dir.stageHashAtRuling : stageBlocked)
+          ? (dir.stageHashAtRuling ? stage.hash === dir.stageHashAtRuling : (stageBlocked || fallbackBlocked))
           : !dir.stageId;
         if (unamendedBlockedStage) {
           return {

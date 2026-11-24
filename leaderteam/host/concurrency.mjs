@@ -461,10 +461,11 @@ export async function pollAndDeliverPowerMonitor(ctx, rt = runtime(), options = 
       trySavePersistedPowerState(baseRt);
     } else {
       let anyDelivered = false;
+      const resumedList = baseRt.powerMonitorState.userResumedTeamsDuringLatch ?? [];
       for (const actor of leaderActors) {
         const pendingList = baseRt.powerMonitorState.pendingTeams ?? [];
         const ackedList = baseRt.powerMonitorState.ackedTeams ?? [];
-        if (ackedList.includes(actor.teamId)) continue;
+        if (resumedList.includes(actor.teamId) || ackedList.includes(actor.teamId)) continue;
         if (!pendingList.includes(actor.teamId) && !(pendingList.length === 0 && ackedList.length === 0 && baseRt.powerMonitorState.pendingNotice)) {
           continue;
         }
@@ -477,6 +478,15 @@ export async function pollAndDeliverPowerMonitor(ctx, rt = runtime(), options = 
           });
           anyDelivered = true;
         }
+      }
+      if (
+        baseRt.powerMonitorState.pendingNotice
+        && (baseRt.powerMonitorState.pendingTeams?.length ?? 0) === 0
+        && leaderActors.length > 0
+        && leaderActors.every(a => resumedList.includes(a.teamId) || (baseRt.powerMonitorState.ackedTeams ?? []).includes(a.teamId))
+      ) {
+        baseRt.powerMonitorState.pendingNotice = false;
+        anyDelivered = true;
       }
       if (anyDelivered || baseRt.powerMonitorStateDirty) {
         trySavePersistedPowerState(baseRt);

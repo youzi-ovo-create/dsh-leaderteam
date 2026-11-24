@@ -12,7 +12,7 @@ const OFFICIAL_EXE_LINUX_CANDIDATES = ['deepseek-harness', 'DeepSeek Harness'];
 const LEGACY_EXE = 'DSH Desktop.exe';
 const EXTRA_VERIFIED_VERSIONS = ['0.2.2-rc.5'];
 
-function splitShellArgs(raw) {
+export function splitShellArgs(raw) {
   const out = [];
   const src = String(raw ?? '');
   let i = 0;
@@ -20,22 +20,53 @@ function splitShellArgs(raw) {
     while (i < src.length && /\s/.test(src[i])) i++;
     if (i >= src.length) break;
     let tok = '';
+    let hasQuote = false;
     while (i < src.length && !/\s/.test(src[i])) {
-      if (src[i] === '"' || src[i] === "'") {
-        const q = src[i++];
-        while (i < src.length && src[i] !== q) {
-          if (q === '"' && src[i] === '\\' && i + 1 < src.length) { tok += src[i + 1]; i += 2; continue; }
+      if (src[i] === "'") {
+        hasQuote = true;
+        i++;
+        while (i < src.length && src[i] !== "'") tok += src[i++];
+        if (i < src.length) i++;
+      } else if (src[i] === '"') {
+        hasQuote = true;
+        i++;
+        while (i < src.length) {
+          if (src[i] === '\\') {
+            let bsCount = 0;
+            while (i < src.length && src[i] === '\\') { bsCount++; i++; }
+            if (i < src.length && src[i] === '"') {
+              tok += '\\'.repeat(Math.floor(bsCount / 2));
+              if (bsCount % 2 === 1) {
+                tok += '"';
+                i++;
+                continue;
+              }
+              break;
+            }
+            // Preserve Windows path separators inside double quotes (`"C:\Build Tools\hook.cjs"`)
+            tok += '\\'.repeat(bsCount);
+            continue;
+          }
+          if (src[i] === '"') break;
           tok += src[i++];
         }
-        if (i < src.length) i++;
+        if (i < src.length && src[i] === '"') i++;
       } else if (src[i] === '\\' && i + 1 < src.length) {
-        tok += src[i + 1];
-        i += 2;
+        if (/[\s"']/.test(src[i + 1])) {
+          tok += src[i + 1];
+          i += 2;
+        } else if (/^[A-Za-z]:/.test(tok) || tok.startsWith('\\\\')) {
+          tok += '\\';
+          i++;
+        } else {
+          tok += src[i + 1];
+          i += 2;
+        }
       } else {
         tok += src[i++];
       }
     }
-    if (tok) out.push(tok);
+    if (tok || hasQuote) out.push(tok);
   }
   return out;
 }

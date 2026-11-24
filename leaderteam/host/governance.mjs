@@ -1146,7 +1146,11 @@ export async function respondInFormalConference({
     leaderModel,
     CONFERENCE_DELIBERATION_SYSTEM,
     JSON.stringify(delibPayload),
-    raw => parseConferenceDeliberation(raw, { forceConclude: remainingDialogueTurns === 0 }),
+    raw => parseConferenceDeliberation(raw, {
+      forceConclude: remainingDialogueTurns === 0,
+      validStageIds: [...frontierState(store, taskSeq).stages.keys()],
+      fallbackTargets: [conf.stageId, ...(conf.targets ?? [])].filter(Boolean),
+    }),
     'conference-deliberation',
     signal,
   );

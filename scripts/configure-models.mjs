@@ -16,8 +16,10 @@ import {
   inspectModelConfiguration,
   applyModelConfigChanges,
   resolveDefaultDshHome,
+  resolveWritableBackupRoot,
   ROLE_KEYS,
 } from '../leaderteam/core/model-config-writer.mjs';
+import { resolveOrBootstrapConfigPath, detectSoloKeyPreset } from '../leaderteam/core/solo-key.mjs';
 import { startModelConfigServer, runDesktopSync } from '../leaderteam/core/model-config-ui.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -331,18 +333,63 @@ function openBrowserUrl(url) {
   } catch {}
 }
 
-function resolveDefaultConfigFile(opts) {
-  if (opts.configFile) return path.resolve(opts.configFile);
-  if (process.env.LEADERTEAM_CONFIG) return path.resolve(process.env.LEADERTEAM_CONFIG);
-  const inNodeModules = ROOT.replaceAll('\\', '/').includes('/node_modules/');
-  if (inNodeModules) {
-    const dshHome = opts.dshHome ?? process.env.LT_DSH_HOME ?? process.env.DSH_HOME ?? (os.homedir() ? path.join(os.homedir(), '.dsh') : null);
-    if (dshHome) {
-      const managed = path.join(path.resolve(dshHome), 'leaderteam', 'config', 'leaderteam.config.json');
-      if (fs.existsSync(managed)) return managed;
+function changesReferenceBundledOnlyRoutes(changes, bundledCfg, bootstrappedCfg) {
+  if (!changes || !bundledCfg?.models || !bootstrappedCfg?.models) return false;
+  const referenced = new Set();
+  for (const r of changes.setRoles ?? []) {
+    if (r?.route) referenced.add(r.route);
+  }
+  for (const r of changes.poolSet ?? []) referenced.add(r);
+  for (const r of changes.poolEnable ?? []) referenced.add(r);
+  for (const up of changes.upsertModels ?? []) {
+    if (up?.route) referenced.delete(up.route);
+  }
+  for (const route of referenced) {
+    if (!Object.hasOwn(bootstrappedCfg.models, route) && Object.hasOwn(bundledCfg.models, route)) {
+      return true;
     }
   }
-  return path.join(ROOT, 'config', 'leaderteam.config.json');
+  return false;
+}
+
+function resolveDefaultConfigFile(opts, { changes = null, bootstrapManaged = false } = {}) {
+  if (opts.configFile) return path.resolve(opts.configFile);
+  if (process.env.LEADERTEAM_CONFIG?.trim()) return path.resolve(process.env.LEADERTEAM_CONFIG.trim());
+
+  const bundledConfigPath = path.join(ROOT, 'config', 'leaderteam.config.json');
+  const isInstalledPackage = ROOT.replaceAll('\\', '/').includes('/node_modules/')
+    || !fs.existsSync(path.join(ROOT, 'test'));
+  const explicitDshHome = opts.dshHome ?? process.env.LT_DSH_HOME ?? process.env.DSH_HOME ?? null;
+
+  if (isInstalledPackage || explicitDshHome) {
+    const dshHome = explicitDshHome ?? (os.homedir() ? path.join(os.homedir(), '.dsh') : null);
+    if (dshHome) {
+      const resolvedHome = path.resolve(dshHome);
+      const managed = path.join(resolvedHome, 'leaderteam', 'config', 'leaderteam.config.json');
+      if (fs.existsSync(managed)) return managed;
+      if (isInstalledPackage && bootstrapManaged) {
+        const res = resolveOrBootstrapConfigPath({
+          explicitConfigPath: null,
+          env: process.env,
+          dshHome: resolvedHome,
+          bundledDefaultConfigPath: bundledConfigPath,
+        });
+        // If user has no Solo-Key env var set and explicitly configures a bundled Magpie route before first start,
+        // seed the managed base config from the bundled catalog so both `--local` and host startup agree on the route.
+        if (res.bootstrapped && !detectSoloKeyPreset({ env: process.env }) && changes) {
+          try {
+            const bundledRaw = JSON.parse(fs.readFileSync(bundledConfigPath, 'utf8'));
+            const bootRaw = JSON.parse(fs.readFileSync(res.configPath, 'utf8'));
+            if (changesReferenceBundledOnlyRoutes(changes, bundledRaw, bootRaw)) {
+              fs.writeFileSync(res.configPath, JSON.stringify(bundledRaw, null, 2) + '\n', 'utf8');
+            }
+          } catch {}
+        }
+        return res.configPath;
+      }
+    }
+  }
+  return bundledConfigPath;
 }
 
 async function main() {
@@ -352,7 +399,10 @@ async function main() {
     return;
   }
 
-  const configFile = resolveDefaultConfigFile(opts);
+  const configFile = resolveDefaultConfigFile(opts, {
+    changes,
+    bootstrapManaged: Boolean((hasMutations && !opts.dryRun) || opts.serve),
+  });
   const commonOpts = {
     configFile,
     localFile: opts.localFile,
@@ -365,7 +415,7 @@ async function main() {
     const srv = await startModelConfigServer({
       ...commonOpts,
       port: opts.port,
-      backupRoot: opts.backupDir ?? path.join(ROOT, 'backups', 'model-config'),
+      backupRoot: opts.backupDir ? path.resolve(opts.backupDir) : null,
     });
     console.log(JSON.stringify({
       mode: 'serve',
@@ -386,12 +436,24 @@ async function main() {
   let applyResult = null;
   if (hasMutations) {
     const stamp = new Date().toISOString().replace(/[-:.TZ]/g, '').slice(0, 14);
+    const targetMode = opts.local ? 'local' : 'base';
     const backupDir = opts.backupDir
       ? path.resolve(opts.backupDir)
-      : (opts.backup ? path.join(ROOT, 'backups', 'model-config', `cli-${stamp}`) : null);
+      : (opts.backup
+        ? path.join(
+          resolveWritableBackupRoot({
+            configFile,
+            localFile: opts.localFile,
+            target: targetMode,
+            dshHome: opts.dshHome,
+            projectRoot: ROOT,
+          }),
+          `cli-${stamp}`,
+        )
+        : null);
     applyResult = applyModelConfigChanges(changes, {
       ...commonOpts,
-      target: opts.local ? 'local' : 'base',
+      target: targetMode,
       dryRun: opts.dryRun,
       syncPatches: opts.syncPatches,
       backupDir,

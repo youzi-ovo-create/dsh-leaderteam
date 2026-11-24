@@ -72,17 +72,60 @@ child.stdout.on('data', d => {
 });
 child.stderr.on('data', d => errlog.write(d));
 child.stdin.end(task);
+let childExited = false;
+let cancelExitCode = null;
+let hardKillTimer = null;
+
+function terminateChildGroup(signal = 'SIGTERM') {
+  if (childExited) return;
+  if (process.platform !== 'win32' && child.pid) {
+    try {
+      process.kill(-child.pid, signal);
+      return;
+    } catch {}
+  }
+  try { child.kill(signal); } catch {}
+}
+
+function scheduleHardKill() {
+  if (hardKillTimer || childExited) return;
+  hardKillTimer = setTimeout(() => {
+    terminateChildGroup('SIGKILL');
+  }, 1500);
+  hardKillTimer.unref?.();
+}
+
+const SIGNAL_EXIT_CODES = { SIGHUP: 129, SIGINT: 130, SIGTERM: 143 };
+for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+  process.on(sig, () => {
+    if (cancelExitCode === null) {
+      cancelExitCode = SIGNAL_EXIT_CODES[sig] ?? 130;
+      clearTimeout(timer);
+      terminateChildGroup(sig);
+      scheduleHardKill();
+    } else {
+      terminateChildGroup('SIGKILL');
+    }
+  });
+}
+process.once('exit', () => {
+  if (!childExited) terminateChildGroup('SIGKILL');
+});
+
 const timer = setTimeout(() => {
   console.error('timeout: stopping DSH');
-  if (process.platform !== 'win32' && child.pid) {
-    try { process.kill(-child.pid, 'SIGTERM'); return; } catch {}
-  }
-  child.kill();
+  terminateChildGroup('SIGTERM');
+  scheduleHardKill();
 }, Number(args['timeout-min'] ?? 120) * 60000);
-child.on('close', code => {
-  clearTimeout(timer); events.end(); errlog.end();
-  fs.writeFileSync(path.join(runDir, 'summary.json'), JSON.stringify({ code, sessionId, final }, null, 2));
-  console.log(`\nexit ${code}; session ${sessionId ?? '-'}; run dir ${runDir}`);
+
+child.on('close', (code, signal) => {
+  childExited = true;
+  clearTimeout(timer);
+  if (hardKillTimer) clearTimeout(hardKillTimer);
+  events.end(); errlog.end();
+  const effectiveCode = cancelExitCode ?? code ?? (signal ? (SIGNAL_EXIT_CODES[signal] ?? 1) : 1);
+  fs.writeFileSync(path.join(runDir, 'summary.json'), JSON.stringify({ code: effectiveCode, signal: signal ?? null, cancelled: cancelExitCode !== null, sessionId, final }, null, 2));
+  console.log(`\nexit ${effectiveCode}; session ${sessionId ?? '-'}; run dir ${runDir}`);
   if (final?.text) console.log(`\n${final.text}`);
-  process.exitCode = code ?? 1;
+  process.exitCode = effectiveCode;
 });

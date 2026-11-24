@@ -63,13 +63,35 @@ function emit(opts, value) {
   process.stdout.write(typeof value === 'string' ? value + '\n' : JSON.stringify(value, null, 2) + '\n');
 }
 
+function resolveArchiveCliConfigFile(opts) {
+  if (opts.configFile) return path.resolve(opts.configFile);
+  if (process.env.LEADERTEAM_CONFIG?.trim()) return path.resolve(process.env.LEADERTEAM_CONFIG.trim());
+
+  const explicitHome = process.env.LT_DSH_HOME?.trim() || process.env.DSH_HOME?.trim() || null;
+  if (explicitHome) {
+    const managed = path.join(path.resolve(explicitHome), 'leaderteam', 'config', 'leaderteam.config.json');
+    if (fs.existsSync(managed)) return managed;
+  }
+
+  const isInstalledPackage = ROOT.replaceAll('\\', '/').includes('/node_modules/')
+    || !fs.existsSync(path.join(ROOT, 'test'));
+  if (isInstalledPackage) {
+    const home = resolveDefaultDshHome({ projectRoot: ROOT });
+    if (home) {
+      const managed = path.join(home, 'leaderteam', 'config', 'leaderteam.config.json');
+      if (fs.existsSync(managed)) return managed;
+    }
+  }
+  return path.join(ROOT, 'config', 'leaderteam.config.json');
+}
+
 try {
   const opts = parseArgs(process.argv.slice(2));
   if (!opts.cmd || opts.cmd === 'help') {
     console.log('Usage: node scripts/plan-archive.mjs (--status | --list | --show <id> | --retrospect <id> | --clean) [options]');
     process.exit(0);
   }
-  const configFile = path.resolve(opts.configFile ?? path.join(ROOT, 'config', 'leaderteam.config.json'));
+  const configFile = resolveArchiveCliConfigFile(opts);
   const cfg = loadConfig(configFile);
   const storageRoot = resolveStorageRoot(cfg, opts);
   const archiveRoot = opts.archiveRoot

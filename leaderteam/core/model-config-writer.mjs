@@ -95,14 +95,32 @@ export function renderMagpieModelRows(cfg, indent = '          ') {
 }
 
 export function rewriteModelsBlock(yamlText, renderedRows) {
-  const re = /(models:\r?\n)((?:[ \t]*- \{id: [^\r\n]+\}\r?\n?)+)/;
-  if (!re.test(yamlText)) throw new Error('Could not locate models block in patch template');
+  const populatedRe = /^([ \t]*models:)[ \t]*\r?\n((?:[ \t]*- \{id: [^\r\n]+\}\r?\n?)+)/m;
+  const emptyRe = /^([ \t]*models:)[ \t]*\[\][ \t]*(\r?\n|$)/m;
   const eol = yamlText.includes('\r\n') ? '\r\n' : '\n';
-  const rows = renderedRows.replace(/\n/g, eol) + eol;
-  return yamlText.replace(re, (_, head, prev) => {
-    const trailingNewline = prev.endsWith(eol);
-    return head + (trailingNewline ? rows : rows.slice(0, -eol.length));
-  });
+  const trimmed = typeof renderedRows === 'string' ? renderedRows.trim() : '';
+
+  if (populatedRe.test(yamlText)) {
+    return yamlText.replace(populatedRe, (_, head, prev) => {
+      const trailingNewline = prev.endsWith(eol) || prev.endsWith('\n');
+      if (!trimmed) {
+        return `${head} []${trailingNewline ? eol : ''}`;
+      }
+      const rows = renderedRows.replace(/\r?\n/g, eol);
+      return `${head}${eol}${rows}${trailingNewline ? eol : ''}`;
+    });
+  }
+  if (emptyRe.test(yamlText)) {
+    return yamlText.replace(emptyRe, (_, head, tailEol) => {
+      const hasTail = Boolean(tailEol);
+      if (!trimmed) {
+        return `${head} []${hasTail ? eol : ''}`;
+      }
+      const rows = renderedRows.replace(/\r?\n/g, eol);
+      return `${head}${eol}${rows}${hasTail ? eol : ''}`;
+    });
+  }
+  throw new Error('Could not locate models block in patch template');
 }
 
 /**
@@ -132,6 +150,69 @@ export function parseMagpiePatchModels(yamlText, { requireManagedBlock = false }
     map.set(id, efforts);
   }
   return map;
+}
+
+function isWritablePathOrAncestor(targetPath) {
+  let cur = path.resolve(targetPath);
+  while (true) {
+    if (fs.existsSync(cur)) {
+      try {
+        fs.accessSync(cur, fs.constants.W_OK);
+        return true;
+      } catch {
+        return false;
+      }
+    }
+    const parent = path.dirname(cur);
+    if (parent === cur) return false;
+    cur = parent;
+  }
+}
+
+export function resolveWritableBackupRoot({
+  explicitBackupRoot = null,
+  configFile,
+  localFile = null,
+  target = 'base',
+  dshHome = null,
+  projectRoot = null,
+} = {}) {
+  if (explicitBackupRoot) return path.resolve(explicitBackupRoot);
+  const resolvedCfg = configFile ? path.resolve(configFile) : null;
+  const resolvedRoot = projectRoot ? path.resolve(projectRoot) : null;
+  const cfgParent = resolvedCfg ? path.resolve(path.dirname(resolvedCfg), '..') : null;
+
+  // Prefer keeping backups beside the managed DSH config (`<dshHome>/leaderteam/backups/model-config`)
+  // or project root ONLY when that directory is actually writable (never fail with EACCES on read-only node_modules).
+  const candidates = [];
+  if (cfgParent && (!resolvedRoot || cfgParent !== resolvedRoot)) {
+    candidates.push(path.join(cfgParent, 'backups', 'model-config'));
+  }
+  if (resolvedRoot) {
+    const inNodeModules = resolvedRoot.replaceAll('\\', '/').includes('/node_modules/');
+    if (!inNodeModules) {
+      candidates.push(path.join(resolvedRoot, 'backups', 'model-config'));
+    }
+  }
+  const effDshHome = resolveDefaultDshHome({ dshHome, configFile: resolvedCfg, projectRoot: resolvedRoot });
+  if (effDshHome) {
+    candidates.push(path.join(effDshHome, 'leaderteam', 'backups', 'model-config'));
+  }
+  if (target === 'local' && localFile) {
+    candidates.push(path.join(path.dirname(path.resolve(localFile)), '.backups', 'model-config'));
+  }
+  if (resolvedCfg) {
+    candidates.push(path.join(path.dirname(resolvedCfg), '.backups', 'model-config'));
+  }
+  if (resolvedRoot) {
+    candidates.push(path.join(resolvedRoot, 'backups', 'model-config'));
+  }
+  candidates.push(path.join(os.tmpdir(), 'leaderteam-backups', 'model-config'));
+
+  for (const cand of candidates) {
+    if (isWritablePathOrAncestor(cand)) return cand;
+  }
+  return candidates[candidates.length - 1];
 }
 
 export function resolveDefaultDshHome({ dshHome, configFile, projectRoot } = {}) {
@@ -305,7 +386,6 @@ function defaultPatchTargets(configFile) {
 
 export function inspectPatchTemplateSync(baseCfg, configFile, patchFiles = defaultPatchTargets(configFile)) {
   const rows = renderMagpieModelRows(baseCfg);
-  if (!rows.trim()) return { patchFiles, inSync: true, drifted: [] };
   const drifted = [];
   for (const file of patchFiles) {
     const current = fs.readFileSync(file, 'utf8');
@@ -802,13 +882,11 @@ export function applyModelConfigChanges(changes = {}, options = {}) {
   if (target === 'base' && options.syncPatches !== false) {
     const patchFiles = options.patchFiles ?? defaultPatchTargets(configFile);
     const rows = renderMagpieModelRows(validatedBase);
-    if (rows.trim()) {
-      for (const pf of patchFiles) {
-        const curYaml = fs.readFileSync(pf, 'utf8');
-        const nextYaml = rewriteModelsBlock(curYaml, rows);
-        if (curYaml.replace(/\r\n/g, '\n') !== nextYaml.replace(/\r\n/g, '\n')) {
-          patchWrites.push({ file: pf, content: nextYaml });
-        }
+    for (const pf of patchFiles) {
+      const curYaml = fs.readFileSync(pf, 'utf8');
+      const nextYaml = rewriteModelsBlock(curYaml, rows);
+      if (curYaml.replace(/\r\n/g, '\n') !== nextYaml.replace(/\r\n/g, '\n')) {
+        patchWrites.push({ file: pf, content: nextYaml });
       }
     }
   }
@@ -817,7 +895,8 @@ export function applyModelConfigChanges(changes = {}, options = {}) {
   const beforeGovernance = governanceSettings(target === 'base' ? baseRaw : localRaw);
   const afterGovernance = governanceSettings(target === 'base' ? nextBase : nextLocal);
   const governanceChanged = hashJson(beforeGovernance) !== hashJson(afterGovernance);
-  const auditFile = path.join(path.dirname(configFile), 'governance-changes.jsonl');
+  const auditDir = target === 'local' ? path.dirname(targetFile) : path.dirname(configFile);
+  const auditFile = path.join(auditDir, 'governance-changes.jsonl');
   let backupPath = null;
   let auditId = null;
   if (!dryRun && changed) {

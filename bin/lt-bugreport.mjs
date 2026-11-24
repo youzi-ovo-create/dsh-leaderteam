@@ -60,33 +60,34 @@ export function redactDiagnosticText(input, options = {}) {
   text = text.replace(/(["'`])(?:[A-Za-z]:(?:\\\\|\\|\/)Users(?:\\\\|\\|\/)|\/(?:home|Users|root)\/|\/mnt\/[a-zA-Z]\/Users\/)[^"'`\r\n]*\1/gi, '$1<USER_HOME>/<REDACTED>$1');
   text = text.replace(/(["'`])(?:[A-Za-z]:(?:\\\\|\\|\/)|(?:\\\\\\\\|\\\\)[A-Za-z0-9._$-]+(?:\\\\|\\)|\/\/[A-Za-z0-9._$-]+\/|\/(?:opt|srv|var|tmp|etc|mnt|media|run|data)\/|file:\/\/\/?)[^"'`\r\n]*\1/gi, '$1<LOCAL_PATH>/<REDACTED>$1');
 
-  // 5. Unquoted Windows UNC & POSIX UNC paths (including directory/file segments containing spaces)
+  // 5. Unquoted Windows UNC & POSIX UNC paths (including ASCII & Unicode/Chinese directory/file segments containing spaces)
+  const SPACED_PATH_CONT = String.raw`(?:[ \t]+(?!(?:failed|error|denied|blocked|unreadable|leaked|missing|at|in|on|with|to|from|for|by)\b|(?:失败|错误|拒绝|不存在|超时|不可读|已泄漏)(?:[\s，。：；！）)]|$))[\p{L}\p{N}\p{M}._~()[\]$-]+)*(?:\.[\p{L}\p{N}]{1,12})?`;
   text = text.replace(
-    /(?:\\\\\\\\|\\\\)[A-Za-z0-9._$-]+(?:\\\\|\\)(?:[^\r\n"'`<>|),;:]*?(?:\\\\|\\))*[^\s"'`<>|),;:\r\n]+(?:[ \t]+(?!(?:failed|error|denied|blocked|at|in|on|with|to|from)\b)[A-Za-z0-9._$-]+)*(?:\.[A-Za-z0-9]{1,10})?/g,
+    new RegExp(String.raw`(?:\\\\\\\\|\\\\)[A-Za-z0-9._$-]+(?:\\\\|\\)(?:[^\r\n"'` + '`' + String.raw`<>|),;:]*?(?:\\\\|\\))*[^\s"'` + '`' + String.raw`<>|),;:\r\n]+` + SPACED_PATH_CONT, 'gu'),
     '<LOCAL_PATH>/<REDACTED>',
   );
   text = text.replace(
-    /(?:^|(?<=[\s"'`(=:]))\/\/[A-Za-z0-9._$-]+\/(?:[^\r\n"'`<>|),;:]*?\/)*[^\s"'`<>|),;:\r\n]+(?:[ \t]+(?!(?:failed|error|denied|blocked|at|in|on|with|to|from)\b)[A-Za-z0-9._$-]+)*(?:\.[A-Za-z0-9]{1,10})?/g,
+    new RegExp(String.raw`(?:^|(?<=[\s"'` + '`' + String.raw`(=:]))\/\/[A-Za-z0-9._$-]+\/(?:[^\r\n"'` + '`' + String.raw`<>|),;:]*?\/)*[^\s"'` + '`' + String.raw`<>|),;:\r\n]+` + SPACED_PATH_CONT, 'gu'),
     '<LOCAL_PATH>/<REDACTED>',
   );
 
-  // 6. Unquoted Windows, WSL2 (/mnt/c/Users/...), & POSIX personal home paths (supports multi-word spaced directories & filenames)
+  // 6. Unquoted Windows, WSL2 (/mnt/c/Users/...), & POSIX personal home paths (supports multi-word spaced ASCII & Chinese filenames)
   text = text.replace(
-    /[A-Za-z]:(?:\\\\|\\|\/)Users(?:\\\\|\\|\/)(?:[^\r\n"'`<>|),;:]*?(?:\\\\|\\|\/))*[^\s"'`<>|),;:\r\n]+(?:[ \t]+(?!(?:failed|error|denied|blocked|at|in|on|with|to|from)\b)[A-Za-z0-9._$-]+)*(?:\.[A-Za-z0-9]{1,10})?/gi,
+    new RegExp(String.raw`[A-Za-z]:(?:\\\\|\\|\/)Users(?:\\\\|\\|\/)(?:[^\r\n"'` + '`' + String.raw`<>|),;:]*?(?:\\\\|\\|\/))*[^\s"'` + '`' + String.raw`<>|),;:\r\n]+` + SPACED_PATH_CONT, 'giu'),
     '<USER_HOME>/<REDACTED>',
   );
   text = text.replace(
-    /(?:^|(?<=[\s"'`(=:]))(?:\/(?:home|Users|root)|\/mnt\/[a-zA-Z]\/Users)\/(?:[^\r\n"'`<>|),;:]*?\/)*[^\s"'`<>|),;:\r\n]+(?:[ \t]+(?!(?:failed|error|denied|blocked|at|in|on|with|to|from)\b)[A-Za-z0-9._$-]+)*(?:\.[A-Za-z0-9]{1,10})?/g,
+    new RegExp(String.raw`(?:^|(?<=[\s"'` + '`' + String.raw`(=:]))(?:\/(?:home|Users|root)|\/mnt\/[a-zA-Z]\/Users)\/(?:[^\r\n"'` + '`' + String.raw`<>|),;:]*?\/)*[^\s"'` + '`' + String.raw`<>|),;:\r\n]+` + SPACED_PATH_CONT, 'gu'),
     '<USER_HOME>/<REDACTED>',
   );
 
-  // 7. Arbitrary Windows drive paths, POSIX local mount/system paths, & file:// URLs (supports multi-word spaced segments)
+  // 7. Arbitrary Windows drive paths, POSIX local mount/system paths, & file:// URLs (supports multi-word spaced ASCII & Chinese segments)
   text = text.replace(
-    /[A-Za-z]:(?:\\\\|\\|\/)(?:[^\r\n"'`<>|),;:]*?(?:\\\\|\\|\/))*[^\s"'`<>|),;:\r\n]+(?:[ \t]+(?!(?:failed|error|denied|blocked|at|in|on|with|to|from)\b)[A-Za-z0-9._$-]+)*(?:\.[A-Za-z0-9]{1,10})?/g,
+    new RegExp(String.raw`[A-Za-z]:(?:\\\\|\\|\/)(?:[^\r\n"'` + '`' + String.raw`<>|),;:]*?(?:\\\\|\\|\/))*[^\s"'` + '`' + String.raw`<>|),;:\r\n]+` + SPACED_PATH_CONT, 'gu'),
     '<LOCAL_PATH>/<REDACTED>',
   );
   text = text.replace(
-    /(?:^|(?<=[\s"'`(=:]))\/(?:opt|srv|var|tmp|mnt|media|data)\/(?:[^\r\n"'`<>|),;:]*?\/)*[^\s"'`<>|),;:\r\n]+(?:[ \t]+(?!(?:failed|error|denied|blocked|at|in|on|with|to|from)\b)[A-Za-z0-9._$-]+)*(?:\.[A-Za-z0-9]{1,10})?/g,
+    new RegExp(String.raw`(?:^|(?<=[\s"'` + '`' + String.raw`(=:]))\/(?:opt|srv|var|tmp|mnt|media|data)\/(?:[^\r\n"'` + '`' + String.raw`<>|),;:]*?\/)*[^\s"'` + '`' + String.raw`<>|),;:\r\n]+` + SPACED_PATH_CONT, 'gu'),
     '<LOCAL_PATH>/<REDACTED>',
   );
   text = text.replace(/\bfile:\/\/[^\r\n"'`<>|),;]+/gi, '<LOCAL_PATH>/<REDACTED>');

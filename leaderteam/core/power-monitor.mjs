@@ -272,10 +272,13 @@ export function acknowledgePowerShutdownNotice(state, ackMeta = null) {
   target.ackedTeams = Array.isArray(target.ackedTeams) ? [...target.ackedTeams] : [];
   target.pausedTeamsAwaitingUser = Array.isArray(target.pausedTeamsAwaitingUser) ? [...target.pausedTeamsAwaitingUser] : [];
 
+  target.userResumedTeamsDuringLatch = Array.isArray(target.userResumedTeamsDuringLatch) ? [...target.userResumedTeamsDuringLatch] : [];
   if (teamId) {
     target.pendingTeams = target.pendingTeams.filter(id => id !== teamId);
     if (!target.ackedTeams.includes(teamId)) target.ackedTeams.push(teamId);
-    if (!target.pausedTeamsAwaitingUser.includes(teamId)) target.pausedTeamsAwaitingUser.push(teamId);
+    if (!target.userResumedTeamsDuringLatch.includes(teamId) && !target.pausedTeamsAwaitingUser.includes(teamId)) {
+      target.pausedTeamsAwaitingUser.push(teamId);
+    }
     target.pendingNotice = target.pendingTeams.length > 0;
   } else {
     target.pendingTeams = [];
@@ -316,20 +319,40 @@ export function registerTeamsForPowerLatch(state, teamIds = []) {
   return target;
 }
 
-/** Clear a team's post-low-battery pause hold ONLY when the user explicitly sends a new message. */
+/** Clear a team's post-low-battery pause hold AND purge any queued stale shutdown notice ONLY when the user explicitly sends a new message. */
 export function clearTeamPowerPauseOnUserTurn(state, teamId) {
   const target = ensureMutableTarget(state);
   if (!teamId) return { changed: false, state: target };
+  target.pendingTeams = Array.isArray(target.pendingTeams) ? [...target.pendingTeams] : [];
+  target.ackedTeams = Array.isArray(target.ackedTeams) ? [...target.ackedTeams] : [];
   target.pausedTeamsAwaitingUser = Array.isArray(target.pausedTeamsAwaitingUser) ? [...target.pausedTeamsAwaitingUser] : [];
   target.userResumedTeamsDuringLatch = Array.isArray(target.userResumedTeamsDuringLatch) ? [...target.userResumedTeamsDuringLatch] : [];
-  const prevLen = target.pausedTeamsAwaitingUser.length;
+
+  const prevPausedLen = target.pausedTeamsAwaitingUser.length;
+  const prevPendingLen = target.pendingTeams.length;
+  const prevPendingNotice = Boolean(target.pendingNotice);
+
   target.pausedTeamsAwaitingUser = target.pausedTeamsAwaitingUser.filter(id => id !== teamId);
+  target.pendingTeams = target.pendingTeams.filter(id => id !== teamId);
+
   let latchOverrideChanged = false;
-  if (target.latched && !target.userResumedTeamsDuringLatch.includes(teamId)) {
-    target.userResumedTeamsDuringLatch.push(teamId);
-    latchOverrideChanged = true;
+  if (target.latched) {
+    if (!target.userResumedTeamsDuringLatch.includes(teamId)) {
+      target.userResumedTeamsDuringLatch.push(teamId);
+      latchOverrideChanged = true;
+    }
+    if (!target.ackedTeams.includes(teamId)) {
+      target.ackedTeams.push(teamId);
+      latchOverrideChanged = true;
+    }
+    target.pendingNotice = target.pendingTeams.length > 0;
   }
-  return { changed: target.pausedTeamsAwaitingUser.length !== prevLen || latchOverrideChanged, state: target };
+
+  const changed = target.pausedTeamsAwaitingUser.length !== prevPausedLen
+    || target.pendingTeams.length !== prevPendingLen
+    || Boolean(target.pendingNotice) !== prevPendingNotice
+    || latchOverrideChanged;
+  return { changed, state: target };
 }
 
 /** Build a fresh low-battery notice from current latched state (for per-team retry delivery). */

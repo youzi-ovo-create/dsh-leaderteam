@@ -51,17 +51,23 @@ function parseLinuxSysfsPower(fsImpl, sysfsDir, isWsl, sampledAt) {
     || /^(?:AC|ADP|ACAD)/i.test(name)
   );
 
+  const joinSys = (base, ...parts) => (
+    (typeof base === 'string' && base.startsWith('/') && !base.includes('\\'))
+      ? path.posix.join(base, ...parts)
+      : path.join(base, ...parts)
+  );
+
   // Pass 1: Discover all online AC / USB-PD mains supplies first so `readdirSync` entry order
   // never drops a battery whose `status` is "Unknown" while resting at a charge threshold.
   for (const rawEntry of entries) {
     const name = typeof rawEntry === 'string' ? rawEntry : rawEntry?.name;
     if (!name) continue;
-    const devDir = path.join(sysfsDir, name);
-    const scope = readTrimmedSafe(fsImpl, path.join(devDir, 'scope')) ?? '';
+    const devDir = joinSys(sysfsDir, name);
+    const scope = readTrimmedSafe(fsImpl, joinSys(devDir, 'scope')) ?? '';
     if (/^Device$/i.test(scope)) continue;
-    const devType = readTrimmedSafe(fsImpl, path.join(devDir, 'type')) ?? '';
+    const devType = readTrimmedSafe(fsImpl, joinSys(devDir, 'type')) ?? '';
     if (isMainsSupply(devType, name)) {
-      const online = readTrimmedSafe(fsImpl, path.join(devDir, 'online'));
+      const online = readTrimmedSafe(fsImpl, joinSys(devDir, 'online'));
       if (online === '1') anyMainsOnline = true;
     }
   }
@@ -71,39 +77,44 @@ function parseLinuxSysfsPower(fsImpl, sysfsDir, isWsl, sampledAt) {
   for (const rawEntry of entries) {
     const name = typeof rawEntry === 'string' ? rawEntry : rawEntry?.name;
     if (!name) continue;
-    const devDir = path.join(sysfsDir, name);
-    const scope = readTrimmedSafe(fsImpl, path.join(devDir, 'scope')) ?? '';
+    const devDir = joinSys(sysfsDir, name);
+    const scope = readTrimmedSafe(fsImpl, joinSys(devDir, 'scope')) ?? '';
     if (/^Device$/i.test(scope)) continue;
-    const present = readTrimmedSafe(fsImpl, path.join(devDir, 'present'));
+    const present = readTrimmedSafe(fsImpl, joinSys(devDir, 'present'));
     if (present === '0') continue;
 
-    const devType = readTrimmedSafe(fsImpl, path.join(devDir, 'type')) ?? '';
+    const devType = readTrimmedSafe(fsImpl, joinSys(devDir, 'type')) ?? '';
     const isBattery = /^Battery$/i.test(devType) || /^BAT/i.test(name);
     if (!isBattery) continue;
     sawBatteryDevice = true;
 
-    const rawCap = readTrimmedSafe(fsImpl, path.join(devDir, 'capacity'));
-    let capNum = rawCap !== null && rawCap !== '' ? Number(rawCap) : Number.NaN;
-    const rawEnergyFull = readTrimmedSafe(fsImpl, path.join(devDir, 'energy_full'));
-    const energyFull = rawEnergyFull !== null && rawEnergyFull !== '' ? Number(rawEnergyFull) : Number.NaN;
+    const rawCap = readTrimmedSafe(fsImpl, joinSys(devDir, 'capacity'));
+    const rawCapNum = rawCap !== null && rawCap !== '' ? Number(rawCap) : Number.NaN;
+    const rawEnergyNow = readTrimmedSafe(fsImpl, joinSys(devDir, 'energy_now'));
+    const rawEnergyFull = readTrimmedSafe(fsImpl, joinSys(devDir, 'energy_full'));
+    const rawChargeNow = readTrimmedSafe(fsImpl, joinSys(devDir, 'charge_now'));
+    const rawChargeFull = readTrimmedSafe(fsImpl, joinSys(devDir, 'charge_full'));
+    const rawVoltMin = readTrimmedSafe(fsImpl, joinSys(devDir, 'voltage_min_design'));
+    const rawVoltNow = readTrimmedSafe(fsImpl, joinSys(devDir, 'voltage_now'));
 
-    if (!Number.isFinite(capNum)) {
-      const rawEnergyNow = readTrimmedSafe(fsImpl, path.join(devDir, 'energy_now'));
-      const energyNow = rawEnergyNow !== null && rawEnergyNow !== '' ? Number(rawEnergyNow) : Number.NaN;
-      if (Number.isFinite(energyNow) && Number.isFinite(energyFull) && energyFull > 0) {
-        capNum = (energyNow / energyFull) * 100;
-      } else {
-        const rawChargeNow = readTrimmedSafe(fsImpl, path.join(devDir, 'charge_now'));
-        const rawChargeFull = readTrimmedSafe(fsImpl, path.join(devDir, 'charge_full'));
-        const chargeNow = rawChargeNow !== null && rawChargeNow !== '' ? Number(rawChargeNow) : Number.NaN;
-        const chargeFull = rawChargeFull !== null && rawChargeFull !== '' ? Number(rawChargeFull) : Number.NaN;
-        if (Number.isFinite(chargeNow) && Number.isFinite(chargeFull) && chargeFull > 0) {
-          capNum = (chargeNow / chargeFull) * 100;
-        }
-      }
+    const energyNow = rawEnergyNow !== null && rawEnergyNow !== '' ? Number(rawEnergyNow) : Number.NaN;
+    const energyFull = rawEnergyFull !== null && rawEnergyFull !== '' ? Number(rawEnergyFull) : Number.NaN;
+    const chargeNow = rawChargeNow !== null && rawChargeNow !== '' ? Number(rawChargeNow) : Number.NaN;
+    const chargeFull = rawChargeFull !== null && rawChargeFull !== '' ? Number(rawChargeFull) : Number.NaN;
+    const voltageUv = (rawVoltMin !== null && rawVoltMin !== '' && Number(rawVoltMin) > 0)
+      ? Number(rawVoltMin)
+      : ((rawVoltNow !== null && rawVoltNow !== '' && Number(rawVoltNow) > 0) ? Number(rawVoltNow) : Number.NaN);
+
+    let capNum = Number.NaN;
+    if (Number.isFinite(energyNow) && energyNow >= 0 && Number.isFinite(energyFull) && energyFull > 0) {
+      capNum = Math.min(100, (energyNow / energyFull) * 100);
+    } else if (Number.isFinite(chargeNow) && chargeNow >= 0 && Number.isFinite(chargeFull) && chargeFull > 0) {
+      capNum = Math.min(100, (chargeNow / chargeFull) * 100);
+    } else if (Number.isFinite(rawCapNum)) {
+      capNum = rawCapNum;
     }
 
-    const rawStatus = readTrimmedSafe(fsImpl, path.join(devDir, 'status'));
+    const rawStatus = readTrimmedSafe(fsImpl, joinSys(devDir, 'status'));
     if (!Number.isFinite(capNum) || capNum < 0 || capNum > 100) continue;
     if (!rawStatus) continue;
 
@@ -117,11 +128,18 @@ function parseLinuxSysfsPower(fsImpl, sysfsDir, isWsl, sampledAt) {
     }
 
     if (devOnBattery !== null) {
-      const weight = Number.isFinite(energyFull) && energyFull > 0 ? energyFull : null;
+      const energyWeight = (Number.isFinite(energyFull) && energyFull > 0)
+        ? energyFull
+        : ((Number.isFinite(chargeFull) && chargeFull > 0 && Number.isFinite(voltageUv) && voltageUv > 0)
+          ? (chargeFull * voltageUv) / 1e6
+          : null);
+      const chargeWeight = (Number.isFinite(chargeFull) && chargeFull > 0) ? chargeFull : null;
       batteryCandidates.push({
+        rawPct: Math.max(0, Math.min(100, capNum)),
         capacity: Math.max(0, Math.min(100, Math.round(capNum))),
         onBattery: devOnBattery,
-        weight,
+        energyWeight,
+        chargeWeight,
       });
     }
   }
@@ -136,13 +154,18 @@ function parseLinuxSysfsPower(fsImpl, sysfsDir, isWsl, sampledAt) {
     return { status: 'unknown', onBattery: null, batteryPct: null, source: 'linux-sysfs', sampledAt };
   }
 
-  const allWeighted = batteryCandidates.every(b => b.weight !== null);
-  const totalWeight = allWeighted
-    ? batteryCandidates.reduce((acc, b) => acc + b.weight, 0)
-    : batteryCandidates.length;
-  const avgPct = allWeighted && totalWeight > 0
-    ? Math.round(batteryCandidates.reduce((acc, b) => acc + b.capacity * b.weight, 0) / totalWeight)
-    : Math.round(batteryCandidates.reduce((acc, b) => acc + b.capacity, 0) / batteryCandidates.length);
+  let avgPct;
+  const allEnergyWeighted = batteryCandidates.every(b => b.energyWeight !== null && b.energyWeight > 0);
+  const allChargeWeighted = batteryCandidates.every(b => b.chargeWeight !== null && b.chargeWeight > 0);
+  if (allEnergyWeighted) {
+    const totalEnergy = batteryCandidates.reduce((acc, b) => acc + b.energyWeight, 0);
+    avgPct = Math.round(batteryCandidates.reduce((acc, b) => acc + b.rawPct * b.energyWeight, 0) / totalEnergy);
+  } else if (allChargeWeighted) {
+    const totalCharge = batteryCandidates.reduce((acc, b) => acc + b.chargeWeight, 0);
+    avgPct = Math.round(batteryCandidates.reduce((acc, b) => acc + b.rawPct * b.chargeWeight, 0) / totalCharge);
+  } else {
+    avgPct = Math.round(batteryCandidates.reduce((acc, b) => acc + b.rawPct, 0) / batteryCandidates.length);
+  }
   const onBattery = anyMainsOnline
     ? false
     : batteryCandidates.some(b => b.onBattery === true);
