@@ -58,8 +58,8 @@ async function runScenario(name, scenario) {
     if (reply.httpStatus) { res.writeHead(reply.httpStatus, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: { message: 'scripted failure' } })); return; }
     const common = { id: `chatcmpl-${calls.length}`, object: 'chat.completion.chunk', created: 1, model: payload.model };
     const adaptToolArgs = (toolName, rawArgs) => {
-      if (toolName === 'send_message' && rawArgs && typeof rawArgs === 'object' && 'agent_id' in rawArgs && !('agent' in rawArgs)) {
-        const smDef = (payload.tools ?? []).find(td => (td.function?.name ?? td.name) === 'send_message');
+      if ((toolName === 'send_message' || toolName === 'interrupt_agent') && rawArgs && typeof rawArgs === 'object' && 'agent_id' in rawArgs && !('agent' in rawArgs)) {
+        const smDef = (payload.tools ?? []).find(td => (td.function?.name ?? td.name) === toolName);
         const props = smDef?.function?.parameters?.properties ?? smDef?.parameters?.properties;
         if (props && 'agent' in props && !('agent_id' in props)) {
           const { agent_id, ...rest } = rawArgs;
@@ -112,7 +112,10 @@ async function runScenario(name, scenario) {
   const runtime = resolveDshRuntime();
   const runOnce = (task, sessionId) => new Promise(resolve => {
     const args = [...runtime.cliArgs, 'headless', ...patches.flatMap(p => ['--patch', p]), '--json', ...(sessionId ? ['--session-id', sessionId] : []), '-'];
-    const child = spawn(runtime.exe, args, { cwd: ws, env: { ...process.env, ELECTRON_RUN_AS_NODE: '1', DSH_HOME: home, DSH_TELEMETRY_DISABLED: '1', LT_TEST_KEY: 'local-test-key', LEADERTEAM_HEADLESS_LEADER: scenario.teamLeader === false ? '0' : '1' }, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+    const nodeBinDir = path.dirname(process.execPath);
+    const curPath = process.env.PATH ?? '';
+    const childPath = curPath.split(path.delimiter).includes(nodeBinDir) ? curPath : `${nodeBinDir}${path.delimiter}${curPath}`;
+    const child = spawn(runtime.exe, args, { cwd: ws, env: { ...process.env, PATH: childPath, ELECTRON_RUN_AS_NODE: '1', DSH_HOME: home, DSH_TELEMETRY_DISABLED: '1', LT_TEST_KEY: 'local-test-key', LEADERTEAM_HEADLESS_LEADER: scenario.teamLeader === false ? '0' : '1' }, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
     let out = '', err = '';
     child.stdout.on('data', d => out += d); child.stderr.on('data', d => err += d);
     child.stdin.end(task);

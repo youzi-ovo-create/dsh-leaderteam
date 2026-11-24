@@ -137,12 +137,17 @@ function defaultAppPath() {
       '/usr/local/lib/node_modules/@deepseek-ai/dsh',
       '/usr/lib/node_modules/@deepseek-ai/dsh',
       '/opt/homebrew/lib/node_modules/@deepseek-ai/dsh',
+      ...(process.env.HOME ? [path.join(process.env.HOME, '.local', 'share', 'dsh-runtime', 'current')] : []),
     ];
     for (const cand of unixCandidates) {
       if (fs.existsSync(cand)) return cand;
     }
     const pathSep = ':';
-    for (const binDir of String(process.env.PATH ?? '').split(pathSep).filter(Boolean)) {
+    const binDirs = [
+      ...String(process.env.PATH ?? '').split(pathSep).filter(Boolean),
+      ...(process.env.HOME ? [path.join(process.env.HOME, '.local', 'bin')] : []),
+    ];
+    for (const binDir of binDirs) {
       const dshBin = path.join(binDir, 'dsh');
       if (!fs.existsSync(dshBin)) continue;
       try {

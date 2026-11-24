@@ -290,11 +290,16 @@ function discoverDefaultHostCandidates({ platform, env, fsImpl }) {
     candidates.push('/opt/deepseek-harness');
     candidates.push('/usr/local/lib/node_modules/@deepseek-ai/dsh');
     candidates.push('/usr/lib/node_modules/@deepseek-ai/dsh');
+    if (env.HOME) candidates.push(path.join(env.HOME, '.local', 'share', 'dsh-runtime', 'current'));
   }
 
-  // Also inspect PATH entries for an npm-installed `dsh` binary symlink or global node_modules
+  // Also inspect PATH entries (plus ~/.local/bin) for an npm-installed `dsh` binary symlink or global node_modules
   const pathSep = platform === 'win32' ? ';' : ':';
-  for (const binDir of String(env.PATH ?? '').split(pathSep).filter(Boolean)) {
+  const searchBins = [
+    ...String(env.PATH ?? '').split(pathSep).filter(Boolean),
+    ...(platform !== 'win32' && env.HOME ? [path.join(env.HOME, '.local', 'bin')] : []),
+  ];
+  for (const binDir of searchBins) {
     try {
       const dshBin = path.join(binDir, platform === 'win32' ? 'dsh.cmd' : 'dsh');
       if (fsImpl.existsSync(dshBin)) {
@@ -589,6 +594,25 @@ export function checkPlatformEnvironment({
       }
     } catch {}
 
+    let pnpmAvailable = false;
+    try {
+      execFileSyncImpl('pnpm', ['--version'], {
+        windowsHide: true,
+        timeout: 3000,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      pnpmAvailable = true;
+    } catch {
+      const pathDirs = [
+        ...String(env?.PATH ?? '').split(':').filter(Boolean),
+        ...(env?.HOME ? [path.join(env.HOME, '.local', 'bin')] : []),
+      ];
+      pnpmAvailable = pathDirs.some(d => {
+        try { return fsImpl.existsSync(path.join(d, 'pnpm')); } catch { return false; }
+      });
+    }
+
     let kernelText = osReleaseText;
     if (kernelText === null) {
       try { kernelText = fsImpl.readFileSync('/proc/sys/kernel/osrelease', 'utf8'); } catch {
@@ -605,12 +629,14 @@ export function checkPlatformEnvironment({
     const bwrapDesc = bwrapAvailable
       ? `, bwrap=present${apparmorRestrictUserns ? ' (apparmor_userns=1)' : ''}`
       : '';
+    const pnpmDesc = pnpmAvailable ? ', pnpm=ok' : ', pnpm=missing (run "corepack enable pnpm" for "dsh plugin add")';
     return {
       status,
       platform: 'linux',
       linuxVariant,
       bashAvailable,
       bashVersion,
+      pnpmAvailable,
       bwrapAvailable,
       apparmorRestrictUserns,
       meminfoReadable,
@@ -619,7 +645,7 @@ export function checkPlatformEnvironment({
       cgroupV2Present,
       cgroupMemoryMaxRaw,
       cgroupMemoryMaxMib,
-      summary: `Linux (${linuxVariant}): bash=${bashAvailable ? 'ok' : 'MISSING'}, /proc/meminfo=${meminfoReadable ? `ok (${memAvailableMib ?? '?'} MiB avail)` : 'unreadable'}, ${cgroupDesc}${bwrapDesc}.`,
+      summary: `Linux (${linuxVariant}): bash=${bashAvailable ? 'ok' : 'MISSING'}, /proc/meminfo=${meminfoReadable ? `ok (${memAvailableMib ?? '?'} MiB avail)` : 'unreadable'}, ${cgroupDesc}${bwrapDesc}${pnpmDesc}.`,
     };
   }
 

@@ -590,7 +590,11 @@ test('[Linux Fix 3] cgroup v2/v1 parent-vs-leaf headroom, hybrid v1+v2 per-contr
     fsImpl: customFs,
   });
   assert.equal(docReport.checks.platformEnvironment.cgroupV2Present, true);
+  assert.equal(docReport.checks.platformEnvironment.pnpmAvailable, true);
   assert.equal(docReport.checks.configuration.status, 'pass', docReport.checks.configuration.summary);
+
+  const headlessPatchText = fs.readFileSync(path.join(REPO_ROOT, 'config', 'headless.patch.yml'), 'utf8');
+  assert.match(headlessPatchText, /- id:\s*tool-subagent-control\s*\n\s*config:\s*\{interrupt:\s*true\}/, 'headless.patch.yml must keep interrupt_agent enabled on DSH 0.2.2-rc.5');
 });
 
 test('[Linux Fix 4] Bash safety gate blocks mounted outside dirs, Chinese symlinks, ANSI-C $\'...\' escapes, .. escapes, and allows in-workspace cd .. & spaced paths (cross-platform)', t => {
@@ -764,6 +768,19 @@ test('[Linux Fix 4] Bash safety gate blocks mounted outside dirs, Chinese symlin
   const pyInline = 'python3 -c "open(chr(47)+\'tmp/pwn\',\'w\').write(\'1\')"';
   assert.equal(boundary(pyInline).confined, false);
   assert.equal(directGate(pyInline).decision, 'needs-model');
+
+  const safeNodeEsm = 'node --input-type=module -e "import { compile } from \'./src/app.mjs\'; console.log(\'PASS:\' + compile(19));"';
+  assert.equal(boundary(safeNodeEsm).confined, true, 'pure in-workspace ESM check without builtins/symlinks may stay sandbox-confined');
+  assert.equal(directGate(safeNodeEsm).decision, 'needs-model', 'direct_exec still sends inline node -e to gate model');
+
+  for (const unsafeNodeInline of [
+    'node -e "import fs from \'fs\'; console.log(fs.readdirSync(\'/\'))"',
+    'node --eval="({}).constructor.constructor(\'return process\')().exit(0)"',
+    'node --input-type=module -e "import x from \'./外部软链/secret.txt\'"',
+    'node --import=data:text/javascript,console.log(1) src/app.mjs',
+  ]) {
+    assert.equal(boundary(unsafeNodeInline).confined, false, `unsafe node inline/import must NOT bypass safety gate: ${unsafeNodeInline}`);
+  }
 
   for (const destructive of ['rm -fr /', 'rm -rf --no-preserve-root /', 'mkfs.ext4 /dev/sda1', 'dd if=/dev/zero of=/dev/nvme0n1']) {
     const cross = evaluateCrossBoundarySafetyGate({ tool: 'bash', args: { command: destructive } }, cfg);

@@ -116,6 +116,15 @@ export function installFinalGate(supportedVersions) {
       try { return await withMemberActivation(rt, store, rt.config, targetId, tSeq, () => original.call(this, exec)); }
       catch (error) { return denied(name, { by: 'rule:member-activation', reason: error.message }); }
     }
+    if (actor.role === 'leader' && name === 'interrupt_agent' && args.agent_id === undefined && typeof args.agent === 'string') {
+      const store = teamStore(actor.teamId);
+      const tSeq = currentTaskSeq(gate.ctx, actor.teamId);
+      const targetId = resolveSendMessageTargetId(store, args, tSeq);
+      const targetMember = typeof targetId === 'string' ? store.getMember(targetId) : null;
+      if (targetMember?.hostAgentName && args.agent !== targetMember.hostAgentName) {
+        exec.arguments = frozenJsonCopy({ ...args, agent: targetMember.hostAgentName });
+      }
+    }
     const isShell = Boolean(runtimeForTeam(actor.teamId).config?.gate?.shellTools?.includes(name));
     if (isShell) runtime().scheduler?.beginShellCall?.();
     try {

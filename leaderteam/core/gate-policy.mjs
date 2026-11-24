@@ -1008,7 +1008,138 @@ function inspectPosixShellEscapes(command, ctx, depth = 0) {
 
 const SAFE_POSIX_CMD_BIN_RE = /^\/(?:usr\/local\/bin|usr\/bin|bin|opt\/[A-Za-z0-9._-]+\/bin)\/[A-Za-z0-9._+-]+$/;
 const POSIX_SYSTEM_ROOT_PREFIX_RE = /^\/(?:etc|usr|var|tmp|opt|home|root|Users|Library|System|Volumes|proc|sys|dev(?!\/(?:null|stdin|stdout|stderr)\b)|mnt|media|srv|run|sbin|lib|lib64|boot|snap|nix)(?:\/|$)/;
-const SHELL_INLINE_INTERPRETER_RE = /\b(?:python3?|node|nodejs|deno|bun|perl|ruby|php|lua)\b[^;|&]*?\s-(?:c|e|E)\b|\bfind\b[^;|&]*?\s-(?:exec|execdir|ok|delete)\b/;
+const NON_NODE_INLINE_INTERPRETER_RE = /\b(?:python3?|perl|ruby|php|lua|deno|bun)\b[^;|&]*?\s(?:-[A-Za-z]*[ceErp]\b|--(?:eval|print)(?:=|\b))|\bfind\b[^;|&]*?\s-(?:exec|execdir|ok|delete)\b/;
+const ALLOWED_NODE_EVAL_FLAGS = new Set(['--input-type=module', '--input-type=commonjs', '--no-warnings']);
+const NODE_EVAL_FORBIDDEN_RE = /\b(?:process|globalThis|global|require|module|exports|eval|Function|Reflect|Proxy|constructor|__proto__|prototype|Buffer|atob|btoa|fromCharCode|fromCodePoint|fetch|WebSocket|Worker|SharedArrayBuffer|Atomics|Deno|Bun|child_process|fs|path|os|net|http|https|tls|dgram|dns|vm|worker_threads|v8|inspector)\b|import\s*\(|import\.meta|\b(?:node|file|data|http|https):/;
+
+function isSafeConfinedNodeEvalSegment(strippedSeg, cmdExecWd, workspace, realWorkspace, platform, tool, realOf, rawCommand) {
+  if (rawCommand.includes('`')) return false;
+  const scripts = [];
+  for (let i = 1; i < strippedSeg.length; i++) {
+    const av = strippedSeg[i].value;
+    if (ALLOWED_NODE_EVAL_FLAGS.has(av)) continue;
+    if (av === '-e' || av === '-p' || av === '--eval' || av === '--print') {
+      i++;
+      if (i >= strippedSeg.length) return false;
+      scripts.push(strippedSeg[i].value);
+      continue;
+    }
+    if (av.startsWith('--eval=') || av.startsWith('--print=')) {
+      scripts.push(av.slice(av.indexOf('=') + 1));
+      continue;
+    }
+    return false;
+  }
+  if (scripts.length === 0) return false;
+
+  const effPlat = platform === 'win32' ? 'win32' : platform;
+  for (const code of scripts) {
+    if (!code || code.length > 400) return false;
+    if (/\\(?![nrt'"\\])/.test(code)) return false;
+    if (NODE_EVAL_FORBIDDEN_RE.test(code)) return false;
+
+    const importKwCount = (code.match(/\bimport\b/g) ?? []).length;
+    const specifiers = [];
+    let matchedImports = 0;
+    const importStmtRe = /\bimport\s+(?:[A-Za-z0-9_$,*\s{}]+\s+from\s+)?(['"])([^'"]+)\1/g;
+    let m;
+    while ((m = importStmtRe.exec(code)) !== null) {
+      matchedImports++;
+      specifiers.push(m[2]);
+    }
+    if (matchedImports !== importKwCount) return false;
+
+    const exportFromRe = /\bexport\s+[A-Za-z0-9_$,*\s{}]+\s+from\s+(['"])([^'"]+)\1/g;
+    while ((m = exportFromRe.exec(code)) !== null) {
+      specifiers.push(m[2]);
+    }
+
+    for (const spec of specifiers) {
+      if (!/^\.\/[A-Za-z0-9._/-]+$/.test(spec) || /(?:^|\/)\.\.(?:\/|$)/.test(spec)) return false;
+      const { resolved, forceOutside } = resolveShellPathForPlatform(spec, cmdExecWd, workspace, platform, tool);
+      if (forceOutside || !resolved || !isInside(resolved, workspace, effPlat) || !isInside(realOf(resolved), realWorkspace, effPlat)) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+function hasUnconfinedInlineInterpreter(args, workspace, realWorkspace, platform, tool, realOf) {
+  const command = typeof args?.command === 'string' ? args.command : '';
+  if (NON_NODE_INLINE_INTERPRETER_RE.test(command)) return true;
+
+  const treatBacktick = tool === 'bash' || platform !== 'win32';
+  const scanned = scanPosixShell(command, { treatBacktickAsSubstitution: treatBacktick });
+  const decodedSummary = scanned.tokens.filter(t => t.type === 'word').map(t => t.value).join(' ');
+  if (NON_NODE_INLINE_INTERPRETER_RE.test(decodedSummary)) return true;
+
+  let curWd = workspace;
+  const rawWorkdir = args?.workdir ?? args?.cwd;
+  if (typeof rawWorkdir === 'string' && rawWorkdir.trim()) {
+    const resolvedWd = resolvePath(rawWorkdir, workspace, platform);
+    if (resolvedWd) curWd = resolvedWd;
+  }
+
+  let tIdx = 0;
+  while (tIdx < scanned.tokens.length) {
+    const segWords = [];
+    while (tIdx < scanned.tokens.length) {
+      const tk = scanned.tokens[tIdx];
+      if (tk.type === 'op' || tk.type === 'paren' || tk.type === 'bg') { tIdx++; break; }
+      if (tk.type === 'word') segWords.push(tk);
+      tIdx++;
+    }
+    const { words: strippedSeg, envChdirTokens } = stripLeadingEnvAssignmentsAndPrefixes(segWords);
+    for (const chdirTok of envChdirTokens) {
+      const { resolved: nextEnvWd } = resolveShellPathForPlatform(chdirTok.value, curWd, workspace, platform, tool);
+      if (nextEnvWd) curWd = nextEnvWd;
+    }
+    if (strippedSeg.length === 0) continue;
+
+    const rawExe = strippedSeg[0].value.replace(/\\/g, '/');
+    const baseExe = (rawExe.includes('/') ? rawExe.slice(rawExe.lastIndexOf('/') + 1) : rawExe).toLowerCase().replace(/\.exe$/, '');
+    if (baseExe === 'node' || baseExe === 'nodejs') {
+      const argsOnly = strippedSeg.slice(1).map(t => t.value);
+      const hasPreloadOrRepl = argsOnly.some(a => (
+        a === '-r' || a === '-i' || a === '--require' || a === '--import' || a === '--loader' || a === '--experimental-loader' || a === '--interactive'
+        || a.startsWith('--require=') || a.startsWith('--import=') || a.startsWith('--loader=') || a.startsWith('--experimental-loader=')
+        || (/^-[A-Za-z]{2,}$/.test(a) && /[ri]/.test(a))
+      ));
+      if (hasPreloadOrRepl) return true;
+
+      const hasEvalOrPrint = argsOnly.some(a => (
+        a === '-e' || a === '-p' || a === '--eval' || a === '--print'
+        || a.startsWith('--eval=') || a.startsWith('--print=')
+        || (/^-[A-Za-z]{2,}$/.test(a) && /[ep]/.test(a))
+      ));
+      if (hasEvalOrPrint && !isSafeConfinedNodeEvalSegment(strippedSeg, curWd, workspace, realWorkspace, platform, tool, realOf, command)) {
+        return true;
+      }
+    }
+
+    if ((baseExe === 'cd' || baseExe === 'pushd') && strippedSeg.length > 1) {
+      for (let a = 1; a < strippedSeg.length; a++) {
+        const av = strippedSeg[a].value;
+        if (av === '--') {
+          const nextAv = strippedSeg[a + 1]?.value;
+          if (nextAv && nextAv !== '-') {
+            const { resolved: nextWd } = resolveShellPathForPlatform(nextAv, curWd, workspace, platform, tool);
+            if (nextWd) curWd = nextWd;
+          }
+          break;
+        }
+        if (av === '-L' || av === '-P' || av === '-e') continue;
+        if (av !== '-') {
+          const { resolved: nextWd } = resolveShellPathForPlatform(av, curWd, workspace, platform, tool);
+          if (nextWd) curWd = nextWd;
+        }
+        break;
+      }
+    }
+  }
+  return false;
+}
 
 function extractCandidatePathStrings(val) {
   if (typeof val !== 'string' || !val) return [];
@@ -1299,7 +1430,7 @@ export function classifySandboxBoundary(input, config) {
   }
   if (config.gate.shellTools.includes(tool)) {
     const res = inspectShellSandboxConfinement(args, workspace, realWorkspace, config, platform, realOf, tool, fsImpl);
-    if (res.confined && typeof args?.command === 'string' && SHELL_INLINE_INTERPRETER_RE.test(args.command)) {
+    if (res.confined && typeof args?.command === 'string' && hasUnconfinedInlineInterpreter(args, workspace, realWorkspace, platform, tool, realOf)) {
       return { confined: false, reason: 'shell command runs inline script interpreter or find -exec requiring safety gate review' };
     }
     return res;
@@ -1311,7 +1442,7 @@ const DIRECT_EXEC_INDIRECT_BYPASS_RE = /\b(?:Start-Process|Start-Job|sajb|wscrip
 
 const SECRET_FILE_BASENAME_RE = /(?:^|\/)(?:\.env(?:\.[A-Za-z0-9._-]+)?|id_(?:rsa|dsa|ecdsa|ed25519)(?:\.pub)?|\.npmrc|\.pypirc|\.netrc|.*credentials.*\.json|.*\.(?:pem|key|pfx|p12))$/i;
 
-const DIRECT_EXEC_AMBIGUOUS_SHELL_RE = /\b(?:child_process|spawnSync|execSync|execFileSync|eval\s*\(|new\s+Function\s*\()\b|\b(?:python3?|node|nodejs|deno|bun|perl|ruby|php|lua)\b[^;|&]*?\s-(?:c|e|E)\b|\bfind\b[^;|&]*?\s-(?:exec|execdir|ok|delete)\b/i;
+const DIRECT_EXEC_AMBIGUOUS_SHELL_RE = /\b(?:child_process|spawnSync|execSync|execFileSync|eval\s*\(|new\s+Function\s*\()\b|\b(?:python3?|node|nodejs|deno|bun|perl|ruby|php|lua)\b[^;|&]*?\s(?:-[A-Za-z]*[ceErpi]\b|--(?:eval|print|require|import|loader)(?:=|\b))|\bfind\b[^;|&]*?\s-(?:exec|execdir|ok|delete)\b/i;
 
 const CROSS_BOUNDARY_HARD_PROHIBITED_RE = /\b(?:Format-Volume|Clear-Disk|Initialize-Disk|bcdedit|vssadmin\s+delete|cipher\s+\/w|mimikatz|sekurlsa|mkfs(?:\.[A-Za-z0-9_+-]+)?|wipefs|pkexec)\b|-Verb\s+RunAs\b|\breg(?:\.exe)?\s+(?:add|delete)\s+HKLM\b|\bgit\s+push\s+(?:--force|-f)\b|\brm\s+(?:-[A-Za-z]*[rf][A-Za-z]*\s+|--no-preserve-root\s+)+\/(?:\*|\s|$)|\bdd\b[^;|&]*\bof=\/dev\/(?:sd[a-z]|nvme\d|vd[a-z]|xvd[a-z]|mmcblk\d)/i;
 

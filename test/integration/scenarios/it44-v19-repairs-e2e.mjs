@@ -4,9 +4,9 @@ import { assert, approve, callsOf, gateReceipts, jsonl, lastToolResult, read, te
 
 const role = (route, effort = 'max') => ({ route, effort, maxTokens: 4000, timeoutMs: 30000, retries: 0, fallback: [] });
 const tool = (name, args) => ({ tool: name, args });
+const SH = process.platform === 'win32' ? 'pwsh' : 'bash';
 
 export default {
-  platforms: ['win32'],
   modelsEndpoint: {
     object: 'list',
     data: [
@@ -102,7 +102,7 @@ export default {
           interfaces: ['pass2(pass1(src)) -> number'],
           acceptance: ['node verification prints PASS:42'],
           profile: 'shell',
-          tools: ['read', 'write', 'edit', 'pwsh'],
+          tools: ['read', 'write', 'edit', SH],
           write_scope: ['src/pass_[1-9].js'],
           refs: ['spec.md'],
           serial_reason: 'Tightly coupled AST representation between pass_1 and pass_2',
@@ -183,16 +183,16 @@ export default {
       // Step 7: allow async Soft Investigator to finish, then attempt cross-boundary command -> enters Auto and is denied!
       if (c.index === 7) {
         await new Promise(r => setTimeout(r, 80));
-        return tool('pwsh', { description: 'Probe external URL', command: 'curl https://example.com/probe' });
+        return tool(SH, { description: 'Probe external URL', command: 'curl https://example.com/probe' });
       }
       // Step 8: write src/pass_2.js (in-sandbox -> 0 Auto calls!)
       if (c.index === 8) {
         assert.match(lastToolResult(c), /blocked by the LeaderTeam safety gate \(model\)/, 'cross-boundary curl entered Auto and was denied');
         return tool('write', { file_path: 'src/pass_2.js', content: 'import { pass1 } from "./pass_1.js";\nexport const compile = x => pass1(x) * 2;\n' });
       }
-      // Step 9: run in-sandbox node verification via pwsh (in-sandbox -> 0 Auto calls!)
+      // Step 9: run in-sandbox node verification via shell (in-sandbox -> 0 Auto calls!)
       if (c.index === 9) {
-        return tool('pwsh', {
+        return tool(SH, {
           description: 'Run compiler verification',
           command: 'node --input-type=module -e "import { compile } from \'./src/pass_2.js\'; console.log(\'PASS:\' + compile(19));"',
         });
@@ -211,15 +211,15 @@ export default {
     assert.ok(allMaxTokens.length > 0);
     assert.ok(allMaxTokens.every(n => n > 16384), `expected all wire max_completion_tokens > 16384, got ${JSON.stringify(allMaxTokens)}`);
 
-    // 2. Verify Sandbox vs Auto: ONLY the 1 cross-boundary curl command invoked Auto; write, team_dispatch, and local node pwsh used by="sandbox"!
+    // 2. Verify Sandbox vs Auto: ONLY the 1 cross-boundary curl command invoked Auto; write, team_dispatch, and local node shell used by="sandbox"!
     const gates = callsOf(t, 'gate');
     assert.equal(gates.length, 1, 'only the single cross-boundary curl command called Auto');
     assert.match(gates[0].request.operation.arguments_json, /curl https:\/\/example\.com/);
     const receipts = gateReceipts(t);
     assert.ok(receipts.some(r => r.tool === 'team_dispatch' && r.by === 'sandbox' && r.decision === 'allow'));
     assert.equal(receipts.filter(r => r.tool === 'write' && r.by === 'sandbox' && r.decision === 'allow').length, 2);
-    assert.ok(receipts.some(r => r.tool === 'pwsh' && r.by === 'sandbox' && r.decision === 'allow'));
-    assert.ok(receipts.some(r => r.tool === 'pwsh' && r.by === 'model' && r.decision === 'deny'));
+    assert.ok(receipts.some(r => r.tool === SH && r.by === 'sandbox' && r.decision === 'allow'));
+    assert.ok(receipts.some(r => r.tool === SH && r.by === 'model' && r.decision === 'deny'));
 
     // 3. Verify resident member survived 3 max-tokens truncations (1 productive + 2 zero-progress), triggered Soft Investigator once, and completed as 1 single member ('done')!
     const dir = teamDir(t);

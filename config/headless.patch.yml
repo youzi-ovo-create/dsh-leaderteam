@@ -20,6 +20,8 @@
   disabled: true
 - id: tool-subagent-fork
   disabled: true
+- id: tool-subagent-control
+  config: {interrupt: true}
 - id: tool-workflow
   disabled: true
 - id: workflow-ptc
