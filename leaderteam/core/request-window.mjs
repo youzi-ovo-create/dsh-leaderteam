@@ -20,9 +20,10 @@ export function pruneRequestWindowTimestamps(timestampsMs = [], windowMs = DEFAU
     ? windowMs
     : DEFAULT_REQUEST_WINDOW_CONFIG.windowMs;
   const lowerBound = nowMs - win;
+  const upperBound = nowMs + 2000; // tolerate minor sub-second ISO timestamp skew
   const out = [];
   for (const t of timestampsMs) {
-    if (typeof t === 'number' && Number.isFinite(t) && t > lowerBound && t <= nowMs) {
+    if (typeof t === 'number' && Number.isFinite(t) && t > lowerBound && t <= upperBound) {
       out.push(t);
     }
   }

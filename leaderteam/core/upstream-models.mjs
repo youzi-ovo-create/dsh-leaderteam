@@ -580,7 +580,8 @@ export function mergeUpstreamModelsIntoConfig(baseConfig, catalog) {
  * when known, omits them otherwise (letting DSH `llm-pi-ai` use its native unthrottled defaults),
  * and cleans up stale hardcoded `131072`/`16384` entries on existing models.
  */
-export async function syncUpstreamModelsToDshSettings(ctx, modelsToEnsure = [], defaultProvider = 'magpie') {
+export async function syncUpstreamModelsToDshSettings(ctx, modelsToEnsure = [], defaultProvider = 'magpie', options = {}) {
+  const providerTemplates = options?.providerTemplates ?? null;
   const settings = ctx?.get?.('settings');
   if (!settings || typeof settings.describe !== 'function' || typeof settings.update !== 'function') {
     return { synced: false, reason: 'settings-service-unavailable', updatedProviders: [] };
@@ -602,7 +603,14 @@ export async function syncUpstreamModelsToDshSettings(ctx, modelsToEnsure = [], 
   for (const item of modelsToEnsure) {
     const prov = item.provider ?? defaultProvider;
     const modelId = item.upstreamModel ?? item.route;
-    const provObj = nextData.providers[prov];
+    const tpl = providerTemplates?.[prov] ?? null;
+    let provObj = nextData.providers[prov];
+    if ((!provObj || typeof provObj !== 'object') && tpl) {
+      const { modelMetadata: _meta, ...profileFields } = tpl;
+      provObj = { ...profileFields, models: [] };
+      nextData.providers[prov] = provObj;
+      if (!updatedProviders.includes(prov)) updatedProviders.push(prov);
+    }
     if (!provObj || typeof provObj !== 'object') continue;
     provObj.models = Array.isArray(provObj.models) ? provObj.models : [];
     const realEfforts = (item.efforts ?? []).filter(e => e && e !== 'none');
@@ -610,8 +618,10 @@ export async function syncUpstreamModelsToDshSettings(ctx, modelsToEnsure = [], 
     const reasoningEfforts = realEfforts.length > 0
       ? Object.fromEntries(realEfforts.map(e => [e, e]))
       : undefined;
-    const desiredCtx = positiveInt(item.contextWindow);
-    const desiredMax = positiveInt(item.maxTokens, item.defaultMaxTokens);
+    const tplModelMeta = tpl?.modelMetadata?.[modelId] ?? null;
+    const desiredCtx = positiveInt(item.contextWindow, tplModelMeta?.contextWindow);
+    const desiredMax = positiveInt(item.maxTokens, item.defaultMaxTokens ?? tplModelMeta?.maxTokens);
+    const desiredCompat = item.compat ?? tplModelMeta?.compat ?? undefined;
 
     if (existingIdx < 0) {
       provObj.models.push({
@@ -619,7 +629,8 @@ export async function syncUpstreamModelsToDshSettings(ctx, modelsToEnsure = [], 
         ...(desiredCtx !== undefined ? { contextWindow: desiredCtx } : {}),
         ...(desiredMax !== undefined ? { maxTokens: desiredMax } : {}),
         input: item.vision ? ['text', 'image'] : ['text'],
-        ...(reasoningEfforts ? { reasoningEfforts } : {}),
+        ...(reasoningEfforts ? { reasoningEfforts } : (tplModelMeta ? { reasoningEfforts: false } : {})),
+        ...(desiredCompat ? { compat: { ...desiredCompat } } : {}),
       });
       if (!updatedProviders.includes(prov)) updatedProviders.push(prov);
     } else if (typeof provObj.models[existingIdx] === 'object' && provObj.models[existingIdx] !== null) {

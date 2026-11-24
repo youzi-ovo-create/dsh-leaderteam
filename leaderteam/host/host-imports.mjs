@@ -42,6 +42,72 @@ function walkAncestors(startFileOrDir, maxDepth = 10) {
   return out;
 }
 
+const HOST_CARRIER_PACKAGES = [
+  '@deepseek-ai/dsh-base/package.json',
+  '@deepseek-ai/dsh-desktop-host/package.json',
+  '@deepseek-ai/dsh-headless/package.json',
+  '@deepseek-ai/dsh-web/package.json',
+];
+
+function tryAnchorFromPackageJson(pkgJson) {
+  if (!pkgJson || !fs.existsSync(pkgJson)) return null;
+  let req;
+  try { req = createRequire(pkgJson); } catch { return null; }
+
+  const canResolveAllPeers = resolver => {
+    try {
+      const toolsPkg = resolver.resolve('@deepseek-ai/dsh-tools/package.json');
+      resolver.resolve('@deepseek-ai/dsh-llm');
+      resolver.resolve('@deepseek-ai/dsh-tool-executor-native');
+      return toolsPkg && fs.existsSync(toolsPkg) ? toolsPkg : null;
+    } catch {
+      return null;
+    }
+  };
+
+  const directToolsPkg = canResolveAllPeers(req);
+  if (directToolsPkg) {
+    const nmDir = path.resolve(path.dirname(directToolsPkg), '..', '..');
+    const carrierDir = path.basename(nmDir) === 'node_modules' ? path.dirname(nmDir) : path.dirname(pkgJson);
+    return {
+      moduleRoot: carrierDir,
+      anchor: pathToFileURL(pkgJson).href,
+    };
+  }
+
+  // Strict non-hoisted pnpm layout (`hoist=false`): `@deepseek-ai/dsh` depends on `@deepseek-ai/dsh-base`,
+  // which in turn depends on `@deepseek-ai/dsh-tools`, `@deepseek-ai/dsh-llm`, and `@deepseek-ai/dsh-tool-executor-native`.
+  const queue = [pkgJson];
+  const visited = new Set([pkgJson]);
+  for (let depth = 0; depth < 2 && queue.length > 0; depth++) {
+    const nextQueue = [];
+    for (const currentPkg of queue) {
+      let curReq;
+      try { curReq = createRequire(currentPkg); } catch { continue; }
+      for (const hopSpec of ['.@deepseek-ai/dsh/package.json'.slice(1), ...HOST_CARRIER_PACKAGES]) {
+        let hopPkg;
+        try { hopPkg = curReq.resolve(hopSpec); } catch { continue; }
+        if (!hopPkg || visited.has(hopPkg) || !fs.existsSync(hopPkg)) continue;
+        visited.add(hopPkg);
+        let hopReq;
+        try { hopReq = createRequire(hopPkg); } catch { continue; }
+        const hopToolsPkg = canResolveAllPeers(hopReq);
+        if (hopToolsPkg) {
+          const nmDir = path.resolve(path.dirname(hopToolsPkg), '..', '..');
+          const carrierDir = path.basename(nmDir) === 'node_modules' ? path.dirname(nmDir) : path.dirname(hopPkg);
+          return {
+            moduleRoot: carrierDir,
+            anchor: pathToFileURL(hopPkg).href,
+          };
+        }
+        nextQueue.push(hopPkg);
+      }
+    }
+    queue.splice(0, queue.length, ...nextQueue);
+  }
+  return null;
+}
+
 function resolveAnchorFromCandidate(dir) {
   if (!dir || typeof dir !== 'string') return null;
   const directPkg = path.join(dir, 'node_modules', '@deepseek-ai', 'dsh-tools', 'package.json');
@@ -52,26 +118,16 @@ function resolveAnchorFromCandidate(dir) {
       anchor: pathToFileURL(fs.existsSync(anchorPkg) ? anchorPkg : directPkg).href,
     };
   }
-  // Support npm / pnpm layouts where `@deepseek-ai/dsh` resolves `@deepseek-ai/dsh-tools` as a dependency or sibling
+  // Support npm / strict pnpm layouts where `@deepseek-ai/dsh` or `@deepseek-ai/dsh-base` resolves `@deepseek-ai/dsh-tools`
   const candidatePkgs = [
     path.join(dir, 'package.json'),
     path.join(dir, 'node_modules', '@deepseek-ai', 'dsh', 'package.json'),
+    path.join(dir, 'node_modules', '@deepseek-ai', 'dsh-base', 'package.json'),
+    path.join(dir, 'node_modules', '@deepseek-ai', 'dsh-desktop-host', 'package.json'),
   ];
   for (const pkgJson of candidatePkgs) {
-    if (!fs.existsSync(pkgJson)) continue;
-    try {
-      const req = createRequire(pkgJson);
-      const toolsPkg = req.resolve('@deepseek-ai/dsh-tools/package.json');
-      if (toolsPkg && fs.existsSync(toolsPkg)) {
-        // Walk two levels up from `.../@deepseek-ai/dsh-tools/package.json` to reach the `node_modules` carrier
-        const nmDir = path.resolve(path.dirname(toolsPkg), '..', '..');
-        const carrierDir = path.basename(nmDir) === 'node_modules' ? path.dirname(nmDir) : path.dirname(pkgJson);
-        return {
-          moduleRoot: carrierDir,
-          anchor: pathToFileURL(pkgJson).href,
-        };
-      }
-    } catch {}
+    const resolved = tryAnchorFromPackageJson(pkgJson);
+    if (resolved) return resolved;
   }
   return null;
 }
@@ -122,12 +178,15 @@ export function locateHostAnchor(options = {}) {
 }
 
 export function bindHostImports() {
+  const existing = globalThis[KEY];
+  if (existing && existing.pluginRoot === pluginRoot && !process.env.LT_DSH_MODULE_ROOT && !process.env.DSH_MODULE_ROOT) {
+    return existing;
+  }
   const found = locateHostAnchor();
   if (!found) {
     throw new Error('LeaderTeam cannot locate the executing DeepSeek Harness host packages (@deepseek-ai/dsh-tools).');
   }
   const { moduleRoot, anchor } = found;
-  const existing = globalThis[KEY];
   if (existing) {
     if (existing.moduleRoot !== moduleRoot || existing.pluginRoot !== pluginRoot) {
       throw new Error('Conflicting LeaderTeam host binding.');

@@ -5,17 +5,16 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { loadRawConfig, validateConfig } from '../leaderteam/core/config.mjs';
+import { detectLegacyProfilePatchConflicts, cleanLegacyProfilePatches } from '../leaderteam/core/legacy-patch-guard.mjs';
 
 const THIS_DIR = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(THIS_DIR, '..');
 
 export const DEFAULT_SUPPORTED_CORE_VERSIONS = Object.freeze([
   '0.2.2-rc.1',
-  '0.2.2-rc.2',
-  '0.2.2-rc.3',
-  '0.2.2-rc.4',
   '0.2.2-rc.5',
 ]);
 
@@ -193,6 +192,52 @@ function probeDshTarget(targetPath, fsImpl = fs) {
       desktopVersion,
       pipelineSource,
     };
+  }
+
+  // Fallback for strict non-hoisted pnpm layouts (`@deepseek-ai/dsh` -> `@deepseek-ai/dsh-base` -> `@deepseek-ai/dsh-tools`)
+  if (fsImpl === fs) {
+    const candidatePkgs = [
+      path.join(resolved, 'package.json'),
+      path.join(resolved, 'node_modules', '@deepseek-ai', 'dsh', 'package.json'),
+      path.join(resolved, 'node_modules', '@deepseek-ai', 'dsh-base', 'package.json'),
+    ];
+    for (const startPkg of candidatePkgs) {
+      if (!fs.existsSync(startPkg)) continue;
+      const queue = [startPkg];
+      const visited = new Set([startPkg]);
+      for (let depth = 0; depth < 3 && queue.length > 0; depth++) {
+        const nextQueue = [];
+        for (const curPkg of queue) {
+          let req;
+          try { req = createRequire(curPkg); } catch { continue; }
+          try {
+            const toolsPkgPath = req.resolve('@deepseek-ai/dsh-tools/package.json');
+            if (toolsPkgPath && fs.existsSync(toolsPkgPath)) {
+              const toolsPkg = JSON.parse(fs.readFileSync(toolsPkgPath, 'utf8'));
+              const pipePath = path.join(path.dirname(toolsPkgPath), 'lib', 'pipeline.js');
+              const pipelineSource = fs.existsSync(pipePath) ? fs.readFileSync(pipePath, 'utf8') : null;
+              return {
+                found: true,
+                resolvedFrom: path.dirname(toolsPkgPath),
+                toolsVersion: String(toolsPkg.version),
+                desktopVersion: null,
+                pipelineSource,
+              };
+            }
+          } catch {}
+          for (const hop of ['@deepseek-ai/dsh/package.json', '@deepseek-ai/dsh-base/package.json', '@deepseek-ai/dsh-desktop-host/package.json', '@deepseek-ai/dsh-headless/package.json', '@deepseek-ai/dsh-web/package.json']) {
+            try {
+              const hp = req.resolve(hop);
+              if (hp && !visited.has(hp) && fs.existsSync(hp)) {
+                visited.add(hp);
+                nextQueue.push(hp);
+              }
+            } catch {}
+          }
+        }
+        queue.splice(0, queue.length, ...nextQueue);
+      }
+    }
   }
   return null;
 }
@@ -611,34 +656,10 @@ export function checkPlatformEnvironment({
   };
 }
 
-function validateConfigWithV22Extensions(raw) {
+function validateConfigStrict(raw) {
   try {
     return { valid: true, config: validateConfig(raw), problems: [] };
   } catch (err) {
-    // Tolerate V2.2 top-level sections (`powerMonitor`, `requestWindow`, `soloKey`) if core config.mjs hasn't added them yet
-    const copy = (raw && typeof raw === 'object' && !Array.isArray(raw)) ? structuredClone(raw) : raw;
-    if (copy && typeof copy === 'object' && !Array.isArray(copy)) {
-      if (copy.powerMonitor !== undefined) {
-        if (typeof copy.powerMonitor !== 'object' || copy.powerMonitor === null || Array.isArray(copy.powerMonitor)) {
-          return { valid: false, config: null, problems: ['powerMonitor must be a JSON object'] };
-        }
-        if (copy.powerMonitor.enabled !== undefined && typeof copy.powerMonitor.enabled !== 'boolean') {
-          return { valid: false, config: null, problems: ['powerMonitor.enabled must be a boolean'] };
-        }
-        delete copy.powerMonitor;
-      }
-      delete copy.requestWindow;
-      delete copy.soloKey;
-      try {
-        return { valid: true, config: validateConfig(copy), problems: [] };
-      } catch (err2) {
-        return {
-          valid: false,
-          config: null,
-          problems: err2?.details?.problems ?? [err2 instanceof Error ? err2.message : String(err2)],
-        };
-      }
-    }
     return {
       valid: false,
       config: null,
@@ -721,12 +742,18 @@ export function checkConfigurationAndSoloKey({
     };
   }
 
-  const validation = validateConfigWithV22Extensions(raw);
+  const validation = validateConfigStrict(raw);
   const powerEnabled = raw?.powerMonitor?.enabled !== false;
   const pollMinutes = Math.round(((raw?.powerMonitor?.pollIntervalMs ?? 720000) / 60000) * 10) / 10;
   const gatewayProvider = typeof raw?.magpie?.provider === 'string' ? raw.magpie.provider : null;
   const hasLocalOverride = fsImpl.existsSync(path.join(path.dirname(selectedConfig), 'leaderteam.local.json'));
   const readinessReady = detectedSoloKeys.length > 0 || hasLocalOverride || configSource === 'dsh-home' || configSource === 'explicit';
+  const legacyPatchConflicts = detectLegacyProfilePatchConflicts({
+    dshHome: effectiveDshHome,
+    currentBundleRoot: REPO_ROOT,
+    fsImpl,
+  });
+  const activeBundleConflicts = legacyPatchConflicts.filter(c => c.bundleInstalled || c.corruptedBlock);
 
   if (!validation.valid) {
     return {
@@ -735,6 +762,7 @@ export function checkConfigurationAndSoloKey({
       configSource,
       configValid: false,
       problems: validation.problems,
+      legacyPatchConflicts,
       soloKeyEnvVarsPresent: detectedSoloKeys,
       gatewayProvider,
       powerMonitor: {
@@ -744,6 +772,26 @@ export function checkConfigurationAndSoloKey({
         privacyNote: 'Reads ONLY (onBattery, batteryPct) every 12m; set "powerMonitor": { "enabled": false } to disable.',
       },
       summary: `Invalid LeaderTeam config (${selectedConfig}): ${validation.problems.join('; ')}`,
+    };
+  }
+
+  if (activeBundleConflicts.length > 0) {
+    const conflictFiles = activeBundleConflicts.map(c => c.patchFile).join(', ');
+    return {
+      status: 'fail',
+      configFile: selectedConfig,
+      configSource,
+      configValid: true,
+      legacyPatchConflicts,
+      soloKeyEnvVarsPresent: detectedSoloKeys,
+      gatewayProvider,
+      powerMonitor: {
+        enabled: powerEnabled,
+        pollIntervalMinutes: pollMinutes,
+        disableSnippet: '"powerMonitor": { "enabled": false }',
+        privacyNote: 'Reads ONLY (onBattery, batteryPct) every 12m; set "powerMonitor": { "enabled": false } to disable.',
+      },
+      summary: `Legacy V2.1 profile patch conflict detected (${conflictFiles}): overrides dsh-leaderteam@2.2.0 bundle entries. Run "npx lt-doctor --clean-legacy-patch" and restart DSH.`,
     };
   }
 
@@ -845,11 +893,12 @@ function formatHumanReport(report) {
 }
 
 function parseCliArgs(argv) {
-  const opts = { json: false, help: false };
+  const opts = { json: false, help: false, cleanLegacyPatch: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--json') opts.json = true;
     else if (a === '--help' || a === '-h') opts.help = true;
+    else if (a === '--clean-legacy-patch') opts.cleanLegacyPatch = true;
     else if (a === '--workspace' && argv[i + 1]) opts.workspace = argv[++i];
     else if (a === '--dsh-home' && argv[i + 1]) opts.dshHome = argv[++i];
     else if (a === '--config' && argv[i + 1]) opts.configPath = argv[++i];
@@ -869,6 +918,7 @@ function printUsage() {
     '  --dsh-home <dir>            Override DSH_HOME directory',
     '  --config <file>             Explicit leaderteam.config.json path to validate',
     '  --check-host <dir>          Isolated compatibility probe against a DSH app/module directory',
+    '  --clean-legacy-patch        Backup and remove legacy V2.1 cordis.patch.yml LeaderTeam blocks',
     '  -h, --help                  Show this help message',
   ].join('\n'));
 }
@@ -880,10 +930,21 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
       printUsage();
       process.exit(0);
     }
+    let cleanedPatches = [];
+    if (cli.cleanLegacyPatch) {
+      const targetHome = cli.dshHome ?? process.env.DSH_HOME ?? path.join(os.homedir(), '.dsh');
+      cleanedPatches = cleanLegacyProfilePatches({ dshHome: targetHome });
+    }
     const report = runDoctorChecks(cli);
+    if (cleanedPatches.length > 0) {
+      report.cleanedLegacyPatches = cleanedPatches;
+    }
     if (cli.json) {
       console.log(JSON.stringify(report, null, 2));
     } else {
+      if (cleanedPatches.length > 0) {
+        console.log(`Cleaned ${cleanedPatches.length} legacy LeaderTeam profile patch block(s): ${cleanedPatches.map(c => c.patchFile).join(', ')}`);
+      }
       console.log(formatHumanReport(report));
     }
     process.exit(report.ok ? 0 : 1);

@@ -2,7 +2,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { loadConfig, validateConfig } from '../core/config.mjs';
+import { loadConfig, validateConfig, routeProvider } from '../core/config.mjs';
 import { hashJson, deepFreeze } from '../core/canonical.mjs';
 import { TeamStore } from '../core/store.mjs';
 import { discoverRuntimeModels, enrichConfigModelsFromCatalog, mergeUpstreamModelsIntoConfig } from '../core/upstream-models.mjs';
@@ -181,6 +181,41 @@ export function recordUsage(teamId, rec) {
   try { teamStore(teamId).appendUsage(rec); }
   catch (e) { runtime().logger?.warn?.(`leaderteam: usage record not written: ${e.message}`); }
 }
+
+export function resolveProviderForRoute(route, cfg) {
+  if (typeof route !== 'string' || !route) return cfg?.magpie?.provider ?? null;
+  const spec = cfg?.models?.[route];
+  if (typeof spec?.provider === 'string' && spec.provider) return spec.provider;
+  if (route.includes('/')) return routeProvider(route);
+  return cfg?.magpie?.provider ?? null;
+}
+
+export function requestWindowCallsPath(storageRoot) {
+  return path.join(storageRoot, 'request-window-calls.jsonl');
+}
+
+/** Record one actual session LLM turn/step (`leader`, `member`, or `direct_exec`) for accurate per-provider 5h accounting. */
+export function recordSessionModelRequest(rt = runtime(), { teamId = null, role = 'leader', route = null, provider = null, atMs = Date.now() } = {}) {
+  const baseRt = baseRuntime(rt);
+  if (!baseRt?.storageRoot || !baseRt?.config) return;
+  const resolvedProvider = provider ?? resolveProviderForRoute(route, baseRt.config);
+  if (!resolvedProvider) return;
+  const rec = {
+    v: 1,
+    at: new Date(atMs).toISOString(),
+    atMs,
+    teamId,
+    role,
+    route: route ?? null,
+    provider: resolvedProvider,
+  };
+  try {
+    fs.mkdirSync(baseRt.storageRoot, { recursive: true });
+    fs.appendFileSync(requestWindowCallsPath(baseRt.storageRoot), JSON.stringify(rec) + '\n', 'utf8');
+  } catch (err) {
+    baseRt.logger?.warn?.(`leaderteam: failed to append request-window call record: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
 export function requireReady() {
   const rt = runtime();
   if (!rt.config || !rt.storageRoot || !rt.llm) throw new Error('LeaderTeam core plugin is not initialized (leaderteam-core row missing or failed)');
@@ -234,11 +269,16 @@ export function registerRuntimePlugin(pluginId, handle = {}, rt = runtime()) {
  * Refresh live DSH `ctx.llm` upstream models (cached briefly unless `force` is true) and return
  * the merged effective runtime config (`rt.config` + dynamically connected DSH models).
  */
-export async function refreshUpstreamCatalog(ctx, rt = runtime(), { force = false, probeEndpoints = false, ttlMs = 3000 } = {}) {
+export async function refreshUpstreamCatalog(ctx, rt = runtime(), { force = false, probeEndpoints = false, ignoreRequestWindow = false, ttlMs = 3000 } = {}) {
   rt = baseRuntime(rt);
   if (!rt?.config) return null;
+  const suppressOptional = !ignoreRequestWindow && typeof rt.shouldSuppressOptionalProbes === 'function' && rt.shouldSuppressOptionalProbes();
+  const effectiveProbeEndpoints = Boolean(probeEndpoints && !suppressOptional);
   const now = Date.now();
-  if (!force && !probeEndpoints && rt.upstreamCatalog && (rt.upstreamCatalog.providers?.length ?? 0) > 0 && (now - (rt.upstreamCatalogAtMs ?? 0)) < ttlMs) {
+  if (!force && !effectiveProbeEndpoints && rt.upstreamCatalog && (rt.upstreamCatalog.providers?.length ?? 0) > 0 && (now - (rt.upstreamCatalogAtMs ?? 0)) < ttlMs) {
+    return rt.upstreamCatalog;
+  }
+  if (suppressOptional && !force && rt.upstreamCatalog) {
     return rt.upstreamCatalog;
   }
   try {
@@ -256,7 +296,7 @@ export async function refreshUpstreamCatalog(ctx, rt = runtime(), { force = fals
         try { return ctx.get(name); } catch { return null; }
       },
     };
-    const cat = await discoverRuntimeModels(effectiveCtx, rt.config, { probeEndpoints });
+    const cat = await discoverRuntimeModels(effectiveCtx, rt.config, { probeEndpoints: effectiveProbeEndpoints });
     rt.upstreamCatalog = cat;
     rt.upstreamCatalogAtMs = now;
     return cat;

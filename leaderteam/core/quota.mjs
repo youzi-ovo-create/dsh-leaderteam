@@ -85,6 +85,48 @@ export function routeQuota(state, route, modelCfg, quotaCfg, now) {
   return { ...base, status, bestRemainingPct: best, bestAccount, nextResetAt, reason: status === 'ok' ? '' : `best account has ${best}% left${reserveNote}` };
 }
 
+const FIVE_HOUR_WINDOW_NAME_RE = /^(?:5\s*(?:h|hr|hrs|hours?)|300\s*(?:m|min|mins|minutes?))$/i;
+
+/**
+ * Quota status strictly for the 5-hour request window of `route` (never conflating 7-day / weekly / monthly windows).
+ */
+export function routeQuota5hWindow(state, route, modelCfg, quotaCfg, now) {
+  const base = { route, status: 'unknown', bestRemainingPct: null, bestAccount: null, nextResetAt: null, snapshotAgeSec: null, reason: '' };
+  if (!state || !state.generatedAt) return { ...base, reason: 'no quota snapshot' };
+  const age = Math.round((now.getTime() - state.generatedAt.getTime()) / 1000);
+  base.snapshotAgeSec = age;
+  if (age > quotaCfg.maxSnapshotAgeSec) return { ...base, reason: `quota snapshot is ${age}s old (limit ${quotaCfg.maxSnapshotAgeSec}s)` };
+  const provider = routeProvider(route);
+  const accounts = state.accounts.filter(a => a.provider === provider);
+  if (accounts.length === 0) return { ...base, reason: `no quota account for provider "${provider}"` };
+  let best = null;
+  let bestAccount = null;
+  const lowResets = [];
+  for (const acc of accounts) {
+    const wins5h = acc.windows.filter(w =>
+      w.remainingPct !== null
+      && FIVE_HOUR_WINDOW_NAME_RE.test(w.name.trim())
+      && (!modelCfg?.quotaWindows || modelCfg.quotaWindows.includes(w.name)),
+    );
+    if (wins5h.length === 0) continue;
+    const min5h = Math.min(...wins5h.map(w => w.remainingPct));
+    for (const w of wins5h) {
+      if (w.remainingPct < quotaCfg.lowBelowPct && w.resetsAt) lowResets.push(w.resetsAt.getTime());
+    }
+    if (best === null || min5h > best) {
+      best = min5h;
+      bestAccount = acc.id;
+    }
+  }
+  if (best === null) return { ...base, reason: `no 5-hour quota window for provider "${provider}"` };
+  const exhaustedThreshold = modelCfg?.family === 'gpt'
+    ? Math.max(quotaCfg.exhaustedBelowPct, quotaCfg.gptReservePct ?? 0)
+    : quotaCfg.exhaustedBelowPct;
+  const status = best < exhaustedThreshold ? 'exhausted' : best < quotaCfg.lowBelowPct ? 'low' : 'ok';
+  const nextResetAt = status === 'ok' || lowResets.length === 0 ? null : new Date(Math.min(...lowResets)).toISOString();
+  return { ...base, status, bestRemainingPct: best, bestAccount, nextResetAt, reason: status === 'ok' ? '' : `best 5h window has ${best}% left` };
+}
+
 /** Recent per-effort usage samples for one route, or {} when absent. */
 export function routeUsage(state, route) {
   const m = state?.models.find(x => x.provider === routeProvider(route) && x.model === routeModel(route));

@@ -156,7 +156,7 @@ function extractBacktickSpan(src, openTickIdx) {
  * Produces token stream (`word`, `op`, `redir`, `in_redir`, `fd_dup`, `bg`, `paren`),
  * plus all command/process substitutions (`$(...)`, `` `...` ``, `<(...)`, `>(...)`).
  */
-function scanPosixShell(command, { treatBacktickAsSubstitution = true } = {}) {
+export function scanPosixShell(command, { treatBacktickAsSubstitution = true } = {}) {
   const tokens = [];
   const substitutions = [];
   const pendingHeredocs = [];
@@ -190,9 +190,11 @@ function scanPosixShell(command, { treatBacktickAsSubstitution = true } = {}) {
     }
   };
 
+  const isHorizontalShellSpace = c => c !== '\n' && /\s/.test(c);
+
   while (i < len) {
     const ch = command[i];
-    if (ch === ' ' || ch === '\t' || ch === '\r') { i++; continue; }
+    if (isHorizontalShellSpace(ch)) { i++; continue; }
     if (ch === '\n') {
       tokens.push({ type: 'op', op: ';' });
       i++;
@@ -299,7 +301,7 @@ function scanPosixShell(command, { treatBacktickAsSubstitution = true } = {}) {
       if (command[i + 1] === '<') {
         const stripTabs = command[i + 2] === '-';
         i += stripTabs ? 3 : 2;
-        while (i < len && (command[i] === ' ' || command[i] === '\t')) i++;
+        while (i < len && isHorizontalShellSpace(command[i])) i++;
         let delim = '';
         let delimQuoted = false;
         while (i < len && !/[\s;&|<>()]/.test(command[i])) {
@@ -326,6 +328,7 @@ function scanPosixShell(command, { treatBacktickAsSubstitution = true } = {}) {
     }
 
     // Parse a shell word
+    const wordStart = i;
     let value = '';
     let rawSlice = '';
     let hasSubstitution = false;
@@ -414,6 +417,12 @@ function scanPosixShell(command, { treatBacktickAsSubstitution = true } = {}) {
       value += wc;
       rawSlice += wc;
       i++;
+    }
+
+    if (i === wordStart) {
+      // Defensive monotonic cursor invariant: never allow an unexpected delimiter to stall `i`.
+      i++;
+      continue;
     }
 
     const hasExternalEnv = /\$(?:HOME|USERPROFILE|TMPDIR|TEMP|TMP|XDG_[A-Z_]+)\b|\$\{(?:HOME|USERPROFILE|TMPDIR|TEMP|TMP|XDG_[A-Z_]+)\}/.test(rawSlice);

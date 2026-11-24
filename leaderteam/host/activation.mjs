@@ -33,15 +33,26 @@ export function assertActivationAdmission(store, cfg, candidate, platform = proc
   if (conflict) throw new Error(`write_scope ${JSON.stringify(candidate.writeScope)} overlaps active running member "${conflict.name}" (child_id="${conflict.childId}", write_scope=${JSON.stringify(conflict.writeScope)}); wait for that member to finish or use disjoint write scopes`);
 }
 
-export function resolveSendMessageTargetId(store, args) {
+export function resolveSendMessageTargetId(store, args, taskSeq = null) {
   if (args && typeof args === 'object' && args.agent_id === undefined && typeof args.agent === 'string') {
     const ref = args.agent;
     const direct = store.getMember(ref);
     if (direct && direct.actorRole !== 'direct_exec') return direct.childId;
-    const byName = [...store.members().values()].findLast(
-      m => m.actorRole !== 'direct_exec' && m.name === ref && m.status !== 'failed' && m.status !== 'cancelled',
-    ) ?? [...store.members().values()].findLast(
-      m => m.actorRole !== 'direct_exec' && m.name === ref,
+    const ordinary = [...store.members().values()].filter(m => m.actorRole !== 'direct_exec');
+    if (Number.isInteger(taskSeq)) {
+      const currentByHostName = ordinary.findLast(m => (m.taskSeq ?? 1) === taskSeq && m.hostAgentName === ref);
+      if (currentByHostName) return currentByHostName.childId;
+      const currentTaskHit = ordinary.findLast(
+        m => (m.taskSeq ?? 1) === taskSeq && m.name === ref && m.status !== 'failed' && m.status !== 'cancelled',
+      );
+      if (currentTaskHit) return currentTaskHit.childId;
+    }
+    const byHostName = ordinary.findLast(m => m.hostAgentName === ref);
+    if (byHostName) return byHostName.childId;
+    const byName = ordinary.findLast(
+      m => m.name === ref && m.status !== 'failed' && m.status !== 'cancelled',
+    ) ?? ordinary.findLast(
+      m => m.name === ref,
     );
     return byName ? byName.childId : ref;
   }

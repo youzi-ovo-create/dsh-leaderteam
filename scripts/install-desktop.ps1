@@ -128,6 +128,18 @@ $profileDir = Join-Path $DshHome "profiles\$Profile"
 if (-not (Test-Path -LiteralPath $profileDir)) {
     throw "Profile directory not found: $profileDir (open DSH Desktop once, then quit it)"
 }
+$profilePkgFile = Join-Path $profileDir 'package.json'
+if (Test-Path -LiteralPath $profilePkgFile -PathType Leaf) {
+    try {
+        $profilePkg = Get-Content -LiteralPath $profilePkgFile -Raw -Encoding UTF8 | ConvertFrom-Json
+        $installedBundles = @($profilePkg.dsh.profile.bundles)
+        if ($installedBundles -contains 'dsh-leaderteam') {
+            throw "Profile '$Profile' already has the standard 'dsh-leaderteam' bundle installed via 'dsh plugin'. Do not mix legacy cordis.patch.yml installation with dsh.bundle; manage upgrades via 'dsh plugin add' instead."
+        }
+    } catch {
+        if ($_.Exception.Message -like "*already has the standard 'dsh-leaderteam' bundle*") { throw }
+    }
+}
 
 $patchFile = Join-Path $profileDir 'cordis.patch.yml'
 $begin = '# >>> leaderteam (managed by scripts/install-desktop.ps1; do not edit inside)'

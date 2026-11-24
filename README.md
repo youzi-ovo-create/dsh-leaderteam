@@ -2,7 +2,7 @@
 
 ![Version](https://img.shields.io/badge/version-2.2.0-blue)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows%20%7C%20macOS-success)
-![DSH Host](https://img.shields.io/badge/DeepSeek%20Harness-0.2.2--rc.1..rc.5-5b6ee1)
+![DSH Host](https://img.shields.io/badge/DeepSeek%20Harness-0.2.2--rc.1%20%7C%200.2.2--rc.5-5b6ee1)
 ![Node.js](https://img.shields.io/badge/node-%3E%3D22.15-339933)
 ![License](https://img.shields.io/badge/license-Apache--2.0-orange)
 
@@ -14,9 +14,12 @@
 
 ### 1. 一行命令标准安装（`dsh.bundle`）
 
-要求 **Node.js `>= 22.15`**（若需从源码构建 `extensions/dsh-context` 推荐 `22.19+` 或 `24.x`）与 **DeepSeek Harness `0.2.2-rc.1`..`0.2.2-rc.5`**：
+要求 **Node.js `>= 22.15`**（若需从源码构建 `extensions/dsh-context` 推荐 `22.19+` 或 `24.x`）与已实机端到端验证的 **DeepSeek Harness `0.2.2-rc.1` 或 `0.2.2-rc.5`**（未实机验证的中间或候选版本默认保持 Fail-Closed，可通过 `lt-doctor --check-host` 离线预检）：
 
 ```bash
+# 若此前通过 V2.1 install-desktop.ps1 写入过旧版 profile 补丁，升级前先一键清理旧补丁（自动备份）：
+npx lt-doctor --clean-legacy-patch
+
 # Linux / macOS / Web CLI Profile 一行安装
 dsh plugin --profile web add dsh-leaderteam
 
@@ -80,7 +83,7 @@ node --test "test/unit/*.test.mjs"
 在生产仓库建议绑定独立 Git 工作分支或 `git worktree` 运行，并配合内置双 CLI 工具进行环境预检与零泄露问题反馈：
 
 ```bash
-# 1. 环境与兼容性预检（Node 版本、DSH 0.2.2-rc.1..rc.5 与 pipeline 契约、Linux bash/cgroup v2、Windows Win32 5 沙箱权限、Solo-Key 状态）
+# 1. 环境与兼容性预检（Node 版本、已验证 DSH 0.2.2-rc.1 / rc.5 与 pipeline 契约、旧补丁冲突、Linux bash/cgroup v2、Windows Win32 5 沙箱权限、Solo-Key 状态）
 npx lt-doctor
 # 或针对未正式签发的候选客户端目录执行隔离探针（明确区分 VERIFIED / UNVERIFIED_COMPATIBLE_SHAPE / INCOMPATIBLE_PIPELINE）：
 node bin/lt-doctor.mjs --check-host <DSH安装目录或模块目录> --workspace <目标工作区>

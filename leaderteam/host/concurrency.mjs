@@ -22,14 +22,26 @@ import {
   createPowerMonitorState,
   evaluatePowerSample,
   acknowledgePowerShutdownNotice,
+  registerTeamsForPowerLatch,
+  clearTeamPowerPauseOnUserTurn,
+  buildNoticeFromLatchedState,
   serializePowerState,
   hydratePowerState,
 } from '../core/power-monitor.mjs';
 import { assessRequestWindow } from '../core/request-window.mjs';
-import { readQuotaStateFile, routeQuota } from '../core/quota.mjs';
+import { readQuotaStateFile, routeQuota5hWindow } from '../core/quota.mjs';
 import { routeProvider } from '../core/config.mjs';
+import { TeamStore } from '../core/store.mjs';
 import { readSystemPowerSample } from './power-adapter.mjs';
-import { runtime, teamStore, syncRuntimeConfig, baseRuntime } from './runtime.mjs';
+import {
+  runtime,
+  teamStore,
+  syncRuntimeConfig,
+  baseRuntime,
+  resolveProviderForRoute,
+  requestWindowCallsPath,
+  recordSessionModelRequest,
+} from './runtime.mjs';
 import { userMessageTexts, currentTaskSeq, reconcileStaleMembers } from './roles.mjs';
 
 export {
@@ -220,31 +232,66 @@ export function syncTeamConcurrency(ctx, teamId, rt = runtime()) {
   return { sched, raised, changed: nextTeamMax !== prevTeamMax || ext.changed || Boolean(chatRes?.changed) };
 }
 
-export function evaluateTeamRequestWindow(rt = runtime(), teamId = null, nowMs = Date.now()) {
+export { requestWindowCallsPath, recordSessionModelRequest };
+
+function buildCheckpointPauseNotice(rwResult) {
+  const summary = `5小时请求窗口检查点暂停保护：${rwResult.reason}`;
+  const text = [
+    `[LeaderTeam 5小时请求窗口检查点暂停] 当前上游提供商 5 小时请求窗口已触发三级保护（tier=checkpoint_pause，原因：${rwResult.reason}）：`,
+    '1. 已暂停新的执行子代理派发（team_dispatch）与直属执行（team_direct_exec）；',
+    '2. 治理双审（discussA / discussB）、仲裁（arbiter）与安全门（gate）严格保持完整，绝不静默跳过；',
+    '3. 请让已在运行中的成员完成安全收尾，通过 team_note 记录当前进度检查点与恢复入口，随后调用 team_status(stop_state="blocked", reason=...) 有序暂停。',
+  ].join('\n');
+  return { summary, text };
+}
+
+export function evaluateTeamRequestWindow(rt = runtime(), teamId = null, nowMs = Date.now(), options = {}) {
   const baseRt = baseRuntime(rt);
   const cfg = baseRt.config;
   if (!cfg || !baseRt.storageRoot) return null;
   const rwCfg = cfg.requestWindow;
-  const leaderRoute = cfg.roles?.leader?.route ?? '';
-  const provider = leaderRoute.includes('/') ? routeProvider(leaderRoute) : (cfg.magpie?.provider ?? null);
+  const teamCfg = teamId ? (() => { try { return teamStore(teamId) && cfg; } catch { return cfg; } })() : cfg;
+  const targetRoute = typeof options.targetRoute === 'string' && options.targetRoute ? options.targetRoute : null;
+  const leaderActor = teamId ? baseRt.actors?.get?.(teamId) : null;
+  const liveSelection = !targetRoute ? (leaderActor?.agent?.model?.current?.() ?? null) : null;
+  const effectiveRoute = targetRoute ?? cfg.roles?.leader?.route ?? '';
+  const provider = options.provider ?? liveSelection?.provider ?? resolveProviderForRoute(effectiveRoute, teamCfg);
 
-  // Collect local call timestamps from `<storageRoot>/teams/*/usage.jsonl` + member creation timestamps
+  const storeForRoot = tid => (baseRt.storageRoot === runtime().storageRoot ? teamStore(tid) : new TeamStore(baseRt.storageRoot, tid));
+
+  // Collect per-provider call timestamps from:
+  // 1. `<storageRoot>/teams/*/usage.jsonl` (governance/gate calls matching `provider`)
+  // 2. `<storageRoot>/request-window-calls.jsonl` (leader/member/direct_exec LLM turns matching `provider`)
   const timestampsMs = [];
   const teamsDir = path.join(baseRt.storageRoot, 'teams');
   try {
     if (fs.existsSync(teamsDir)) {
       for (const tid of fs.readdirSync(teamsDir)) {
         try {
-          const st = teamStore(tid);
+          const st = storeForRoot(tid);
           for (const u of st.usageRecords()) {
+            const uProv = u?.provider ?? resolveProviderForRoute(u?.route, cfg);
+            if (provider && uProv && uProv !== provider) continue;
             const t = typeof u?.at === 'string' ? Date.parse(u.at) : (typeof u?.atMs === 'number' ? u.atMs : NaN);
             if (Number.isFinite(t)) timestampsMs.push(t);
           }
-          for (const m of st.members().values()) {
-            const rawAt = m?.at ?? m?.createdAt;
-            const t = typeof rawAt === 'string' ? Date.parse(rawAt) : NaN;
-            if (Number.isFinite(t)) timestampsMs.push(t);
-          }
+        } catch {}
+      }
+    }
+  } catch {}
+
+  const sessionCallsFile = requestWindowCallsPath(baseRt.storageRoot);
+  try {
+    if (fs.existsSync(sessionCallsFile)) {
+      const rawLines = fs.readFileSync(sessionCallsFile, 'utf8').split(/\r?\n/);
+      for (const line of rawLines) {
+        if (!line.trim()) continue;
+        try {
+          const r = JSON.parse(line);
+          const rProv = r?.provider ?? resolveProviderForRoute(r?.route, cfg);
+          if (provider && rProv && rProv !== provider) continue;
+          const t = typeof r?.atMs === 'number' ? r.atMs : (typeof r?.at === 'string' ? Date.parse(r.at) : NaN);
+          if (Number.isFinite(t)) timestampsMs.push(t);
         } catch {}
       }
     }
@@ -253,10 +300,11 @@ export function evaluateTeamRequestWindow(rt = runtime(), teamId = null, nowMs =
   let confirmedQuota = null;
   if (cfg.quota?.stateFile) {
     const qr = readQuotaStateFile(cfg.quota.stateFile);
-    if (qr.ok && leaderRoute && cfg.models?.[leaderRoute]) {
-      const rq = routeQuota(qr.state, leaderRoute, cfg.models[leaderRoute], cfg.quota, new Date(nowMs));
-      if (rq.status !== 'unknown' && typeof rq.bestRemainingPct === 'number') {
-        confirmedQuota = { remainingPct: rq.bestRemainingPct, status: rq.status, nextResetAt: rq.nextResetAt };
+    const modelEntry = effectiveRoute && cfg.models?.[effectiveRoute] ? cfg.models[effectiveRoute] : null;
+    if (qr.ok && effectiveRoute && modelEntry) {
+      const rq5h = routeQuota5hWindow(qr.state, effectiveRoute, modelEntry, cfg.quota, new Date(nowMs));
+      if (rq5h.status !== 'unknown' && typeof rq5h.bestRemainingPct === 'number') {
+        confirmedQuota = { remainingPct: rq5h.bestRemainingPct, status: rq5h.status, nextResetAt: rq5h.nextResetAt };
       }
     }
   }
@@ -275,15 +323,28 @@ export function evaluateTeamRequestWindow(rt = runtime(), teamId = null, nowMs =
     nowMs,
   });
 
-  if (result.auditRecord && result.tier === 'checkpoint_pause') {
+  if (result.auditRecord && result.tier === 'checkpoint_pause' && options.skipAuditWrite !== true) {
     const auditFile = path.join(baseRt.storageRoot, 'request-window-audit.jsonl');
-    const lastKey = `${teamId ?? 'global'}:${result.tier}:${result.local_estimated_requests_5h}`;
+    const lastKey = `${provider ?? 'default'}:${result.tier}:${result.local_estimated_requests_5h}:${result.confirmedRemainingPct ?? 'na'}`;
     if (baseRt.lastRequestWindowAuditKey !== lastKey) {
       baseRt.lastRequestWindowAuditKey = lastKey;
       try {
         fs.mkdirSync(baseRt.storageRoot, { recursive: true });
         fs.appendFileSync(auditFile, JSON.stringify({ teamId, ...result.auditRecord }) + '\n', 'utf8');
-      } catch {}
+      } catch (err) {
+        baseRt.logger?.warn?.(`leaderteam: failed to write request-window audit log: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      const targetTeams = teamId
+        ? [teamId]
+        : [...(baseRt.actors?.values() ?? [])].filter(a => a.role === 'leader').map(a => a.teamId);
+      for (const tid of targetTeams) {
+        try {
+          storeForRoot(tid).appendGovernanceEvent({
+            type: 'request-window-checkpoint-pause',
+            ...result.auditRecord,
+          });
+        } catch {}
+      }
     }
   }
   return result;
@@ -313,6 +374,47 @@ export function savePersistedPowerState(storageRoot, state) {
   fs.renameSync(tmp, file);
 }
 
+function trySavePersistedPowerState(baseRt) {
+  if (!baseRt?.storageRoot || !baseRt?.powerMonitorState) return false;
+  try {
+    savePersistedPowerState(baseRt.storageRoot, baseRt.powerMonitorState);
+    baseRt.powerMonitorStateDirty = false;
+    return true;
+  } catch (err) {
+    baseRt.powerMonitorStateDirty = true;
+    baseRt.logger?.warn?.(`leaderteam: failed to persist power-monitor-state.json (will retry): ${err instanceof Error ? err.message : String(err)}`);
+    return false;
+  }
+}
+
+export function isTeamAwaitingUserAfterPowerPause(rt = runtime(), teamId = null) {
+  const baseRt = baseRuntime(rt);
+  if (!baseRt?.config || baseRt.config.powerMonitor?.enabled === false) return false;
+  if (!baseRt.powerMonitorState && baseRt.storageRoot) {
+    baseRt.powerMonitorState = loadPersistedPowerState(baseRt.storageRoot);
+  }
+  const st = baseRt.powerMonitorState;
+  if (!st) return false;
+  if (st.latched) return true;
+  if (teamId && Array.isArray(st.pausedTeamsAwaitingUser) && st.pausedTeamsAwaitingUser.includes(teamId)) {
+    return true;
+  }
+  return false;
+}
+
+export function clearPowerPauseForTeamOnUserMessage(rt = runtime(), teamId = null) {
+  const baseRt = baseRuntime(rt);
+  if (!baseRt?.storageRoot || !teamId) return false;
+  if (!baseRt.powerMonitorState) {
+    baseRt.powerMonitorState = loadPersistedPowerState(baseRt.storageRoot);
+  }
+  const res = clearTeamPowerPauseOnUserTurn(baseRt.powerMonitorState, teamId);
+  if (res.changed || baseRt.powerMonitorStateDirty) {
+    trySavePersistedPowerState(baseRt);
+  }
+  return res.changed;
+}
+
 export async function pollAndDeliverPowerMonitor(ctx, rt = runtime(), options = {}) {
   const baseRt = baseRuntime(rt);
   if (!baseRt.config || !baseRt.storageRoot) return null;
@@ -326,38 +428,99 @@ export async function pollAndDeliverPowerMonitor(ctx, rt = runtime(), options = 
   const nowMs = options.nowMs ?? Date.now();
   const outcome = evaluatePowerSample(baseRt.powerMonitorState, sample, pmCfg, nowMs);
   baseRt.powerMonitorState = outcome.state;
-  try { savePersistedPowerState(baseRt.storageRoot, baseRt.powerMonitorState); } catch {}
 
-  if ((outcome.action === 'notify_graceful_shutdown' || outcome.action === 'retry_pending_notice') && outcome.notice) {
-    let anyDelivered = false;
-    for (const actor of baseRt.actors.values()) {
-      if (actor.role !== 'leader') continue;
-      const leaderAgent = actor.agent ?? ctx?.get?.('agents')?.get?.(actor.teamId);
-      if (deliverSchedulerNotice(leaderAgent, outcome.notice)) {
-        anyDelivered = true;
-      }
-    }
-    if (anyDelivered) {
-      acknowledgePowerShutdownNotice(baseRt.powerMonitorState, { ackedAtMs: nowMs, deliveredBy: 'scheduler-followup' });
-      try { savePersistedPowerState(baseRt.storageRoot, baseRt.powerMonitorState); } catch {}
+  const leaderActors = [...baseRt.actors.values()].filter(a => a.role === 'leader');
+  const activeLeaderTeamIds = leaderActors.map(a => a.teamId).filter(Boolean);
+  if (outcome.latched) {
+    registerTeamsForPowerLatch(baseRt.powerMonitorState, activeLeaderTeamIds);
+  }
+  if (outcome.action === 'notify_graceful_shutdown') {
+    for (const tid of activeLeaderTeamIds) {
+      try {
+        teamStore(tid).appendGovernanceEvent({
+          type: 'low-battery-graceful-shutdown',
+          action: 'notify_graceful_shutdown',
+          batteryPct: outcome.notice?.batteryPct ?? sample?.batteryPct ?? null,
+          lowBatteryPct: pmCfg?.lowBatteryPct ?? 20,
+          atMs: nowMs,
+        });
+      } catch {}
     }
   }
-  // CRITICAL: when action === 'rearmed', we NEVER wake/auto-resume paused leaders!
+  trySavePersistedPowerState(baseRt);
+
+  if (outcome.latched) {
+    const noticeToSend = outcome.notice ?? buildNoticeFromLatchedState(baseRt.powerMonitorState, pmCfg, nowMs);
+    if (leaderActors.length === 0 && outcome.notice && options.acknowledgeWhenNoLeaders === true) {
+      acknowledgePowerShutdownNotice(baseRt.powerMonitorState, { ackedAtMs: nowMs, deliveredBy: 'headless-no-leaders' });
+      trySavePersistedPowerState(baseRt);
+    } else {
+      let anyDelivered = false;
+      for (const actor of leaderActors) {
+        const pendingList = baseRt.powerMonitorState.pendingTeams ?? [];
+        const ackedList = baseRt.powerMonitorState.ackedTeams ?? [];
+        if (ackedList.includes(actor.teamId)) continue;
+        if (!pendingList.includes(actor.teamId) && !(pendingList.length === 0 && ackedList.length === 0 && baseRt.powerMonitorState.pendingNotice)) {
+          continue;
+        }
+        const leaderAgent = actor.agent ?? ctx?.get?.('agents')?.get?.(actor.teamId);
+        if (deliverSchedulerNotice(leaderAgent, noticeToSend)) {
+          acknowledgePowerShutdownNotice(baseRt.powerMonitorState, {
+            teamId: actor.teamId,
+            ackedAtMs: nowMs,
+            deliveredBy: 'scheduler-followup',
+          });
+          anyDelivered = true;
+        }
+      }
+      if (anyDelivered || baseRt.powerMonitorStateDirty) {
+        trySavePersistedPowerState(baseRt);
+      }
+    }
+  }
+  // CRITICAL: when action === 'rearmed', we NEVER wake/auto-resume paused leaders (`pausedTeamsAwaitingUser` remains locked until user message)!
   return outcome;
+}
+
+function evaluateExecutionPoolWindowSummary(baseRt, teamId, nowMs = Date.now()) {
+  const cfg = baseRt?.config;
+  if (!cfg || !baseRt?.storageRoot) return null;
+  const poolRoutes = Array.isArray(cfg.team?.executionPool) && cfg.team.executionPool.length > 0
+    ? cfg.team.executionPool
+    : [cfg.roles?.leader?.route].filter(Boolean);
+  const seenProviders = new Set();
+  const evaluations = [];
+  for (const r of poolRoutes) {
+    const prov = resolveProviderForRoute(r, cfg) ?? '';
+    if (seenProviders.has(prov)) continue;
+    seenProviders.add(prov);
+    const ev = evaluateTeamRequestWindow(baseRt, teamId, nowMs, { targetRoute: r, skipAuditWrite: true });
+    if (ev) evaluations.push(ev);
+  }
+  if (evaluations.length === 0) {
+    return evaluateTeamRequestWindow(baseRt, teamId, nowMs);
+  }
+  const allPaused = evaluations.every(e => e.triggerCheckpointPause);
+  if (allPaused) {
+    // Re-evaluate primary route with audit enabled so the checkpoint_pause audit event is persisted
+    return evaluateTeamRequestWindow(baseRt, teamId, nowMs, { targetRoute: poolRoutes[0] });
+  }
+  if (evaluations.some(e => e.maxNewDispatchCap === null)) {
+    return { maxNewDispatchCap: null, triggerCheckpointPause: false };
+  }
+  const maxCap = Math.max(...evaluations.map(e => (typeof e.maxNewDispatchCap === 'number' ? e.maxNewDispatchCap : 0)));
+  return { maxNewDispatchCap: maxCap, triggerCheckpointPause: false };
 }
 
 function effectiveExternalDispatchCap(rt, teamId) {
   const baseRt = baseRuntime(rt);
   if (!baseRt.config || !baseRt.storageRoot) return undefined;
-  if (!baseRt.powerMonitorState) {
-    baseRt.powerMonitorState = loadPersistedPowerState(baseRt.storageRoot);
-  }
-  if (baseRt.config.powerMonitor?.enabled !== false && baseRt.powerMonitorState?.latched) {
+  if (isTeamAwaitingUserAfterPowerPause(baseRt, teamId)) {
     return 0;
   }
-  const rw = evaluateTeamRequestWindow(baseRt, teamId);
-  if (rw && typeof rw.maxNewDispatchCap === 'number') {
-    return rw.maxNewDispatchCap;
+  const poolSummary = evaluateExecutionPoolWindowSummary(baseRt, teamId);
+  if (poolSummary && typeof poolSummary.maxNewDispatchCap === 'number') {
+    return poolSummary.maxNewDispatchCap;
   }
   return undefined;
 }
@@ -413,20 +576,40 @@ export function onLeaderTurnCompleted(ctx, teamId) {
     if (!baseRt.powerMonitorState) {
       baseRt.powerMonitorState = loadPersistedPowerState(baseRt.storageRoot);
     }
-    if (baseRt.config.powerMonitor?.enabled !== false && baseRt.powerMonitorState?.pendingNotice) {
-      const pct = baseRt.powerMonitorState.lastBatteryPct ?? baseRt.config.powerMonitor.lowBatteryPct;
-      const retryOutcome = evaluatePowerSample(
-        baseRt.powerMonitorState,
-        { status: 'ok', onBattery: true, batteryPct: pct },
-        baseRt.config.powerMonitor,
-      );
-      if (retryOutcome.notice && deliverSchedulerNotice(leaderAgent, retryOutcome.notice)) {
-        acknowledgePowerShutdownNotice(baseRt.powerMonitorState, { ackedAtMs: Date.now(), deliveredBy: 'turn-end-retry' });
-        try { savePersistedPowerState(baseRt.storageRoot, baseRt.powerMonitorState); } catch {}
-        return;
+    if (baseRt.powerMonitorStateDirty) {
+      trySavePersistedPowerState(baseRt);
+    }
+    if (baseRt.config.powerMonitor?.enabled !== false && baseRt.powerMonitorState?.latched) {
+      registerTeamsForPowerLatch(baseRt.powerMonitorState, [teamId]);
+      const pendingTeams = baseRt.powerMonitorState.pendingTeams ?? [];
+      const ackedTeams = baseRt.powerMonitorState.ackedTeams ?? [];
+      if (!ackedTeams.includes(teamId) && (pendingTeams.includes(teamId) || (pendingTeams.length === 0 && ackedTeams.length === 0 && baseRt.powerMonitorState.pendingNotice))) {
+        const retryNotice = buildNoticeFromLatchedState(baseRt.powerMonitorState, baseRt.config.powerMonitor);
+        if (deliverSchedulerNotice(leaderAgent, retryNotice)) {
+          acknowledgePowerShutdownNotice(baseRt.powerMonitorState, {
+            teamId,
+            ackedAtMs: Date.now(),
+            deliveredBy: 'turn-end-retry',
+          });
+          trySavePersistedPowerState(baseRt);
+          return;
+        }
       }
     }
-    if (!baseRt.powerMonitorState?.latched) {
+    const rw = evaluateExecutionPoolWindowSummary(baseRt, teamId);
+    if (rw?.triggerCheckpointPause) {
+      baseRt.notifiedCheckpointPauseTeams ??= new Set();
+      const cpKey = `${teamId}:${taskSeq}`;
+      if (!baseRt.notifiedCheckpointPauseTeams.has(cpKey)) {
+        const notice = buildCheckpointPauseNotice(rw);
+        if (deliverSchedulerNotice(leaderAgent, notice)) {
+          baseRt.notifiedCheckpointPauseTeams.add(cpKey);
+          return;
+        }
+      }
+      return;
+    }
+    if (!isTeamAwaitingUserAfterPowerPause(baseRt, teamId)) {
       maybeNotifyLeaderScaleUp(ctx, teamId, { userCapRaised: false });
     }
   }
@@ -457,8 +640,8 @@ export function formatLeaderConcurrencyContext(ctx, teamId) {
         : 'unknown';
       lines.push(`- 5h request window: local_estimated=${rw.local_estimated_requests_5h} (local-estimate), provider_confirmed=${confirmedLabel}, tier=${rw.tier} (governance reviews never skipped)`);
     }
-    if (baseRt.config.powerMonitor?.enabled !== false && baseRt.powerMonitorState?.latched) {
-      lines.push(`- Battery-aware wind-down ACTIVE (${baseRt.powerMonitorState.lastBatteryPct ?? '<=20'}% on battery): stop new non-essential dispatches, let active members reach safe checkpoints, persist progress & resume entry.`);
+    if (isTeamAwaitingUserAfterPowerPause(baseRt, teamId)) {
+      lines.push(`- Battery-aware wind-down ACTIVE (${baseRt.powerMonitorState?.latched ? `${baseRt.powerMonitorState.lastBatteryPct ?? '<=20'}% on battery` : 'awaiting explicit user message to resume after low-battery pause'}): stop new non-essential dispatches, let active members reach safe checkpoints, persist progress & resume entry.`);
     }
     lines.push(`- Action: ${snap.guidance}`);
     return lines.join('\n');
@@ -470,6 +653,9 @@ export function formatLeaderConcurrencyContext(ctx, teamId) {
 export function maybeNotifyLeaderScaleUp(ctx, teamId, { userCapRaised = false } = {}) {
   const rt = runtime();
   if (!rt.config || !rt.storageRoot || !teamId) return false;
+  if (isTeamAwaitingUserAfterPowerPause(rt, teamId)) return false;
+  const rw = evaluateExecutionPoolWindowSummary(baseRuntime(rt), teamId);
+  if (rw?.triggerCheckpointPause) return false;
   const { sched, raised: syncRaised } = syncTeamConcurrency(ctx, teamId, rt);
   const effectiveUserRaise = Boolean(userCapRaised || syncRaised);
   const leaderActor = rt.actors.get(teamId);

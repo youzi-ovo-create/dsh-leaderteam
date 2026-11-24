@@ -107,8 +107,13 @@ export function installFinalGate(supportedVersions) {
     if (actor.role === 'leader' && name === 'send_message') {
       const rt = runtimeForTeam(actor.teamId), store = teamStore(actor.teamId);
       reconcileStaleMembers(rt, store);
-      const targetId = resolveSendMessageTargetId(store, args);
-      try { return await withMemberActivation(rt, store, rt.config, targetId, currentTaskSeq(gate.ctx, actor.teamId), () => original.call(this, exec)); }
+      const tSeq = currentTaskSeq(gate.ctx, actor.teamId);
+      const targetId = resolveSendMessageTargetId(store, args, tSeq);
+      const targetMember = typeof targetId === 'string' ? store.getMember(targetId) : null;
+      if (args.agent_id === undefined && typeof args.agent === 'string' && targetMember?.hostAgentName && args.agent !== targetMember.hostAgentName) {
+        exec.arguments = frozenJsonCopy({ ...args, agent: targetMember.hostAgentName });
+      }
+      try { return await withMemberActivation(rt, store, rt.config, targetId, tSeq, () => original.call(this, exec)); }
       catch (error) { return denied(name, { by: 'rule:member-activation', reason: error.message }); }
     }
     const isShell = Boolean(runtimeForTeam(actor.teamId).config?.gate?.shellTools?.includes(name));
@@ -148,8 +153,9 @@ export class Gate {
       try {
         const store = teamStore(actor.teamId);
         reconcileStaleMembers(rt, store);
-        const targetId = resolveSendMessageTargetId(store, args);
-        resumeAdmission(store, activationConfig(rt, store, cfg), targetId, currentTaskSeq(this.ctx, actor.teamId));
+        const tSeq = currentTaskSeq(this.ctx, actor.teamId);
+        const targetId = resolveSendMessageTargetId(store, args, tSeq);
+        resumeAdmission(store, activationConfig(rt, store, cfg), targetId, tSeq);
       } catch (error) { return { rule: 'member-activation', reason: error.message }; }
     }
     return undefined;

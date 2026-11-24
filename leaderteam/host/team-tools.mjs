@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { defineTool } from '@deepseek-ai/dsh-tools';
-import { requireReady, teamStore, runtime, recordUsage, runtimeForTeam, isPluginActive, activePluginsMap, refreshUpstreamCatalog, effectiveRuntimeConfig } from './runtime.mjs';
+import { requireReady, teamStore, runtime, baseRuntime, recordUsage, runtimeForTeam, isPluginActive, activePluginsMap, refreshUpstreamCatalog, effectiveRuntimeConfig } from './runtime.mjs';
 import { resolveActor, userTaskText, currentTaskSeq, reconcileStaleMembers } from './roles.mjs';
 import { callRoleJson } from './llm.mjs';
 import { roleRouteChain, degradedNote } from '../core/role-routes.mjs';
@@ -22,7 +22,7 @@ import { readCurrentPlan, writeCurrentPlan, currentPlanFile } from '../core/curr
 import { replay, nextAction, buildMemberRequest, buildArbiterRequest, parseMemberOpinion, parseArbiterRuling, normalizeReview, namedDocuments } from '../core/agreement.mjs';
 import { memberInitialPrompt, directExecInitialPrompt } from '../core/prompts.mjs';
 import { isAutonomousGovernance, replayGovernanceState, checkGovernanceExecutionGate } from '../core/governance-protocol.mjs';
-import { queueAsyncSupervision, respondInFormalConference } from './governance.mjs';
+import { queueAsyncSupervision, retryDeferredSupervisions, awaitTeamGovernanceJobs, respondInFormalConference } from './governance.mjs';
 import { frontierState, frontierView, frontierNeedsPlanning, frontierHasDispatchableWork, recordOverview, recordStage, recordStageVerification, requireReadyStage, stageApproval } from '../core/frontier.mjs';
 import { dispatchContract } from '../core/dispatch-contract.mjs';
 import { resolveMemberRefs } from '../core/member-refs.mjs';
@@ -31,7 +31,7 @@ import { needsSerialProof, buildSerialReviewRequest, parseSerialProof } from '..
 import { memberToolGrant } from '../core/tool-policy.mjs';
 import { discoverSkills, loadSkill } from '../core/skills.mjs';
 import { skillOptions, profileDefinitions } from './capability-tools.mjs';
-import { syncTeamConcurrency, evaluateTeamConcurrency, reserveTeamDispatch } from './concurrency.mjs';
+import { syncTeamConcurrency, evaluateTeamConcurrency, reserveTeamDispatch, evaluateTeamRequestWindow, isTeamAwaitingUserAfterPowerPause } from './concurrency.mjs';
 import {
   ensurePlanArchive,
   touchTeamTimer,
@@ -49,10 +49,25 @@ const json = { schema: { type: 'json' }, render: (_a, v) => [{ type: 'text', tex
 const jsonCompact = { schema: { type: 'json' }, render: (_a, v) => [{ type: 'text', text: JSON.stringify(v) }] };
 const strList = (description) => ({ type: 'array', items: { type: 'string' }, description });
 
-async function startSubagentCompat(subagents, {
+function buildCatalogCandidateNames(validName, taskSeq = 1) {
+  const candidates = [validName];
+  for (let attempt = 2; attempt <= 20; attempt++) {
+    const suffix = attempt === 2 ? `-t${taskSeq}` : `-t${taskSeq}-${attempt}`;
+    const maxBase = Math.max(1, 32 - suffix.length);
+    const trimmedBase = validName.slice(0, maxBase).replace(/-+$/, '') || 'm';
+    const candidate = `${trimmedBase}${suffix}`;
+    if (/^[a-z][a-z0-9-]{0,31}$/.test(candidate) && candidate !== 'lead' && !candidates.includes(candidate)) {
+      candidates.push(candidate);
+    }
+  }
+  return candidates;
+}
+
+export async function startSubagentCompat(subagents, {
   provider,
   childId,
   name,
+  taskSeq = 1,
   label,
   delivery,
   signal,
@@ -63,7 +78,7 @@ async function startSubagentCompat(subagents, {
 }) {
   const isFlatSpec = typeof subagents?.resolveName === 'function' || typeof subagents?.waitForTreeWork === 'function';
   if (!isFlatSpec) {
-    return subagents.startActivation({
+    const res = await subagents.startActivation({
       provider,
       childId,
       label,
@@ -71,6 +86,7 @@ async function startSubagentCompat(subagents, {
       signal,
       request: { prompt, parent, agentPreset, agentOptions },
     });
+    return { ...res, hostAgentName: null };
   }
   const validName = typeof name === 'string' && /^[a-z][a-z0-9-]{0,31}$/.test(name) && name !== 'lead' ? name : undefined;
   const baseSpec = {
@@ -85,13 +101,23 @@ async function startSubagentCompat(subagents, {
     agentOptions,
   };
   if (validName && delivery === 'parent') {
-    try {
-      return await subagents.startActivation({ ...baseSpec, name: validName });
-    } catch (err) {
-      if (err?.code !== 'DUPLICATE_AGENT_NAME' && err?.code !== 'INVALID_AGENT_NAME') throw err;
+    let lastDuplicateErr = null;
+    for (const candidateName of buildCatalogCandidateNames(validName, taskSeq)) {
+      try {
+        const res = await subagents.startActivation({ ...baseSpec, name: candidateName });
+        return { ...res, hostAgentName: candidateName };
+      } catch (err) {
+        if (err?.code === 'DUPLICATE_AGENT_NAME') {
+          lastDuplicateErr = err;
+          continue;
+        }
+        throw err;
+      }
     }
+    throw lastDuplicateErr ?? new Error(`unable to allocate unique subagent catalog name for "${validName}"`);
   }
-  return subagents.startActivation(baseSpec);
+  const res = await subagents.startActivation(baseSpec);
+  return { ...res, hostAgentName: null };
 }
 
 function compactConcurrency(snap) {
@@ -133,6 +159,10 @@ function fallbackConcurrencySnapshot(cfg, store, rt, teamId) {
 
 async function leaderOf(ctx, exec) {
   let rt = requireReady();
+  const base = baseRuntime(rt);
+  if (base.initialSettingsSyncPromise) {
+    try { await base.initialSettingsSyncPromise; } catch {}
+  }
   await refreshUpstreamCatalog(ctx, rt);
   const agent = exec.agent;
   if (!agent) throw new Error('team tools require a calling agent');
@@ -677,6 +707,13 @@ export function registerTeamTools(ctx) {
       if (taskMemberCount >= cfg.team.maxMembersPerTeam) {
         throw new Error(`team member limit ${cfg.team.maxMembersPerTeam} reached for current task`);
       }
+      const rwDispatch = evaluateTeamRequestWindow(rt, actor.teamId, Date.now(), { targetRoute: args.model });
+      if (rwDispatch?.triggerCheckpointPause) {
+        throw new Error(`5-hour request window entered checkpoint_pause for route "${args.model}" (${rwDispatch.reason}): new execution dispatches on this provider are paused to protect quota while governance reviews stay active. Save your progress checkpoint via team_note and declare team_status(stop_state="blocked", reason=...) (or dispatch an alternate provider route if available).`);
+      }
+      if (isTeamAwaitingUserAfterPowerPause(rt, actor.teamId)) {
+        throw new Error('Battery-aware graceful shutdown is active (or awaiting an explicit user message to resume after low-battery pause): stop new execution dispatches, persist progress via team_note, and wait for user instructions.');
+      }
       const profile = cfg.profiles[args.profile];
       const grant = memberToolGrant(cfg, args.profile, args.tools, args.defer_tools ?? []);
       if (grant.allowedTools.some(n => cfg.gate.shellTools.includes(n)) && rt.workspaceShellFailures?.has(pathKey(actor.cwd))) throw new Error('workspace OS sandbox initialization failed; stop shell dispatches and report the permissions problem. Repair requires the workspace owner, then restart and dispatch a new member.');
@@ -776,6 +813,7 @@ export function registerTeamTools(ctx) {
           provider: 'spawn',
           childId,
           name: args.name,
+          taskSeq,
           label: args.name,
           delivery: 'parent',
           signal: exec.signal,
@@ -784,6 +822,9 @@ export function registerTeamTools(ctx) {
           agentPreset: profile.preset,
           agentOptions: target,
         });
+        if (started.hostAgentName) {
+          store.setMemberHostName(childId, started.hostAgentName);
+        }
         if (store.getMember(childId)?.status === 'starting') store.setMemberStatus(childId, 'started');
         if (boundPlanId) {
           recordArchivedMemberDispatched({
@@ -796,6 +837,15 @@ export function registerTeamTools(ctx) {
         const postSnap = schedulerActive ? evaluateTeamConcurrency(ctx, actor.teamId) : null;
         reservation.commit(postSnap);
         if (autonomous && cfg.governance?.autoSuperviseDispatches !== false && consensusActive) {
+          retryDeferredSupervisions({
+            ctx,
+            rt,
+            store,
+            actor,
+            leaderAgent: exec.agent,
+            leaderModel: currentSelection(exec.agent) ?? null,
+            taskSeq,
+          });
           const boundStage = args.stage_id ? frontierState(store, taskSeq).stages.get(args.stage_id) : null;
           queueAsyncSupervision({
             ctx,
@@ -863,6 +913,9 @@ export function registerTeamTools(ctx) {
         const gateBlock = checkGovernanceExecutionGate(gov, actor, 'team_direct_exec', args, null, platform);
         if (gateBlock) throw new Error(gateBlock.reason);
       }
+      if (isTeamAwaitingUserAfterPowerPause(rt, actor.teamId)) {
+        throw new Error('Battery-aware graceful shutdown is active (or awaiting an explicit user message to resume after low-battery pause): team_direct_exec is paused until the user sends a resume instruction.');
+      }
       const taskText = typeof args.task === 'string' ? args.task.trim() : '';
       if (!taskText) throw new Error('team_direct_exec requires a non-empty task');
       if (taskText.length > 24000) throw new Error('team_direct_exec task exceeds 24000 characters');
@@ -888,10 +941,16 @@ export function registerTeamTools(ctx) {
       const now = new Date();
       const q = quotaState(rt);
       const chain = roleRouteChain(cfg, 'directExec', currentSelection(exec.agent) ?? null);
-      const chosen = chain.find(t => quotaGate(cfg, q, t.route, now).allowed) ?? chain[0];
+      const chosen = chain.find(t => quotaGate(cfg, q, t.route, now).allowed && !evaluateTeamRequestWindow(rt, actor.teamId, now.getTime(), { targetRoute: t.route, skipAuditWrite: true })?.triggerCheckpointPause)
+        ?? chain.find(t => quotaGate(cfg, q, t.route, now).allowed)
+        ?? chain[0];
       if (!chosen) throw new Error('no configured route available for roles.directExec');
       const qCheck = quotaGate(cfg, q, chosen.route, now);
       if (!qCheck.allowed) throw new Error(qCheck.error);
+      const rwDirect = evaluateTeamRequestWindow(rt, actor.teamId, now.getTime(), { targetRoute: chosen.route });
+      if (rwDirect?.triggerCheckpointPause) {
+        throw new Error(`5-hour request window entered checkpoint_pause for route "${chosen.route}" (${rwDirect.reason}): team_direct_exec is paused to protect quota while governance reviews stay active. Save your progress checkpoint via team_note and declare team_status(stop_state="blocked", reason=...).`);
+      }
       const modelSpec = cfg.models[chosen.route];
       const chosenEffort = (typeof args.effort === 'string' && modelSpec?.efforts?.includes(args.effort))
         ? args.effort
@@ -1089,6 +1148,15 @@ export function registerTeamTools(ctx) {
         const proposalText = autoStage
           ? JSON.stringify(autoStage.contract, null, 2)
           : String(args.proposal ?? args.topic ?? '');
+        retryDeferredSupervisions({
+          ctx,
+          rt,
+          store,
+          actor,
+          leaderAgent: exec.agent,
+          leaderModel: currentSelection(exec.agent) ?? null,
+          taskSeq,
+        });
         const job = queueAsyncSupervision({
           ctx,
           rt,
@@ -1121,7 +1189,8 @@ export function registerTeamTools(ctx) {
             next_step_hint: 'Autonomous governance active: Dual Reviewers supervise asynchronously in the background and have no veto power. Proceed immediately with team_dispatch (no plan_id needed) or team_direct_exec.',
           };
         }
-        if (job?.promise) await job.promise;
+        const jobResult = job?.promise ? await job.promise : null;
+        await awaitTeamGovernanceJobs(rt, actor.teamId, 60000);
         const govAfter = replayGovernanceState(store.governanceEvents(), taskSeq);
         if (govAfter.activeConference) {
           return {
@@ -1141,12 +1210,28 @@ export function registerTeamTools(ctx) {
             next_step_hint: '3rd unanimous objection escalated directly to User (§5). Call team_status(stop_state="waiting_user", ...) and present the dispute dossier.',
           };
         }
+        if (jobResult?.status === 'deferred' || (!jobResult && !job?.deduplicated) || govAfter.pendingSupervisions?.length > 0) {
+          return {
+            status: 'error',
+            governance_mode: 'autonomous',
+            error: 'Dual supervision incomplete: both Reviewer A and Reviewer B must return valid opinions before delivery can settle.',
+            pending_supervisions: (govAfter.pendingSupervisions ?? []).map(p => ({
+              supervision_id: p.supervisionId,
+              phase_kind: p.phaseKind,
+              target: p.targetLabel,
+              missing_reviewers: [!p.hasValidOpinionA ? 'discussA' : null, !p.hasValidOpinionB ? 'discussB' : null].filter(Boolean),
+              error_a: p.errorA,
+              error_b: p.errorB,
+            })),
+            hint: 'Retry team_discuss(kind="delivery", ...) once reviewer routes are reachable, or call team_status(stop_state="blocked", reason=...) if upstream reviewer routes remain unavailable.',
+          };
+        }
         return {
           status: 'settled',
           governance_mode: 'autonomous',
           outcome: { decision: 'approve', by: 'autonomous-supervision' },
           advisory_notes: govAfter.advisoryNotes.slice(-2),
-          next_step_hint: 'Supervision completed with no formal Arbiter intervention; declare team_status(stop_state="delivered") and deliver in the user\'s language.',
+          next_step_hint: 'Supervision completed with two valid reviewer opinions and no formal Arbiter intervention; declare team_status(stop_state="delivered") and deliver in the user\'s language.',
         };
       }
       if (args.resume_id) {

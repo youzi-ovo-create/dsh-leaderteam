@@ -78,5 +78,7 @@ export function disposePlanning(rt) {
   const base = baseRuntime(rt);
   for (const job of base.governanceJobs?.values() ?? []) job.controller?.abort?.();
   base.governanceJobs?.clear?.();
+  base.inFlightSupervisionKeys?.clear?.();
+  base.partialSupervisionOpinions?.clear?.();
   base.supervisedDigests?.clear?.();
 }

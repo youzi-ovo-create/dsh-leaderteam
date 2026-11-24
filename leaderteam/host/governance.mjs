@@ -1266,9 +1266,38 @@ export async function respondInFormalConference({
   };
 }
 
+function formatRoleError(res, fallbackCode) {
+  if (!res || res.ok) return null;
+  const err = res.error;
+  if (!err) return fallbackCode;
+  if (typeof err === 'string') return err;
+  return [err.kind, err.code, err.message].filter(Boolean).join(': ') || fallbackCode;
+}
+
+function seedSupervisionRuntimeFromStore(base, store, taskSeq) {
+  let events;
+  try { events = store.governanceEvents(); } catch { return; }
+  for (const ev of events) {
+    if ((ev.taskSeq ?? 1) !== taskSeq) continue;
+    if (ev.type === 'supervision-completed' && ev.dedupeKey) {
+      base.supervisedDigests.add(ev.dedupeKey);
+      base.partialSupervisionOpinions.delete(ev.dedupeKey);
+    } else if (ev.type === 'supervision-deferred' && ev.dedupeKey && !base.supervisedDigests.has(ev.dedupeKey)) {
+      const prev = base.partialSupervisionOpinions.get(ev.dedupeKey);
+      const opinionA = ev.opinionA ?? prev?.opinionA ?? null;
+      const opinionB = ev.opinionB ?? prev?.opinionB ?? null;
+      if (opinionA || opinionB) {
+        base.partialSupervisionOpinions.set(ev.dedupeKey, { opinionA, opinionB });
+      }
+    }
+  }
+}
+
 /**
  * Queue non-blocking Stage 1 Async Dual Supervision (or Stage 4 Post-Conference Re-Review).
  * Never blocks Leader tool execution; tracks background promise on `baseRuntime(rt).governanceJobs`.
+ * CRITICAL (G6): Never converts a failed reviewer call into a synthetic `endorse`, and never marks
+ * a supervision settled until BOTH Reviewer A and Reviewer B return valid parsed opinions.
  */
 export function queueAsyncSupervision({
   ctx,
@@ -1301,6 +1330,9 @@ export function queueAsyncSupervision({
   const base = baseRuntime(rt);
   base.governanceJobs ??= new Map();
   base.supervisedDigests ??= new Set();
+  base.inFlightSupervisionKeys ??= new Set();
+  base.partialSupervisionOpinions ??= new Map();
+  seedSupervisionRuntimeFromStore(base, store, taskSeq);
 
   const normTargets = normalizeDisputeTargets(targets);
   const targetFileHashes = collectTargetFileHashes(actor.cwd, normTargets, rt.config.paths?.protectedDirs);
@@ -1321,12 +1353,40 @@ export function queueAsyncSupervision({
     : snapshotDigest;
   const dedupeKey = `${store.teamId}:${taskSeq}:${phaseKind}:${dedupeIdentity}:${postConferencePacket?.conference_id ?? 'initial'}`;
   if (base.supervisedDigests.has(dedupeKey)) {
-    return { queued: false, deduplicated: true, behaviorDigest: snapshotDigest };
+    return { queued: false, deduplicated: true, status: 'already_completed', behaviorDigest: snapshotDigest };
   }
-  base.supervisedDigests.add(dedupeKey);
+  if (base.inFlightSupervisionKeys.has(dedupeKey)) {
+    const existingJob = [...base.governanceJobs.values()].find(j => j.dedupeKey === dedupeKey);
+    return {
+      queued: false,
+      inFlight: true,
+      supervisionId: existingJob?.supervisionId ?? null,
+      behaviorDigest: snapshotDigest,
+      promise: existingJob?.promise ?? null,
+    };
+  }
+  base.inFlightSupervisionKeys.add(dedupeKey);
 
   const supervisionId = `sup-${randomUUID().slice(0, 8)}`;
   const controller = new AbortController();
+  const retrySpec = {
+    phaseKind,
+    stageId,
+    stageHash,
+    targets: normTargets,
+    profile,
+    tools,
+    interfaces,
+    goal,
+    method,
+    summary,
+    proposal,
+    evidence,
+    evidenceFiles,
+    userTask,
+    parentDisputeId,
+    postConferencePacket,
+  };
 
   const jobPromise = (async () => {
     try {
@@ -1334,6 +1394,7 @@ export function queueAsyncSupervision({
         type: 'supervision-started',
         taskSeq,
         supervisionId,
+        dedupeKey,
         phaseKind,
         stageId,
         targets: normTargets,
@@ -1379,21 +1440,65 @@ export function queueAsyncSupervision({
       const userPrompt = buildSupervisionReviewerUser(reviewerPayload);
       const purpose = postConferencePacket ? 'stage4-re-review' : 'async-supervision';
 
+      const cachedPartial = base.partialSupervisionOpinions.get(dedupeKey) ?? null;
       const [resA, resB] = await Promise.all([
-        callGovernanceRole(rt, actor.teamId, taskSeq, 'discussA', leaderModel, SUPERVISION_REVIEWER_SYSTEM, userPrompt, parseSupervisionOpinion, purpose, controller.signal),
-        callGovernanceRole(rt, actor.teamId, taskSeq, 'discussB', leaderModel, SUPERVISION_REVIEWER_SYSTEM, userPrompt, parseSupervisionOpinion, purpose, controller.signal),
+        cachedPartial?.opinionA
+          ? Promise.resolve({ ok: true, opinion: cachedPartial.opinionA, cached: true })
+          : callGovernanceRole(rt, actor.teamId, taskSeq, 'discussA', leaderModel, SUPERVISION_REVIEWER_SYSTEM, userPrompt, parseSupervisionOpinion, purpose, controller.signal),
+        cachedPartial?.opinionB
+          ? Promise.resolve({ ok: true, opinion: cachedPartial.opinionB, cached: true })
+          : callGovernanceRole(rt, actor.teamId, taskSeq, 'discussB', leaderModel, SUPERVISION_REVIEWER_SYSTEM, userPrompt, parseSupervisionOpinion, purpose, controller.signal),
       ]);
 
       if (controller.signal.aborted) return null;
 
-      const opinionA = resA.ok ? resA.opinion : { stance: 'endorse', intervene: false, summary: 'unavailable', concerns: [], suggestions: [], targetPaths: [], directivesVerified: null };
-      const opinionB = resB.ok ? resB.opinion : { stance: 'endorse', intervene: false, summary: 'unavailable', concerns: [], suggestions: [], targetPaths: [], directivesVerified: null };
+      const opinionA = resA?.ok ? resA.opinion : null;
+      const opinionB = resB?.ok ? resB.opinion : null;
+      if (!opinionA || !opinionB) {
+        if (opinionA || opinionB) {
+          base.partialSupervisionOpinions.set(dedupeKey, { opinionA, opinionB });
+        }
+        const errorA = opinionA ? null : formatRoleError(resA, 'reviewer_a_unavailable');
+        const errorB = opinionB ? null : formatRoleError(resB, 'reviewer_b_unavailable');
+        store.appendGovernanceEvent({
+          type: 'supervision-deferred',
+          taskSeq,
+          supervisionId,
+          dedupeKey,
+          phaseKind,
+          stageId,
+          targetLabel: stageId ?? (normTargets.join(',') || phaseKind),
+          targets: normTargets,
+          disputeId: parentDisputeId ?? null,
+          isStage4ReReview: Boolean(postConferencePacket),
+          hasValidOpinionA: Boolean(opinionA),
+          hasValidOpinionB: Boolean(opinionB),
+          ...(opinionA ? { opinionA } : {}),
+          ...(opinionB ? { opinionB } : {}),
+          errorA,
+          errorB,
+          retrySpec,
+        });
+        return {
+          status: 'deferred',
+          completed: false,
+          supervisionId,
+          dedupeKey,
+          missingReviewers: [!opinionA ? 'discussA' : null, !opinionB ? 'discussB' : null].filter(Boolean),
+          errorA,
+          errorB,
+        };
+      }
+
+      base.supervisedDigests.add(dedupeKey);
+      base.partialSupervisionOpinions.delete(dedupeKey);
       const stage1 = evaluateStage1Supervision(opinionA, opinionB);
 
       store.appendGovernanceEvent({
         type: 'supervision-completed',
         taskSeq,
         supervisionId,
+        dedupeKey,
         phaseKind,
         stageId,
         targetLabel: stageId ?? (normTargets.join(',') || phaseKind),
@@ -1575,12 +1680,45 @@ export function queueAsyncSupervision({
       rt.logger?.warn?.(`leaderteam: async supervision error: ${err instanceof Error ? err.message : String(err)}`);
       return null;
     } finally {
+      base.inFlightSupervisionKeys.delete(dedupeKey);
       base.governanceJobs.delete(supervisionId);
     }
   })();
 
-  base.governanceJobs.set(supervisionId, { teamId: store.teamId, taskSeq, controller, promise: jobPromise });
-  return { queued: true, supervisionId, behaviorDigest: snapshotDigest, promise: jobPromise };
+  base.governanceJobs.set(supervisionId, { supervisionId, dedupeKey, teamId: store.teamId, taskSeq, controller, promise: jobPromise });
+  return { queued: true, supervisionId, dedupeKey, behaviorDigest: snapshotDigest, promise: jobPromise };
+}
+
+/** Re-queue any deferred dual supervisions for `taskSeq` that have not yet obtained two valid reviewer opinions. */
+export function retryDeferredSupervisions({
+  ctx,
+  rt,
+  store,
+  actor,
+  leaderAgent,
+  leaderModel = null,
+  taskSeq = 1,
+}) {
+  if (!rt || rt.planningDisposed || !isAutonomousGovernance(rt.config)) return [];
+  if (rt.config.plugins?.consensus === false || !actor?.cwd) return [];
+  const gov = replayGovernanceState(store.governanceEvents(), taskSeq);
+  if (!gov.pendingSupervisions?.length) return [];
+  const jobs = [];
+  for (const pending of gov.pendingSupervisions) {
+    if (!pending.retrySpec) continue;
+    const job = queueAsyncSupervision({
+      ctx,
+      rt,
+      store,
+      actor,
+      leaderAgent,
+      leaderModel,
+      taskSeq,
+      ...pending.retrySpec,
+    });
+    if (job?.promise) jobs.push(job);
+  }
+  return jobs;
 }
 
 /** Await any in-flight async supervision/caucus jobs for a team (used at delivery boundary). */
@@ -1652,6 +1790,10 @@ export function formatLeaderGovernanceContext(store, taskSeq) {
   }
   for (const d of gov.activeDirectives) {
     lines.push(`- Active Arbiter directive (${d.conferenceId}, ${d.decision} — verified completion required): ${d.directives.join('; ')}`);
+  }
+  if (gov.pendingSupervisions?.length > 0) {
+    const labels = gov.pendingSupervisions.slice(-3).map(p => `${p.targetLabel} (missing: ${[!p.hasValidOpinionA ? 'discussA' : null, !p.hasValidOpinionB ? 'discussB' : null].filter(Boolean).join(',') || 'reviewer'})`);
+    lines.push(`- Pending dual supervision (${gov.pendingSupervisions.length} awaiting two valid reviewer opinions before final delivery): ${labels.join(' | ')}`);
   }
   if (gov.advisoryNotes.length > 0) {
     const latest = gov.advisoryNotes.slice(-2).map(n => `[${n.targetLabel}] ${(n.suggestions.length ? n.suggestions : n.concerns).slice(0, 2).join('; ')}`);

@@ -2,7 +2,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { runtime, baseRuntime, teamStore, runtimeForTeam, isPluginActive, activePluginsMap, effectiveRuntimeConfig } from './runtime.mjs';
+import { runtime, baseRuntime, teamStore, runtimeForTeam, isPluginActive, activePluginsMap, effectiveRuntimeConfig, recordSessionModelRequest } from './runtime.mjs';
 import { TeamStore } from '../core/store.mjs';
 import { leaderSection, memberSection, directExecSection } from '../core/prompts.mjs';
 import { resolvePath, pathKey } from '../core/paths.mjs';
@@ -23,6 +23,7 @@ import { runCircuitInvestigation } from './investigator.mjs';
 import { isAutonomousGovernance, replayGovernanceState } from '../core/governance-protocol.mjs';
 import {
   awaitTeamGovernanceJobs,
+  retryDeferredSupervisions,
   parseCheckpointFromMemberOutput,
   buildCheckpointResumePrompt,
   verifyActiveArbiterDirectives,
@@ -119,11 +120,13 @@ export function onAgentCreated(ctx, { agent }) {
     teamStore(actor.teamId).ensure({ workspace: actor.cwd, surface: rt.surface });
     reconcileStaleMembers(rt, teamStore(actor.teamId));
     try { rt.onLeaderSessionReady?.(ctx, actor.teamId, actor.cwd); } catch {}
-    // Apply the configured default only before this session has any durable selection.
-    // Resuming a session must preserve its actual model/effort and report a mismatch.
-    if (rt.surface === 'desktop' && agent.model?.recordedSelection?.() === null) {
-      const target = resolveModelTarget(cfg, cfg.roles.leader.route, cfg.roles.leader.effort);
-      agent.model.select(target);
+    // Apply the configured default only before this session has any durable or CLI-specified selection.
+    // Resuming a session or passing an explicit `--model` in headless preserves its actual model/effort.
+    if (agent.model?.recordedSelection?.() === null && !agent.options?.model) {
+      try {
+        const target = resolveModelTarget(cfg, cfg.roles.leader.route, cfg.roles.leader.effort);
+        agent.model.select(target);
+      } catch {}
     }
     const prompt = agent.ctx.systemPrompt;
     const disposers = [];
@@ -496,6 +499,17 @@ async function maybeAutoContinueLeader(ctx, rt, actor, agent) {
     if (isAutonomousGovernance(rt.config)) {
       const hasDeliveryClaimText = /^\s*DELIVERY:\s*(approved|completed)\b/im.test(finalText);
       if (declaration?.state === 'delivered' || hasDeliveryClaimText || activeMembers.length === 0) {
+        if (isPluginActive(rt, 'consensus')) {
+          retryDeferredSupervisions({
+            ctx,
+            rt,
+            store,
+            actor,
+            leaderAgent: agent,
+            leaderModel: agent.model?.current?.() ?? null,
+            taskSeq,
+          });
+        }
         await awaitTeamGovernanceJobs(rt, actor.teamId, 30000);
         if (agent.status === 'running' || currentTaskSeq(ctx, actor.teamId) !== taskSeq || (agent.inbox?.nextTurn?.length ?? 0) > 0 || (agent.inbox?.nextStep?.length ?? 0) > 0) return;
       }
@@ -619,6 +633,22 @@ async function maybeAutoContinueLeader(ctx, rt, actor, agent) {
       }
 
       if (activeMembers.length === 0 && (declaration?.state === 'delivered' || hasDeliveryClaimText)) {
+        if (isPluginActive(rt, 'consensus') && gov.pendingSupervisions?.length > 0) {
+          const missingSummary = gov.pendingSupervisions
+            .map(p => `${p.targetLabel}: ${[p.errorA, p.errorB].filter(Boolean).join('; ') || 'reviewer unavailable'}`)
+            .slice(0, 3)
+            .join(' | ');
+          const fingerprint = `pending-sup:${gov.pendingSupervisions.map(p => p.dedupeKey).join(',')}`;
+          rt.autoContinueState ??= new Map();
+          const stateKey = `${actor.teamId}:${taskSeq}`;
+          const prev = rt.autoContinueState.get(stateKey);
+          const streak = prev && prev.fingerprint === fingerprint ? prev.streak + 1 : 1;
+          rt.autoContinueState.set(stateKey, { fingerprint, streak });
+          if (streak <= 2) {
+            agent.followup(buildContinuationMessage(rt, `[LeaderTeam Dual Supervision Incomplete] ${gov.pendingSupervisions.length} autonomous supervision item(s) do not yet have two valid reviewer opinions (${missingSummary}). Delivery cannot be marked completed without completed dual supervision. Call team_discuss(kind="delivery", ...) once reviewer routes recover, or declare team_status(stop_state="blocked", reason=...) if upstream reviewer routes remain unavailable.`));
+          }
+          return;
+        }
         return;
       }
 
@@ -786,6 +816,41 @@ export function onAgentError(_ctx, { agent, error } = {}) {
 export function onSessionEvent(ctx, session, event) {
   const rt = runtime();
   if (!rt.config || !rt.storageRoot || !session || !event) return;
+  if (event.type === 'assistant/message') {
+    const leader = [...rt.actors.values()].find(a => a.role === 'leader' && (a.agent?.session === session || a.teamId === session.id));
+    if (leader) {
+      const src = event.data?.source ?? null;
+      const sel = leader.agent?.model?.current?.() ?? null;
+      const route = src?.provider && src?.model
+        ? `${src.provider}/${src.model}`
+        : (sel?.provider && sel?.model ? `${sel.provider}/${sel.model}` : runtimeForTeam(leader.teamId).config?.roles?.leader?.route ?? null);
+      recordSessionModelRequest(rt, {
+        teamId: leader.teamId,
+        role: 'leader',
+        route,
+        provider: src?.provider ?? sel?.provider ?? null,
+        atMs: typeof event.time === 'number' && Number.isFinite(event.time) ? event.time : Date.now(),
+      });
+      return;
+    }
+    const subActor = [...rt.actors.values()].find(a => (a.role === 'member' || a.role === 'direct_exec') && a.agent?.session === session)
+      ?? (session.header?.origin === 'subagent' && typeof session.header?.parentSession === 'string' && typeof session.id === 'string' && TeamStore.exists(rt.storageRoot, session.header.parentSession)
+        ? { role: teamStore(session.header.parentSession).getMember(session.id)?.actorRole === 'direct_exec' ? 'direct_exec' : 'member', teamId: session.header.parentSession, agentId: session.id }
+        : null);
+    if (subActor) {
+      const rec = teamStore(subActor.teamId).getMember(subActor.agentId);
+      const src = event.data?.source ?? null;
+      const route = src?.provider && src?.model ? `${src.provider}/${src.model}` : (rec?.model ?? null);
+      recordSessionModelRequest(rt, {
+        teamId: subActor.teamId,
+        role: subActor.role,
+        route,
+        provider: src?.provider ?? null,
+        atMs: typeof event.time === 'number' && Number.isFinite(event.time) ? event.time : Date.now(),
+      });
+    }
+    return;
+  }
   if (event.type === 'user/message' && event.data?.source?.kind === 'user') {
     const leader = [...rt.actors.values()].find(a => a.role === 'leader' && (a.agent?.session === session || a.teamId === session.id));
     if (leader) rt.onLeaderUserMessage?.(ctx, leader.teamId);

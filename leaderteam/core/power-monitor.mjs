@@ -43,6 +43,9 @@ export function createPowerMonitorState() {
     v: 1,
     latched: false,
     pendingNotice: false,
+    pendingTeams: [],
+    ackedTeams: [],
+    pausedTeamsAwaitingUser: [],
     autoResumeAllowed: false,
     triggerCount: 0,
     lastTriggeredAtMs: null,
@@ -146,11 +149,13 @@ export function evaluatePowerSample(state, sample, cfg = DEFAULT_POWER_MONITOR_C
   target.lastSampledAtMs = ts;
 
   // Reset condition: AC connected (onBattery === false) OR batteryPct >= resetBatteryPct (e.g. 25%).
-  // CRITICAL INVARIANT: rearmed ONLY resets the detector latch and MUST keep autoResumeAllowed: false!
+  // CRITICAL INVARIANT: rearmed ONLY resets the detector latch and MUST keep `pausedTeamsAwaitingUser` intact (`autoResumeAllowed: false`)!
   if (onBattery === false || (batteryPct !== null && batteryPct >= c.resetBatteryPct)) {
     if (target.latched) {
       target.latched = false;
       target.pendingNotice = false;
+      target.pendingTeams = [];
+      target.ackedTeams = [];
       target.lastRearmedAtMs = ts;
       target.autoResumeAllowed = false;
       return {
@@ -184,6 +189,9 @@ export function evaluatePowerSample(state, sample, cfg = DEFAULT_POWER_MONITOR_C
   if (!target.latched && onBattery === true && batteryPct !== null && batteryPct <= c.lowBatteryPct) {
     target.latched = true;
     target.pendingNotice = true;
+    target.pendingTeams = Array.isArray(target.pendingTeams) ? [...target.pendingTeams] : [];
+    target.ackedTeams = [];
+    target.pausedTeamsAwaitingUser = Array.isArray(target.pausedTeamsAwaitingUser) ? [...target.pausedTeamsAwaitingUser] : [];
     target.triggerCount = (Number.isInteger(target.triggerCount) ? target.triggerCount : 0) + 1;
     target.lastTriggeredAtMs = ts;
     target.autoResumeAllowed = false;
@@ -256,7 +264,20 @@ export function acknowledgePowerShutdownNotice(state, ackMeta = null) {
   const ts = typeof ackMeta?.ackedAtMs === 'number' && Number.isFinite(ackMeta.ackedAtMs)
     ? ackMeta.ackedAtMs
     : (typeof ackMeta?.nowMs === 'number' && Number.isFinite(ackMeta.nowMs) ? ackMeta.nowMs : Date.now());
-  target.pendingNotice = false;
+  const teamId = typeof ackMeta?.teamId === 'string' && ackMeta.teamId ? ackMeta.teamId : null;
+  target.pendingTeams = Array.isArray(target.pendingTeams) ? [...target.pendingTeams] : [];
+  target.ackedTeams = Array.isArray(target.ackedTeams) ? [...target.ackedTeams] : [];
+  target.pausedTeamsAwaitingUser = Array.isArray(target.pausedTeamsAwaitingUser) ? [...target.pausedTeamsAwaitingUser] : [];
+
+  if (teamId) {
+    target.pendingTeams = target.pendingTeams.filter(id => id !== teamId);
+    if (!target.ackedTeams.includes(teamId)) target.ackedTeams.push(teamId);
+    if (!target.pausedTeamsAwaitingUser.includes(teamId)) target.pausedTeamsAwaitingUser.push(teamId);
+    target.pendingNotice = target.pendingTeams.length > 0;
+  } else {
+    target.pendingTeams = [];
+    target.pendingNotice = false;
+  }
   target.autoResumeAllowed = false;
   target.lastAckedAtMs = ts;
   if (ackMeta && typeof ackMeta === 'object') {
@@ -269,13 +290,57 @@ export function acknowledgePowerShutdownNotice(state, ackMeta = null) {
   return target;
 }
 
+/** Register active team IDs onto a latched power-monitor state so every team receives its own notice & user-resume hold. */
+export function registerTeamsForPowerLatch(state, teamIds = []) {
+  const target = ensureMutableTarget(state);
+  target.pendingTeams = Array.isArray(target.pendingTeams) ? [...target.pendingTeams] : [];
+  target.ackedTeams = Array.isArray(target.ackedTeams) ? [...target.ackedTeams] : [];
+  target.pausedTeamsAwaitingUser = Array.isArray(target.pausedTeamsAwaitingUser) ? [...target.pausedTeamsAwaitingUser] : [];
+  for (const tid of teamIds) {
+    if (typeof tid !== 'string' || !tid) continue;
+    if (!target.pausedTeamsAwaitingUser.includes(tid)) {
+      target.pausedTeamsAwaitingUser.push(tid);
+    }
+    if (target.latched && !target.ackedTeams.includes(tid) && !target.pendingTeams.includes(tid)) {
+      target.pendingTeams.push(tid);
+    }
+  }
+  if (target.latched && target.pendingTeams.length > 0) {
+    target.pendingNotice = true;
+  }
+  return target;
+}
+
+/** Clear a team's post-low-battery pause hold ONLY when the user explicitly sends a new message. */
+export function clearTeamPowerPauseOnUserTurn(state, teamId) {
+  const target = ensureMutableTarget(state);
+  if (!teamId || !Array.isArray(target.pausedTeamsAwaitingUser)) return { changed: false, state: target };
+  const prevLen = target.pausedTeamsAwaitingUser.length;
+  target.pausedTeamsAwaitingUser = target.pausedTeamsAwaitingUser.filter(id => id !== teamId);
+  return { changed: target.pausedTeamsAwaitingUser.length !== prevLen, state: target };
+}
+
+/** Build a fresh low-battery notice from current latched state (for per-team retry delivery). */
+export function buildNoticeFromLatchedState(state, cfg = DEFAULT_POWER_MONITOR_CONFIG, nowMs = Date.now()) {
+  const c = normalizePowerMonitorConfig(cfg);
+  const pct = typeof state?.lastBatteryPct === 'number' && Number.isFinite(state.lastBatteryPct)
+    ? state.lastBatteryPct
+    : c.lowBatteryPct;
+  return buildGracefulShutdownNotice(pct, c.lowBatteryPct, state?.lastTriggeredAtMs ?? nowMs);
+}
+
 /** Convert power monitor state to a clean JSON-serializable plain object. */
 export function serializePowerState(state) {
   const s = state && typeof state === 'object' ? state : createPowerMonitorState();
+  const cleanIds = arr => Array.isArray(arr) ? [...new Set(arr.filter(x => typeof x === 'string' && x))] : [];
+  const pendingTeams = cleanIds(s.pendingTeams);
   return {
     v: 1,
     latched: Boolean(s.latched),
-    pendingNotice: Boolean(s.pendingNotice),
+    pendingNotice: Boolean(s.pendingNotice || (s.latched && pendingTeams.length > 0)),
+    pendingTeams,
+    ackedTeams: cleanIds(s.ackedTeams),
+    pausedTeamsAwaitingUser: cleanIds(s.pausedTeamsAwaitingUser),
     autoResumeAllowed: false,
     triggerCount: Number.isInteger(s.triggerCount) && s.triggerCount >= 0 ? s.triggerCount : 0,
     lastTriggeredAtMs: typeof s.lastTriggeredAtMs === 'number' && Number.isFinite(s.lastTriggeredAtMs) ? s.lastTriggeredAtMs : null,

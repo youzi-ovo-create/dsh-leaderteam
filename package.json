@@ -7,7 +7,7 @@
   "icon": "icon.svg",
   "engines": {
     "node": ">=22.15",
-    "dsh": ">=0.2.2-rc.1 <=0.2.2-rc.5"
+    "dsh": "0.2.2-rc.1 || 0.2.2-rc.5"
   },
   "bin": {
     "lt-doctor": "./bin/lt-doctor.mjs",

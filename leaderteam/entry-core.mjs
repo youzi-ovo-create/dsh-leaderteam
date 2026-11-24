@@ -2,16 +2,16 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadConfig } from './core/config.mjs';
-import { resolveOrBootstrapConfigPath } from './core/solo-key.mjs';
+import { resolveOrBootstrapConfigPath, buildSoloProviderSettingsTemplates } from './core/solo-key.mjs';
 import { isPluginActive, runtimeForTeam, runtime, bindRuntimeConfigFile, refreshUpstreamCatalog, effectiveRuntimeConfig } from './host/runtime.mjs';
-import { syncUpstreamModelsToDshSettings } from './core/upstream-models.mjs';
+import { syncUpstreamModelsToDshSettings, resolveModelTarget } from './core/upstream-models.mjs';
 import { onAgentCreated, onAgentPresetSelected, onAgentDisposed, onAgentStatus, onAgentError, onSessionEvent, onToolResult } from './host/roles.mjs';
 import { bindHostImports } from './host/host-imports.mjs';
 import { disposePlanning } from './host/planning.mjs';
 import { frontierNeedsPlanning } from './core/frontier.mjs';
 import { isAutonomousGovernance } from './core/governance-protocol.mjs';
 import { isReadGrantOnlyMessage } from './core/gate-policy.mjs';
-import { formatLeaderGovernanceContext, resolveHumanEscalationOnUserTurn } from './host/governance.mjs';
+import { formatLeaderGovernanceContext, resolveHumanEscalationOnUserTurn, retryDeferredSupervisions } from './host/governance.mjs';
 import { teamStore } from './host/runtime.mjs';
 import { currentTaskSeq, userMessageTexts } from './host/roles.mjs';
 import pkg from './package.json' with { type: 'json' };
@@ -65,6 +65,7 @@ export function apply(ctx, config) {
   rt.planningDisposed = false;
   rt.currentPlanningTaskSeq = teamId => currentTaskSeq(ctx, teamId);
   rt.createUserMessage = hostLlm?.createUserMessage ?? null;
+  rt.shouldSuppressOptionalProbes = () => Boolean(hostConcurrency?.evaluateTeamRequestWindow?.(rt)?.suppressOptionalModelProbes);
   if (!rt.cordisCompositionMode && rt.config.plugins?.scheduler !== false) {
     hostConcurrency.ensureScheduler(rt);
   }
@@ -101,8 +102,11 @@ export function apply(ctx, config) {
   };
   rt.onLeaderUserMessage = (hookCtx, teamId) => {
     const teamRt = runtimeForTeam(teamId), actor = rt.actors.get(teamId);
+    const latestMsg = userMessageTexts(hookCtx, teamId).at(-1) ?? '';
+    if (latestMsg && !isReadGrantOnlyMessage(latestMsg)) {
+      hostConcurrency?.clearPowerPauseForTeamOnUserMessage?.(rt, teamId);
+    }
     if (isAutonomousGovernance(teamRt.config)) {
-      const latestMsg = userMessageTexts(hookCtx, teamId).at(-1) ?? '';
       if (latestMsg && !isReadGrantOnlyMessage(latestMsg)) {
         void resolveHumanEscalationOnUserTurn({
           ctx: hookCtx,
@@ -112,6 +116,17 @@ export function apply(ctx, config) {
           taskSeq: currentTaskSeq(hookCtx, teamId),
           userText: latestMsg,
         }).catch(() => {});
+        if (actor && isPluginActive(teamRt, 'consensus')) {
+          retryDeferredSupervisions({
+            ctx: hookCtx,
+            rt: teamRt,
+            store: teamStore(teamId),
+            actor,
+            leaderAgent: actor.agent ?? null,
+            leaderModel: actor.agent?.model?.current?.() ?? null,
+            taskSeq: currentTaskSeq(hookCtx, teamId),
+          });
+        }
       }
     }
     if (teamRt.config.team.rollingPlanning && actor && isPluginActive(teamRt, 'consensus')) {
@@ -167,24 +182,49 @@ export function apply(ctx, config) {
   const ready = Object.freeze({ coreVersion: pkg.version, modular: rt.cordisCompositionMode });
   rt.startupReady = ready;
   ctx.provide('leaderteamReady', ready);
-  // Asynchronously probe upstream `/v1/models` on startup so live `contextWindow` / `maxTokens` enrich runtime config and DSH settings.
+  const syncConfiguredModelsToHostSettings = async settingsCtx => {
+    const eff = effectiveRuntimeConfig(rt) ?? rt.config;
+    if (!eff || rt.planningDisposed) return null;
+    const defaultProvider = eff.magpie?.provider ?? 'magpie';
+    const providerTemplates = buildSoloProviderSettingsTemplates(process.env);
+    const modelsToSync = Object.entries(eff.models ?? {}).map(([route, spec]) => ({
+      route,
+      provider: spec.provider ?? defaultProvider,
+      upstreamModel: spec.upstreamModel ?? route,
+      efforts: spec.efforts,
+      vision: spec.vision,
+      contextWindow: spec.contextWindow,
+      maxTokens: spec.maxTokens,
+    }));
+    const syncRes = await syncUpstreamModelsToDshSettings(settingsCtx, modelsToSync, defaultProvider, { providerTemplates });
+    if (syncRes?.synced) {
+      for (const actor of rt.actors.values()) {
+        if (actor.role !== 'leader' || !actor.agent) continue;
+        if (actor.agent.model?.recordedSelection?.() === null && !actor.agent.options?.model) {
+          try {
+            const teamCfg = runtimeForTeam(actor.teamId).config;
+            const target = resolveModelTarget(teamCfg, teamCfg.roles.leader.route, teamCfg.roles.leader.effort);
+            actor.agent.model.select(target);
+          } catch {}
+        }
+      }
+    }
+    return syncRes;
+  };
+  if (typeof ctx.inject === 'function') {
+    ctx.inject(['settings'], settingsCtx => {
+      rt.initialSettingsSyncPromise = syncConfiguredModelsToHostSettings(settingsCtx).catch(() => null);
+    });
+  }
+  // Asynchronously sync Solo-Key / configured providers first, then probe upstream `/v1/models` to enrich `contextWindow` / `maxTokens`.
   queueMicrotask(() => {
-    refreshUpstreamCatalog(ctx, rt, { force: true, probeEndpoints: true }).then(cat => {
-      if (!cat || rt.planningDisposed) return;
-      const eff = effectiveRuntimeConfig(rt);
-      if (!eff) return;
-      const defaultProvider = eff.magpie?.provider ?? 'magpie';
-      const modelsToSync = Object.entries(eff.models ?? {}).map(([route, spec]) => ({
-        route,
-        provider: spec.provider ?? defaultProvider,
-        upstreamModel: spec.upstreamModel ?? route,
-        efforts: spec.efforts,
-        vision: spec.vision,
-        contextWindow: spec.contextWindow,
-        maxTokens: spec.maxTokens,
-      }));
-      return syncUpstreamModelsToDshSettings(ctx, modelsToSync, defaultProvider);
-    }).catch(() => {});
+    Promise.resolve(rt.initialSettingsSyncPromise ?? syncConfiguredModelsToHostSettings(ctx))
+      .then(() => refreshUpstreamCatalog(ctx, rt, { force: true, probeEndpoints: true }))
+      .then(cat => {
+        if (!cat || rt.planningDisposed) return;
+        return syncConfiguredModelsToHostSettings(ctx);
+      })
+      .catch(() => {});
   });
   ctx.logger?.info?.(`leaderteam: core ${pkg.version} active (surface=${rt.surface}, storage=${rt.storageRoot})`);
 }

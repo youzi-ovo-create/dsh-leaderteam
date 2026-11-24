@@ -263,8 +263,10 @@ test('lt-doctor CLI: executes with --json and --check-host without console popup
       execFileSyncImpl: () => 'bash 5.2',
       env: { DEEPSEEK_API_KEY: 'sk-asar' },
     });
-    assert.equal(asarCheck.checks.dshHost.classification, 'VERIFIED');
+    assert.equal(asarCheck.checks.dshHost.classification, 'UNVERIFIED_COMPATIBLE_SHAPE');
     assert.equal(asarCheck.checks.dshHost.toolsVersion, '0.2.2-rc.3');
+    assert.equal(asarCheck.checks.dshHost.status, 'warn');
+    assert.equal(asarCheck.checks.dshHost.productionAllowed, false);
 
     const proc = spawnSync(process.execPath, [DOCTOR_BIN, '--json', '--check-host', verifiedHost], {
       cwd: REPO_ROOT,

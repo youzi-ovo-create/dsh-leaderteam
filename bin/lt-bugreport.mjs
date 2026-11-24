@@ -56,14 +56,36 @@ export function redactDiagnosticText(input, options = {}) {
   text = text.replace(/\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g, '[REDACTED_KEY]');
   text = text.replace(/\bAIza[0-9A-Za-z_-]{20,}\b/g, '[REDACTED_KEY]');
 
-  // 4. Windows & POSIX personal home paths (supports both raw `\` and JSON-escaped `\\`)
-  text = text.replace(/[A-Za-z]:(?:\\\\|\\|\/)Users(?:\\\\|\\|\/)[^\s"'`<>|),;]+/gi, '<USER_HOME>/<REDACTED>');
-  text = text.replace(/(?:^|(?<=[\s"'`(=:]))\/(?:home|Users)\/[^\s"'`<>|),;]+/g, '<USER_HOME>/<REDACTED>');
-  text = text.replace(/(?:^|(?<=[\s"'`(=:]))\/root\/[^\s"'`<>|),;]+/g, '<USER_HOME>/<REDACTED>');
+  // 4. Quoted Windows / UNC / POSIX paths (preserving surrounding quotes, capturing spaces inside paths)
+  text = text.replace(/(["'`])(?:[A-Za-z]:(?:\\\\|\\|\/)Users(?:\\\\|\\|\/)|\/(?:home|Users|root)\/)[^"'`\r\n]*\1/gi, '$1<USER_HOME>/<REDACTED>$1');
+  text = text.replace(/(["'`])(?:[A-Za-z]:(?:\\\\|\\|\/)|(?:\\\\\\\\|\\\\)[A-Za-z0-9._$-]+(?:\\\\|\\)|\/\/[A-Za-z0-9._$-]+\/|file:\/\/\/)[^"'`\r\n]*\1/gi, '$1<LOCAL_PATH>/<REDACTED>$1');
 
-  // 5. Arbitrary Windows drive paths (e.g. E:\..., D:/..., C:\...)
-  text = text.replace(/[A-Za-z]:(?:\\\\|\\|\/)[^\s"'`<>|),;]+/g, '<LOCAL_PATH>/<REDACTED>');
-  text = text.replace(/\bfile:\/\/\/[^\s"'`<>|),;]+/gi, '<LOCAL_PATH>/<REDACTED>');
+  // 5. Unquoted Windows UNC & POSIX UNC paths (including directory/file segments containing spaces)
+  text = text.replace(
+    /(?:\\\\\\\\|\\\\)[A-Za-z0-9._$-]+(?:\\\\|\\)(?:[^\r\n"'`<>|),;:]*?(?:\\\\|\\))*[^\s"'`<>|),;:\r\n]+(?:\s+[^\s"'`<>|),;:\r\n]+\.[A-Za-z0-9]{1,10})?/g,
+    '<LOCAL_PATH>/<REDACTED>',
+  );
+  text = text.replace(
+    /(?:^|(?<=[\s"'`(=:]))\/\/[A-Za-z0-9._$-]+\/(?:[^\r\n"'`<>|),;:]*?\/)*[^\s"'`<>|),;:\r\n]+(?:\s+[^\s"'`<>|),;:\r\n]+\.[A-Za-z0-9]{1,10})?/g,
+    '<LOCAL_PATH>/<REDACTED>',
+  );
+
+  // 6. Unquoted Windows & POSIX personal home paths (supports spaces across path segments and filenames)
+  text = text.replace(
+    /[A-Za-z]:(?:\\\\|\\|\/)Users(?:\\\\|\\|\/)(?:[^\r\n"'`<>|),;:]*?(?:\\\\|\\|\/))*[^\s"'`<>|),;:\r\n]+(?:\s+[^\s"'`<>|),;:\r\n]+\.[A-Za-z0-9]{1,10})?/gi,
+    '<USER_HOME>/<REDACTED>',
+  );
+  text = text.replace(
+    /(?:^|(?<=[\s"'`(=:]))\/(?:home|Users|root)\/(?:[^\r\n"'`<>|),;:]*?\/)*[^\s"'`<>|),;:\r\n]+(?:\s+[^\s"'`<>|),;:\r\n]+\.[A-Za-z0-9]{1,10})?/g,
+    '<USER_HOME>/<REDACTED>',
+  );
+
+  // 7. Arbitrary Windows drive paths & file:// URLs (supports spaces across path segments and filenames)
+  text = text.replace(
+    /[A-Za-z]:(?:\\\\|\\|\/)(?:[^\r\n"'`<>|),;:]*?(?:\\\\|\\|\/))*[^\s"'`<>|),;:\r\n]+(?:\s+[^\s"'`<>|),;:\r\n]+\.[A-Za-z0-9]{1,10})?/g,
+    '<LOCAL_PATH>/<REDACTED>',
+  );
+  text = text.replace(/\bfile:\/\/\/[^\r\n"'`<>|),;]+/gi, '<LOCAL_PATH>/<REDACTED>');
 
   // 6. Long hex (>=32 chars) and high-entropy base64 secrets (>=32 chars with mixed case + digits)
   text = text.replace(/\b[0-9a-fA-F]{32,}\b/g, '[REDACTED_SECRET]');
@@ -309,7 +331,35 @@ function addBucket(target, delta) {
   target.totalTokens += delta.totalTokens;
 }
 
-function aggregateTeamMetrics(teamDir, fsImpl = fs) {
+function readGlobalGuardCounts(storageRoot, targetTeamName, fsImpl = fs) {
+  let globalRequestWindowEvents = 0;
+  const globalRwTimestamps = new Set();
+  if (storageRoot) {
+    const rwAudit = readJsonlTolerant(path.join(storageRoot, 'request-window-audit.jsonl'), fsImpl);
+    for (const r of rwAudit.records) {
+      if (targetTeamName && r.teamId && r.teamId !== targetTeamName) continue;
+      globalRequestWindowEvents += 1;
+      if (r.atMs !== undefined && r.atMs !== null) globalRwTimestamps.add(String(r.atMs));
+      else if (typeof r.at === 'string') globalRwTimestamps.add(r.at);
+    }
+  }
+  let globalLowBatteryTriggerCount = 0;
+  if (storageRoot) {
+    const pmState = readJsonOptional(path.join(storageRoot, 'power-monitor-state.json'), fsImpl);
+    if (typeof pmState?.triggerCount === 'number' && Number.isFinite(pmState.triggerCount) && pmState.triggerCount > 0) {
+      globalLowBatteryTriggerCount = Math.trunc(pmState.triggerCount);
+    } else if (pmState?.latched === true) {
+      globalLowBatteryTriggerCount = 1;
+    }
+  }
+  return { globalRequestWindowEvents, globalRwTimestamps, globalLowBatteryTriggerCount };
+}
+
+function aggregateTeamMetrics(teamDir, fsImpl = fs, options = {}) {
+  const storageRoot = options.storageRoot ?? (teamDir ? path.dirname(path.dirname(teamDir)) : null);
+  const targetTeamName = teamDir ? path.basename(teamDir) : null;
+  const { globalRequestWindowEvents, globalRwTimestamps, globalLowBatteryTriggerCount } = readGlobalGuardCounts(storageRoot, targetTeamName, fsImpl);
+
   if (!teamDir) {
     return {
       teamFound: false,
@@ -326,8 +376,8 @@ function aggregateTeamMetrics(teamDir, fsImpl = fs) {
         conferencesOpened: 0,
         conferencesConcluded: 0,
         humanEscalations: 0,
-        requestWindowEvents: 0,
-        lowBatteryEvents: 0,
+        requestWindowEvents: globalRequestWindowEvents,
+        lowBatteryEvents: globalLowBatteryTriggerCount,
       },
     };
   }
@@ -411,7 +461,10 @@ function aggregateTeamMetrics(teamDir, fsImpl = fs) {
     }
 
     if (t.includes('request-window') || t.includes('request_window')) {
-      governance.requestWindowEvents += 1;
+      const stamp = ev?.atMs !== undefined && ev?.atMs !== null ? String(ev.atMs) : (typeof ev?.at === 'string' ? ev.at : null);
+      if (!stamp || !globalRwTimestamps.has(stamp)) {
+        governance.requestWindowEvents += 1;
+      }
     }
     if (
       t.includes('low-battery')
@@ -423,6 +476,8 @@ function aggregateTeamMetrics(teamDir, fsImpl = fs) {
       governance.lowBatteryEvents += 1;
     }
   }
+  governance.requestWindowEvents += globalRequestWindowEvents;
+  governance.lowBatteryEvents = Math.max(governance.lowBatteryEvents, globalLowBatteryTriggerCount);
 
   return {
     teamFound: true,
@@ -508,7 +563,8 @@ function deepScrubObject(value, redactOpts) {
   if (value && typeof value === 'object') {
     const out = {};
     for (const [k, v] of Object.entries(value)) {
-      out[redactDiagnosticText(k, redactOpts)] = deepScrubObject(v, redactOpts);
+      // Preserve schema field names verbatim so usernames like `role` or `status` never corrupt report structure
+      out[k] = deepScrubObject(v, redactOpts);
     }
     return out;
   }
@@ -578,7 +634,7 @@ export function generateRedactedBugReport(options = {}) {
   };
 
   const config = sanitizeConfigSummary(rawConfig);
-  const metrics = aggregateTeamMetrics(teamDir, fsImpl);
+  const metrics = aggregateTeamMetrics(teamDir, fsImpl, { storageRoot });
 
   const redactOpts = {
     hostname: options.hostname,

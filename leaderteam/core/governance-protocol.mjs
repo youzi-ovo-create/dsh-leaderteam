@@ -427,6 +427,8 @@ export function replayGovernanceState(events = [], taskSeq = 1) {
   const advisoryNotes = [];
   const activeDirectives = new Map(); // disputeId -> directive record
   const concludedConferenceIds = new Set();
+  const deferredSupervisions = new Map(); // dedupeKey -> deferred supervision record
+  let completedSupervisionCount = 0;
   let pausingConference = null;
   let activeConferenceId = null;
   let activeHumanEscalation = null;
@@ -437,8 +439,41 @@ export function replayGovernanceState(events = [], taskSeq = 1) {
 
     if (ev.type === 'supervision-started') {
       inFlightPhase = 'supervising';
+    } else if (ev.type === 'supervision-deferred') {
+      if (inFlightPhase === 'supervising') inFlightPhase = null;
+      const key = ev.dedupeKey ?? ev.supervisionId;
+      if (key) {
+        const prev = deferredSupervisions.get(key);
+        const opinionA = ev.opinionA ?? prev?.opinionA ?? null;
+        const opinionB = ev.opinionB ?? prev?.opinionB ?? null;
+        deferredSupervisions.set(key, {
+          supervisionId: ev.supervisionId,
+          dedupeKey: key,
+          phaseKind: ev.phaseKind ?? prev?.phaseKind ?? 'execution',
+          stageId: ev.stageId ?? prev?.stageId ?? null,
+          targetLabel: ev.targetLabel ?? ev.stageId ?? prev?.targetLabel ?? 'task',
+          targets: ev.targets ?? prev?.targets ?? [],
+          disputeId: ev.disputeId ?? prev?.disputeId ?? null,
+          isStage4ReReview: Boolean(ev.isStage4ReReview ?? prev?.isStage4ReReview),
+          hasValidOpinionA: Boolean(opinionA),
+          hasValidOpinionB: Boolean(opinionB),
+          opinionA,
+          opinionB,
+          errorA: opinionA ? null : (ev.errorA ?? prev?.errorA ?? 'reviewer_a_unavailable'),
+          errorB: opinionB ? null : (ev.errorB ?? prev?.errorB ?? 'reviewer_b_unavailable'),
+          retrySpec: ev.retrySpec ?? prev?.retrySpec ?? null,
+          at: ev.at ?? null,
+        });
+      }
     } else if (ev.type === 'supervision-completed') {
       if (inFlightPhase === 'supervising') inFlightPhase = null;
+      completedSupervisionCount++;
+      if (ev.dedupeKey) deferredSupervisions.delete(ev.dedupeKey);
+      if (ev.supervisionId) {
+        for (const [k, v] of deferredSupervisions.entries()) {
+          if (v.supervisionId === ev.supervisionId) deferredSupervisions.delete(k);
+        }
+      }
       if (ev.advisoryOnly && (ev.advisoryConcerns?.length || ev.advisorySuggestions?.length)) {
         advisoryNotes.push({
           supervisionId: ev.supervisionId,
@@ -628,6 +663,8 @@ export function replayGovernanceState(events = [], taskSeq = 1) {
     taskSeq,
     eventsCount: Array.isArray(events) ? events.length : 0,
     phase,
+    completedSupervisionCount,
+    pendingSupervisions: [...deferredSupervisions.values()],
     pausingConference,
     activeConference,
     activeHumanEscalation,

@@ -153,9 +153,16 @@ async function readWin32PowerSample(execFileImpl, timeoutMs, sampledAt) {
     return { status: 'unsupported', onBattery: null, batteryPct: null, source: 'win32-cim', sampledAt };
   }
 
-  const statusCode = Number(item.BatteryStatus);
-  const charge = Number(item.EstimatedChargeRemaining);
-  if (!Number.isFinite(charge) || charge < 0 || charge > 100) {
+  const rawStatus = item.BatteryStatus;
+  const rawCharge = item.EstimatedChargeRemaining;
+  const hasNumericStatus = typeof rawStatus === 'number' || (typeof rawStatus === 'string' && rawStatus.trim() !== '');
+  const hasNumericCharge = typeof rawCharge === 'number' || (typeof rawCharge === 'string' && rawCharge.trim() !== '');
+  if (!hasNumericStatus || !hasNumericCharge) {
+    return { status: 'unknown', onBattery: null, batteryPct: null, source: 'win32-cim', sampledAt };
+  }
+  const statusCode = Number(rawStatus);
+  const charge = Number(rawCharge);
+  if (!Number.isFinite(statusCode) || !Number.isFinite(charge) || charge < 0 || charge > 100) {
     return { status: 'unknown', onBattery: null, batteryPct: null, source: 'win32-cim', sampledAt };
   }
 

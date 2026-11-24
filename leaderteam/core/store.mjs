@@ -108,6 +108,7 @@ export class TeamStore {
         });
       }
       else if (r.type === 'member-tools' && map.has(r.childId)) map.set(r.childId, { ...map.get(r.childId), loadedTools: r.loadedTools, ...(r.shellFailure ? { shellFailure: r.shellFailure } : {}) });
+      else if (r.type === 'member-host-name' && map.has(r.childId)) map.set(r.childId, { ...map.get(r.childId), hostAgentName: r.hostAgentName });
       else if (r.type === 'member-binding' && map.has(r.childId)) map.set(r.childId, { ...map.get(r.childId), taskSeq: r.taskSeq, planId: r.planId });
       else if (r.type === 'member-governance' && map.has(r.childId)) {
         map.set(r.childId, {
@@ -125,6 +126,7 @@ export class TeamStore {
   addMember(rec) { appendJsonl(this.membersFile, { v: 1, type: 'member', at: new Date().toISOString(), ...rec }); }
   setMemberStatus(childId, status, error, failure) { appendJsonl(this.membersFile, { v: 1, type: 'member-status', at: new Date().toISOString(), childId, status, ...(error ? { error } : {}), ...(failure ? { failure } : {}) }); }
   setMemberBinding(childId, taskSeq, planId) { appendJsonl(this.membersFile, { v: 1, type: 'member-binding', at: new Date().toISOString(), childId, taskSeq, planId }); }
+  setMemberHostName(childId, hostAgentName) { appendJsonl(this.membersFile, { v: 1, type: 'member-host-name', at: new Date().toISOString(), childId, hostAgentName }); }
   setMemberTools(childId, loadedTools, shellFailure) { appendJsonl(this.membersFile, { v: 1, type: 'member-tools', at: new Date().toISOString(), childId, loadedTools, ...(shellFailure ? { shellFailure } : {}) }); }
   setMemberGovernanceState(childId, governanceState, meta = {}) { appendJsonl(this.membersFile, { v: 1, type: 'member-governance', at: new Date().toISOString(), childId, governanceState, ...meta }); }
   agreementEvents(id) { return readJsonl(this.agreementsFile).records.filter(r => r.id === id).map(({ v, at, ...ev }) => ev); }

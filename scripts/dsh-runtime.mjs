@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
@@ -8,7 +9,26 @@ const DEFAULT_APP = path.join(ROOT, 'runtime', 'official-desktop', '0.2.2-rc.1')
 const PATHS_CONFIG = path.join(ROOT, 'config', 'official-desktop.paths.json');
 const OFFICIAL_EXE = 'DeepSeek Harness.exe';
 const LEGACY_EXE = 'DSH Desktop.exe';
-const EXTRA_VERIFIED_VERSIONS = ['0.2.2-rc.2', '0.2.2-rc.3', '0.2.2-rc.4', '0.2.2-rc.5'];
+const EXTRA_VERIFIED_VERSIONS = ['0.2.2-rc.5'];
+
+function resolveToolsPkgFromDshBin(bin, moduleRoot) {
+  const direct = path.join(moduleRoot, 'node_modules', '@deepseek-ai', 'dsh-tools', 'package.json');
+  if (fs.existsSync(direct)) return direct;
+  const dshPkg = path.join(path.dirname(path.dirname(bin)), 'package.json');
+  if (fs.existsSync(dshPkg)) {
+    try {
+      const req = createRequire(dshPkg);
+      try { return req.resolve('@deepseek-ai/dsh-tools/package.json'); } catch {}
+      for (const carrier of ['@deepseek-ai/dsh-base/package.json', '@deepseek-ai/dsh-headless/package.json', '@deepseek-ai/dsh-web/package.json']) {
+        try {
+          const cPkg = req.resolve(carrier);
+          return createRequire(cPkg).resolve('@deepseek-ai/dsh-tools/package.json');
+        } catch {}
+      }
+    } catch {}
+  }
+  return null;
+}
 
 function resolveNpmCliRuntime(dir) {
   const candidates = [
@@ -20,8 +40,8 @@ function resolveNpmCliRuntime(dir) {
   const normalizedBin = bin.replaceAll('\\', '/');
   const marker = normalizedBin.lastIndexOf('/node_modules/');
   const moduleRoot = marker >= 0 ? bin.slice(0, marker) : path.dirname(path.dirname(bin));
-  const toolsPkgFile = path.join(moduleRoot, 'node_modules', '@deepseek-ai', 'dsh-tools', 'package.json');
-  if (!fs.existsSync(toolsPkgFile)) throw new Error(`Missing @deepseek-ai/dsh-tools in npm CLI runtime: ${moduleRoot}`);
+  const toolsPkgFile = resolveToolsPkgFromDshBin(bin, moduleRoot);
+  if (!toolsPkgFile || !fs.existsSync(toolsPkgFile)) throw new Error(`Missing @deepseek-ai/dsh-tools in npm CLI runtime: ${moduleRoot}`);
   const toolsVersion = JSON.parse(fs.readFileSync(toolsPkgFile, 'utf8')).version;
   const supported = ['0.2.2-rc.1', ...EXTRA_VERIFIED_VERSIONS];
   if (!supported.includes(toolsVersion)) {
