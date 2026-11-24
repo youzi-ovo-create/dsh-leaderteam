@@ -1194,6 +1194,7 @@ export function registerTeamTools(ctx) {
           leaderAgent: exec.agent,
           leaderModel: currentSelection(exec.agent) ?? null,
           taskSeq,
+          excludePhaseKind: args.kind === 'delivery' ? 'delivery' : null,
         });
         const job = queueAsyncSupervision({
           ctx,

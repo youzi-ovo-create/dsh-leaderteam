@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { loadConfig, validateConfig } from '../../leaderteam/core/config.mjs';
 import { TeamStore } from '../../leaderteam/core/store.mjs';
@@ -12,6 +12,7 @@ import { replayGovernanceState } from '../../leaderteam/core/governance-protocol
 import {
   LEGACY_PATCH_BEGIN,
   LEGACY_PATCH_END,
+  stripLegacyManagedPatchBlock,
   detectLegacyProfilePatchConflicts,
   cleanLegacyProfilePatches,
 } from '../../leaderteam/core/legacy-patch-guard.mjs';
@@ -857,5 +858,286 @@ test('P2-3 & P2-4: lt-bugreport scrubs UNC & spaced paths, preserves schema keys
     assert.match(report.markdown, /lowBatteryEvents=3/);
   } finally {
     fs.rmSync(tmpStore, { recursive: true, force: true });
+  }
+});
+
+// ============================================================================
+// Round-2 Windows Re-Audit Regression Scenarios (R2-P1-1 .. R2-P1-4)
+// ============================================================================
+
+test('R2-P1-1: cleaning V2.1 comment-encoded empty array (`# leaderteam-original-empty-array: W10=`) restores valid top-level YAML `[]`', async () => {
+  const v21EncodedPatch = [
+    '# Profile overlay',
+    `# leaderteam-original-empty-array: ${Buffer.from('[]', 'utf8').toString('base64')}`,
+    '',
+    LEGACY_PATCH_BEGIN,
+    '- id: leaderteam-core',
+    '  name: "file:///C:/old-lt-v2.1/leaderteam/entry-core.mjs"',
+    LEGACY_PATCH_END,
+    '',
+  ].join('\n');
+
+  const res = stripLegacyManagedPatchBlock(v21EncodedPatch);
+  assert.equal(res.changed, true);
+  assert.equal(res.text, '# Profile overlay\n[]\n');
+
+  const commentOnlyPatch = [
+    '# Header comment without array marker',
+    LEGACY_PATCH_BEGIN,
+    '- id: leaderteam-core',
+    LEGACY_PATCH_END,
+  ].join('\n');
+  const res2 = stripLegacyManagedPatchBlock(commentOnlyPatch);
+  assert.equal(res2.changed, true);
+  assert.equal(res2.text, '# Header comment without array marker\n[]\n');
+
+  const blockOnlyPatch = [
+    LEGACY_PATCH_BEGIN,
+    '- id: leaderteam-core',
+    LEGACY_PATCH_END,
+  ].join('\n');
+  const res3 = stripLegacyManagedPatchBlock(blockOnlyPatch);
+  assert.equal(res3.changed, true);
+  assert.equal(res3.text, '[]\n');
+
+  const rc5Yaml = path.resolve(REPO_ROOT, '..', 'dsh-rc5-clean', 'node_modules', 'yaml', 'dist', 'index.js');
+  if (fs.existsSync(rc5Yaml)) {
+    const { parseDocument, isSeq } = await import(pathToFileURL(rc5Yaml).href);
+    for (const sample of [res.text, res2.text, res3.text]) {
+      const doc = parseDocument(sample);
+      assert.equal(doc.errors.length, 0);
+      assert.equal(isSeq(doc.contents), true, `expected top-level YAML array for:\n${sample}`);
+      assert.deepEqual(doc.toJSON(), []);
+    }
+  }
+});
+
+test('R2-P1-2: modifying workspace target files while supervision is deferred clears old deferred entry upon retry completion', async () => {
+  const tmpStoreRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'lt-r2-p1-2-store-'));
+  const tmpWs = fs.mkdtempSync(path.join(os.tmpdir(), 'lt-r2-p1-2-ws-'));
+  try {
+    const { queueAsyncSupervision, retryDeferredSupervisions } = await import('../../leaderteam/host/governance.mjs');
+    const targetPath = path.join(tmpWs, 'feature.js');
+    fs.writeFileSync(targetPath, 'export const version = 1;\n', 'utf8');
+
+    const customRaw = buildSoloKeyStarterConfig(BASE_RAW_CFG, { preset: SOLO_PROVIDER_PRESETS[0] });
+    customRaw.roles.discussA.fallback = [];
+    customRaw.roles.discussA.retries = 0;
+    customRaw.roles.discussB.fallback = [];
+    customRaw.roles.discussB.retries = 0;
+    customRaw.team.leaderModelAsLastResort = false;
+    const cfg = validateConfig(customRaw);
+
+    let failReviewers = true;
+    const seenPrompts = [];
+    const mockLlm = {
+      async *stream(req) {
+        if (failReviewers) throw new Error('503 temporary reviewer outage');
+        seenPrompts.push(req.messages?.[0]?.content?.[0]?.text ?? '');
+        yield {
+          type: 'text-delta',
+          text: JSON.stringify({
+            stance: 'endorse',
+            intervene: false,
+            summary: `Reviewed ${req.model} on updated file`,
+            concerns: [],
+            suggestions: [],
+            target_paths: ['feature.js'],
+          }),
+        };
+        yield { type: 'usage', usage: { inputTokens: 12, outputTokens: 18, totalTokens: 30 } };
+        yield { type: 'finish', reason: { kind: 'stop' } };
+      },
+    };
+
+    const store = new TeamStore(tmpStoreRoot, 'team-r2-sup');
+    store.ensure({ workspace: tmpWs, surface: 'headless' });
+    const fakeRt = {
+      config: cfg,
+      storageRoot: tmpStoreRoot,
+      llm: mockLlm,
+      logger: { warn() {}, info() {} },
+      governanceJobs: new Map(),
+      supervisedDigests: new Set(),
+      inFlightSupervisionKeys: new Set(),
+      partialSupervisionOpinions: new Map(),
+    };
+    const actor = { role: 'leader', teamId: 'team-r2-sup', cwd: tmpWs };
+
+    const job1 = queueAsyncSupervision({
+      ctx: {},
+      rt: fakeRt,
+      store,
+      actor,
+      leaderAgent: { session: { messages: [] } },
+      taskSeq: 1,
+      phaseKind: 'execution',
+      stageId: 'stage-impl',
+      stageHash: 'hash-stage-1',
+      targets: ['feature.js'],
+      summary: 'Implement feature',
+      proposal: 'Write feature.js',
+    });
+    const res1 = await job1.promise;
+    assert.equal(res1.status, 'deferred');
+    const gov1 = replayGovernanceState(store.governanceEvents(), 1);
+    assert.equal(gov1.pendingSupervisions.length, 1);
+    assert.equal(gov1.completedSupervisionCount, 0);
+
+    fs.writeFileSync(targetPath, 'export const version = 2;\n', 'utf8');
+
+    failReviewers = false;
+    const retryJobs = retryDeferredSupervisions({
+      ctx: {},
+      rt: fakeRt,
+      store,
+      actor,
+      leaderAgent: { session: { messages: [] } },
+      taskSeq: 1,
+    });
+    assert.equal(retryJobs.length, 1);
+    const res2 = await retryJobs[0].promise;
+    assert.equal(res2.status, 'advisory');
+    assert.equal(seenPrompts.length, 2);
+    assert.ok(seenPrompts.every(p => p.includes('export const version = 2;')), 'both reviewers must inspect updated v2 file content');
+
+    const gov2 = replayGovernanceState(store.governanceEvents(), 1);
+    assert.equal(gov2.completedSupervisionCount, 1);
+    assert.equal(gov2.pendingSupervisions.length, 0, 'stale v1 deferred supervision must be cleared when v2 retry completes');
+
+    const retryAgain = retryDeferredSupervisions({
+      ctx: {},
+      rt: fakeRt,
+      store,
+      actor,
+      leaderAgent: { session: { messages: [] } },
+      taskSeq: 1,
+    });
+    assert.equal(retryAgain.length, 0);
+  } finally {
+    fs.rmSync(tmpStoreRoot, { recursive: true, force: true });
+    fs.rmSync(tmpWs, { recursive: true, force: true });
+  }
+});
+
+test('R2-P1-3: DeepSeek Solo-Key clean config uses active deepseek-v4-pro & deepseek-flash models (and smoke config validates cleanly)', () => {
+  const soloRaw = buildSoloKeyStarterConfig(BASE_RAW_CFG, { preset: SOLO_PROVIDER_PRESETS[0] });
+  const soloValidated = validateConfig(soloRaw);
+  assert.equal(soloValidated.roles.leader.route, 'deepseek/deepseek-v4-pro');
+  assert.equal(soloValidated.roles.discussA.route, 'deepseek/deepseek-v4-pro');
+  assert.equal(soloValidated.roles.discussB.route, 'deepseek/deepseek-flash');
+  assert.equal(soloValidated.roles.gate.route, 'deepseek/deepseek-flash');
+  assert.deepEqual(soloValidated.team.executionPool, ['deepseek/deepseek-flash', 'deepseek/deepseek-v4-pro']);
+  assert.equal(Object.keys(soloValidated.models).some(k => k.includes('deepseek-reasoner') || k.includes('deepseek-chat')), false);
+
+  const smokeCfg = loadConfig(path.join(REPO_ROOT, 'examples', 'smoke-bugfix', 'leaderteam.smoke.json'));
+  assert.equal(smokeCfg.roles.leader.route, 'deepseek/deepseek-v4-pro');
+  assert.equal(smokeCfg.roles.gate.route, 'deepseek/deepseek-flash');
+});
+
+test('R2-P1-4: shipped Magpie gateway config enforces Codex 5h local cap consistently across session events and dispatch checks', async () => {
+  const tmpStoreRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'lt-r2-p1-4-magpie-'));
+  try {
+    const { runtime, baseRuntime } = await import('../../leaderteam/host/runtime.mjs');
+    const { onSessionEvent } = await import('../../leaderteam/host/roles.mjs');
+    const { evaluateTeamRequestWindow } = await import('../../leaderteam/host/concurrency.mjs');
+
+    const shippedRaw = structuredClone(BASE_RAW_CFG);
+    shippedRaw.quota.stateFile = null;
+    shippedRaw.requestWindow = {
+      enabled: true,
+      windowMs: 5 * 60 * 60 * 1000,
+      windowsByProvider: {
+        codex: { maxRequests: 10 },
+      },
+      softThrottlePct: 20,
+      hardPausePct: 5,
+    };
+    const cfg = validateConfig(shippedRaw);
+    assert.equal(cfg.magpie.provider, 'magpie');
+    assert.equal(cfg.roles.leader.route, 'codex/gpt-6.1-sol');
+
+    const globalRt = baseRuntime(runtime());
+    const prevCfg = globalRt.config;
+    const prevStorage = globalRt.storageRoot;
+    const prevActors = new Map(globalRt.actors);
+    const prevStores = new Map(globalRt.stores);
+    const prevViews = globalRt.teamConfigViews;
+
+    try {
+      globalRt.config = cfg;
+      globalRt.storageRoot = tmpStoreRoot;
+      globalRt.actors.clear();
+      globalRt.stores.clear();
+      globalRt.teamConfigViews = new Map();
+
+      const teamId = 'team-magpie-codex';
+      const st = new TeamStore(tmpStoreRoot, teamId);
+      st.ensure({ workspace: tmpStoreRoot, surface: 'headless' });
+      globalRt.stores.set(teamId, st);
+
+      const leaderSession = { id: teamId, messages: [] };
+      const leaderAgent = {
+        id: teamId,
+        session: leaderSession,
+        model: {
+          current: () => ({ provider: 'magpie', model: 'codex/gpt-6.1-sol' }),
+        },
+      };
+      globalRt.actors.set(teamId, { role: 'leader', teamId, agent: leaderAgent, cwd: tmpStoreRoot });
+
+      const nowMs = 1_800_000_000_000;
+      for (let i = 0; i < 10; i++) {
+        onSessionEvent(
+          {},
+          leaderSession,
+          {
+            type: 'assistant/message',
+            time: nowMs - (10 - i) * 1000,
+            data: { source: { provider: 'magpie', model: 'codex/gpt-6.1-sol' } },
+          },
+        );
+      }
+
+      const sessionEval = evaluateTeamRequestWindow(globalRt, teamId, nowMs, { skipAuditWrite: true });
+      assert.equal(sessionEval.local_estimated_requests_5h, 10);
+      assert.equal(sessionEval.tier, 'checkpoint_pause');
+      assert.equal(sessionEval.triggerCheckpointPause, true);
+      assert.equal(sessionEval.maxNewDispatchCap, 0);
+      assert.equal(sessionEval.skipGovernanceReviews, false);
+
+      const dispatchTerra = evaluateTeamRequestWindow(globalRt, teamId, nowMs, {
+        targetRoute: 'codex/gpt-6.1-terra',
+        skipAuditWrite: true,
+      });
+      assert.equal(dispatchTerra.local_estimated_requests_5h, 10);
+      assert.equal(dispatchTerra.tier, 'checkpoint_pause');
+      assert.equal(dispatchTerra.triggerCheckpointPause, true);
+      assert.equal(dispatchTerra.maxNewDispatchCap, 0);
+
+      const dispatchSol = evaluateTeamRequestWindow(globalRt, teamId, nowMs, {
+        targetRoute: 'codex/gpt-6.1-sol',
+        skipAuditWrite: true,
+      });
+      assert.equal(dispatchSol.local_estimated_requests_5h, 10);
+      assert.equal(dispatchSol.tier, 'checkpoint_pause');
+
+      const dispatchZcode = evaluateTeamRequestWindow(globalRt, teamId, nowMs, {
+        targetRoute: 'zcode/GLM-5.3',
+        skipAuditWrite: true,
+      });
+      assert.equal(dispatchZcode.local_estimated_requests_5h, 0);
+      assert.equal(dispatchZcode.tier, 'normal');
+      assert.equal(dispatchZcode.triggerCheckpointPause, false);
+      assert.equal(dispatchZcode.maxNewDispatchCap, null);
+    } finally {
+      globalRt.config = prevCfg;
+      globalRt.storageRoot = prevStorage;
+      globalRt.actors = prevActors;
+      globalRt.stores = prevStores;
+      globalRt.teamConfigViews = prevViews;
+    }
+  } finally {
+    fs.rmSync(tmpStoreRoot, { recursive: true, force: true });
   }
 });

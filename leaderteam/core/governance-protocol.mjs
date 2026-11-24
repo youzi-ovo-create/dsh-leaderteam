@@ -470,12 +470,23 @@ export function replayGovernanceState(events = [], taskSeq = 1) {
       if (inFlightPhase === 'supervising') inFlightPhase = null;
       const key = ev.dedupeKey ?? ev.supervisionId;
       if (key) {
-        const prev = deferredSupervisions.get(key);
-        const opinionA = ev.opinionA ?? prev?.opinionA ?? null;
-        const opinionB = ev.opinionB ?? prev?.opinionB ?? null;
+        let prev = deferredSupervisions.get(key);
+        if (!prev && ev.logicalSlotKey) {
+          for (const [oldKey, oldVal] of deferredSupervisions.entries()) {
+            if (oldVal.logicalSlotKey === ev.logicalSlotKey) {
+              prev = oldVal;
+              deferredSupervisions.delete(oldKey);
+            }
+          }
+        }
+        // Only carry cached partial opinion forward when exact content-hashed `dedupeKey` matches
+        const sameSnapshot = prev?.dedupeKey === key;
+        const opinionA = ev.opinionA ?? (sameSnapshot ? prev?.opinionA : null) ?? null;
+        const opinionB = ev.opinionB ?? (sameSnapshot ? prev?.opinionB : null) ?? null;
         deferredSupervisions.set(key, {
           supervisionId: ev.supervisionId,
           dedupeKey: key,
+          logicalSlotKey: ev.logicalSlotKey ?? prev?.logicalSlotKey ?? null,
           phaseKind: ev.phaseKind ?? prev?.phaseKind ?? 'execution',
           stageId: ev.stageId ?? prev?.stageId ?? null,
           targetLabel: ev.targetLabel ?? ev.stageId ?? prev?.targetLabel ?? 'task',
@@ -486,8 +497,8 @@ export function replayGovernanceState(events = [], taskSeq = 1) {
           hasValidOpinionB: Boolean(opinionB),
           opinionA,
           opinionB,
-          errorA: opinionA ? null : (ev.errorA ?? prev?.errorA ?? 'reviewer_a_unavailable'),
-          errorB: opinionB ? null : (ev.errorB ?? prev?.errorB ?? 'reviewer_b_unavailable'),
+          errorA: opinionA ? null : (ev.errorA ?? (sameSnapshot ? prev?.errorA : null) ?? 'reviewer_a_unavailable'),
+          errorB: opinionB ? null : (ev.errorB ?? (sameSnapshot ? prev?.errorB : null) ?? 'reviewer_b_unavailable'),
           retrySpec: ev.retrySpec ?? prev?.retrySpec ?? null,
           at: ev.at ?? null,
         });
@@ -496,9 +507,16 @@ export function replayGovernanceState(events = [], taskSeq = 1) {
       if (inFlightPhase === 'supervising') inFlightPhase = null;
       completedSupervisionCount++;
       if (ev.dedupeKey) deferredSupervisions.delete(ev.dedupeKey);
-      if (ev.supervisionId) {
-        for (const [k, v] of deferredSupervisions.entries()) {
-          if (v.supervisionId === ev.supervisionId) deferredSupervisions.delete(k);
+      for (const oldKey of ev.supersedesDedupeKeys ?? []) {
+        if (oldKey) deferredSupervisions.delete(oldKey);
+      }
+      const supersededIds = new Set([
+        ...(ev.supervisionId ? [ev.supervisionId] : []),
+        ...(ev.supersedesSupervisionIds ?? []),
+      ]);
+      for (const [k, v] of deferredSupervisions.entries()) {
+        if (supersededIds.has(v.supervisionId) || (ev.logicalSlotKey && v.logicalSlotKey === ev.logicalSlotKey)) {
+          deferredSupervisions.delete(k);
         }
       }
       if (ev.advisoryOnly && (ev.advisoryConcerns?.length || ev.advisorySuggestions?.length)) {

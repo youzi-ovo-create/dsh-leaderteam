@@ -38,7 +38,9 @@ import {
   teamStore,
   syncRuntimeConfig,
   baseRuntime,
+  resolveCanonicalRouteFromHostSelection,
   resolveProviderForRoute,
+  resolveHostProviderForRoute,
   requestWindowCallsPath,
   recordSessionModelRequest,
 } from './runtime.mjs';
@@ -254,8 +256,32 @@ export function evaluateTeamRequestWindow(rt = runtime(), teamId = null, nowMs =
   const targetRoute = typeof options.targetRoute === 'string' && options.targetRoute ? options.targetRoute : null;
   const leaderActor = teamId ? baseRt.actors?.get?.(teamId) : null;
   const liveSelection = !targetRoute ? (leaderActor?.agent?.model?.current?.() ?? null) : null;
-  const effectiveRoute = targetRoute ?? cfg.roles?.leader?.route ?? '';
-  const provider = options.provider ?? liveSelection?.provider ?? resolveProviderForRoute(effectiveRoute, teamCfg);
+  const effectiveRoute = targetRoute
+    ?? (liveSelection?.model
+      ? resolveCanonicalRouteFromHostSelection(teamCfg, liveSelection.provider ?? null, liveSelection.model, cfg.roles?.leader?.route ?? '')
+      : (cfg.roles?.leader?.route ?? ''));
+  const upstreamProvider = resolveProviderForRoute(effectiveRoute, teamCfg);
+  const hostGateway = resolveHostProviderForRoute(effectiveRoute, teamCfg);
+  const configuredWindows = (rwCfg?.windowsByProvider && typeof rwCfg.windowsByProvider === 'object')
+    ? rwCfg.windowsByProvider
+    : null;
+  const matchByHostGateway = !options.provider
+    && Boolean(configuredWindows)
+    && Boolean(hostGateway)
+    && hostGateway !== upstreamProvider
+    && !(upstreamProvider && Object.prototype.hasOwnProperty.call(configuredWindows, upstreamProvider))
+    && Object.prototype.hasOwnProperty.call(configuredWindows, hostGateway);
+  const provider = options.provider ?? (matchByHostGateway ? hostGateway : upstreamProvider);
+
+  const matchesProvider = (recRoute, recProv, recHostProv = null) => {
+    if (!provider) return true;
+    if (matchByHostGateway) {
+      const hp = recHostProv ?? resolveHostProviderForRoute(recRoute, cfg) ?? recProv;
+      return !hp || hp === provider;
+    }
+    const up = recRoute ? resolveProviderForRoute(recRoute, cfg) : recProv;
+    return !up || up === provider;
+  };
 
   const storeForRoot = tid => (baseRt.storageRoot === runtime().storageRoot ? teamStore(tid) : new TeamStore(baseRt.storageRoot, tid));
 
@@ -270,8 +296,7 @@ export function evaluateTeamRequestWindow(rt = runtime(), teamId = null, nowMs =
         try {
           const st = storeForRoot(tid);
           for (const u of st.usageRecords()) {
-            const uProv = u?.provider ?? resolveProviderForRoute(u?.route, cfg);
-            if (provider && uProv && uProv !== provider) continue;
+            if (!matchesProvider(u?.route ?? null, u?.provider ?? null, u?.hostProvider ?? null)) continue;
             const t = typeof u?.at === 'string' ? Date.parse(u.at) : (typeof u?.atMs === 'number' ? u.atMs : NaN);
             if (Number.isFinite(t)) timestampsMs.push(t);
           }
@@ -288,8 +313,7 @@ export function evaluateTeamRequestWindow(rt = runtime(), teamId = null, nowMs =
         if (!line.trim()) continue;
         try {
           const r = JSON.parse(line);
-          const rProv = r?.provider ?? resolveProviderForRoute(r?.route, cfg);
-          if (provider && rProv && rProv !== provider) continue;
+          if (!matchesProvider(r?.route ?? null, r?.provider ?? null, r?.hostProvider ?? null)) continue;
           const t = typeof r?.atMs === 'number' ? r.atMs : (typeof r?.at === 'string' ? Date.parse(r.at) : NaN);
           if (Number.isFinite(t)) timestampsMs.push(t);
         } catch {}

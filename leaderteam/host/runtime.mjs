@@ -182,12 +182,70 @@ export function recordUsage(teamId, rec) {
   catch (e) { runtime().logger?.warn?.(`leaderteam: usage record not written: ${e.message}`); }
 }
 
+/**
+ * Map a live DSH host selection `(hostProvider, hostModel)` back to the canonical LeaderTeam config route
+ * (e.g. `("magpie", "codex/gpt-6.1-terra")` -> `"codex/gpt-6.1-terra"`, `("deepseek", "deepseek-v4-pro")` -> `"deepseek/deepseek-v4-pro"`).
+ */
+export function resolveCanonicalRouteFromHostSelection(cfg, hostProvider, hostModel, fallbackRoute = null) {
+  if (typeof hostModel !== 'string' || !hostModel.trim()) return fallbackRoute;
+  const modelId = hostModel.trim();
+  const provId = typeof hostProvider === 'string' && hostProvider.trim() ? hostProvider.trim() : null;
+  const defaultGw = cfg?.magpie?.provider ?? null;
+  const models = cfg?.models ?? {};
+
+  if (provId) {
+    for (const [routeKey, spec] of Object.entries(models)) {
+      const specHostProv = spec?.provider ?? defaultGw;
+      const specUpstreamModel = spec?.upstreamModel ?? routeKey;
+      if (specHostProv === provId && specUpstreamModel === modelId) {
+        return routeKey;
+      }
+    }
+    if (defaultGw && provId === defaultGw && modelId.includes('/')) {
+      return modelId;
+    }
+    const directCandidate = `${provId}/${modelId}`;
+    if (models[directCandidate] || !modelId.includes('/')) {
+      return directCandidate;
+    }
+    return modelId;
+  }
+
+  if (models[modelId] || modelId.includes('/')) return modelId;
+  return defaultGw ? `${defaultGw}/${modelId}` : (fallbackRoute ?? modelId);
+}
+
+/**
+ * Resolve the logical upstream quota/window provider for a LeaderTeam route:
+ * - Gateway-routed models (`cfg.magpie.provider === "magpie"`, route `"codex/gpt-6.1-terra"`) resolve to `"codex"`,
+ *   even after upstream catalog enrichment populates `spec.provider = "magpie"`.
+ * - Direct non-gateway routes (`spec.provider === "deepseek"`, including disambiguated `"deepseek@direct/..."`)
+ *   resolve to `spec.provider`.
+ */
 export function resolveProviderForRoute(route, cfg) {
-  if (typeof route !== 'string' || !route) return cfg?.magpie?.provider ?? null;
-  const spec = cfg?.models?.[route];
+  const gw = cfg?.magpie?.provider ?? null;
+  if (typeof route !== 'string' || !route) return gw;
+  const normalized = (gw && route.startsWith(`${gw}/`) && route.slice(gw.length + 1).includes('/'))
+    ? route.slice(gw.length + 1)
+    : route;
+  const spec = cfg?.models?.[normalized];
+  if (typeof spec?.provider === 'string' && spec.provider && spec.provider !== gw) {
+    return spec.provider;
+  }
+  if (normalized.includes('/')) return routeProvider(normalized);
   if (typeof spec?.provider === 'string' && spec.provider) return spec.provider;
-  if (route.includes('/')) return routeProvider(route);
-  return cfg?.magpie?.provider ?? null;
+  return gw;
+}
+
+export function resolveHostProviderForRoute(route, cfg) {
+  const gw = cfg?.magpie?.provider ?? null;
+  if (typeof route !== 'string' || !route) return gw;
+  const normalized = (gw && route.startsWith(`${gw}/`) && route.slice(gw.length + 1).includes('/'))
+    ? route.slice(gw.length + 1)
+    : route;
+  const spec = cfg?.models?.[normalized];
+  if (typeof spec?.provider === 'string' && spec.provider) return spec.provider;
+  return gw ?? (normalized.includes('/') ? routeProvider(normalized) : null);
 }
 
 export function requestWindowCallsPath(storageRoot) {
@@ -195,19 +253,39 @@ export function requestWindowCallsPath(storageRoot) {
 }
 
 /** Record one actual session LLM turn/step (`leader`, `member`, or `direct_exec`) for accurate per-provider 5h accounting. */
-export function recordSessionModelRequest(rt = runtime(), { teamId = null, role = 'leader', route = null, provider = null, atMs = Date.now() } = {}) {
+export function recordSessionModelRequest(rt = runtime(), {
+  teamId = null,
+  role = 'leader',
+  route = null,
+  provider = null,
+  hostProvider = null,
+  hostModel = null,
+  atMs = Date.now(),
+} = {}) {
   const baseRt = baseRuntime(rt);
   if (!baseRt?.storageRoot || !baseRt?.config) return;
-  const resolvedProvider = provider ?? resolveProviderForRoute(route, baseRt.config);
+  const cfg = baseRt.config;
+  const canonicalRoute = (hostProvider || hostModel)
+    ? resolveCanonicalRouteFromHostSelection(cfg, hostProvider ?? provider, hostModel, route)
+    : (typeof route === 'string' && route ? route : null);
+  const gw = cfg?.magpie?.provider ?? null;
+  const effectiveRoute = (canonicalRoute && gw && canonicalRoute.startsWith(`${gw}/`) && canonicalRoute.slice(gw.length + 1).includes('/'))
+    ? canonicalRoute.slice(gw.length + 1)
+    : canonicalRoute;
+  const resolvedProvider = effectiveRoute
+    ? resolveProviderForRoute(effectiveRoute, cfg)
+    : (provider ?? resolveProviderForRoute(null, cfg));
   if (!resolvedProvider) return;
+  const resolvedHostProvider = hostProvider ?? resolveHostProviderForRoute(effectiveRoute, cfg) ?? provider ?? null;
   const rec = {
     v: 1,
     at: new Date(atMs).toISOString(),
     atMs,
     teamId,
     role,
-    route: route ?? null,
+    route: effectiveRoute ?? null,
     provider: resolvedProvider,
+    ...(resolvedHostProvider && resolvedHostProvider !== resolvedProvider ? { hostProvider: resolvedHostProvider } : {}),
   };
   try {
     fs.mkdirSync(baseRt.storageRoot, { recursive: true });

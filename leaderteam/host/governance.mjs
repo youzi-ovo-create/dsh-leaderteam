@@ -1278,21 +1278,47 @@ function formatRoleError(res, fallbackCode) {
   return [err.kind, err.code, err.message].filter(Boolean).join(': ') || fallbackCode;
 }
 
+function computeSupervisionLogicalSlotKey({
+  teamId,
+  taskSeq = 1,
+  phaseKind = 'execution',
+  stageId = null,
+  targets = [],
+  parentDisputeId = null,
+  postConferencePacket = null,
+}) {
+  const confKey = postConferencePacket?.conference_id ?? 'initial';
+  if (phaseKind === 'delivery' && !postConferencePacket) {
+    return `${teamId}:${taskSeq}:delivery:${confKey}`;
+  }
+  const slotIdentity = (stageId && !postConferencePacket)
+    ? `stage:${stageId}`
+    : `${phaseKind}:${targets.join(',') || 'task'}:${parentDisputeId ?? 'none'}`;
+  return `${teamId}:${taskSeq}:${phaseKind}:${slotIdentity}:${confKey}`;
+}
+
 function seedSupervisionRuntimeFromStore(base, store, taskSeq) {
   let events;
   try { events = store.governanceEvents(); } catch { return; }
   for (const ev of events) {
     if ((ev.taskSeq ?? 1) !== taskSeq) continue;
-    if (ev.type === 'supervision-completed' && ev.dedupeKey) {
-      base.supervisedDigests.add(ev.dedupeKey);
-      base.partialSupervisionOpinions.delete(ev.dedupeKey);
-    } else if (ev.type === 'supervision-deferred' && ev.dedupeKey && !base.supervisedDigests.has(ev.dedupeKey)) {
-      const prev = base.partialSupervisionOpinions.get(ev.dedupeKey);
-      const opinionA = ev.opinionA ?? prev?.opinionA ?? null;
-      const opinionB = ev.opinionB ?? prev?.opinionB ?? null;
-      if (opinionA || opinionB) {
-        base.partialSupervisionOpinions.set(ev.dedupeKey, { opinionA, opinionB });
+    if (ev.type === 'supervision-completed') {
+      if (ev.dedupeKey) {
+        base.supervisedDigests.add(ev.dedupeKey);
+        base.partialSupervisionOpinions.delete(ev.dedupeKey);
       }
+      for (const oldKey of ev.supersedesDedupeKeys ?? []) {
+        if (oldKey) base.partialSupervisionOpinions.delete(oldKey);
+      }
+    }
+  }
+  const gov = replayGovernanceState(events, taskSeq);
+  for (const pending of gov.pendingSupervisions ?? []) {
+    if (pending.dedupeKey && (pending.opinionA || pending.opinionB)) {
+      base.partialSupervisionOpinions.set(pending.dedupeKey, {
+        opinionA: pending.opinionA ?? null,
+        opinionB: pending.opinionB ?? null,
+      });
     }
   }
 }
@@ -1327,6 +1353,8 @@ export function queueAsyncSupervision({
   userTask = '',
   parentDisputeId = null,
   postConferencePacket = null,
+  supersedesDedupeKeys = [],
+  supersedesSupervisionIds = [],
 }) {
   if (!rt || rt.planningDisposed || !isAutonomousGovernance(rt.config)) return null;
   if (rt.config.plugins?.consensus === false) return null;
@@ -1339,6 +1367,33 @@ export function queueAsyncSupervision({
   seedSupervisionRuntimeFromStore(base, store, taskSeq);
 
   const normTargets = normalizeDisputeTargets(targets);
+  const logicalSlotKey = computeSupervisionLogicalSlotKey({
+    teamId: store.teamId,
+    taskSeq,
+    phaseKind,
+    stageId,
+    targets: normTargets,
+    parentDisputeId,
+    postConferencePacket,
+  });
+  let slotPending = [];
+  try {
+    const curGov = replayGovernanceState(store.governanceEvents(), taskSeq);
+    slotPending = (curGov.pendingSupervisions ?? []).filter(p =>
+      (p.logicalSlotKey && p.logicalSlotKey === logicalSlotKey)
+      || supersedesDedupeKeys.includes(p.dedupeKey)
+      || supersedesSupervisionIds.includes(p.supervisionId),
+    );
+  } catch {}
+  const effectiveSupersedesKeys = [...new Set([
+    ...supersedesDedupeKeys.filter(Boolean),
+    ...slotPending.map(p => p.dedupeKey).filter(Boolean),
+  ])];
+  const effectiveSupersedesIds = [...new Set([
+    ...supersedesSupervisionIds.filter(Boolean),
+    ...slotPending.map(p => p.supervisionId).filter(Boolean),
+  ])];
+
   const targetFileHashes = collectTargetFileHashes(actor.cwd, normTargets, rt.config.paths?.protectedDirs);
   const snapshotDigest = computeActualBehaviorDigest({
     phaseKind,
@@ -1356,7 +1411,7 @@ export function queueAsyncSupervision({
     ? `stage:${stageId}:${stageHash}:${JSON.stringify(targetFileHashes)}`
     : snapshotDigest;
   const dedupeKey = `${store.teamId}:${taskSeq}:${phaseKind}:${dedupeIdentity}:${postConferencePacket?.conference_id ?? 'initial'}`;
-  if (base.supervisedDigests.has(dedupeKey)) {
+  if (base.supervisedDigests.has(dedupeKey) && slotPending.length === 0 && effectiveSupersedesKeys.length === 0) {
     return { queued: false, deduplicated: true, status: 'already_completed', behaviorDigest: snapshotDigest };
   }
   if (base.inFlightSupervisionKeys.has(dedupeKey)) {
@@ -1399,6 +1454,7 @@ export function queueAsyncSupervision({
         taskSeq,
         supervisionId,
         dedupeKey,
+        logicalSlotKey,
         phaseKind,
         stageId,
         targets: normTargets,
@@ -1469,6 +1525,7 @@ export function queueAsyncSupervision({
           taskSeq,
           supervisionId,
           dedupeKey,
+          logicalSlotKey,
           phaseKind,
           stageId,
           targetLabel: stageId ?? (normTargets.join(',') || phaseKind),
@@ -1488,6 +1545,7 @@ export function queueAsyncSupervision({
           completed: false,
           supervisionId,
           dedupeKey,
+          logicalSlotKey,
           missingReviewers: [!opinionA ? 'discussA' : null, !opinionB ? 'discussB' : null].filter(Boolean),
           errorA,
           errorB,
@@ -1496,6 +1554,9 @@ export function queueAsyncSupervision({
 
       base.supervisedDigests.add(dedupeKey);
       base.partialSupervisionOpinions.delete(dedupeKey);
+      for (const oldKey of effectiveSupersedesKeys) {
+        base.partialSupervisionOpinions.delete(oldKey);
+      }
       const stage1 = evaluateStage1Supervision(opinionA, opinionB);
 
       store.appendGovernanceEvent({
@@ -1503,6 +1564,9 @@ export function queueAsyncSupervision({
         taskSeq,
         supervisionId,
         dedupeKey,
+        logicalSlotKey,
+        ...(effectiveSupersedesKeys.length > 0 ? { supersedesDedupeKeys: effectiveSupersedesKeys } : {}),
+        ...(effectiveSupersedesIds.length > 0 ? { supersedesSupervisionIds: effectiveSupersedesIds } : {}),
         phaseKind,
         stageId,
         targetLabel: stageId ?? (normTargets.join(',') || phaseKind),
@@ -1702,14 +1766,28 @@ export function retryDeferredSupervisions({
   leaderAgent,
   leaderModel = null,
   taskSeq = 1,
+  excludePhaseKind = null,
 }) {
   if (!rt || rt.planningDisposed || !isAutonomousGovernance(rt.config)) return [];
   if (rt.config.plugins?.consensus === false || !actor?.cwd) return [];
   const gov = replayGovernanceState(store.governanceEvents(), taskSeq);
   if (!gov.pendingSupervisions?.length) return [];
-  const jobs = [];
+
+  const groupedBySlot = new Map();
   for (const pending of gov.pendingSupervisions) {
     if (!pending.retrySpec) continue;
+    if (excludePhaseKind && pending.phaseKind === excludePhaseKind && !pending.isStage4ReReview) continue;
+    const slotKey = pending.logicalSlotKey ?? pending.dedupeKey ?? pending.supervisionId;
+    const prev = groupedBySlot.get(slotKey);
+    groupedBySlot.set(slotKey, {
+      retrySpec: pending.retrySpec,
+      supersedesDedupeKeys: [...(prev?.supersedesDedupeKeys ?? []), ...(pending.dedupeKey ? [pending.dedupeKey] : [])],
+      supersedesSupervisionIds: [...(prev?.supersedesSupervisionIds ?? []), ...(pending.supervisionId ? [pending.supervisionId] : [])],
+    });
+  }
+
+  const jobs = [];
+  for (const group of groupedBySlot.values()) {
     const job = queueAsyncSupervision({
       ctx,
       rt,
@@ -1718,7 +1796,9 @@ export function retryDeferredSupervisions({
       leaderAgent,
       leaderModel,
       taskSeq,
-      ...pending.retrySpec,
+      ...group.retrySpec,
+      supersedesDedupeKeys: group.supersedesDedupeKeys,
+      supersedesSupervisionIds: group.supersedesSupervisionIds,
     });
     if (job?.promise) jobs.push(job);
   }

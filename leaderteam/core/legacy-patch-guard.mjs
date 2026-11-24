@@ -5,6 +5,24 @@ import path from 'node:path';
 
 export const LEGACY_PATCH_BEGIN = '# >>> leaderteam (managed by scripts/install-desktop.ps1; do not edit inside)';
 export const LEGACY_PATCH_END = '# <<< leaderteam';
+const EMPTY_ARRAY_COMMENT_RE = /^[ \t]*# leaderteam-original-empty-array: ([A-Za-z0-9+/=]+)[ \t]*\r?$/m;
+const EMPTY_ARRAY_COMMENT_LINE_RE = /^[ \t]*# leaderteam-original-empty-array: [A-Za-z0-9+/=]+[ \t]*\r?\n?/gm;
+
+function decodeEmptyArrayMarkerLine(b64) {
+  try {
+    const candidate = Buffer.from(b64, 'base64').toString('utf8').replace(/[\r\n]+$/, '');
+    if (/^[ \t]*\[\](?:[ \t]*#.*)?$/.test(candidate)) return candidate;
+  } catch {}
+  return '[]';
+}
+
+function hasNonCommentYamlContent(text) {
+  for (const rawLine of text.split(/\r?\n/)) {
+    const trimmed = rawLine.trim();
+    if (trimmed.length > 0 && !trimmed.startsWith('#')) return true;
+  }
+  return false;
+}
 
 /** Inspect a single `cordis.patch.yml` text for legacy V2.1 LeaderTeam overrides. Pure. */
 export function inspectPatchTextForLegacyLeaderTeam(patchText, currentBundleRoot = null) {
@@ -59,9 +77,28 @@ export function stripLegacyManagedPatchBlock(patchText) {
   const before = patchText.slice(0, beginIdx).trimEnd();
   const after = patchText.slice(endIdx + LEGACY_PATCH_END.length).replace(/^[\r\n]+/, '').trimEnd();
   const joined = [before, after].filter(Boolean).join('\n');
+  const withoutMarker = joined.replace(EMPTY_ARRAY_COMMENT_LINE_RE, '').trimEnd();
+
+  if (hasNonCommentYamlContent(withoutMarker)) {
+    return {
+      changed: true,
+      text: `${withoutMarker}\n`,
+    };
+  }
+
+  if (EMPTY_ARRAY_COMMENT_RE.test(joined)) {
+    const restored = joined
+      .replace(EMPTY_ARRAY_COMMENT_RE, (_, b64) => decodeEmptyArrayMarkerLine(b64))
+      .trimEnd();
+    return {
+      changed: true,
+      text: `${restored}\n`,
+    };
+  }
+
   return {
     changed: true,
-    text: joined ? `${joined}\n` : '',
+    text: withoutMarker ? `${withoutMarker}\n[]\n` : '[]\n',
   };
 }
 

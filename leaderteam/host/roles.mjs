@@ -2,7 +2,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { runtime, baseRuntime, teamStore, runtimeForTeam, isPluginActive, activePluginsMap, effectiveRuntimeConfig, recordSessionModelRequest } from './runtime.mjs';
+import { runtime, baseRuntime, teamStore, runtimeForTeam, isPluginActive, activePluginsMap, effectiveRuntimeConfig, recordSessionModelRequest, resolveCanonicalRouteFromHostSelection } from './runtime.mjs';
 import { TeamStore } from '../core/store.mjs';
 import { leaderSection, memberSection, directExecSection } from '../core/prompts.mjs';
 import { resolvePath, pathKey } from '../core/paths.mjs';
@@ -822,14 +822,21 @@ export function onSessionEvent(ctx, session, event) {
     if (leader) {
       const src = event.data?.source ?? null;
       const sel = leader.agent?.model?.current?.() ?? null;
-      const route = src?.provider && src?.model
-        ? `${src.provider}/${src.model}`
-        : (sel?.provider && sel?.model ? `${sel.provider}/${sel.model}` : runtimeForTeam(leader.teamId).config?.roles?.leader?.route ?? null);
+      const hostProvider = src?.provider ?? sel?.provider ?? null;
+      const hostModel = src?.model ?? sel?.model ?? null;
+      const teamCfg = runtimeForTeam(leader.teamId).config ?? rt.config;
+      const route = resolveCanonicalRouteFromHostSelection(
+        teamCfg,
+        hostProvider,
+        hostModel,
+        teamCfg?.roles?.leader?.route ?? null,
+      );
       recordSessionModelRequest(rt, {
         teamId: leader.teamId,
         role: 'leader',
         route,
-        provider: src?.provider ?? sel?.provider ?? null,
+        hostProvider,
+        hostModel,
         atMs: typeof event.time === 'number' && Number.isFinite(event.time) ? event.time : Date.now(),
       });
       return;
@@ -841,12 +848,19 @@ export function onSessionEvent(ctx, session, event) {
     if (subActor) {
       const rec = teamStore(subActor.teamId).getMember(subActor.agentId);
       const src = event.data?.source ?? null;
-      const route = src?.provider && src?.model ? `${src.provider}/${src.model}` : (rec?.model ?? null);
+      const teamCfg = runtimeForTeam(subActor.teamId).config ?? rt.config;
+      const route = resolveCanonicalRouteFromHostSelection(
+        teamCfg,
+        src?.provider ?? null,
+        src?.model ?? null,
+        rec?.model ?? null,
+      );
       recordSessionModelRequest(rt, {
         teamId: subActor.teamId,
         role: subActor.role,
         route,
-        provider: src?.provider ?? null,
+        hostProvider: src?.provider ?? null,
+        hostModel: src?.model ?? null,
         atMs: typeof event.time === 'number' && Number.isFinite(event.time) ? event.time : Date.now(),
       });
     }
