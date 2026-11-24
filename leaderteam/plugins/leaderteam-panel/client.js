@@ -236,6 +236,24 @@
         }
       };
 
+      const onTogglePowerMonitor = async (nextVal) => {
+        setLoading(true);
+        setError(null);
+        setNotice(null);
+        try {
+          const res = await postApi(ROUTES.APPLY, {
+            target: saveTarget,
+            changes: { setPowerMonitor: { enabled: nextVal } },
+          });
+          hydrateFromState(res.state);
+          setNotice('电池感知式安全收尾已切换为 ' + (nextVal ? '启用' : '停用') + '。');
+        } catch (e) {
+          setError(e && e.message ? e.message : String(e));
+        } finally {
+          setLoading(false);
+        }
+      };
+
       const onFilterArchive = async (nextCat, nextState) => {
         setCatFilter(nextCat);
         setStateFilter(nextState);
@@ -510,6 +528,21 @@
                 h('button', { style: btnStyle(cfgVal), onClick: () => onTogglePlugin(pm.key, !cfgVal), disabled: loading }, cfgVal ? '已启用（点击拆卸）' : '已停用（点击启用）')
               );
             })
+          ),
+          h('div', { style: cardStyle },
+            h('strong', null, '长跑护栏与隐私安全开关（实时热重载）'),
+            (() => {
+              const pmEnabled = !(data && data.configSnapshot && data.configSnapshot.powerMonitor && data.configSnapshot.powerMonitor.enabled === false);
+              return h(
+                'div',
+                { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '8px 0', marginTop: '6px', borderTop: '1px solid rgba(128,128,128,0.15)', gap: '8px' } },
+                h('div', null,
+                  h('div', { style: { fontWeight: 600, fontSize: '13px' } }, '电池感知式安全收尾 (powerMonitor.enabled)' + (pmEnabled ? ' [已启用]' : ' [已关闭]')),
+                  h('div', { style: { fontSize: '11px', opacity: 0.75 } }, '默认每 12 分钟无窗口静默读取 (onBattery, batteryPct) 两个数值（绝不采集任何硬件序列号；Linux VPS / WSL2 自动静默跳过）。电池供电 <=20% 时单次通知领队落盘检查点；接电恢复绝不擅自重启已暂停工程。')
+                ),
+                h('button', { style: btnStyle(pmEnabled), onClick: () => onTogglePowerMonitor(!pmEnabled), disabled: loading }, pmEnabled ? '已启用（点击关闭）' : '已关闭（点击启用）')
+              );
+            })()
           )
         ) : null,
 

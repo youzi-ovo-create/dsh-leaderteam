@@ -6,5 +6,5 @@ export const inject = ['leaderteamReady'];
 
 export function apply(ctx) {
   const rt = runtime();
-  ctx.effect(() => registerRuntimePlugin('consensus', { version: '2.1.0' }, rt), { label: 'leaderteam-consensus registration' });
+  ctx.effect(() => registerRuntimePlugin('consensus', { version: '2.2.0' }, rt), { label: 'leaderteam-consensus registration' });
 }

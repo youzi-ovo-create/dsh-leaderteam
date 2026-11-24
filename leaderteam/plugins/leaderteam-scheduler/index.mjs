@@ -19,5 +19,5 @@ export function apply(ctx) {
     hostConcurrency.ensureScheduler(rt);
     ctx.effect(() => hostConcurrency.startConcurrencyWatchers(ctx), { label: 'leaderteam-scheduler watchers' });
   }
-  ctx.effect(() => registerRuntimePlugin('scheduler', { version: '2.1.0' }, rt), { label: 'leaderteam-scheduler registration' });
+  ctx.effect(() => registerRuntimePlugin('scheduler', { version: '2.2.0' }, rt), { label: 'leaderteam-scheduler registration' });
 }

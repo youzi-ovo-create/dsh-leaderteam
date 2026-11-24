@@ -19,5 +19,5 @@ export function apply(ctx) {
     const archiveRoot = resolvePlanArchiveRoot({ config: rt.config, storageRoot: rt.storageRoot, workspaceRoot: null });
     rt.planArchiveStore = new PlanArchiveStore(archiveRoot);
   }
-  ctx.effect(() => registerRuntimePlugin('timerArchive', { version: '2.1.0' }, rt), { label: 'leaderteam-timer-archive registration' });
+  ctx.effect(() => registerRuntimePlugin('timerArchive', { version: '2.2.0' }, rt), { label: 'leaderteam-timer-archive registration' });
 }

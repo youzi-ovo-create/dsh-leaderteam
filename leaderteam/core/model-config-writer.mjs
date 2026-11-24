@@ -372,6 +372,8 @@ export function inspectModelConfiguration(options = {}) {
     plugins: structuredClone(effective.plugins),
     timer: structuredClone(effective.timer),
     planArchive: structuredClone(effective.planArchive),
+    powerMonitor: structuredClone(effective.powerMonitor),
+    requestWindow: structuredClone(effective.requestWindow),
     patchSync,
     desktopSync,
   };
@@ -739,6 +741,14 @@ export function applyModelConfigChanges(changes = {}, options = {}) {
     const dest = target === 'base' ? nextBase : nextLocal;
     dest.planArchive = { ...(dest.planArchive ?? {}), ...changes.setPlanArchive };
   }
+  if (isPlainObj(changes.setPowerMonitor)) {
+    const dest = target === 'base' ? nextBase : nextLocal;
+    dest.powerMonitor = { ...(dest.powerMonitor ?? {}), ...changes.setPowerMonitor };
+  }
+  if (isPlainObj(changes.setRequestWindow)) {
+    const dest = target === 'base' ? nextBase : nextLocal;
+    dest.requestWindow = { ...(dest.requestWindow ?? {}), ...changes.setRequestWindow };
+  }
 
   pruneEmptyObjects(nextLocal);
 
@@ -855,6 +865,8 @@ export function applyModelConfigChanges(changes = {}, options = {}) {
       plugins: structuredClone(effective.plugins),
       timer: structuredClone(effective.timer),
       planArchive: structuredClone(effective.planArchive),
+      powerMonitor: structuredClone(effective.powerMonitor),
+      requestWindow: structuredClone(effective.requestWindow),
     },
     desktopSync,
   };
