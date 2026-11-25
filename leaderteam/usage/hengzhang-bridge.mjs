@@ -1,0 +1,371 @@
+/**
+ * Modular, Non-Blocking Hengzhang (`lt-usage-plugin`) Integration Bridge for Leader Team
+ *
+ * Architectural Guarantees (Section 五 & 六):
+ * 1. NEVER enters the critical path of model inference: Magpie usage watermark polling runs
+ *    asynchronously out-of-band with short timeouts and swallows upstream errors.
+ * 2. Fault-isolated & toggleable: If Hengzhang is disabled or encounters any error, LT continues
+ *    operating with zero impact.
+ * 3. Strictly honest accounting (`unknown != 0`): Never fabricates prices, tokens, or upstream
+ *    provider attribution when unavailable.
+ * 4. Read-only on `<DSH_HOME>/sessions`: Custom pricing overrides and watermarks live strictly
+ *    under `<storageRoot>/usage/`.
+ */
+
+import fs from 'node:fs';
+import path from 'node:path';
+import { writeFileAtomic } from '../core/store.mjs';
+import {
+  defaultPricing,
+  pricingCatalog,
+  listSessions,
+  overviewFor,
+  reportFor,
+} from '../../packages/lt-usage/index.mjs';
+import { getOrCreateGatewayManager, normalizeMagpieUsageRow } from '../gateway/index.mjs';
+
+const MAX_CACHED_GATEWAY_RECORDS = 5000;
+
+function readJsonSafe(file, fallback = null) {
+  try {
+    if (!fs.existsSync(file)) return fallback;
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch {
+    return fallback;
+  }
+}
+
+export class HengzhangUsageBridge {
+  constructor({
+    storageRoot,
+    dshHome = null,
+    gatewayManager = null,
+    fetchImpl = globalThis.fetch,
+  }) {
+    if (!storageRoot) throw new Error('HengzhangUsageBridge requires storageRoot');
+    this.storageRoot = path.resolve(storageRoot);
+    this.usageDir = path.join(this.storageRoot, 'usage');
+    this.pricingFile = path.join(this.usageDir, 'custom-pricing.json');
+    this.stateFile = path.join(this.usageDir, 'bridge-state.json');
+    this.explicitDshHome = dshHome ? path.resolve(dshHome) : null;
+    this.gatewayManager = gatewayManager ?? getOrCreateGatewayManager(this.storageRoot, { fetchImpl });
+    this.fetchImpl = fetchImpl;
+
+    this.gatewayRecords = [];
+    this.gatewayRecordIds = new Set();
+    this.nextCursor = 'start';
+    this.syncInFlight = null;
+    this.lastSyncAt = null;
+    this.lastSyncError = null;
+    this.faultInjector = null; // Test-only hook to prove fault isolation
+  }
+
+  resolveDshHome(overrideHome = null) {
+    if (typeof overrideHome === 'string' && overrideHome.trim()) {
+      return path.resolve(overrideHome.trim());
+    }
+    if (this.explicitDshHome) return this.explicitDshHome;
+    if (process.env.DSH_HOME?.trim()) return path.resolve(process.env.DSH_HOME.trim());
+    return path.dirname(this.storageRoot);
+  }
+
+  _loadState() {
+    const raw = readJsonSafe(this.stateFile, null);
+    return {
+      enabled: raw?.enabled !== false,
+    };
+  }
+
+  isEnabled() {
+    return this._loadState().enabled;
+  }
+
+  setEnabled(enabled) {
+    fs.mkdirSync(this.usageDir, { recursive: true });
+    const next = { enabled: Boolean(enabled), updatedAt: new Date().toISOString() };
+    writeFileAtomic(this.stateFile, JSON.stringify(next, null, 2) + '\n');
+    return next;
+  }
+
+  getPricing() {
+    const custom = readJsonSafe(this.pricingFile, null);
+    if (custom && typeof custom === 'object' && custom.routes && typeof custom.routes === 'object') {
+      return {
+        usdToCny: Number.isFinite(Number(custom.usdToCny)) && Number(custom.usdToCny) > 0
+          ? Number(custom.usdToCny)
+          : defaultPricing.usdToCny,
+        routes: { ...defaultPricing.routes, ...custom.routes },
+      };
+    }
+    return structuredClone(defaultPricing);
+  }
+
+  savePricing(nextPricing) {
+    if (!nextPricing || typeof nextPricing !== 'object' || typeof nextPricing.routes !== 'object') {
+      throw new Error('Invalid pricing payload: expected { usdToCny, routes }');
+    }
+    const usdToCny = Number(nextPricing.usdToCny);
+    if (!Number.isFinite(usdToCny) || usdToCny <= 0) {
+      throw new Error('usdToCny must be a positive number');
+    }
+    const sanitizedRoutes = {};
+    for (const [route, entry] of Object.entries(nextPricing.routes)) {
+      if (!entry || typeof entry !== 'object') continue;
+      sanitizedRoutes[route] = entry;
+    }
+    fs.mkdirSync(this.usageDir, { recursive: true });
+    const payload = { usdToCny, routes: sanitizedRoutes };
+    writeFileAtomic(this.pricingFile, JSON.stringify(payload, null, 2) + '\n');
+    return this.getPricing();
+  }
+
+  resetPricing() {
+    if (fs.existsSync(this.pricingFile)) {
+      fs.rmSync(this.pricingFile, { force: true });
+    }
+    return this.getPricing();
+  }
+
+  /**
+   * Fire-and-forget out-of-band sync from Magpie `/v1/magpie/usage/requests?cursor=...`.
+   * NEVER throws, NEVER blocks model calls, and immediately no-ops if Hengzhang is disabled.
+   */
+  triggerBackgroundMagpieSync() {
+    if (!this.isEnabled()) return Promise.resolve({ synced: false, reason: 'disabled' });
+    if (this.syncInFlight) return this.syncInFlight;
+    this.syncInFlight = this._pullMagpieFeedOnce()
+      .catch(err => {
+        this.lastSyncError = err instanceof Error ? err.message : String(err);
+        return { synced: false, error: this.lastSyncError };
+      })
+      .finally(() => {
+        this.syncInFlight = null;
+      });
+    return this.syncInFlight;
+  }
+
+  async _pullMagpieFeedOnce() {
+    const ep = this.gatewayManager?.getActiveEndpoints?.();
+    if (!ep?.gatewayUrl || ep.mode === 'disabled') {
+      return { synced: false, reason: 'gateway-disabled' };
+    }
+    const client = this.gatewayManager.createClient();
+    let rounds = 0;
+    let added = 0;
+    while (rounds < 4) {
+      rounds += 1;
+      const page = await client.fetchUsageFeed({ cursor: this.nextCursor, limit: 500 });
+      for (const rawRow of page.rows) {
+        const norm = normalizeMagpieUsageRow(rawRow);
+        if (!norm || this.gatewayRecordIds.has(norm.gatewayRecordId)) continue;
+        this.gatewayRecordIds.add(norm.gatewayRecordId);
+        this.gatewayRecords.push(norm);
+        added += 1;
+      }
+      if (this.gatewayRecords.length > MAX_CACHED_GATEWAY_RECORDS) {
+        const overflow = this.gatewayRecords.length - MAX_CACHED_GATEWAY_RECORDS;
+        const evicted = this.gatewayRecords.splice(0, overflow);
+        for (const ev of evicted) this.gatewayRecordIds.delete(ev.gatewayRecordId);
+      }
+      this.nextCursor = page.nextCursor || this.nextCursor;
+      if (!page.hasMore || page.rows.length === 0) break;
+    }
+    this.lastSyncAt = new Date().toISOString();
+    this.lastSyncError = null;
+    return { synced: true, added, totalCached: this.gatewayRecords.length };
+  }
+
+  _guardEnabledAndHealthy() {
+    if (!this.isEnabled()) {
+      return { active: false, reason: 'disabled', error: null };
+    }
+    if (typeof this.faultInjector === 'function') {
+      this.faultInjector();
+    }
+    return { active: true, reason: null, error: null };
+  }
+
+  async getStatus({ home = null } = {}) {
+    try {
+      const check = this._guardEnabledAndHealthy();
+      const resolvedHome = this.resolveDshHome(home);
+      return {
+        enabled: check.active,
+        healthy: true,
+        dshHome: resolvedHome,
+        homeExists: fs.existsSync(path.join(resolvedHome, 'sessions')),
+        cachedGatewayRecords: this.gatewayRecords.length,
+        lastSyncAt: this.lastSyncAt,
+        lastSyncError: this.lastSyncError,
+      };
+    } catch (e) {
+      return {
+        enabled: this.isEnabled(),
+        healthy: false,
+        dshHome: null,
+        homeExists: false,
+        cachedGatewayRecords: this.gatewayRecords.length,
+        lastSyncAt: this.lastSyncAt,
+        lastSyncError: e instanceof Error ? e.message : String(e),
+      };
+    }
+  }
+
+  async getOverview({ home = null, syncGateway = true } = {}) {
+    const check = this._guardEnabledAndHealthy();
+    if (!check.active) {
+      return { enabled: false, overview: null };
+    }
+    if (syncGateway) {
+      // Bounded best-effort sync; failures are swallowed inside triggerBackgroundMagpieSync
+      await Promise.race([
+        this.triggerBackgroundMagpieSync(),
+        new Promise(r => setTimeout(r, 1200)),
+      ]);
+    }
+    const resolvedHome = this.resolveDshHome(home);
+    const pricing = this.getPricing();
+    const overview = fs.existsSync(path.join(resolvedHome, 'sessions'))
+      ? overviewFor(resolvedHome, pricing, { gatewayRecords: this.gatewayRecords })
+      : {
+        totals: {
+          callsTotal: 0,
+          callsSucceeded: 0,
+          unmeteredCalls: 0,
+          unpricedCalls: 0,
+          inputTokens: 0,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          outputTokens: 0,
+          totalTokens: 0,
+          cacheHitRatePct: 0,
+          cacheSavingsCny: 0,
+          costPeakCny: { input: 0, cacheRead: 0, cacheWrite: 0, output: 0, total: 0 },
+          costOffPeakCny: { input: 0, cacheRead: 0, cacheWrite: 0, output: 0, total: 0 },
+          costActualCny: { input: 0, cacheRead: 0, cacheWrite: 0, output: 0, total: 0 },
+          costPeakUsd: 0,
+          costOffPeakUsd: 0,
+          costActualUsd: 0,
+        },
+        byModel: [],
+        sessions: [],
+        errors: [],
+      };
+    return { enabled: true, dshHome: resolvedHome, pricing, pricingCatalog, overview };
+  }
+
+  async getSessions({ home = null, syncGateway = false } = {}) {
+    const check = this._guardEnabledAndHealthy();
+    if (!check.active) {
+      return { enabled: false, sessions: [] };
+    }
+    if (syncGateway) {
+      await Promise.race([
+        this.triggerBackgroundMagpieSync(),
+        new Promise(r => setTimeout(r, 1000)),
+      ]);
+    }
+    const resolvedHome = this.resolveDshHome(home);
+    if (!fs.existsSync(path.join(resolvedHome, 'sessions'))) {
+      return { enabled: true, dshHome: resolvedHome, sessions: [] };
+    }
+    const sessions = listSessions(resolvedHome, this.getPricing(), { gatewayRecords: this.gatewayRecords });
+    return { enabled: true, dshHome: resolvedHome, sessions };
+  }
+
+  async getSessionReport({ sessionId, home = null, syncGateway = true } = {}) {
+    const check = this._guardEnabledAndHealthy();
+    if (!check.active) {
+      return { enabled: false, report: null };
+    }
+    if (!sessionId || typeof sessionId !== 'string') {
+      throw new Error('sessionId is required');
+    }
+    if (syncGateway) {
+      await Promise.race([
+        this.triggerBackgroundMagpieSync(),
+        new Promise(r => setTimeout(r, 1200)),
+      ]);
+    }
+    const resolvedHome = this.resolveDshHome(home);
+    const pricing = this.getPricing();
+    const res = reportFor(resolvedHome, sessionId, pricing, { gatewayRecords: this.gatewayRecords });
+    if (!res) return { enabled: true, report: null, signature: null };
+    return {
+      enabled: true,
+      dshHome: resolvedHome,
+      signature: res.signature,
+      report: res.report,
+      publicRecords: toPublicLogicalUsageRecords(res.report, pricing),
+    };
+  }
+}
+
+/**
+ * Convert a Hengzhang `UsageReport` into `lt.public.v1` `LogicalUsageRecord[]`,
+ * strictly enforcing `unknown != 0`, 4-bucket cache identity, and logical vs physical attempts separation.
+ */
+export function toPublicLogicalUsageRecords(report, pricing = defaultPricing) {
+  if (!report || !Array.isArray(report.calls)) return [];
+  const teamId = report.meta?.kind === 'team' ? (report.team?.teamId ?? report.meta?.sessionId ?? null) : null;
+  const usdToCny = Number(pricing?.usdToCny) > 0 ? Number(pricing.usdToCny) : 6.71;
+
+  return report.calls.map(call => {
+    const metered = !call.unmetered;
+    const costKnown = call.costActualCny !== null && call.costActualCny !== undefined;
+    const actualUsd = costKnown ? Number((call.costActualCny / usdToCny).toFixed(6)) : null;
+
+    return {
+      logicalRequestId: `${report.meta?.sessionId ?? 'sess'}:n${call.n}:${call.responseId || call.step}`,
+      timestampMs: call.timeMs ?? 0,
+      status: call.ok ? 'ok' : 'error',
+      requestedRoute: call.route || 'unknown',
+      actualProvider: call.actualProvider || 'unknown',
+      actualModel: call.actualModel || 'unknown',
+      sourceKind: call.responseId ? 'magpie' : (call.group === 'governance' ? 'lt-governance' : 'dsh-session'),
+      physicalAttemptCount: Number.isInteger(call.physicalAttempts) ? call.physicalAttempts : null,
+      latencyMs: Number.isFinite(call.latencyMs) ? call.latencyMs : null,
+      ttftMs: Number.isFinite(call.ttftMs) ? call.ttftMs : null,
+      metered,
+      tokens: {
+        uncachedInputTokens: metered ? call.inputTokens : null,
+        cacheReadTokens: metered ? call.cacheReadTokens : null,
+        cacheWriteTokens: metered ? call.cacheWriteTokens : null,
+        outputTokens: metered ? call.outputTokens : null,
+        reasoningTokens: null,
+        totalTokens: metered ? call.totalTokens : null,
+      },
+      cost: {
+        known: costKnown,
+        currency: costKnown ? 'CNY' : null,
+        actualCny: costKnown ? Number(call.costActualCny.toFixed(6)) : null,
+        peakCny: call.costPeakCny != null ? Number(call.costPeakCny.toFixed(6)) : null,
+        offPeakCny: call.costOffPeakCny != null ? Number(call.costOffPeakCny.toFixed(6)) : null,
+        actualUsd,
+        priceSource: costKnown ? 'catalog' : 'unknown',
+      },
+      attribution: {
+        sessionId: call.sessionId ?? null,
+        teamId,
+        taskSeq: call.taskSeq ?? null,
+        stageId: call.stageId ?? null,
+        group: call.group || 'unknown',
+        role: call.role ?? null,
+        actorName: call.actor ?? null,
+        degraded: Boolean(call.degraded),
+      },
+    };
+  });
+}
+
+const BRIDGE_CACHE = new Map();
+
+export function getOrCreateHengzhangBridge(storageRoot, options = {}) {
+  const key = path.resolve(storageRoot);
+  let bridge = BRIDGE_CACHE.get(key);
+  if (!bridge) {
+    bridge = new HengzhangUsageBridge({ storageRoot: key, ...options });
+    BRIDGE_CACHE.set(key, bridge);
+  }
+  return bridge;
+}
