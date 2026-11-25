@@ -622,10 +622,12 @@ export async function syncUpstreamModelsToDshSettings(ctx, modelsToEnsure = [], 
       : null;
     const reasoningEfforts = realEfforts.length > 0
       ? {
-          ...(hasNoneWithThinking ? { off: 'none' } : {}),
+          ...(hasNoneWithThinking ? { off: explicitWireMap && typeof explicitWireMap.off === 'string' ? explicitWireMap.off : 'none' } : {}),
           ...Object.fromEntries(realEfforts.map(e => [
             e,
-            explicitWireMap && e in explicitWireMap ? explicitWireMap[e] : e,
+            explicitWireMap && typeof explicitWireMap[e] === 'string'
+              ? explicitWireMap[e]
+              : (e === 'off' ? 'none' : e),
           ])),
         }
       : undefined;
@@ -649,10 +651,10 @@ export async function syncUpstreamModelsToDshSettings(ctx, modelsToEnsure = [], 
       let entryChanged = false;
       if (reasoningEfforts) {
         const curEff = (cur.reasoningEfforts && typeof cur.reasoningEfforts === 'object') ? cur.reasoningEfforts : {};
-        const desiredKeys = Object.keys(reasoningEfforts);
-        if (desiredKeys.some(e => !(e in curEff))) {
-          // Preserve existing user/gateway wire values (e.g. `off: "none"`) while adding newly discovered keys
-          cur.reasoningEfforts = { ...reasoningEfforts, ...curEff };
+        const nextEff = { ...reasoningEfforts, ...curEff, ...(explicitWireMap ?? {}) };
+        if (Object.keys(nextEff).some(k => curEff[k] !== nextEff[k])) {
+          // Preserve existing user/gateway wire values while applying newly discovered keys and explicit LT wire overrides
+          cur.reasoningEfforts = nextEff;
           entryChanged = true;
         }
       }

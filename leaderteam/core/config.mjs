@@ -82,7 +82,7 @@ export function validateConfig(raw) {
     const at = `models["${route}"]`;
     if (!MODEL_ROUTE_RE.test(route)) p.push(`${at}: route must look like "<provider>/<model>"`);
     if (!isObj(m)) { p.push(`${at} must be an object`); continue; }
-    onlyKeys(m, ['family', 'label', 'efforts', 'defaultEffort', 'strengths', 'quotaWindows', 'vision', 'provider', 'upstreamModel', 'contextWindow', 'maxTokens'], at);
+    onlyKeys(m, ['family', 'label', 'efforts', 'defaultEffort', 'reasoningEfforts', 'strengths', 'quotaWindows', 'vision', 'provider', 'upstreamModel', 'contextWindow', 'maxTokens'], at);
     if (!FAMILIES.includes(m.family)) p.push(`${at}.family must be one of ${FAMILIES.join(', ')}`);
     str(m.label, `${at}.label`);
     if (strArr(m.efforts, `${at}.efforts`, { nonEmpty: true })) {
@@ -91,6 +91,15 @@ export function validateConfig(raw) {
         else if (!DSH_EFFORTS.includes(eff)) p.push(`${at}.efforts entry "${eff}" is unsupported by DSH; use one of ${DSH_EFFORTS.join(', ')}`);
       }
       if (!m.efforts.includes(m.defaultEffort)) p.push(`${at}.defaultEffort must be one of its efforts`);
+    }
+    if (m.reasoningEfforts !== undefined) {
+      if (!isObj(m.reasoningEfforts)) p.push(`${at}.reasoningEfforts must be an object`);
+      else {
+        for (const [ek, ev] of Object.entries(m.reasoningEfforts)) {
+          if (!DSH_EFFORTS.includes(ek) || ek === 'none') p.push(`${at}.reasoningEfforts key "${ek}" must be a DSH thinking or "off" effort`);
+          str(ev, `${at}.reasoningEfforts["${ek}"]`);
+        }
+      }
     }
     if (m.strengths !== undefined) str(m.strengths, `${at}.strengths`);
     if (m.quotaWindows !== undefined) strArr(m.quotaWindows, `${at}.quotaWindows`, { nonEmpty: true });

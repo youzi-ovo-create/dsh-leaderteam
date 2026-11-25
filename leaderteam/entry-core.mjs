@@ -193,6 +193,7 @@ export function apply(ctx, config) {
       provider: spec.provider ?? defaultProvider,
       upstreamModel: spec.upstreamModel ?? route,
       efforts: spec.efforts,
+      ...(spec.reasoningEfforts ? { reasoningEfforts: spec.reasoningEfforts } : {}),
       vision: spec.vision,
       contextWindow: spec.contextWindow,
       maxTokens: spec.maxTokens,

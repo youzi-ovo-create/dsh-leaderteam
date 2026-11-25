@@ -4,8 +4,10 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { registerHooks } from 'node:module';
+import { fileURLToPath } from 'node:url';
 
 import { ElasticConcurrencyScheduler } from '../../leaderteam/core/scheduler.mjs';
+import { validateConfig, loadRawConfig } from '../../leaderteam/core/config.mjs';
 import { renderMagpieModelRows, parseMagpiePatchModels } from '../../leaderteam/core/model-config-writer.mjs';
 import { syncUpstreamModelsToDshSettings } from '../../leaderteam/core/upstream-models.mjs';
 import { TeamStore } from '../../leaderteam/core/store.mjs';
@@ -261,4 +263,89 @@ test('V2.2.1 [3]: explicit off->none wire mapping, preservation of existing sett
     high: 'high',
     max: 'max',
   });
+
+  // 4. [F06] Brand-new DSH settings entry with logical `efforts: ['off', 'high']` maps `off -> "none"` identically to YAML,
+  //    explicit `models[route].reasoningEfforts` passes config validation, and chat-only `['none']` omits reasoningEfforts
+  let freshData = { providers: { magpie: { models: [] } } };
+  const freshCtx = {
+    get: name => (name === 'settings' ? {
+      describe: () => ({ namespaces: [{ ns: 'llm-pi-ai', data: freshData }] }),
+      update: async (_ns, next) => { freshData = next; },
+    } : null),
+  };
+  await syncUpstreamModelsToDshSettings(freshCtx, [
+    { route: 'codex/gpt-6.1-sol', provider: 'magpie', efforts: ['off', 'high'], vision: false },
+    { route: 'custom/wire', provider: 'magpie', efforts: ['off', 'max'], reasoningEfforts: { off: 'disabled', max: 'ultra' }, vision: false },
+    { route: 'plain/chat', provider: 'magpie', efforts: ['none'], vision: false },
+  ], 'magpie');
+  assert.deepEqual(freshData.providers.magpie.models[0].reasoningEfforts, { off: 'none', high: 'high' });
+  assert.deepEqual(freshData.providers.magpie.models[1].reasoningEfforts, { off: 'disabled', max: 'ultra' });
+  assert.equal(freshData.providers.magpie.models[2].reasoningEfforts, undefined);
+
+  const rawExplicit = loadRawConfig(fileURLToPath(new URL('../../config/leaderteam.config.json', import.meta.url)), { includeLocal: false });
+  rawExplicit.models['codex/gpt-6.1-sol'].reasoningEfforts = { off: 'none', high: 'high' };
+  const validatedExplicit = validateConfig(rawExplicit);
+  assert.deepEqual(validatedExplicit.models['codex/gpt-6.1-sol'].reasoningEfforts, { off: 'none', high: 'high' });
+});
+
+test('V2.2.1 [F07 & F08]: multi-team hysteresis recovery never double-counts one sample, and passive CPU sampler honors configured sampleIntervalMs', () => {
+  // 1. [F07] Evaluating multiple teams at the same sample timestamp increments cleanSamples only once
+  let now = 10_000;
+  let cpu = 95;
+  const sample = () => ({
+    sampledAtMs: now,
+    logicalCores: 8,
+    cpuBusyPct: cpu,
+    cpuSmoothedPct: cpu,
+    totalPhysMib: 16384,
+    availPhysMib: 12000,
+    totalCommitMib: null,
+    availCommitMib: null,
+    commitUsedPct: null,
+  });
+  const baseCfg = configWith({ scheduler: { hysteresisRecoverSamples: 2, hysteresisCooldownMs: 4000 } });
+  const sched = new ElasticConcurrencyScheduler(baseCfg, { now: () => now, sampler: { sample } });
+  sched.teamState('team-a', 1);
+  sched.teamState('team-b', 1);
+  sched.evaluate({ teamId: 'team-a', taskSeq: 1 });
+  assert.equal(sched.hysteresis.mode, 'throttled');
+
+  now += sched.cfg.hysteresisCooldownMs + 1;
+  cpu = 10;
+  sched.prepareScaleUpNotice({ teamId: 'team-a', taskSeq: 1 });
+  assert.equal(sched.hysteresis.mode, 'throttled');
+  assert.equal(sched.hysteresis.cleanSamples, 1);
+
+  // Team B evaluated on the exact same sample (and even +5ms within the same timer sweep) must NOT advance cleanSamples to 2!
+  sched.prepareScaleUpNotice({ teamId: 'team-b', taskSeq: 1 });
+  assert.equal(sched.hysteresis.mode, 'throttled');
+  assert.equal(sched.hysteresis.cleanSamples, 1);
+
+  // Second genuinely distinct healthy sample (>= 200ms later) completes recovery to `normal`
+  now += 1000;
+  sched.prepareScaleUpNotice({ teamId: 'team-a', taskSeq: 1 });
+  assert.equal(sched.hysteresis.mode, 'normal');
+
+  // 2. [F08] Normal constructor wires `this.cfg.sampleIntervalMs` into `createDeviceSampler` passive window (500ms, 2000ms, 20000ms)
+  const originalCpus = os.cpus;
+  try {
+    const checkPassive = (sampleIntervalMs, elapsedMs) => {
+      let tick = 0;
+      os.cpus = () => [{ model: 'test', speed: 3000, times: { user: tick, idle: 0, nice: 0, sys: 0, irq: 0 } }];
+      const sc = new ElasticConcurrencyScheduler(configWith({ scheduler: { sampleIntervalMs } }), { now: () => tick });
+      tick = elapsedMs;
+      const passiveBusy = sc.sampler.sample().cpuBusyPct;
+      const forcedBusy = sc.sampler.sample({ force: true }).cpuBusyPct;
+      return { passiveBusy, forcedBusy };
+    };
+    // 20,000ms interval -> passive window 10,000ms: 1,100ms elapsed holds 0%, while forced sample (>=200ms) reads 100%
+    assert.deepEqual(checkPassive(20000, 1100), { passiveBusy: 0, forcedBusy: 100 });
+    // 2,000ms interval -> passive window 1,000ms: 900ms holds 0%, 1,050ms reads 100%
+    assert.equal(checkPassive(2000, 900).passiveBusy, 0);
+    assert.equal(checkPassive(2000, 1050).passiveBusy, 100);
+    // 500ms interval -> passive window 250ms: 300ms elapsed reads 100%
+    assert.equal(checkPassive(500, 300).passiveBusy, 100);
+  } finally {
+    os.cpus = originalCpus;
+  }
 });

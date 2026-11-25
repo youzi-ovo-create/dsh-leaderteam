@@ -938,7 +938,7 @@ export class ElasticConcurrencyScheduler {
       },
     };
     this.now = options.now ?? (() => Date.now());
-    this.sampler = options.sampler ?? createDeviceSampler({ ...options, now: this.now, probe: options.deviceProbe });
+    this.sampler = options.sampler ?? createDeviceSampler({ sampleIntervalMs: this.cfg.sampleIntervalMs, ...options, now: this.now, probe: options.deviceProbe });
 
     this.baseUserMax = clampCap(config?.team?.maxActiveMembers ?? 8);
     this.userOverride = null; // global override: { maxActiveMembers, source, updatedAtMs }
@@ -1545,7 +1545,10 @@ export class ElasticConcurrencyScheduler {
         rateLimits === 0 &&
         this.inFlightGateReviews <= this.cfg.gateQueueRecoverWater;
 
-      if (advanceSample || ts - this.hysteresis.lastSampleEvaluatedAtMs >= Math.max(250, Math.floor(this.cfg.sampleIntervalMs / 2))) {
+      const sampleStamp = Number.isFinite(dev.sampledAtMs) ? dev.sampledAtMs : ts;
+      const minSampleStepMs = Math.max(250, Math.floor(this.cfg.sampleIntervalMs / 2));
+      const minRequiredStepMs = advanceSample ? 200 : minSampleStepMs;
+      if (sampleStamp > this.hysteresis.lastSampleEvaluatedAtMs && ts - this.hysteresis.lastSampleEvaluatedAtMs >= minRequiredStepMs) {
         this.hysteresis.lastSampleEvaluatedAtMs = ts;
         if (recoveryMet) this.hysteresis.cleanSamples += 1;
         else this.hysteresis.cleanSamples = 0;
