@@ -1,8 +1,9 @@
 // Ported from dsh-auto-review v0.15.0 src/review.ts (Apache-2.0); see ../NOTICE. Pure.
 export const REDACTED = '[REDACTED]';
 const INLINE_SECRET_KEY = '(?:api[_-]?key|token|secret|password|passwd|pwd|authorization|credential|private[_-]?key|access[_-]?key)';
-const INLINE_SECRET_ASSIGN = new RegExp(`((?:["'])?${INLINE_SECRET_KEY}(?:["'])?\\s*[:=]\\s*)(["']?)((?:(?:Bearer|Basic)\\s+)?)([^\\s"';&|,)}\\]\\[]+)`, 'giu');
-const INLINE_SECRET_FLAG = new RegExp(`(--?${INLINE_SECRET_KEY}\\s+)(["']?)([^\\s"';&|,)]+)`, 'giu');
+const URL_USERINFO_SECRET_RE = /\b([a-z][a-z0-9+.-]*:\/\/[^/\s:@"'\\]+:)(?!\[REDACTED\]@)((?:(?!\\+["'])[^@/?#\s"'])+)@/giu;
+const INLINE_SECRET_ASSIGN = new RegExp(`((?:\\\\*["'])?${INLINE_SECRET_KEY}(?:\\\\*["'])?\\s*[:=]\\s*)((?:\\\\*["'])?)((?:(?:Bearer|Basic)\\s+)?)(?!\\[REDACTED\\]|\\{)((?:(?!\\\\+["'])[^\\s"';&|,)}\\]\\[])+)`, 'giu');
+const INLINE_SECRET_FLAG = new RegExp(`(--?${INLINE_SECRET_KEY}\\s+)((?:\\\\*["'])?)(?!\\[REDACTED\\])((?:(?!\\\\+["'])[^\\s"';&|,)])+)`, 'giu');
 const STANDALONE_BEARER_RE = /\b(Bearer)\s+(?!\[REDACTED\b|tokens?\b|headers?\b|auth(?:entication|orization)?\b|scheme\b)([A-Za-z0-9._~+/=-]{6,})/giu;
 const STANDALONE_BASIC_RE = /\b(Basic)\s+(?!\[REDACTED\b)(?=[A-Za-z0-9+/=]*(?:[0-9+/=]|[A-Z].*[A-Z]))([A-Za-z0-9+/=]{6,})/gu;
 const STANDALONE_KEY_PREFIX_RE = /\b(?:(?:sk|ak|pk|rk)-[A-Za-z0-9_-]{8,}|(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{12,}|github_pat_[A-Za-z0-9_]{16,}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})\b/gu;
@@ -45,6 +46,7 @@ function isSensitiveKey(key) {
 
 export function redactInlineSecrets(text) {
   return text
+    .replace(URL_USERINFO_SECRET_RE, (_m, prefix) => `${prefix}${REDACTED}@`)
     .replace(INLINE_SECRET_ASSIGN, (_m, head, quote, scheme) => head + quote + scheme + REDACTED)
     .replace(INLINE_SECRET_FLAG, (_m, head, quote) => head + quote + REDACTED)
     .replace(STANDALONE_BEARER_RE, (_m, scheme) => `${scheme} ${REDACTED}`)
@@ -53,13 +55,16 @@ export function redactInlineSecrets(text) {
 }
 /**
  * The inline values redactInlineSecrets would hide in `text`, in order. Pure.
- * Each: { form: 'assign' | 'flag', separator: '=' | ':' | ' ', quoted: boolean, value: string }.
+ * Each: { form: 'assign' | 'flag' | 'url_userinfo', separator: '=' | ':' | ' ', quoted: boolean, value: string }.
  * `quoted` is true only when a quote directly follows the separator (the value is a string literal).
  */
 export function inlineSecretMatches(text) {
+  const raw = String(text);
   const out = [];
-  for (const m of String(text).matchAll(INLINE_SECRET_ASSIGN)) out.push({ form: 'assign', separator: m[1].includes('=') ? '=' : ':', quoted: m[2] !== '', value: m[4] });
-  for (const m of String(text).matchAll(INLINE_SECRET_FLAG)) out.push({ form: 'flag', separator: ' ', quoted: m[2] !== '', value: m[3] });
+  for (const m of raw.matchAll(URL_USERINFO_SECRET_RE)) out.push({ form: 'url_userinfo', separator: ':', quoted: false, value: m[2] });
+  const afterUrl = raw.replace(URL_USERINFO_SECRET_RE, (_m, prefix) => `${prefix}${REDACTED}@`);
+  for (const m of afterUrl.matchAll(INLINE_SECRET_ASSIGN)) out.push({ form: 'assign', separator: m[1].includes('=') ? '=' : ':', quoted: m[2] !== '', value: m[4] });
+  for (const m of afterUrl.matchAll(INLINE_SECRET_FLAG)) out.push({ form: 'flag', separator: ' ', quoted: m[2] !== '', value: m[3] });
   return out;
 }
 export function sanitizeArguments(value) {

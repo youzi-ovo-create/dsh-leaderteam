@@ -77,14 +77,27 @@ function decodeZstdSessionLog(buf) {
 export function summarizeTeamUsage(sessions, governance, cfg = null) {
   const receipts = [];
   for (const s of sessions) {
-    const seen = new Set(); let route = null;
+    const seen = new Map();
+    let route = null;
     for (const row of s.rows) {
       route = row.data?.header?.config?.model ?? (row.type === 'model/selection' ? row.data?.model : null) ?? route;
       if (!nativeResponse(row) || row.surfaceOp === 'seed') continue;
       const key = nativeRowKey(row);
-      if (seen.has(key)) continue; seen.add(key);
       const resolvedRoute = extractNativeRowRoute(row, route, cfg) ?? 'unknown';
-      receipts.push({ group:s.group, session:s.id, member:s.name, route:resolvedRoute, usage:row.data.usage });
+      if (seen.has(key)) {
+        const prevIdx = seen.get(key);
+        const prev = receipts[prevIdx];
+        if (prev && !measured(prev.usage) && (measured(row.data?.usage) || (!prev.usage && row.data?.usage))) {
+          receipts[prevIdx] = {
+            ...prev,
+            route: resolvedRoute !== 'unknown' ? resolvedRoute : prev.route,
+            usage: row.data.usage,
+          };
+        }
+        continue;
+      }
+      seen.set(key, receipts.length);
+      receipts.push({ group: s.group, session: s.id, member: s.name, route: resolvedRoute, usage: row.data?.usage });
     }
   }
   receipts.push(...governance.map(r => ({...r, group:'governance'})));
@@ -147,12 +160,19 @@ function durableRows(home,id) {
 
 function dedupedNativeRows(rows) {
   const out = [];
-  const seen = new Set();
+  const seen = new Map();
   for (const r of rows) {
     if (!nativeResponse(r) || r.surfaceOp === 'seed') continue;
     const k = nativeRowKey(r);
-    if (seen.has(k)) continue;
-    seen.add(k);
+    if (seen.has(k)) {
+      const prevIdx = seen.get(k);
+      const prev = out[prevIdx];
+      if (prev && !measured(prev.data?.usage) && (measured(r.data?.usage) || (!prev.data?.usage && r.data?.usage))) {
+        out[prevIdx] = r;
+      }
+      continue;
+    }
+    seen.set(k, out.length);
     out.push(r);
   }
   return out;
@@ -168,20 +188,65 @@ export function teamObservability(ctx,rt,teamId) {
   try { home??=ctx?.get?.('profileContext')?.home; } catch {}
   home??=path.dirname(rt.storageRoot);
   const members=[...store.members().values()];
-  const sessions=[{id:teamId,name:'leader',group:'leader'},...members.map(m=>({id:m.childId,name:m.name,group:'execution'}))].map(s=>{
+  const sessions=[
+    {id:teamId,name:'leader',group:'leader',actorRole:'leader',configuredModel:null},
+    ...members.map(m=>({id:m.childId,name:m.name,group:'execution',actorRole:m.actorRole??'member',configuredModel:m.model??null})),
+  ].map(s=>{
     let rows=rt.actors.get(s.id)?.agent?.session?.snapshotEvents?.();
     if (!rows?.some(nativeResponse)) rows=durableRows(home,s.id);
     return {...s,rows:rows??[],available:rows!==null&&rows!==undefined};
   });
+  const extractSessionFallbackRoute = sess => {
+    let fallback = sess.configuredModel ?? null;
+    for (const r of sess.rows) {
+      fallback = r.data?.header?.config?.model ?? (r.type === 'model/selection' ? r.data?.model : null) ?? fallback;
+    }
+    return fallback;
+  };
+  const leaderFallbackRoute = extractSessionFallbackRoute(sessions[0]);
   const leaderRows=dedupedNativeRows(sessions[0].rows);
+  const directSessions=sessions.filter(s=>s.actorRole==='direct_exec');
+  const directNativeEntries=directSessions.flatMap(ds=>{
+    const fb=extractSessionFallbackRoute(ds);
+    return dedupedNativeRows(ds.rows).map(r=>({row:r,route:extractNativeRowRoute(r,fb,cfg)}));
+  });
   return { teamId,governanceSha256:snapshot?.sourceSha256??null,
     roles:Object.entries(cfg.roles).map(([role,value])=>{
       const actual=governance.filter(r=>r.role===role);
-      const requestRoutes=role==='leader'?[...new Set(sessions[0].rows.filter(r=>r.type==='request/header').map(r=>r.data?.header?.config?.model).filter(Boolean))]:[];
-      return {role,configured:value,actualRoutes:role==='leader'?[...new Set(leaderRows.map(r=>extractNativeRowRoute(r,null,cfg)).filter(Boolean))]:[...new Set(actual.map(r=>r.route))],
-        requestRoutes,requested:requestRoutes.length>0,
-        calls:role==='leader'?leaderRows.length:actual.length,called:role==='leader'?leaderRows.length>0:actual.length>0,
-        degraded:actual.some(r=>r.degraded),missingUsage:role==='leader'?leaderRows.filter(r=>!measured(r.data.usage)).length:actual.filter(r=>!measured(r.usage)).length,tokens:role==='leader'?sum(leaderRows.map(r=>({usage:r.data.usage}))):sum(actual)};
+      if (role==='leader') {
+        const requestRoutes=[...new Set(sessions[0].rows.filter(r=>r.type==='request/header').map(r=>r.data?.header?.config?.model).filter(Boolean))];
+        return {role,configured:value,
+          actualRoutes:[...new Set(leaderRows.map(r=>extractNativeRowRoute(r,leaderFallbackRoute,cfg)).filter(Boolean))],
+          requestRoutes,requested:requestRoutes.length>0,
+          calls:leaderRows.length,called:leaderRows.length>0,
+          degraded:actual.some(r=>r.degraded),
+          missingUsage:leaderRows.filter(r=>!measured(r.data?.usage)).length,
+          tokens:sum(leaderRows.map(r=>({usage:r.data?.usage})))};
+      }
+      if (role==='directExec') {
+        const requestRoutes=[...new Set(directSessions.flatMap(ds=>ds.rows.filter(r=>r.type==='request/header').map(r=>r.data?.header?.config?.model).filter(Boolean)))];
+        const combinedRoutes=[...new Set([
+          ...directNativeEntries.map(e=>e.route).filter(Boolean),
+          ...actual.map(r=>r.route).filter(Boolean),
+        ])];
+        const totalCalls=directNativeEntries.length+actual.length;
+        const missingCount=directNativeEntries.filter(e=>!measured(e.row.data?.usage)).length+actual.filter(r=>!measured(r.usage)).length;
+        const combinedUsage=[...directNativeEntries.map(e=>({usage:e.row.data?.usage})),...actual];
+        return {role,configured:value,
+          actualRoutes:combinedRoutes,
+          requestRoutes,requested:requestRoutes.length>0,
+          calls:totalCalls,called:totalCalls>0,
+          degraded:actual.some(r=>r.degraded),
+          missingUsage:missingCount,
+          tokens:sum(combinedUsage)};
+      }
+      return {role,configured:value,
+        actualRoutes:[...new Set(actual.map(r=>r.route))],
+        requestRoutes:[],requested:false,
+        calls:actual.length,called:actual.length>0,
+        degraded:actual.some(r=>r.degraded),
+        missingUsage:actual.filter(r=>!measured(r.usage)).length,
+        tokens:sum(actual)};
     }), members:members.map(m=>({id:m.childId,name:m.name,configuredModel:m.model,effort:m.effort,status:m.status})),usage:summarizeTeamUsage(sessions,governance,cfg) };
 }
 

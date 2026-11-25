@@ -9,6 +9,7 @@ import zlib from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 import { safeId } from '../leaderteam/core/store.mjs';
 import { deepMergePlain } from '../leaderteam/core/config.mjs';
+import { isInside } from '../leaderteam/core/paths.mjs';
 import { checkDshHostCompatibility } from './lt-doctor.mjs';
 
 const THIS_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -43,11 +44,16 @@ export function redactDiagnosticText(input, options = {}) {
 
   // 1. URLs (strip custom internal endpoints, userinfo, query tokens)
   text = text.replace(/\bhttps?:\/\/[^\s"'`<>|)\],;]+/gi, '<REDACTED_URL>');
+  text = text.replace(/\b([a-z][a-z0-9+.-]*:\/\/[^/\s:@"'\\]+:)(?!\[REDACTED)((?:(?!\\+["'])[^@/?#\s"'])+)@/gi, '$1[REDACTED]@');
 
-  // 2. Bearer / Basic auth headers, JSON-serialized secrets, & inline key=value secrets
+  // 2. Bearer / Basic auth headers, JSON-serialized secrets (including escaped quotes), CLI flags, & inline key=value secrets
   text = text.replace(/\b(Bearer|Basic)\s+(?!\[REDACTED)[A-Za-z0-9._~+/=-]{4,}/gi, '$1 [REDACTED_TOKEN]');
   text = text.replace(
-    /((?:["'])?(?:api[_-]?key|token|secret|password|passwd|pwd|authorization|credential|private[_-]?key|access[_-]?key)(?:["'])?\s*[:=]\s*["']?(?:(?:Bearer|Basic)\s+)?)([^\s"';&|,)\]}[]+)/gi,
+    /((?:\\*["'])?(?:api[_-]?key|token|secret|password|passwd|pwd|authorization|credential|private[_-]?key|access[_-]?key)(?:\\*["'])?\s*[:=]\s*(?:\\*["'])?(?:(?:Bearer|Basic)\s+)?)(?!\[REDACTED|\{)((?:(?!\\+["'])[^\s"';&|,)\]}[])+)/gi,
+    '$1[REDACTED]',
+  );
+  text = text.replace(
+    /(--?(?:api[_-]?key|token|secret|password|passwd|pwd|authorization|credential|private[_-]?key|access[_-]?key)\s+(?:\\*["'])?)(?!\[REDACTED)((?:(?!\\+["'])[^\s"';&|,)])+)/gi,
     '$1[REDACTED]',
   );
 
@@ -359,11 +365,15 @@ function encodeDshSegment(raw) {
   return out;
 }
 
+const MAX_NATIVE_SESSION_FILE_BYTES = 64 * 1024 * 1024;
+const MAX_NATIVE_SESSION_OUTPUT_BYTES = 256 * 1024 * 1024;
+const NATIVE_SESSION_FILENAMES = Object.freeze(['session.v4.jsonl.zstd', 'session.v4.jsonl']);
+
 function decodeZstdSessionBuffer(buf) {
   if (!buf || buf.length === 0) return '';
   const rawBuf = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
   try {
-    return zlib.zstdDecompressSync(rawBuf).toString('utf8');
+    return zlib.zstdDecompressSync(rawBuf, { maxOutputLength: MAX_NATIVE_SESSION_OUTPUT_BYTES }).toString('utf8');
   } catch {}
   const starts = [];
   for (let i = 0; i + 3 < rawBuf.length; i++) {
@@ -372,12 +382,17 @@ function decodeZstdSessionBuffer(buf) {
     }
   }
   const parts = [];
+  let totalDecoded = 0;
   let n = 0;
-  while (n < starts.length) {
+  while (n < starts.length && totalDecoded < MAX_NATIVE_SESSION_OUTPUT_BYTES) {
     let found = false;
     for (let end = n + 1; end <= starts.length; end++) {
       try {
-        parts.push(zlib.zstdDecompressSync(rawBuf.subarray(starts[n], starts[end] ?? rawBuf.length)));
+        const chunk = zlib.zstdDecompressSync(rawBuf.subarray(starts[n], starts[end] ?? rawBuf.length), {
+          maxOutputLength: MAX_NATIVE_SESSION_OUTPUT_BYTES - totalDecoded,
+        });
+        parts.push(chunk);
+        totalDecoded += chunk.length;
         n = end;
         found = true;
         break;
@@ -388,27 +403,53 @@ function decodeZstdSessionBuffer(buf) {
   return parts.length > 0 ? Buffer.concat(parts).toString('utf8') : '';
 }
 
+function isSafeContainedSessionFile(file, root, fsImpl) {
+  const absRoot = path.resolve(root);
+  const absFile = path.resolve(file);
+  if (!isInside(absFile, absRoot)) return false;
+  try {
+    const lst = typeof fsImpl.lstatSync === 'function' ? fsImpl.lstatSync(absFile) : fsImpl.statSync(absFile);
+    if ((typeof lst.isSymbolicLink === 'function' && lst.isSymbolicLink()) || !lst.isFile()) return false;
+    if (!Number.isFinite(lst.size) || lst.size < 0 || lst.size > MAX_NATIVE_SESSION_FILE_BYTES) return false;
+    if (typeof fsImpl.realpathSync === 'function') {
+      const realRoot = fsImpl.realpathSync(absRoot);
+      const realFile = fsImpl.realpathSync(absFile);
+      if (!isInside(realFile, realRoot)) return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function findNativeSessionZstdFile(sessionsRoots, sessionId, fsImpl) {
-  const segs = [...new Set([sessionId, encodeDshSegment(sessionId)])];
+  const rawId = String(sessionId ?? '');
+  if (!rawId) return null;
+  const isSafeRawSeg = /^[A-Za-z0-9._-]+$/.test(rawId) && rawId !== '.' && rawId !== '..';
+  const segs = [...new Set([
+    ...(isSafeRawSeg ? [rawId] : []),
+    encodeDshSegment(rawId),
+  ])];
   for (const root of sessionsRoots) {
     for (const seg of segs) {
-      const flat = path.join(root, seg, 'session.v4.jsonl.zstd');
-      try {
-        if (fsImpl.existsSync(flat) && fsImpl.statSync(flat).isFile()) return flat;
-      } catch {}
+      for (const fileName of NATIVE_SESSION_FILENAMES) {
+        const flat = path.join(root, seg, fileName);
+        if (isSafeContainedSessionFile(flat, root, fsImpl)) return flat;
+      }
     }
     let buckets;
     try {
-      buckets = fsImpl.readdirSync(root, { withFileTypes: true }).filter(d => d.isDirectory());
+      buckets = fsImpl.readdirSync(root, { withFileTypes: true }).filter(d => d.isDirectory() && !(typeof d.isSymbolicLink === 'function' && d.isSymbolicLink()));
     } catch {
       continue;
     }
     for (const b of buckets) {
+      if (!/^[A-Za-z0-9.~_-]+$/.test(b.name) || b.name === '.' || b.name === '..') continue;
       for (const seg of segs) {
-        const nested = path.join(root, b.name, seg, 'session.v4.jsonl.zstd');
-        try {
-          if (fsImpl.existsSync(nested) && fsImpl.statSync(nested).isFile()) return nested;
-        } catch {}
+        for (const fileName of NATIVE_SESSION_FILENAMES) {
+          const nested = path.join(root, b.name, seg, fileName);
+          if (isSafeContainedSessionFile(nested, root, fsImpl)) return nested;
+        }
       }
     }
   }
@@ -416,7 +457,7 @@ function findNativeSessionZstdFile(sessionsRoots, sessionId, fsImpl) {
 }
 
 /**
- * Fold physical 4-bucket token totals from native DSH `session.v4.jsonl.zstd` logs (`leader`, `member`, `directExec`),
+ * Fold physical 4-bucket token totals from native DSH `session.v4.jsonl.zstd` / `session.v4.jsonl` logs (`leader`, `member`, `directExec`),
  * deduplicated by `message.id` / `compactionId`. Emits numeric counts ONLY — zero message text, model URLs, or paths.
  */
 function foldNativeSessionUsage({ dshHome, storageRoot, sessionRoleMap, usageByRole, usageTotal, fsImpl }) {
@@ -434,12 +475,23 @@ function foldNativeSessionUsage({ dshHome, storageRoot, sessionRoleMap, usageByR
     if (!file) continue;
     let text;
     try {
-      text = decodeZstdSessionBuffer(fsImpl.readFileSync(file));
+      const lst = typeof fsImpl.lstatSync === 'function' ? fsImpl.lstatSync(file) : fsImpl.statSync(file);
+      if ((typeof lst.isSymbolicLink === 'function' && lst.isSymbolicLink()) || !lst.isFile() || lst.size > MAX_NATIVE_SESSION_FILE_BYTES) {
+        continue;
+      }
+      if (file.endsWith('.zstd')) {
+        text = decodeZstdSessionBuffer(fsImpl.readFileSync(file));
+      } else {
+        const rawJsonl = fsImpl.readFileSync(file);
+        if (rawJsonl.length > MAX_NATIVE_SESSION_OUTPUT_BYTES) continue;
+        text = Buffer.isBuffer(rawJsonl) ? rawJsonl.toString('utf8') : String(rawJsonl);
+      }
     } catch {
       continue;
     }
     if (!text) continue;
-    const seen = new Set();
+    const seen = new Map();
+    const sessionDeltas = [];
     let lineIdx = 0;
     for (const line of text.split(/\r?\n/)) {
       lineIdx += 1;
@@ -453,10 +505,19 @@ function foldNativeSessionUsage({ dshHome, storageRoot, sessionRoleMap, usageByR
       const key = row.data?.message?.id
         ? `msg:${row.data.message.id}`
         : (row.data?.compactionId ? `comp:${row.data.compactionId}` : `${row.type}:${row.seq ?? row.time ?? lineIdx}`);
-      if (seen.has(key)) continue;
-      seen.add(key);
-      const safeRole = sanitizeRoleKey(role);
       const delta = extract4BucketUsage(row.data);
+      if (seen.has(key)) {
+        const prevIdx = seen.get(key);
+        if (sessionDeltas[prevIdx].totalTokens === 0 && delta.totalTokens > 0) {
+          sessionDeltas[prevIdx] = delta;
+        }
+        continue;
+      }
+      seen.set(key, sessionDeltas.length);
+      sessionDeltas.push(delta);
+    }
+    const safeRole = sanitizeRoleKey(role);
+    for (const delta of sessionDeltas) {
       usageByRole[safeRole] ??= emptyBucket();
       addBucket(usageByRole[safeRole], delta);
       addBucket(usageTotal, delta);

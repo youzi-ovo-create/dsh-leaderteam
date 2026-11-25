@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import { registerHooks } from 'node:module';
 import os from 'node:os';
@@ -79,8 +80,10 @@ const {
   classifySandboxBoundary,
   evaluateDirectExecSafetyGate,
   findProtectedWriteScopeOverlap,
+  scanPosixShell,
+  redactionHidesCode,
 } = await import('../../leaderteam/core/gate-policy.mjs');
-const { redactInlineSecrets, sanitizeArguments, REDACTED } = await import('../../leaderteam/core/redact.mjs');
+const { redactInlineSecrets, inlineSecretMatches, sanitizeArguments, REDACTED } = await import('../../leaderteam/core/redact.mjs');
 const { parseQuotaState, routeQuota5hWindow } = await import('../../leaderteam/core/quota.mjs');
 const { normalizeReview } = await import('../../leaderteam/core/review-policy.mjs');
 const { PlanArchiveStore } = await import('../../leaderteam/core/plan-archive.mjs');
@@ -105,6 +108,8 @@ const entryCore = await import('../../leaderteam/entry-core.mjs');
 const { zstdFrames } = await import('../../scripts/dev/lib/session-rows.mjs');
 const { parseCliArgs: parseConfigureCliArgs } = await import('../../scripts/configure-models.mjs');
 const { parseHeadlessCliArgs } = await import('../../scripts/headless-run.mjs');
+const { runPlanArchiveCli } = await import('../../scripts/plan-archive.mjs');
+const { loadBoundedWorkspaceExcerpts, respondInFormalConference } = await import('../../leaderteam/host/governance.mjs');
 
 function makeTempDir(t, suffix = '') {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), `lt-s2-core-${suffix}`));
@@ -969,4 +974,616 @@ test('CH-16 (P2): entry-core delayed settings sync race, activation agent="..." 
   assert.ok(syncedModel, 'late settings registration synced configured model');
   assert.equal(syncedModel.contextWindow, 262144, 'late settings sync preserved enriched contextWindow');
   assert.equal(syncedModel.maxTokens, 65536, 'late settings sync preserved enriched maxTokens');
+});
+
+test('S3-SYS-01 (P0): subshell/compound-group pipe RHS, env -S/--split-string, and *awk dynamic execution cannot bypass safety gate or direct_exec', () => {
+  const cfg = loadConfig(path.join(ROOT, 'config', 'leaderteam.config.json'), { includeLocal: false });
+  const ws = '/tmp/lt-s4-sys-ws';
+  const member = {
+    role: 'member',
+    name: 'worker',
+    profile: 'shell',
+    allowedTools: ['read', 'write', 'edit', 'bash'],
+    loadedTools: ['read', 'write', 'edit', 'bash'],
+    writeScope: ['mod_a/**'],
+    unreadRefs: [],
+  };
+  const direct = { ...member, role: 'direct_exec' };
+
+  const escapes = [
+    'printf "%s\\n" "cd /tmp && pwd" | (bash -s)',
+    '(printf "%s\\n" "cd /tmp && pwd") | (bash -s)',
+    'printf "%s\\n" "import os; print(os.listdir(\'/tmp\'))" | (python3 -u)',
+    'printf "%s\\n" "cd /tmp && pwd" | { bash -s; }',
+    'echo "cd /tmp && pwd" | if true; then bash -s; fi',
+    'env -S "cat /etc/hostname"',
+    'env --split-string="cat /etc/hostname"',
+    'env -S "python3 -u" <<< "import os; print(os.listdir(\'/tmp\'))"',
+    'env -iS "bash -s" <<< "cd /tmp && pwd"',
+    'awk \'BEGIN{system("cat /etc/hostname")}\'',
+    'gawk \'BEGIN{system("cd /tmp && pwd")}\'',
+    'echo "cat /etc/hostname" | awk \'{system($0)}\'',
+    'mawk \'BEGIN{"id" | getline u; print u}\'',
+    'nawk \'{print "pwn" > "/tmp/x"}\' mod_a/a.js',
+    'awk -f mod_a/evil.awk mod_a/a.js',
+  ];
+
+  for (const command of escapes) {
+    const sb = classifySandboxBoundary({ tool: 'bash', args: { command }, actor: member, cwd: ws, platform: 'linux' }, cfg);
+    assert.equal(sb.confined, false, `S3-SYS-01 must not classify as confined: ${command}`);
+
+    const dg = evaluateDirectExecSafetyGate({ tool: 'bash', args: { command }, actor: direct, cwd: ws, platform: 'linux' }, cfg);
+    assert.equal(dg.decision, 'deny', `S3-SYS-01 direct_exec gate must deny: ${command}`);
+
+    const dh = evaluateHardRules({ tool: 'bash', args: { command }, actor: direct, cwd: ws, platform: 'linux' }, cfg);
+    assert.ok(dh, `S3-SYS-01 direct_exec hard rules must block: ${command}`);
+  }
+
+  // Deterministic hard-rule blocks on literal pipe/herestring/awk escapes even for ordinary `member`
+  for (const hardMemberCmd of [
+    'printf "%s\\n" "cd /tmp && pwd" | (bash -s)',
+    'printf "%s\\n" "cd /tmp && pwd" | { bash -s; }',
+    'env -iS "bash -s" <<< "cd /tmp && pwd"',
+    'gawk \'BEGIN{system("cd /tmp && pwd")}\'',
+    'nawk \'{print "pwn" > "/tmp/x"}\' mod_a/a.js',
+  ]) {
+    assert.equal(
+      evaluateHardRules({ tool: 'bash', args: { command: hardMemberCmd }, actor: member, cwd: ws, platform: 'linux' }, cfg)?.rule,
+      'path-outside-workspace',
+      hardMemberCmd,
+    );
+  }
+
+  // Legitimate workspace subshells and benign awk filters remain confined & allowed
+  for (const okCmd of [
+    '(npm test && node mod_a/index.mjs)',
+    "awk '/ERROR/ {print $0}' mod_a/a.js",
+    'git status | (head -n 5)',
+  ]) {
+    assert.equal(evaluateHardRules({ tool: 'bash', args: { command: okCmd }, actor: member, cwd: ws, platform: 'linux' }, cfg), undefined, okCmd);
+    assert.equal(classifySandboxBoundary({ tool: 'bash', args: { command: okCmd }, actor: member, cwd: ws, platform: 'linux' }, cfg).confined, true, okCmd);
+    assert.equal(evaluateDirectExecSafetyGate({ tool: 'bash', args: { command: okCmd }, actor: direct, cwd: ws, platform: 'linux' }, cfg).decision, 'allow', okCmd);
+  }
+});
+
+test('S3-SYS-02 (P0): dotted key.sub=/path options, unquoted bash brace expansion, and clustered short flags on custom mounts are enforced', () => {
+  const cfg = loadConfig(path.join(ROOT, 'config', 'leaderteam.config.json'), { includeLocal: false });
+  const ws = '/tmp/lt-s4-sys-ws';
+  const member = {
+    role: 'member',
+    name: 'worker',
+    profile: 'shell',
+    allowedTools: ['bash'],
+    loadedTools: ['bash'],
+    writeScope: ['mod_a/**'],
+    unreadRefs: [],
+  };
+  const direct = { ...member, role: 'direct_exec' };
+
+  const mockFs = {
+    existsSync: p => p === '/data2' || p === '/data2/archive.tar' || String(p).startsWith(ws),
+    lstatSync: p => {
+      if (p === '/data2' || p === '/data2/archive.tar' || String(p).startsWith(ws)) {
+        return { isSymbolicLink: () => false, isDirectory: () => p === '/data2' || p === ws, isFile: () => p === '/data2/archive.tar' };
+      }
+      throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+    },
+    statSync: p => {
+      if (p === '/data2' || String(p).startsWith(ws)) return { isDirectory: () => p === '/data2' || p === ws };
+      if (p === '/data2/archive.tar') return { isDirectory: () => false };
+      throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+    },
+    realpathSync: p => p,
+  };
+
+  // Verify scanPosixShell marks unquoted brace expansions accurately
+  assert.equal(scanPosixShell('cat {/,}etc/hostname').tokens[1].hasBraceExpansion, true);
+  assert.equal(scanPosixShell('cat {1..5}.txt').tokens[1].hasBraceExpansion, true);
+  assert.equal(scanPosixShell("echo '{\"a\":1,\"b\":2}'").tokens[1].hasBraceExpansion, false);
+  assert.equal(scanPosixShell('git diff HEAD@{1}..HEAD@{0}').tokens[2].hasBraceExpansion, false);
+
+  for (const cmd of [
+    'git -c core.hooksPath=/tmp/evil status',
+    'git -c include.path=/etc/passwd status',
+    'java -Dapp.config=/etc/passwd Main',
+    'node mod_a/run.js --output.dir=/tmp/out',
+    'gcc -Wl,-rpath,/tmp/evil mod_a/main.c -o mod_a/main',
+    'cat {/,}etc/hostname',
+    "cat {'/',}etc/hostname",
+    'cat mod_a/file{1..3}.js',
+    'tar -tf/data2/archive.tar',
+  ]) {
+    assert.equal(classifySandboxBoundary({ tool: 'bash', args: { command: cmd }, actor: member, cwd: ws, platform: 'linux', fs: mockFs }, cfg).confined, false, cmd);
+    assert.equal(evaluateDirectExecSafetyGate({ tool: 'bash', args: { command: cmd }, actor: direct, cwd: ws, platform: 'linux', fs: mockFs }, cfg).decision, 'deny', cmd);
+    assert.equal(evaluateHardRules({ tool: 'bash', args: { command: cmd }, actor: direct, cwd: ws, platform: 'linux', fs: mockFs }, cfg)?.rule, 'direct-exec-sandbox-lock', cmd);
+  }
+
+  // Quoted JSON, git reflog ranges, and in-workspace dotted properties remain confined without false positives
+  for (const safeCmd of [
+    "node mod_a/cli.js --payload='{\"a\":1,\"b\":2}'",
+    'git diff HEAD@{1}..HEAD@{0}',
+    'java -Dapp.config=mod_a/app.properties Main',
+  ]) {
+    assert.equal(evaluateHardRules({ tool: 'bash', args: { command: safeCmd }, actor: member, cwd: ws, platform: 'linux', fs: mockFs }, cfg), undefined, safeCmd);
+    assert.equal(classifySandboxBoundary({ tool: 'bash', args: { command: safeCmd }, actor: member, cwd: ws, platform: 'linux', fs: mockFs }, cfg).confined, true, safeCmd);
+    assert.equal(evaluateDirectExecSafetyGate({ tool: 'bash', args: { command: safeCmd }, actor: direct, cwd: ws, platform: 'linux', fs: mockFs }, cfg).decision, 'allow', safeCmd);
+  }
+});
+
+test('S3-SYS-03 (P0): brace-expansion targets, dd/rsync/touch/mkdir/truncate/tar/unzip/*awk -i inplace, sed -Ei.bak, and compound prefixes enforce write_scope while preserving /dev/null', t => {
+  const customCfg = configWith({
+    paths: {
+      protectedDirs: ['.leaderteam', '.git', '.agents', 'AGENTS.md', '.github'],
+    },
+  });
+  const ws = makeTempDir(t, 's3-sys03-ws-');
+  fs.mkdirSync(path.join(ws, 'mod_a'), { recursive: true });
+  fs.mkdirSync(path.join(ws, 'mod_b'), { recursive: true });
+
+  const memberA = {
+    role: 'member',
+    name: 'worker-a',
+    profile: 'shell',
+    allowedTools: ['bash'],
+    loadedTools: ['bash'],
+    writeScope: ['mod_a/**'],
+    unreadRefs: [],
+  };
+  const directA = { ...memberA, role: 'direct_exec' };
+
+  // 1. Brace expansion in tee / redirection is blocked deterministically in evaluateHardRules, classifySandboxBoundary, and direct_exec
+  for (const braceWriteCmd of [
+    'tee mod_a/{../.g,x}it/hooks/pre-commit < mod_a/a.js',
+    'echo pwn > mod_a/{../mod_b/b.js,ok.js}',
+  ]) {
+    assert.equal(evaluateHardRules({ tool: 'bash', args: { command: braceWriteCmd }, actor: memberA, cwd: ws, platform: 'linux' }, customCfg)?.rule, 'shell-dynamic-target', braceWriteCmd);
+    assert.equal(classifySandboxBoundary({ tool: 'bash', args: { command: braceWriteCmd }, actor: memberA, cwd: ws, platform: 'linux' }, customCfg).confined, false, braceWriteCmd);
+    assert.equal(evaluateDirectExecSafetyGate({ tool: 'bash', args: { command: braceWriteCmd }, actor: directA, cwd: ws, platform: 'linux' }, customCfg).decision, 'deny', braceWriteCmd);
+  }
+
+  // 2. Out-of-scope mutating commands (`dd`, `rsync`, `touch`, `mkdir`, `truncate`, `tar`, `unzip`, `gawk -i inplace`, `sed -Ei.bak`, `{ cp ...; }`, `if ... then ... fi`)
+  for (const outCmd of [
+    'dd if=mod_a/a.js of=mod_b/b.js',
+    'dd if=mod_a/a.js --output=mod_b/b.js',
+    'rsync -a mod_a/a.js mod_b/b.js',
+    'touch mod_b/new.js',
+    'mkdir -p mod_b/sub',
+    'truncate -s 0 mod_b/b.js',
+    'tar -xf mod_a/a.tar',
+    'tar -xf mod_a/a.tar -C mod_b',
+    'tar -czf mod_b/out.tar.gz mod_a',
+    'unzip mod_a/a.zip',
+    'unzip -q mod_a/a.zip -d mod_b',
+    "gawk -i inplace '{gsub(/a/, \"b\"); print}' mod_b/b.js",
+    'sed -Ei.bak "s/2/9/" mod_b/b.js',
+    '{ cp mod_a/a.js mod_b/b.js; }',
+    'if true; then cp mod_a/a.js mod_b/b.js; fi',
+  ]) {
+    assert.equal(classifySandboxBoundary({ tool: 'bash', args: { command: outCmd }, actor: memberA, cwd: ws, platform: 'linux' }, customCfg).confined, false, `must block out-of-scope mutation: ${outCmd}`);
+    assert.equal(evaluateDirectExecSafetyGate({ tool: 'bash', args: { command: outCmd }, actor: directA, cwd: ws, platform: 'linux' }, customCfg).decision, 'deny', `direct_exec must deny out-of-scope mutation: ${outCmd}`);
+    assert.equal(evaluateHardRules({ tool: 'bash', args: { command: outCmd }, actor: directA, cwd: ws, platform: 'linux' }, customCfg)?.rule, 'direct-exec-sandbox-lock', outCmd);
+  }
+
+  // 3. In-scope counterparts AND `/dev/null` redirections remain confined & allowed
+  for (const inCmd of [
+    'dd if=mod_a/a.js of=mod_a/copy.js',
+    'dd if=mod_a/a.js of=/dev/null',
+    'rsync -a mod_a/a.js mod_a/copy.js',
+    'touch mod_a/new.js',
+    'mkdir -p mod_a/sub',
+    'truncate -s 0 mod_a/a.js',
+    'tar -xf mod_a/a.tar -C mod_a',
+    'tar -tf mod_b/a.tar',
+    'unzip -q mod_a/a.zip -d mod_a/out',
+    'unzip -l mod_b/a.zip',
+    "gawk -i inplace '{gsub(/a/, \"b\"); print}' mod_a/a.js",
+    'sed -Ei.bak "s/2/9/" mod_a/a.js',
+    '{ cp mod_a/a.js mod_a/copy.js; }',
+    'npm test 2>/dev/null',
+    'npm test >/dev/null 2>&1',
+    'npm test &>/dev/null',
+  ]) {
+    assert.equal(evaluateHardRules({ tool: 'bash', args: { command: inCmd }, actor: memberA, cwd: ws, platform: 'linux' }, customCfg), undefined, inCmd);
+    assert.equal(classifySandboxBoundary({ tool: 'bash', args: { command: inCmd }, actor: memberA, cwd: ws, platform: 'linux' }, customCfg).confined, true, `in-scope command must remain confined: ${inCmd}`);
+    assert.equal(evaluateDirectExecSafetyGate({ tool: 'bash', args: { command: inCmd }, actor: directA, cwd: ws, platform: 'linux' }, customCfg).decision, 'allow', `direct_exec must allow in-scope command: ${inCmd}`);
+  }
+});
+
+test('S3-SYS-04 (P1): escaped JSON quotes, CLI secret flags in lt-bugreport, and URL userinfo credentials in redact.mjs are scrubbed cleanly', () => {
+  const escapedJsonCmd = 'curl -X POST http://127.0.0.1:8080/auth -d "{\\"apiKey\\":\\"custom-gw-key-9876\\",\\"password\\":\\"MyUnitTestPass!2026\\"}"';
+
+  const coreRedacted = redactInlineSecrets(escapedJsonCmd);
+  assert.equal(coreRedacted.includes('custom-gw-key-9876'), false, coreRedacted);
+  assert.equal(coreRedacted.includes('MyUnitTestPass!2026'), false, coreRedacted);
+  assert.ok(coreRedacted.includes('\\"apiKey\\":\\"[REDACTED]\\"'), `expected escaped quotes preserved: ${coreRedacted}`);
+
+  const bugRedacted = redactDiagnosticText(escapedJsonCmd, { username: 'devuser', hostname: 'devbox' });
+  assert.equal(bugRedacted.includes('custom-gw-key-9876'), false, bugRedacted);
+  assert.equal(bugRedacted.includes('MyUnitTestPass!2026'), false, bugRedacted);
+
+  const multiSecretDiag = redactDiagnosticText(
+    'apiKey=secA1234 token="secB5678" --password "secC9012" --api-key \\"secE7890\\" Authorization: "Bearer secD3456"',
+    { username: 'devuser', hostname: 'devbox' },
+  );
+  for (const s of ['secA1234', 'secB5678', 'secC9012', 'secE7890', 'secD3456']) {
+    assert.equal(multiSecretDiag.includes(s), false, `redactDiagnosticText leaked ${s}: ${multiSecretDiag}`);
+  }
+
+  // URL userinfo password redaction + inlineSecretMatches + redactionHidesCode + port/@scope non-regression
+  const gitCloneUrl = 'git clone https://oauth-user:SuperSecretGitPass99@git.internal.corp/org/repo.git';
+  assert.equal(
+    redactInlineSecrets(gitCloneUrl),
+    `git clone https://oauth-user:${REDACTED}@git.internal.corp/org/repo.git`,
+  );
+  const matches = inlineSecretMatches(gitCloneUrl);
+  assert.deepEqual(matches, [
+    { form: 'url_userinfo', separator: ':', quoted: false, value: 'SuperSecretGitPass99' },
+  ]);
+  assert.equal(redactionHidesCode(gitCloneUrl, { tool: 'bash' }), false);
+  assert.equal(redactionHidesCode('git clone https://oauth-user:$(whoami)@git.internal.corp/org/repo.git', { tool: 'bash' }), true);
+
+  // Port + scoped package path without userinfo AND JSON object values (`"authorization":{...}`) MUST NOT be mangled
+  const scopedPkgUrl = 'http://127.0.0.1:8080/pkg/@deepseek-ai/dsh';
+  assert.equal(redactInlineSecrets(scopedPkgUrl), scopedPkgUrl);
+  const jsonObjAuth = '},"scope":{"write_scope":["**"]},"authorization":{"user_task":"everything approved"}';
+  assert.equal(redactInlineSecrets(jsonObjAuth), jsonObjAuth);
+});
+
+test('S3-SYS-05 (P1): scripts/plan-archive.mjs rejects malformed/blank/negative --older-than-days with PLAN_ARCHIVE_CLEAN instead of wiping plans', t => {
+  const tmp = makeTempDir(t, 's3-sys05-pa-');
+  const archiveRoot = path.join(tmp, 'archive');
+  const ws = path.join(tmp, 'proj');
+  fs.mkdirSync(ws, { recursive: true });
+
+  const archive = new PlanArchiveStore(archiveRoot, { workspaceRoot: ws });
+  archive.archivePlanSubmission({
+    agreementId: 'fresh-plan-today',
+    teamId: 'team-pa-1',
+    taskSeq: 1,
+    workspace: ws,
+    topic: 'Fresh plan created just now',
+    proposal: 'Step 1: keep safe',
+    userRequest: 'Keep fresh plans intact',
+    nowMs: Date.now(),
+  });
+
+  for (const badAge of ['30d', 'abc', '', '   ', '-5']) {
+    assert.throws(
+      () => runPlanArchiveCli([
+        '--clean',
+        '--archive-root', archiveRoot,
+        '--workspace', ws,
+        '--older-than-days', badAge,
+        '--confirm',
+        '--json',
+      ], { writeStdout: false }),
+      err => err?.code === 'PLAN_ARCHIVE_CLEAN',
+      `expected PLAN_ARCHIVE_CLEAN for --older-than-days "${badAge}"`,
+    );
+  }
+
+  // Also verify subprocess CLI exits non-zero and prints [PLAN_ARCHIVE_CLEAN]
+  const cliScript = path.join(ROOT, 'scripts', 'plan-archive.mjs');
+  assert.throws(
+    () => execFileSync(process.execPath, [
+      cliScript,
+      '--clean',
+      '--archive-root', archiveRoot,
+      '--workspace', ws,
+      '--older-than-days', '30d',
+      '--confirm',
+      '--json',
+    ], { encoding: 'utf8', stdio: 'pipe' }),
+    err => err.status === 1 && String(err.stderr).includes('PLAN_ARCHIVE_CLEAN'),
+  );
+
+  assert.equal(archive.listPlans().length, 1, 'fresh plan must remain completely untouched');
+});
+
+test('S3-SYS-06 (P1): lt-bugreport blocks sessionId path traversal & symlink escape, caps session file size <= 64MiB, and falls back to session.v4.jsonl', t => {
+  const probeRoot = makeTempDir(t, 's3-sys06-');
+  const dshHome = path.join(probeRoot, 'dsh-home');
+  const storageRoot = path.join(dshHome, 'leaderteam');
+  const teamDir = path.join(storageRoot, 'teams', 'team-s06');
+  const outsideSessDir = path.join(probeRoot, 'outside-secret-sess');
+  fs.mkdirSync(teamDir, { recursive: true });
+  fs.mkdirSync(outsideSessDir, { recursive: true });
+
+  // External session outside dshHome with 77,778 tokens that MUST NOT be read via traversal or symlink
+  fs.writeFileSync(
+    path.join(outsideSessDir, 'session.v4.jsonl.zstd'),
+    zlib.zstdCompressSync(Buffer.from(JSON.stringify({
+      type: 'assistant/message',
+      seq: 1,
+      data: { message: { id: 'ext-1' }, usage: { inputTokens: 77777, outputTokens: 1, totalTokens: 77778 } },
+    }) + '\n', 'utf8')),
+  );
+
+  // Symlinked session directory & symlinked file inside dshHome/sessions pointing outside
+  const sessionsDir = path.join(dshHome, 'sessions');
+  fs.mkdirSync(path.join(sessionsDir, 'sym-file-sess'), { recursive: true });
+  fs.symlinkSync(outsideSessDir, path.join(sessionsDir, 'sym-dir-sess'), 'dir');
+  fs.symlinkSync(
+    path.join(outsideSessDir, 'session.v4.jsonl.zstd'),
+    path.join(sessionsDir, 'sym-file-sess', 'session.v4.jsonl.zstd'),
+  );
+
+  // Valid uncompressed `session.v4.jsonl` fallback inside `dshHome/sessions` (`330` totalTokens)
+  const jsonlFallbackDir = path.join(sessionsDir, 'plain-jsonl-mem');
+  fs.mkdirSync(jsonlFallbackDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(jsonlFallbackDir, 'session.v4.jsonl'),
+    JSON.stringify({
+      type: 'assistant/message',
+      seq: 1,
+      data: { message: { id: 'ok-jsonl-1' }, usage: { inputTokens: 300, outputTokens: 30, totalTokens: 330 } },
+    }) + '\n',
+    'utf8',
+  );
+
+  // Oversized session file (> 64 MiB mocked via fs wrapper) that must be skipped without reading
+  const hugeSessDir = path.join(sessionsDir, 'huge-mem');
+  const hugeSessFile = path.join(hugeSessDir, 'session.v4.jsonl.zstd');
+  fs.mkdirSync(hugeSessDir, { recursive: true });
+  fs.writeFileSync(
+    hugeSessFile,
+    zlib.zstdCompressSync(Buffer.from(JSON.stringify({
+      type: 'assistant/message',
+      seq: 1,
+      data: { message: { id: 'huge-1' }, usage: { inputTokens: 88888, outputTokens: 1, totalTokens: 88889 } },
+    }) + '\n', 'utf8')),
+  );
+
+  fs.writeFileSync(path.join(teamDir, 'team.json'), JSON.stringify({ v: 1, teamId: 'team-s06', createdAt: '2026-11-25T19:00:00Z' }), 'utf8');
+  fs.writeFileSync(
+    path.join(teamDir, 'members.jsonl'),
+    [
+      JSON.stringify({ v: 1, type: 'member', childId: '../outside-secret-sess', name: 'trav-1', status: 'done' }),
+      JSON.stringify({ v: 1, type: 'member', childId: '../../outside-secret-sess', name: 'trav-2', status: 'done' }),
+      JSON.stringify({ v: 1, type: 'member', childId: 'sym-dir-sess', name: 'sym-dir', status: 'done' }),
+      JSON.stringify({ v: 1, type: 'member', childId: 'sym-file-sess', name: 'sym-file', status: 'done' }),
+      JSON.stringify({ v: 1, type: 'member', childId: 'huge-mem', name: 'huge', status: 'done' }),
+      JSON.stringify({ v: 1, type: 'member', childId: 'plain-jsonl-mem', name: 'ok-jsonl', status: 'done' }),
+    ].join('\n') + '\n',
+    'utf8',
+  );
+
+  let readHugeAttempted = false;
+  const wrappedFs = {
+    ...fs,
+    lstatSync(p, ...rest) {
+      const st = fs.lstatSync(p, ...rest);
+      if (path.resolve(String(p)) === hugeSessFile) {
+        return Object.assign(Object.create(Object.getPrototypeOf(st)), st, { size: 65 * 1024 * 1024 });
+      }
+      return st;
+    },
+    readFileSync(p, ...rest) {
+      if (path.resolve(String(p)) === hugeSessFile) readHugeAttempted = true;
+      return fs.readFileSync(p, ...rest);
+    },
+  };
+
+  const report = generateRedactedBugReport({
+    dshHome,
+    storageRoot,
+    fsImpl: wrappedFs,
+    hostname: 'host-s06',
+    username: 'user-s06',
+  });
+  assert.equal(readHugeAttempted, false, 'oversized >64MiB session log must be skipped before readFileSync');
+  assert.deepEqual(report.metrics.usageByRole.member, {
+    calls: 1,
+    inputTokens: 300,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    outputTokens: 30,
+    totalTokens: 330,
+  });
+  assert.equal(report.metrics.usageTotal.totalTokens, 330);
+});
+
+test('S3-SYS-07 (P1): governance loadBoundedWorkspaceExcerpts & respondInFormalConference block symlinks, secret/protected files, unbounded reads, and inline secrets', async t => {
+  const baseDir = makeTempDir(t, 's3-sys07-');
+  const ws = path.join(baseDir, 'ws');
+  const outside = path.join(baseDir, 'outside');
+  const storageRoot = path.join(baseDir, 'storage');
+  fs.mkdirSync(path.join(ws, 'src'), { recursive: true });
+  fs.mkdirSync(path.join(ws, '.git'), { recursive: true });
+  fs.mkdirSync(outside, { recursive: true });
+
+  const externalSecret = 'TOP_SECRET_EXTERNAL_DATA_998877';
+  fs.writeFileSync(path.join(outside, 'host-secret.txt'), `${externalSecret}\n`, 'utf8');
+  fs.symlinkSync(path.join(outside, 'host-secret.txt'), path.join(ws, 'src', 'ext-link.txt'));
+  fs.symlinkSync(outside, path.join(ws, 'src', 'ext-dir'), 'dir');
+
+  fs.writeFileSync(path.join(ws, '.env'), 'API_KEY=env_file_secret_112233\n', 'utf8');
+  fs.writeFileSync(path.join(ws, '.git', 'config'), '[core]\n\trepositoryformatversion = 0\n', 'utf8');
+  fs.writeFileSync(path.join(ws, 'AGENTS.md'), '# Protected instructions\n', 'utf8');
+  fs.writeFileSync(
+    path.join(ws, 'src', 'valid.js'),
+    `const apiKey = "inline-secret-val-556677";\nexport const ok = true;\n${'x'.repeat(40000)}\n`,
+    'utf8',
+  );
+
+  const excerpts = loadBoundedWorkspaceExcerpts(ws, [
+    'src/ext-link.txt',
+    'src/ext-dir/host-secret.txt',
+    '.env',
+    '.git/config',
+    'AGENTS.md',
+    'src/valid.js',
+  ], 24000, ['.leaderteam', '.git', '.agents', 'AGENTS.md']);
+
+  assert.equal(excerpts.length, 1, 'only legitimate non-symlink, non-secret, non-protected file loaded');
+  assert.equal(excerpts[0].file, 'src/valid.js');
+  assert.equal(excerpts[0].content.includes(externalSecret), false);
+  assert.equal(excerpts[0].content.includes('inline-secret-val-556677'), false);
+  assert.ok(excerpts[0].content.includes(REDACTED));
+  assert.ok(excerpts[0].content.length <= 8001);
+
+  // Verify `respondInFormalConference` never persists symlinked external files into `governance.jsonl`
+  const cfg = configWith({
+    storage: { root: storageRoot },
+    governance: { mode: 'autonomous' },
+  });
+  const rt = runtime();
+  const prev = { config: rt.config, storageRoot: rt.storageRoot, llm: rt.llm };
+  t.after(() => {
+    rt.config = prev.config;
+    rt.storageRoot = prev.storageRoot;
+    rt.llm = prev.llm;
+  });
+  rt.config = cfg;
+  rt.storageRoot = storageRoot;
+  rt.llm = null; // callGovernanceRole returns unavailable cleanly after conference-turn is appended
+
+  const st = new (teamStore('team-s07').constructor)(storageRoot, 'team-s07');
+  st.ensure({ workspace: ws, surface: 'headless' });
+  st.appendGovernanceEvent({
+    type: 'conference-opened',
+    taskSeq: 1,
+    conferenceId: 'conf-s07',
+    disputeId: 'disp-s07',
+    strike: 1,
+    targets: ['src/valid.js'],
+    initialExpectation: 'Verify implementation',
+    opening: { summary: 'Open' },
+  });
+
+  await respondInFormalConference({
+    ctx: {},
+    rt,
+    store: st,
+    actor: { teamId: 'team-s07', cwd: ws },
+    leaderAgent: null,
+    leaderModel: 'zcode/GLM-5.3',
+    taskSeq: 1,
+    conferenceId: 'conf-s07',
+    explanation: 'Providing workspace evidence',
+    newEvidenceFiles: ['src/ext-link.txt', '.env', 'src/valid.js'],
+    userTask: 'Verify fix',
+  });
+
+  const govRaw = fs.readFileSync(path.join(st.dir, 'governance.jsonl'), 'utf8');
+  assert.equal(govRaw.includes(externalSecret), false, 'external symlink content must never enter governance.jsonl');
+  assert.equal(govRaw.includes('env_file_secret_112233'), false);
+  assert.equal(govRaw.includes('inline-secret-val-556677'), false);
+});
+
+test('S3-SYS-08 (P2): observability upgrades streaming partial assistant/message rows on finalized usage and aggregates directExec in roles', t => {
+  // 1. Streaming partial `assistant/message` without `usage` upgraded by finalized row with same `message.id`
+  const streamingSummary = summarizeTeamUsage([
+    {
+      id: 'team-stream-1',
+      name: 'leader',
+      group: 'leader',
+      available: true,
+      rows: [
+        {
+          type: 'assistant/message',
+          seq: 1,
+          data: { message: { id: 'msg-stream-1', source: { model: 'zcode/GLM-5.3' } } },
+        },
+        {
+          type: 'assistant/message',
+          seq: 2,
+          data: {
+            message: { id: 'msg-stream-1', source: { model: 'zcode/GLM-5.3' } },
+            usage: { inputTokens: 1000, cacheReadTokens: 200, cacheWriteTokens: 0, outputTokens: 50, totalTokens: 1250 },
+          },
+        },
+        {
+          // Duplicate finalized row must NOT double-count
+          type: 'assistant/message',
+          seq: 3,
+          data: {
+            message: { id: 'msg-stream-1', source: { model: 'zcode/GLM-5.3' } },
+            usage: { inputTokens: 1000, cacheReadTokens: 200, cacheWriteTokens: 0, outputTokens: 50, totalTokens: 1250 },
+          },
+        },
+      ],
+    },
+  ], []);
+
+  assert.equal(streamingSummary.groups.leader.receiptCount, 1);
+  assert.equal(streamingSummary.groups.leader.missingUsage, 0);
+  assert.equal(streamingSummary.groups.leader.tokens.totalTokens, 1250);
+  assert.equal(streamingSummary.complete, true);
+
+  // 2. `teamObservability` upgrades leader streaming rows AND populates `roles` entry for `directExec`
+  const home = makeTempDir(t, 's3-sys08-home-');
+  const storageRoot = path.join(home, 'leaderteam');
+  const cfg = configWith({ storage: { root: storageRoot } });
+  const rt = runtime();
+  const prev = { config: rt.config, storageRoot: rt.storageRoot };
+  t.after(() => {
+    rt.config = prev.config;
+    rt.storageRoot = prev.storageRoot;
+  });
+  rt.config = cfg;
+  rt.storageRoot = storageRoot;
+
+  const teamId = 'team-s08';
+  const st = new (teamStore(teamId).constructor)(storageRoot, teamId);
+  st.ensure({ workspace: home, surface: 'headless' });
+  st.addMember({
+    childId: 'dir-exec-1',
+    name: 'direct-runner',
+    actorRole: 'direct_exec',
+    profile: 'code',
+    model: 'zcode/GLM-5.3-Flash',
+    effort: 'low',
+    status: 'done',
+  });
+  st.addMember({
+    childId: 'mem-exec-1',
+    name: 'worker-1',
+    actorRole: 'member',
+    profile: 'code',
+    model: 'zcode/GLM-5.3',
+    effort: 'high',
+    status: 'done',
+  });
+
+  const writeNativeZstd = (sid, rows) => {
+    const dir = path.join(home, 'sessions', sid);
+    fs.mkdirSync(dir, { recursive: true });
+    const payload = Buffer.concat(rows.map(r => zlib.zstdCompressSync(Buffer.from(JSON.stringify(r) + '\n', 'utf8'))));
+    fs.writeFileSync(path.join(dir, 'session.v4.jsonl.zstd'), payload);
+  };
+
+  writeNativeZstd(teamId, [
+    { type: 'request/header', seq: 0, data: { header: { config: { model: 'zcode/GLM-5.3' } } } },
+    { type: 'assistant/message', seq: 1, data: { message: { id: 'lead-m1', source: { provider: 'magpie', model: 'zcode/GLM-5.3' } } } },
+    { type: 'assistant/message', seq: 2, data: { message: { id: 'lead-m1', source: { provider: 'magpie', model: 'zcode/GLM-5.3' } }, usage: { inputTokens: 400, outputTokens: 100, totalTokens: 500 } } },
+  ]);
+  writeNativeZstd('dir-exec-1', [
+    { type: 'request/header', seq: 0, data: { header: { config: { model: 'zcode/GLM-5.3-Flash' } } } },
+    { type: 'assistant/message', seq: 1, data: { message: { id: 'de-m1', source: { provider: 'magpie', model: 'zcode/GLM-5.3-Flash' } } } },
+    { type: 'assistant/message', seq: 2, data: { message: { id: 'de-m1', source: { provider: 'magpie', model: 'zcode/GLM-5.3-Flash' } }, usage: { inputTokens: 60, outputTokens: 15, totalTokens: 75 } } },
+  ]);
+  writeNativeZstd('mem-exec-1', [
+    { type: 'assistant/message', seq: 1, data: { message: { id: 'mem-m1', source: { provider: 'magpie', model: 'zcode/GLM-5.3' } }, usage: { inputTokens: 200, outputTokens: 50, totalTokens: 250 } } },
+  ]);
+
+  const obs = teamObservability({ get: k => (k === 'profileContext' ? { home } : null) }, rt, teamId);
+  const leaderRole = obs.roles.find(r => r.role === 'leader');
+  const directExecRole = obs.roles.find(r => r.role === 'directExec');
+
+  assert.equal(leaderRole.calls, 1);
+  assert.equal(leaderRole.missingUsage, 0);
+  assert.equal(leaderRole.tokens.totalTokens, 500);
+
+  assert.ok(directExecRole, 'directExec role entry exists');
+  assert.equal(directExecRole.calls, 1);
+  assert.equal(directExecRole.called, true);
+  assert.deepEqual(directExecRole.actualRoutes, ['zcode/GLM-5.3-Flash']);
+  assert.deepEqual(directExecRole.requestRoutes, ['zcode/GLM-5.3-Flash']);
+  assert.equal(directExecRole.missingUsage, 0);
+  assert.equal(directExecRole.tokens.totalTokens, 75);
+
+  // Total usage counts leader (500) + directExec (75) + member (250) = 825 once without double counting
+  assert.equal(obs.usage.total.totalTokens, 825);
+  assert.equal(obs.usage.complete, true);
 });
