@@ -493,8 +493,11 @@ async function maybeAutoContinueLeader(ctx, rt, actor, agent) {
     }
 
     const endTurn = evs[lastTurnEndIdx]?.data?.turn ?? null;
-    const declaration = store.workflowEvents().findLast(e => e.type === 'stop-declared' && e.taskSeq === taskSeq && e.turn === endTurn);
+    const turnDeclaration = store.workflowEvents().findLast(e => e.type === 'stop-declared' && e.taskSeq === taskSeq && e.turn === endTurn);
     const activeMembers = [...store.members().values()].filter(m => m.actorRole !== 'direct_exec' && ACTIVE_MEMBER_STATES.has(m.status));
+    const priorStopForTask = store.workflowEvents().findLast(e => e.type === 'stop-declared' && e.taskSeq === taskSeq);
+    // Preserve an already-recorded terminal `delivered` state across spurious post-delivery turns in the same taskSeq
+    const declaration = turnDeclaration ?? (activeMembers.length === 0 && priorStopForTask?.state === 'delivered' ? priorStopForTask : undefined);
 
     if (isAutonomousGovernance(rt.config)) {
       const hasDeliveryClaimText = /^\s*DELIVERY:\s*(approved|completed)\b/im.test(finalText);

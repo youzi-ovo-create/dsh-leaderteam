@@ -77,6 +77,10 @@ export function renderMagpieModelRows(cfg, indent = '          ') {
     const upstreamId = spec?.upstreamModel ?? id;
     const yamlId = /[:@\s"']/.test(upstreamId) ? JSON.stringify(upstreamId) : upstreamId;
     const realEfforts = spec.efforts.filter(e => e !== 'none');
+    const hasNoneWithThinking = realEfforts.length > 0 && spec.efforts.includes('none') && !realEfforts.includes('off');
+    const effectiveEfforts = hasNoneWithThinking ? ['off', ...realEfforts] : realEfforts;
+    const explicitWireMap = isPlainObj(spec?.reasoningEfforts) ? spec.reasoningEfforts : null;
+    const yamlScalar = v => (/^(?:y|n|yes|no|true|false|on|off|null|~)$/i.test(v) || /[:@\s"']/.test(v) ? JSON.stringify(v) : v);
     const fields = [`id: ${yamlId}`];
     if (Number.isInteger(spec?.contextWindow) && spec.contextWindow > 0) {
       fields.push(`contextWindow: ${spec.contextWindow}`);
@@ -85,8 +89,14 @@ export function renderMagpieModelRows(cfg, indent = '          ') {
       fields.push(`maxTokens: ${spec.maxTokens}`);
     }
     fields.push(`input: ${spec.vision ? '[text, image]' : '[text]'}`);
-    if (realEfforts.length > 0) {
-      const efforts = realEfforts.map(e => `${e}: ${e}`).join(', ');
+    if (effectiveEfforts.length > 0) {
+      const efforts = effectiveEfforts.map(e => {
+        const wire = explicitWireMap && typeof explicitWireMap[e] === 'string'
+          ? explicitWireMap[e]
+          : (e === 'off' ? 'none' : e);
+        const wireOut = e === 'off' ? JSON.stringify(wire) : yamlScalar(wire);
+        return `${yamlScalar(e)}: ${wireOut}`;
+      }).join(', ');
       fields.push(`reasoningEfforts: {${efforts}}`);
     }
     rows.push(`${indent}- {${fields.join(', ')}}`);
@@ -145,7 +155,7 @@ export function parseMagpiePatchModels(yamlText, { requireManagedBlock = false }
     const id = (match[1] ?? match[2] ?? match[3] ?? '').trim();
     const rawEfforts = (match[4] ?? '').trim();
     const efforts = rawEfforts
-      ? rawEfforts.split(',').map(part => part.split(':')[0].trim()).filter(Boolean)
+      ? rawEfforts.split(',').map(part => part.split(':')[0].trim().replace(/^["']|["']$/g, '')).filter(Boolean)
       : ['none'];
     map.set(id, efforts);
   }

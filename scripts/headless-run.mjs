@@ -46,9 +46,10 @@ const mat = name => {
   let text = fs.readFileSync(path.join(ROOT, 'config', name), 'utf8').replaceAll('__LT_ROOT__', fwd(ROOT)).replaceAll('__LT_CONFIG__', fwd(cfgFile))
     .replaceAll('__MAGPIE_BASEURL__', magpieBaseUrl).replaceAll('__MAGPIE_KEY_ENV__', 'LEADERTEAM_MAGPIE_KEY')
     .replaceAll('__LEADER_MODEL__', leaderRole.route);
+  const yamlLeaderEffort = leaderRole.effort === 'off' ? '"off"' : leaderRole.effort;
   text = leaderRole.effort === 'none'
     ? text.replace(/\r?\n[ \t]*reasoningEffort:\s*__LEADER_EFFORT__/, '')
-    : text.replaceAll('__LEADER_EFFORT__', leaderRole.effort);
+    : text.replaceAll('__LEADER_EFFORT__', yamlLeaderEffort);
   if (name === 'magpie-models.patch.yml') text = rewriteModelsBlock(text, renderMagpieModelRows(runnerConfig));
   const out = path.join(runDir, name.replace('.yml', '.mat.yml')); fs.writeFileSync(out, text); return out;
 };

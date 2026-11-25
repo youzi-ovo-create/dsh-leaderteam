@@ -32,6 +32,8 @@ import { assessRequestWindow } from '../core/request-window.mjs';
 import { readQuotaStateFile, routeQuota5hWindow } from '../core/quota.mjs';
 import { routeProvider } from '../core/config.mjs';
 import { TeamStore } from '../core/store.mjs';
+import { frontierState, frontierNeedsPlanning } from '../core/frontier.mjs';
+import { hasAdmissibleFrontierWork } from './activation.mjs';
 import { readSystemPowerSample } from './power-adapter.mjs';
 import {
   runtime,
@@ -705,8 +707,30 @@ export function maybeNotifyLeaderScaleUp(ctx, teamId, { userCapRaised = false } 
   }
   const taskSeq = currentTaskSeq(ctx, teamId);
   if ((leaderAgent.inbox?.nextTurn?.length ?? 0) > 0 || (leaderAgent.inbox?.nextStep?.length ?? 0) > 0) return false;
+  const store = teamStore(teamId);
+  const wfEvents = store.workflowEvents().filter(e => e.taskSeq === taskSeq);
+  const lastStopDecl = wfEvents.findLast(e => e.type === 'stop-declared');
+  // Terminal delivery suppresses all subsequent scale-up wakeups for this taskSeq
+  if (lastStopDecl?.state === 'delivered') {
+    sched.clearAwaitingSlots(teamId, taskSeq);
+    return false;
+  }
   const turn = leaderAgent.session?.snapshotEvents?.().findLast(e => e.type === 'turn/start')?.data?.turn;
-  if (teamStore(teamId).workflowEvents().some(e => e.type === 'stop-reviewed' && e.taskSeq === taskSeq && e.turn === turn && e.result?.action === 'stop')) return false;
+  if (wfEvents.some(e => e.type === 'stop-reviewed' && e.turn === turn && e.result?.action === 'stop')) return false;
+
+  // Decouple capacity shifts from wakeup delivery under rolling planning: when no explicit pendingParallelTasks are held back
+  // and rolling stages exist, suppress wakeups whenever the plan frontier has zero admissible undispatched stages.
+  const teamSt = sched.teamState(teamId, taskSeq);
+  if (rt.config.team?.rollingPlanning && teamSt.pendingParallelTasks === 0) {
+    const fState = frontierState(store, taskSeq);
+    if (fState.revision > 0) {
+      const hasFrontierDispatch = hasAdmissibleFrontierWork(rt, store, rt.config, taskSeq);
+      if (!hasFrontierDispatch && (!frontierNeedsPlanning(store, taskSeq) || lastStopDecl?.state === 'waiting_members')) {
+        return false;
+      }
+    }
+  }
+
   const { activeMembers, otherActiveMembers } = collectTeamAndOtherActiveMembers(rt, teamId, sched);
   const prepared = sched.prepareScaleUpNotice({
     teamId,
@@ -760,7 +784,7 @@ export function startConcurrencyWatchers(ctx) {
     if (!rt.startupReady) return;
     syncExternalConcurrencyControls(rt);
     // Sample hardware even when idle so rolling CPU delta stays warm
-    sched.sampler.sample();
+    sched.sampler.sample({ force: true });
     notifyAllTeams({ userCapRaised: false });
   }, sampleMs));
   sampleTimer.unref?.();

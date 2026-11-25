@@ -1042,7 +1042,9 @@ export function registerTeamTools(ctx) {
           if (store.getMember(childId)?.status === 'starting') store.setMemberStatus(childId, 'started');
           const settled = await started.result;
           const outputText = (settled?.output ?? []).filter(b => b?.type === 'text').map(b => b.text).join('\n');
-          const stopKind = settled?.stopReason?.kind ?? 'completed';
+          const stopKind = typeof settled?.stopReason === 'string' && settled.stopReason
+            ? settled.stopReason
+            : (settled?.stopReason?.kind ?? 'completed');
           const curRec = store.getMember(childId);
           const wasPausedForConf = curRec?.status === 'paused' || /^\s*STATUS:\s*paused\b/im.test(outputText);
           if (curRec && ACTIVE_MEMBER_STATUSES.has(curRec.status)) {
@@ -1726,6 +1728,9 @@ export function registerTeamTools(ctx) {
         const priorStop = turn !== null ? store.workflowEvents().findLast(e => e.type === 'stop-declared' && e.taskSeq === taskSeq && e.turn === turn) : null;
         const duplicateInTurn = Boolean(priorStop && priorStop.state === decl.state);
         if (!duplicateInTurn) store.appendWorkflowEvent({ type: 'stop-declared', ...decl });
+        if (_args.stop_state === 'delivered') {
+          rt.scheduler?.clearAwaitingSlots?.(actor.teamId, taskSeq);
+        }
         return {
           task_seq: taskSeq,
           stop_declaration: {

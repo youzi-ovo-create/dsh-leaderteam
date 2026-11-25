@@ -613,10 +613,21 @@ export async function syncUpstreamModelsToDshSettings(ctx, modelsToEnsure = [], 
     }
     if (!provObj || typeof provObj !== 'object') continue;
     provObj.models = Array.isArray(provObj.models) ? provObj.models : [];
-    const realEfforts = (item.efforts ?? []).filter(e => e && e !== 'none');
+    const rawEfforts = item.efforts ?? [];
+    const realEfforts = rawEfforts.filter(e => e && e !== 'none');
+    const hasNoneWithThinking = realEfforts.length > 0 && rawEfforts.includes('none') && !realEfforts.includes('off');
     const existingIdx = provObj.models.findIndex(m => (typeof m === 'string' ? m : m?.id) === modelId);
+    const explicitWireMap = (item.reasoningEfforts && typeof item.reasoningEfforts === 'object' && !Array.isArray(item.reasoningEfforts))
+      ? item.reasoningEfforts
+      : null;
     const reasoningEfforts = realEfforts.length > 0
-      ? Object.fromEntries(realEfforts.map(e => [e, e]))
+      ? {
+          ...(hasNoneWithThinking ? { off: 'none' } : {}),
+          ...Object.fromEntries(realEfforts.map(e => [
+            e,
+            explicitWireMap && e in explicitWireMap ? explicitWireMap[e] : e,
+          ])),
+        }
       : undefined;
     const tplModelMeta = tpl?.modelMetadata?.[modelId] ?? null;
     const desiredCtx = positiveInt(item.contextWindow, tplModelMeta?.contextWindow);
@@ -637,9 +648,11 @@ export async function syncUpstreamModelsToDshSettings(ctx, modelsToEnsure = [], 
       const cur = { ...provObj.models[existingIdx] };
       let entryChanged = false;
       if (reasoningEfforts) {
-        const curEff = cur.reasoningEfforts ?? {};
-        if (realEfforts.some(e => !(e in curEff))) {
-          cur.reasoningEfforts = { ...curEff, ...reasoningEfforts };
+        const curEff = (cur.reasoningEfforts && typeof cur.reasoningEfforts === 'object') ? cur.reasoningEfforts : {};
+        const desiredKeys = Object.keys(reasoningEfforts);
+        if (desiredKeys.some(e => !(e in curEff))) {
+          // Preserve existing user/gateway wire values (e.g. `off: "none"`) while adding newly discovered keys
+          cur.reasoningEfforts = { ...reasoningEfforts, ...curEff };
           entryChanged = true;
         }
       }

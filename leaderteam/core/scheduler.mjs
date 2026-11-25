@@ -882,14 +882,16 @@ export function createDeviceSampler(options = {}) {
   let prevSampleMs = now();
   let lastBusyPct = 0;
   let smoothedBusyPct = null;
+  const passiveMinIntervalMs = Math.max(250, Math.floor((options.sampleIntervalMs ?? DEFAULT_SCHEDULER_CONFIG.sampleIntervalMs) / 2));
 
   return {
-    sample() {
+    sample(sampleOpts = {}) {
       const ts = now();
       const curCpu = readCpuTotals();
       const deltaTotal = curCpu.total - prevCpu.total;
       const deltaIdle = curCpu.idle - prevCpu.idle;
-      if (deltaTotal > 0 && ts - prevSampleMs >= 25) {
+      const minWindowMs = sampleOpts?.force ? 200 : passiveMinIntervalMs;
+      if (deltaTotal > 0 && ts - prevSampleMs >= minWindowMs) {
         const busy = Math.max(0, Math.min(100, (1 - deltaIdle / deltaTotal) * 100));
         lastBusyPct = Math.round(busy * 10) / 10;
         smoothedBusyPct = smoothedBusyPct === null
@@ -965,7 +967,8 @@ export class ElasticConcurrencyScheduler {
 
     // Per-team / per-task soft preference, progressive wave & wakeup tracking
     this.teams = new Map(); // teamId -> teamState
-    this.lastDevice = this.sampler.sample();
+    this.normalBandCapByProfile = new Map(); // profileKey -> last stabilized normal-band hardware cap
+    this.lastDevice = this.sampler.sample({ force: true });
   }
 
   teamState(teamId, taskSeq = 1) {
@@ -982,12 +985,16 @@ export class ElasticConcurrencyScheduler {
         dispatchesSincePendingSet: 0,
         waveFilledSincePendingSet: false,
         awaitingSlots: false,
+        awaitingSetAtTurn: -1,
+        dispatchesSinceAwaitingSet: 0,
         hadCappedTurn: false,
         pendingUserScaleUp: false,
         waveStartMs: 0,
         waveDispatched: 0,
         lastObservedEffectiveCap: this.currentUserMax(),
         lastNotifiedKey: '',
+        lastNotifiedActiveCount: null,
+        maxNotifiedAvailableForActive: 0,
         autoWakeups: 0,
         chatOverride: null, // per-session chat override: { maxActiveMembers, updatedAtMs }
         chatLoadedFromDisk: false,
@@ -1004,11 +1011,15 @@ export class ElasticConcurrencyScheduler {
       st.dispatchesSincePendingSet = 0;
       st.waveFilledSincePendingSet = false;
       st.awaitingSlots = false;
+      st.awaitingSetAtTurn = -1;
+      st.dispatchesSinceAwaitingSet = 0;
       st.hadCappedTurn = false;
       st.pendingUserScaleUp = false;
       st.waveStartMs = 0;
       st.waveDispatched = 0;
       st.lastNotifiedKey = '';
+      st.lastNotifiedActiveCount = null;
+      st.maxNotifiedAvailableForActive = 0;
       st.autoWakeups = 0;
     }
     return st;
@@ -1191,6 +1202,22 @@ export class ElasticConcurrencyScheduler {
       // Leader set a total count before dispatching, did not hit any cap, and ended voluntarily with open slots
       st.pendingParallelTasks = Math.max(0, st.pendingParallelTasks - st.dispatchesSincePendingSet);
       st.awaitingSlots = st.pendingParallelTasks > 0;
+      if (!st.awaitingSlots) {
+        st.awaitingSetAtTurn = -1;
+        st.dispatchesSinceAwaitingSet = 0;
+      }
+    } else if (
+      st.pendingParallelTasks === 0 &&
+      st.awaitingSlots &&
+      endSnapshot &&
+      endSnapshot.controls.ramp_available_now > 0 &&
+      endSnapshot.active_execution_members.total < endSnapshot.controls.effective_cap &&
+      (st.leaderTurnSeq > st.awaitingSetAtTurn || st.dispatchesSinceAwaitingSet > 0)
+    ) {
+      // Unregistered awaitingSlots latch clears once Leader ends a turn with open slots without being capped again
+      st.awaitingSlots = false;
+      st.awaitingSetAtTurn = -1;
+      st.dispatchesSinceAwaitingSet = 0;
     }
     st.leaderTurnSeq += 1;
   }
@@ -1198,7 +1225,17 @@ export class ElasticConcurrencyScheduler {
   markAwaitingSlots(teamId, taskSeq) {
     const st = this.teamState(teamId, taskSeq);
     st.awaitingSlots = true;
+    st.awaitingSetAtTurn = st.leaderTurnSeq;
+    st.dispatchesSinceAwaitingSet = 0;
     st.hadCappedTurn = true;
+  }
+
+  clearAwaitingSlots(teamId, taskSeq) {
+    const st = this.teams.get(teamId);
+    if (!st || (taskSeq !== undefined && st.taskSeq !== taskSeq)) return;
+    st.awaitingSlots = false;
+    st.awaitingSetAtTurn = -1;
+    st.dispatchesSinceAwaitingSet = 0;
   }
 
   #incrementWave(teamId, taskSeq) {
@@ -1217,6 +1254,10 @@ export class ElasticConcurrencyScheduler {
   #applyPendingAfterDispatch(teamId, taskSeq, postSnapshot = null) {
     const st = this.teamState(teamId, taskSeq);
     st.dispatchesSincePendingSet += 1;
+    if (st.awaitingSlots) st.dispatchesSinceAwaitingSet += 1;
+    st.lastNotifiedKey = '';
+    st.lastNotifiedActiveCount = null;
+    st.maxNotifiedAvailableForActive = 0;
     if (postSnapshot && (postSnapshot.active_execution_members.total >= postSnapshot.controls.effective_cap || postSnapshot.controls.ramp_available_now <= 0)) {
       st.waveFilledSincePendingSet = true;
     }
@@ -1227,7 +1268,11 @@ export class ElasticConcurrencyScheduler {
         }
       } else {
         st.pendingParallelTasks = Math.max(0, st.pendingParallelTasks - 1);
-        if (st.pendingParallelTasks === 0) st.awaitingSlots = false;
+        if (st.pendingParallelTasks === 0) {
+          st.awaitingSlots = false;
+          st.awaitingSetAtTurn = -1;
+          st.dispatchesSinceAwaitingSet = 0;
+        }
       }
     }
   }
@@ -1366,7 +1411,7 @@ export class ElasticConcurrencyScheduler {
   evaluate({ teamId = 'default', taskSeq = 1, activeMembers = [], otherActiveMembers = [], targetProfile = null, advanceSample = false, requestWindowMaxCap } = {}) {
     const ts = this.now();
     this.#pruneEvents(ts);
-    const dev = this.sampler.sample();
+    const dev = this.sampler.sample({ force: Boolean(advanceSample) });
     this.lastDevice = dev;
 
     const st = this.teamState(teamId, taskSeq);
@@ -1436,7 +1481,7 @@ export class ElasticConcurrencyScheduler {
       ? 0
       : Math.floor((cpuHeadroomPct * coreScale) / perMemberCpuEst);
 
-    const rawHardwareCap = Math.max(1, Math.min(200, globalActiveCount + Math.min(additionalMemSlots, additionalCpuSlots)));
+    const rawHardwareCapUnfiltered = Math.max(1, Math.min(200, globalActiveCount + Math.min(additionalMemSlots, additionalCpuSlots)));
 
     // 2. Remote-model & approval pipeline bottlenecks (computed over globalActiveCount & globalByProfile)
     const rateLimits = this.rateLimitEvents.length;
@@ -1518,6 +1563,21 @@ export class ElasticConcurrencyScheduler {
         this.hysteresis.throttledCap = 200;
         this.hysteresis.cleanSamples = 0;
       }
+    }
+
+    const profileKey = targetProfile ?? 'default';
+    const prevNormalCap = this.normalBandCapByProfile.get(profileKey) ?? null;
+    // Schmidt-trigger upward deadband (+2 slots) in normal operating band prevents 1-slot oscillation on 5% CPU boundary crossings,
+    // while downward drops react immediately for safety.
+    let rawHardwareCap = rawHardwareCapUnfiltered;
+    if (tripReasons.length === 0 && this.hysteresis.mode === 'normal' && prevNormalCap !== null) {
+      if (rawHardwareCapUnfiltered > prevNormalCap && rawHardwareCapUnfiltered < prevNormalCap + 2) {
+        rawHardwareCap = Math.max(globalActiveCount, prevNormalCap);
+      } else {
+        this.normalBandCapByProfile.set(profileKey, rawHardwareCapUnfiltered);
+      }
+    } else {
+      this.normalBandCapByProfile.set(profileKey, rawHardwareCapUnfiltered);
     }
 
     let deviceCapacity = Math.min(rawHardwareCap, pipelineCap);
@@ -1704,10 +1764,24 @@ export class ElasticConcurrencyScheduler {
     if (!hasWaitingWork) return null;
     if (!effectiveUserRaise && st.autoWakeups >= this.cfg.maxAutoWakeupsPerTask) return null;
 
+    // Monotonicity & anti-ping-pong guard for automatic wakeups:
+    // Only notify when a running member finishes (`activeCount < lastNotifiedActiveCount`) or available dispatch slots
+    // strictly exceed the highest count already notified at this `activeCount`. Capacity decreases NEVER trigger wakeups.
+    if (!effectiveUserRaise && st.lastNotifiedActiveCount !== null) {
+      if (activeCount === st.lastNotifiedActiveCount && availableNow <= st.maxNotifiedAvailableForActive) {
+        return null;
+      }
+      if (activeCount > st.lastNotifiedActiveCount && availableNow <= st.maxNotifiedAvailableForActive) {
+        return null;
+      }
+    }
+
     const key = `${taskSeq}:${effectiveCap}:${activeCount}:${availableNow}`;
     if (st.lastNotifiedKey === key) return null;
     return {
       key,
+      activeCount,
+      availableNow,
       effectiveUserRaise,
       summary: `并发容量可用：运行中 ${activeCount}/${effectiveCap}（可补派 ${availableNow}）`,
       text: `[LeaderTeam 弹性并发调度通知] 当前运行中执行子代理 ${activeCount} 个，实时有效并发上限为 ${effectiveCap}（用户上限 ${userMax}，设备/链路动态承载 ${deviceCap}），本轮可新增派发 ${availableNow} 个执行子代理${st.pendingParallelTasks > 0 ? `（已登记待派并行任务 ${st.pendingParallelTasks} 个）` : ''}。若当前已批准计划中仍有独立就绪的待派子任务，请按需调用 team_dispatch 补派；若所有合适任务均已派发，切勿为凑满上限强行拆分或新造任务。`,
@@ -1719,6 +1793,14 @@ export class ElasticConcurrencyScheduler {
     const st = this.teams.get(teamId);
     if (!st || st.taskSeq !== taskSeq || !prepared) return;
     st.lastNotifiedKey = prepared.key;
+    if (typeof prepared.activeCount === 'number' && typeof prepared.availableNow === 'number') {
+      if (st.lastNotifiedActiveCount !== prepared.activeCount) {
+        st.lastNotifiedActiveCount = prepared.activeCount;
+        st.maxNotifiedAvailableForActive = prepared.availableNow;
+      } else {
+        st.maxNotifiedAvailableForActive = Math.max(st.maxNotifiedAvailableForActive, prepared.availableNow);
+      }
+    }
     st.pendingUserScaleUp = false;
     if (!prepared.effectiveUserRaise) st.autoWakeups += 1;
   }
