@@ -820,13 +820,19 @@ export function onAgentError(_ctx, { agent, error } = {}) {
 export function onSessionEvent(ctx, session, event) {
   const rt = runtime();
   if (!rt.config || !rt.storageRoot || !session || !event) return;
-  if (event.type === 'assistant/message') {
+  if ((event.type === 'assistant/message' || event.type === 'compaction/summary') && event.surfaceOp !== 'seed') {
+    const src = event.type === 'compaction/summary'
+      ? {
+          provider: event.data?.provider ?? event.data?.message?.source?.provider ?? null,
+          model: event.data?.model ?? event.data?.message?.source?.model ?? null,
+        }
+      : (event.data?.message?.source ?? event.data?.source ?? null);
+    const hasExplicitModel = typeof src?.model === 'string' && src.model.trim().length > 0;
     const leader = [...rt.actors.values()].find(a => a.role === 'leader' && (a.agent?.session === session || a.teamId === session.id));
     if (leader) {
-      const src = event.data?.source ?? null;
       const sel = leader.agent?.model?.current?.() ?? null;
-      const hostProvider = src?.provider ?? sel?.provider ?? null;
-      const hostModel = src?.model ?? sel?.model ?? null;
+      const hostProvider = hasExplicitModel ? (src?.provider ?? null) : (src?.provider ?? sel?.provider ?? null);
+      const hostModel = hasExplicitModel ? src.model : (sel?.model ?? null);
       const teamCfg = runtimeForTeam(leader.teamId).config ?? rt.config;
       const route = resolveCanonicalRouteFromHostSelection(
         teamCfg,
@@ -850,7 +856,6 @@ export function onSessionEvent(ctx, session, event) {
         : null);
     if (subActor) {
       const rec = teamStore(subActor.teamId).getMember(subActor.agentId);
-      const src = event.data?.source ?? null;
       const teamCfg = runtimeForTeam(subActor.teamId).config ?? rt.config;
       const route = resolveCanonicalRouteFromHostSelection(
         teamCfg,

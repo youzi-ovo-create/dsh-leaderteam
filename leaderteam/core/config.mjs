@@ -377,6 +377,7 @@ export function validateConfig(raw) {
       if (cb.investigatorRole !== undefined && !['arbiter', 'discussA', 'discussB', 'gate'].includes(cb.investigatorRole)) {
         p.push('circuitBreaker.investigatorRole must be one of arbiter, discussA, discussB, gate');
       }
+      const cbFieldOk = {};
       for (const k of [
         'zeroProgressTruncationSoft', 'zeroProgressTruncationHard',
         'repeatedFailureSoft', 'repeatedFailureHard',
@@ -385,9 +386,21 @@ export function validateConfig(raw) {
         'runtimeErrorSoft', 'runtimeErrorHard',
         'maxConsolidationsPerAgent',
       ]) {
-        if (cb[k] !== undefined) int(cb[k], `circuitBreaker.${k}`, 1, 10000);
+        cbFieldOk[k] = cb[k] === undefined || int(cb[k], `circuitBreaker.${k}`, 1, 10000);
       }
       if (cb.cooldownMs !== undefined) int(cb.cooldownMs, 'circuitBreaker.cooldownMs', 0, 3600000);
+      const effCb = { ...DEFAULT_CIRCUIT_BREAKER_CONFIG, ...cb };
+      for (const [softKey, hardKey] of [
+        ['zeroProgressTruncationSoft', 'zeroProgressTruncationHard'],
+        ['repeatedFailureSoft', 'repeatedFailureHard'],
+        ['identicalSignatureSoft', 'identicalSignatureHard'],
+        ['stagnantSpinSoft', 'stagnantSpinHard'],
+        ['runtimeErrorSoft', 'runtimeErrorHard'],
+      ]) {
+        if (cbFieldOk[softKey] && cbFieldOk[hardKey] && effCb[softKey] > effCb[hardKey]) {
+          p.push(`circuitBreaker.${softKey} must be <= circuitBreaker.${hardKey}`);
+        }
+      }
     }
   }
 
@@ -404,8 +417,12 @@ export function validateConfig(raw) {
       if (gv.mode !== undefined && !['autonomous', 'approval'].includes(gv.mode)) {
         p.push('governance.mode must be "autonomous" or "approval"');
       }
-      if (gv.caucusQuorumNumerator !== undefined) int(gv.caucusQuorumNumerator, 'governance.caucusQuorumNumerator', 1, 10);
-      if (gv.caucusQuorumDenominator !== undefined) int(gv.caucusQuorumDenominator, 'governance.caucusQuorumDenominator', 1, 10);
+      const numOk = gv.caucusQuorumNumerator === undefined || int(gv.caucusQuorumNumerator, 'governance.caucusQuorumNumerator', 1, 10);
+      const denOk = gv.caucusQuorumDenominator === undefined || int(gv.caucusQuorumDenominator, 'governance.caucusQuorumDenominator', 1, 10);
+      const effGv = { ...DEFAULT_GOVERNANCE_CONFIG, ...gv };
+      if (numOk && denOk && effGv.caucusQuorumNumerator > effGv.caucusQuorumDenominator) {
+        p.push('governance.caucusQuorumNumerator must be <= governance.caucusQuorumDenominator');
+      }
       if (gv.maxInternalArbitrationRounds !== undefined) int(gv.maxInternalArbitrationRounds, 'governance.maxInternalArbitrationRounds', 1, 5);
       if (gv.maxConferenceDialogueTurns !== undefined) int(gv.maxConferenceDialogueTurns, 'governance.maxConferenceDialogueTurns', 0, 5);
       if (gv.autoSuperviseStages !== undefined) bool(gv.autoSuperviseStages, 'governance.autoSuperviseStages');
@@ -422,9 +439,10 @@ export function validateConfig(raw) {
       onlyKeys(pm, ['enabled', 'pollIntervalMs', 'lowBatteryPct', 'resetBatteryPct'], 'powerMonitor');
       if (pm.enabled !== undefined) bool(pm.enabled, 'powerMonitor.enabled');
       if (pm.pollIntervalMs !== undefined) int(pm.pollIntervalMs, 'powerMonitor.pollIntervalMs', 600000, 900000);
-      if (pm.lowBatteryPct !== undefined) int(pm.lowBatteryPct, 'powerMonitor.lowBatteryPct', 5, 50);
-      if (pm.resetBatteryPct !== undefined) int(pm.resetBatteryPct, 'powerMonitor.resetBatteryPct', 10, 90);
-      if (Number.isInteger(pm.lowBatteryPct) && Number.isInteger(pm.resetBatteryPct) && pm.resetBatteryPct <= pm.lowBatteryPct) {
+      const lowOk = pm.lowBatteryPct === undefined || int(pm.lowBatteryPct, 'powerMonitor.lowBatteryPct', 5, 50);
+      const resetOk = pm.resetBatteryPct === undefined || int(pm.resetBatteryPct, 'powerMonitor.resetBatteryPct', 10, 90);
+      const effPm = { ...DEFAULT_POWER_MONITOR_CONFIG, ...pm };
+      if (lowOk && resetOk && effPm.resetBatteryPct <= effPm.lowBatteryPct) {
         p.push('powerMonitor.resetBatteryPct must be greater than powerMonitor.lowBatteryPct');
       }
     }
@@ -437,8 +455,12 @@ export function validateConfig(raw) {
       onlyKeys(rw, ['enabled', 'windowMs', 'softThrottlePct', 'hardPausePct', 'windowsByProvider'], 'requestWindow');
       if (rw.enabled !== undefined) bool(rw.enabled, 'requestWindow.enabled');
       if (rw.windowMs !== undefined) int(rw.windowMs, 'requestWindow.windowMs', 60000, 86400000);
-      if (rw.softThrottlePct !== undefined) num(rw.softThrottlePct, 'requestWindow.softThrottlePct', 1, 80);
-      if (rw.hardPausePct !== undefined) num(rw.hardPausePct, 'requestWindow.hardPausePct', 0, 50);
+      const softOk = rw.softThrottlePct === undefined || num(rw.softThrottlePct, 'requestWindow.softThrottlePct', 1, 80);
+      const hardOk = rw.hardPausePct === undefined || num(rw.hardPausePct, 'requestWindow.hardPausePct', 0, 50);
+      const effRw = { ...DEFAULT_REQUEST_WINDOW_CONFIG, ...rw };
+      if (softOk && hardOk && effRw.hardPausePct > effRw.softThrottlePct) {
+        p.push('requestWindow.hardPausePct must be <= requestWindow.softThrottlePct');
+      }
       if (rw.windowsByProvider !== undefined) {
         if (!isObj(rw.windowsByProvider)) p.push('requestWindow.windowsByProvider must be an object');
         else {

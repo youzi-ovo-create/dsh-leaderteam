@@ -937,13 +937,22 @@ export class PlanArchiveStore {
     olderThanDays = null,
     all = false,
     dryRun = true,
+    confirm = undefined,
     nowMs = resolveNowMs(),
   } = {}) {
+    if (olderThanDays !== null && olderThanDays !== undefined) {
+      if (typeof olderThanDays !== 'number' || !Number.isFinite(olderThanDays) || olderThanDays < 0) {
+        throw new LtError('PLAN_ARCHIVE_CLEAN', 'olderThanDays must be a finite non-negative number');
+      }
+    }
+    if (!dryRun && confirm === false) {
+      throw new LtError('PLAN_ARCHIVE_CLEAN', 'Destructive plan archive clean requires confirm: true');
+    }
     if (!all && !projectKey && !workspace && !teamId && !category && (olderThanDays === null || olderThanDays === undefined)) {
       throw new LtError('PLAN_ARCHIVE_CLEAN', 'clean requires an explicit filter (projectKey, workspace, teamId, category, olderThanDays) or all=true');
     }
     const wantProj = projectKey ?? (workspace ? computeProjectKey(workspace, this.platform) : null);
-    const cutoffMs = (typeof olderThanDays === 'number' && Number.isFinite(olderThanDays) && olderThanDays >= 0)
+    const cutoffMs = (olderThanDays !== null && olderThanDays !== undefined)
       ? nowMs - olderThanDays * 86400 * 1000
       : null;
 

@@ -19,6 +19,7 @@ import {
   resolveWritableBackupRoot,
   ROLE_KEYS,
 } from '../leaderteam/core/model-config-writer.mjs';
+import { DSH_EFFORTS } from '../leaderteam/core/constants.mjs';
 import { resolveOrBootstrapConfigPath, detectSoloKeyPreset } from '../leaderteam/core/solo-key.mjs';
 import { startModelConfigServer, runDesktopSync } from '../leaderteam/core/model-config-ui.mjs';
 
@@ -62,7 +63,7 @@ function printHelp() {
     '  --remove-model <r1,r2,...> [--prune-pool]',
     '',
     'Governance & Leader Roles (roles.*):',
-    '  --set-role <role>=<provider/model>[:<effort>]   (repeatable; role = leader|gate|discussA|discussB|arbiter)',
+    `  --set-role <role>=<provider/model>[:<effort>]   (repeatable; role = ${ROLE_KEYS.join('|')})`,
     '  --role <role> --model <provider/model> [--effort <eff>] [--max-tokens <N>] [--timeout-ms <N>] [--retries <N>]',
     '  --leader-policy <enforce|warn|off>',
     '',
@@ -237,8 +238,10 @@ export function parseCliArgs(argv) {
       const rest = spec.slice(eq + 1).trim();
       if (!ROLE_KEYS.includes(role)) throw new Error(`unknown role "${role}" (expected ${ROLE_KEYS.join(', ')})`);
       const colon = rest.lastIndexOf(':');
-      const route = colon > 0 ? rest.slice(0, colon).trim() : rest;
-      const effort = colon > 0 ? rest.slice(colon + 1).trim() : undefined;
+      const maybeEffort = colon > 0 ? rest.slice(colon + 1).trim() : '';
+      const hasEffortSuffix = colon > 0 && DSH_EFFORTS.includes(maybeEffort);
+      const route = hasEffortSuffix ? rest.slice(0, colon).trim() : rest;
+      const effort = hasEffortSuffix ? maybeEffort : undefined;
       changes.setRoles.push({ role, route, ...(effort ? { effort } : {}) });
       i++;
       continue;

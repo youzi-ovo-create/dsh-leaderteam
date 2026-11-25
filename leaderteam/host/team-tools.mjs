@@ -12,7 +12,8 @@ import { callRoleJson } from './llm.mjs';
 import { roleRouteChain, degradedNote } from '../core/role-routes.mjs';
 import { readQuotaStateFile } from '../core/quota.mjs';
 import { executionModelRows, quotaGate, checkLeaderModel } from '../core/models.mjs';
-import { resolvePath, isInside, normalizeGlob, hasGlobWildcard, relativeInside, realpathBestEffort, pathKey, anyGlobOverlaps } from '../core/paths.mjs';
+import { resolvePath, isInside, normalizeGlob, relativeInside, realpathBestEffort, pathKey } from '../core/paths.mjs';
+import { findProtectedWriteScopeOverlap } from '../core/gate-policy.mjs';
 import { MEMBER_NAME_RE, AGREEMENT_KINDS, PLAN_CATEGORIES, PLAN_LIFECYCLE_STATES, DIRECT_EXEC_ALLOWED_TOOLS } from '../core/constants.mjs';
 import { resolveModelTarget } from '../core/upstream-models.mjs';
 import { hashJson } from '../core/canonical.mjs';
@@ -728,10 +729,8 @@ export function registerTeamTools(ctx) {
       if (profile.mutating) {
         writeScope = (args.write_scope ?? []).map(normalizeGlob);
         if (writeScope.length === 0) throw new Error(`profile "${args.profile}" writes files: write_scope must list at least one workspace-relative glob`);
-        const protectedEntries = (cfg.paths.protectedDirs ?? []).map(normalizeGlob).filter(Boolean);
         for (const g of writeScope) {
-          if (hasGlobWildcard(g.split('/')[0])) continue;
-          const hit = protectedEntries.find(d => anyGlobOverlaps([g], [d, `${d}/**`], platform));
+          const hit = findProtectedWriteScopeOverlap(g, cfg.paths.protectedDirs ?? [], platform);
           if (hit) {
             throw new Error(`write_scope glob "${g}" targets protected path "${hit}" (members cannot modify protectedDirs ${JSON.stringify(cfg.paths.protectedDirs)}; update ${cfg.paths.projectRefsDir}/* directly from leader via team_note, and restrict member write_scope to non-protected workspace paths)`);
           }
@@ -926,10 +925,8 @@ export function registerTeamTools(ctx) {
 
       const writeScope = (args.write_scope ?? []).map(normalizeGlob).filter(Boolean);
       if (writeScope.length > 0) {
-        const protectedEntries = (cfg.paths.protectedDirs ?? []).map(normalizeGlob).filter(Boolean);
         for (const g of writeScope) {
-          if (hasGlobWildcard(g.split('/')[0])) continue;
-          const hit = protectedEntries.find(d => anyGlobOverlaps([g], [d, `${d}/**`], platform));
+          const hit = findProtectedWriteScopeOverlap(g, cfg.paths.protectedDirs ?? [], platform);
           if (hit) {
             throw new Error(`write_scope glob "${g}" targets protected path "${hit}" (direct_exec cannot modify protectedDirs ${JSON.stringify(cfg.paths.protectedDirs)})`);
           }

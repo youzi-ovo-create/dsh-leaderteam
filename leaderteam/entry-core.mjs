@@ -213,18 +213,33 @@ export function apply(ctx, config) {
     }
     return syncRes;
   };
+  rt.initialSettingsSyncPromise = null;
+  rt.upstreamCatalog = null;
+  let activeSettingsCtx = ctx;
+  let microtaskStarted = false;
   if (typeof ctx.inject === 'function') {
     ctx.inject(['settings'], settingsCtx => {
-      rt.initialSettingsSyncPromise = syncConfiguredModelsToHostSettings(settingsCtx).catch(() => null);
+      activeSettingsCtx = settingsCtx;
+      let chain = syncConfiguredModelsToHostSettings(settingsCtx).catch(() => null);
+      if (microtaskStarted) {
+        chain = chain
+          .then(() => refreshUpstreamCatalog(settingsCtx, rt, { force: true, probeEndpoints: true }))
+          .then(cat => (cat && !rt.planningDisposed ? syncConfiguredModelsToHostSettings(settingsCtx) : null))
+          .catch(() => null);
+      } else if (rt.upstreamCatalog) {
+        chain = chain.then(() => syncConfiguredModelsToHostSettings(settingsCtx).catch(() => null));
+      }
+      rt.initialSettingsSyncPromise = chain;
     });
   }
   // Asynchronously sync Solo-Key / configured providers first, then probe upstream `/v1/models` to enrich `contextWindow` / `maxTokens`.
   queueMicrotask(() => {
-    Promise.resolve(rt.initialSettingsSyncPromise ?? syncConfiguredModelsToHostSettings(ctx))
-      .then(() => refreshUpstreamCatalog(ctx, rt, { force: true, probeEndpoints: true }))
+    microtaskStarted = true;
+    Promise.resolve(rt.initialSettingsSyncPromise ?? syncConfiguredModelsToHostSettings(activeSettingsCtx))
+      .then(() => refreshUpstreamCatalog(activeSettingsCtx, rt, { force: true, probeEndpoints: true }))
       .then(cat => {
         if (!cat || rt.planningDisposed) return;
-        return syncConfiguredModelsToHostSettings(ctx);
+        return syncConfiguredModelsToHostSettings(activeSettingsCtx);
       })
       .catch(() => {});
   });

@@ -5,8 +5,10 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import zlib from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 import { safeId } from '../leaderteam/core/store.mjs';
+import { deepMergePlain } from '../leaderteam/core/config.mjs';
 import { checkDshHostCompatibility } from './lt-doctor.mjs';
 
 const THIS_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -42,19 +44,20 @@ export function redactDiagnosticText(input, options = {}) {
   // 1. URLs (strip custom internal endpoints, userinfo, query tokens)
   text = text.replace(/\bhttps?:\/\/[^\s"'`<>|)\],;]+/gi, '<REDACTED_URL>');
 
-  // 2. Bearer / Basic auth headers & inline key=value secrets
-  text = text.replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{4,}/gi, '$1 [REDACTED_TOKEN]');
+  // 2. Bearer / Basic auth headers, JSON-serialized secrets, & inline key=value secrets
+  text = text.replace(/\b(Bearer|Basic)\s+(?!\[REDACTED)[A-Za-z0-9._~+/=-]{4,}/gi, '$1 [REDACTED_TOKEN]');
   text = text.replace(
-    /((?:api[_-]?key|token|secret|password|passwd|pwd|authorization|credential|private[_-]?key|access[_-]?key)\s*[:=]\s*["']?)([^\s"';&|,)\]}]+)/gi,
+    /((?:["'])?(?:api[_-]?key|token|secret|password|passwd|pwd|authorization|credential|private[_-]?key|access[_-]?key)(?:["'])?\s*[:=]\s*["']?(?:(?:Bearer|Basic)\s+)?)([^\s"';&|,)\]}[]+)/gi,
     '$1[REDACTED]',
   );
 
-  // 3. Provider & API key prefixes (sk-..., ak-..., ghp_..., github_pat_..., xoxb-..., AIza...)
+  // 3. Provider & API key prefixes (sk-..., ak-..., ghp_..., github_pat_..., xoxb-..., AIza..., JWTs)
   text = text.replace(/\b(?:sk|ak|pk|rk)-[A-Za-z0-9_-]{8,}\b/g, '[REDACTED_KEY]');
   text = text.replace(/\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{12,}\b/g, '[REDACTED_KEY]');
   text = text.replace(/\bgithub_pat_[A-Za-z0-9_]{16,}\b/g, '[REDACTED_KEY]');
   text = text.replace(/\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g, '[REDACTED_KEY]');
   text = text.replace(/\bAIza[0-9A-Za-z_-]{20,}\b/g, '[REDACTED_KEY]');
+  text = text.replace(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g, '[REDACTED_TOKEN]');
 
   // 4. Quoted Windows / UNC / POSIX paths (preserving surrounding quotes, capturing spaces inside paths)
   text = text.replace(/(["'`])(?:[A-Za-z]:(?:\\\\|\\|\/)Users(?:\\\\|\\|\/)|\/(?:home|Users|root)\/|\/mnt\/[a-zA-Z]\/Users\/)[^"'`\r\n]*\1/gi, '$1<USER_HOME>/<REDACTED>$1');
@@ -87,7 +90,7 @@ export function redactDiagnosticText(input, options = {}) {
     '<LOCAL_PATH>/<REDACTED>',
   );
   text = text.replace(
-    new RegExp(String.raw`(?:^|(?<=[\s"'` + '`' + String.raw`(=:]))\/(?:opt|srv|var|tmp|mnt|media|data)\/(?:[^\r\n"'` + '`' + String.raw`<>|),;:]*?\/)*[^\s"'` + '`' + String.raw`<>|),;:\r\n]+` + SPACED_PATH_CONT, 'gu'),
+    new RegExp(String.raw`(?:^|(?<=[\s"'` + '`' + String.raw`(=:]))\/(?:opt|srv|var|tmp|etc|run|mnt|media|data)\/(?:[^\r\n"'` + '`' + String.raw`<>|),;:]*?\/)*[^\s"'` + '`' + String.raw`<>|),;:\r\n]+` + SPACED_PATH_CONT, 'gu'),
     '<LOCAL_PATH>/<REDACTED>',
   );
   text = text.replace(/\bfile:\/\/[^\r\n"'`<>|),;]+/gi, '<LOCAL_PATH>/<REDACTED>');
@@ -342,6 +345,125 @@ function addBucket(target, delta) {
   target.totalTokens += delta.totalTokens;
 }
 
+function encodeDshSegment(raw) {
+  const s = String(raw ?? '');
+  if (s.length === 0) return '~';
+  if (s === '.') return '~002E';
+  if (s === '..') return '~002E~002E';
+  let out = '';
+  for (let i = 0; i < s.length; i++) {
+    const code = s.charCodeAt(i);
+    const ch = String.fromCharCode(code);
+    out += ch !== '~' && /^[A-Za-z0-9._-]$/.test(ch) ? ch : '~' + code.toString(16).toUpperCase().padStart(4, '0');
+  }
+  return out;
+}
+
+function decodeZstdSessionBuffer(buf) {
+  if (!buf || buf.length === 0) return '';
+  const rawBuf = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
+  try {
+    return zlib.zstdDecompressSync(rawBuf).toString('utf8');
+  } catch {}
+  const starts = [];
+  for (let i = 0; i + 3 < rawBuf.length; i++) {
+    if (rawBuf[i] === 0x28 && rawBuf[i + 1] === 0xb5 && rawBuf[i + 2] === 0x2f && rawBuf[i + 3] === 0xfd) {
+      starts.push(i);
+    }
+  }
+  const parts = [];
+  let n = 0;
+  while (n < starts.length) {
+    let found = false;
+    for (let end = n + 1; end <= starts.length; end++) {
+      try {
+        parts.push(zlib.zstdDecompressSync(rawBuf.subarray(starts[n], starts[end] ?? rawBuf.length)));
+        n = end;
+        found = true;
+        break;
+      } catch {}
+    }
+    if (!found) break;
+  }
+  return parts.length > 0 ? Buffer.concat(parts).toString('utf8') : '';
+}
+
+function findNativeSessionZstdFile(sessionsRoots, sessionId, fsImpl) {
+  const segs = [...new Set([sessionId, encodeDshSegment(sessionId)])];
+  for (const root of sessionsRoots) {
+    for (const seg of segs) {
+      const flat = path.join(root, seg, 'session.v4.jsonl.zstd');
+      try {
+        if (fsImpl.existsSync(flat) && fsImpl.statSync(flat).isFile()) return flat;
+      } catch {}
+    }
+    let buckets;
+    try {
+      buckets = fsImpl.readdirSync(root, { withFileTypes: true }).filter(d => d.isDirectory());
+    } catch {
+      continue;
+    }
+    for (const b of buckets) {
+      for (const seg of segs) {
+        const nested = path.join(root, b.name, seg, 'session.v4.jsonl.zstd');
+        try {
+          if (fsImpl.existsSync(nested) && fsImpl.statSync(nested).isFile()) return nested;
+        } catch {}
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Fold physical 4-bucket token totals from native DSH `session.v4.jsonl.zstd` logs (`leader`, `member`, `directExec`),
+ * deduplicated by `message.id` / `compactionId`. Emits numeric counts ONLY — zero message text, model URLs, or paths.
+ */
+function foldNativeSessionUsage({ dshHome, storageRoot, sessionRoleMap, usageByRole, usageTotal, fsImpl }) {
+  if (!sessionRoleMap || sessionRoleMap.size === 0) return;
+  const candidateHomes = [
+    dshHome ? path.resolve(dshHome) : null,
+    storageRoot ? path.dirname(path.resolve(storageRoot)) : null,
+    storageRoot ? path.resolve(storageRoot) : null,
+  ].filter(Boolean);
+  const sessionsRoots = [...new Set(candidateHomes.map(h => path.join(h, 'sessions')))];
+  if (sessionsRoots.length === 0) return;
+
+  for (const [sessionId, role] of sessionRoleMap.entries()) {
+    const file = findNativeSessionZstdFile(sessionsRoots, sessionId, fsImpl);
+    if (!file) continue;
+    let text;
+    try {
+      text = decodeZstdSessionBuffer(fsImpl.readFileSync(file));
+    } catch {
+      continue;
+    }
+    if (!text) continue;
+    const seen = new Set();
+    let lineIdx = 0;
+    for (const line of text.split(/\r?\n/)) {
+      lineIdx += 1;
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      let row;
+      try { row = JSON.parse(trimmed); } catch { continue; }
+      if (!row || typeof row !== 'object' || row.surfaceOp === 'seed') continue;
+      const u = row.data?.usage;
+      if (!u || typeof u !== 'object') continue;
+      const key = row.data?.message?.id
+        ? `msg:${row.data.message.id}`
+        : (row.data?.compactionId ? `comp:${row.data.compactionId}` : `${row.type}:${row.seq ?? row.time ?? lineIdx}`);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const safeRole = sanitizeRoleKey(role);
+      const delta = extract4BucketUsage(row.data);
+      usageByRole[safeRole] ??= emptyBucket();
+      addBucket(usageByRole[safeRole], delta);
+      addBucket(usageTotal, delta);
+    }
+  }
+}
+
 function readGlobalGuardCounts(storageRoot, targetTeamName, fsImpl = fs) {
   let globalRequestWindowEvents = 0;
   const globalRwTimestamps = new Set();
@@ -400,6 +522,7 @@ function aggregateTeamMetrics(teamDir, fsImpl = fs, options = {}) {
 
   // 1. Fold members.jsonl -> counts by status ONLY (never emit member names, errors, or checkpoints)
   const memberStates = new Map();
+  const memberRoles = new Map();
   let anonIdx = 0;
   const membersData = readJsonlTolerant(path.join(teamDir, 'members.jsonl'), fsImpl);
   for (const r of membersData.records) {
@@ -407,6 +530,9 @@ function aggregateTeamMetrics(teamDir, fsImpl = fs, options = {}) {
     if (r.type === 'member' || (!r.type && id)) {
       const key = id ?? `m_${++anonIdx}`;
       memberStates.set(key, sanitizeMemberStatus(r.status ?? 'starting'));
+      if (id) {
+        memberRoles.set(id, r.actorRole === 'direct_exec' ? 'directExec' : 'member');
+      }
     } else if (r.type === 'member-status' && id) {
       memberStates.set(id, sanitizeMemberStatus(r.status));
     }
@@ -428,7 +554,7 @@ function aggregateTeamMetrics(teamDir, fsImpl = fs, options = {}) {
     gate.byRule[decision][code] = (gate.byRule[decision][code] ?? 0) + 1;
   }
 
-  // 3. Aggregate usage.jsonl -> 4-bucket physical token totals by role ONLY
+  // 3. Aggregate usage.jsonl + native session.v4.jsonl.zstd -> 4-bucket physical token totals by role ONLY
   const usageData = readJsonlTolerant(path.join(teamDir, 'usage.jsonl'), fsImpl);
   const usageByRole = {};
   const usageTotal = emptyBucket();
@@ -439,6 +565,24 @@ function aggregateTeamMetrics(teamDir, fsImpl = fs, options = {}) {
     addBucket(usageByRole[role], delta);
     addBucket(usageTotal, delta);
   }
+
+  const teamMetaForId = readJsonOptional(path.join(teamDir, 'team.json'), fsImpl);
+  const leaderSessionId = (typeof teamMetaForId?.teamId === 'string' && teamMetaForId.teamId.trim())
+    ? teamMetaForId.teamId.trim()
+    : targetTeamName;
+  const sessionRoleMap = new Map();
+  if (leaderSessionId) sessionRoleMap.set(leaderSessionId, 'leader');
+  for (const [mId, mRole] of memberRoles.entries()) {
+    sessionRoleMap.set(mId, mRole);
+  }
+  foldNativeSessionUsage({
+    dshHome: options.dshHome ?? null,
+    storageRoot,
+    sessionRoleMap,
+    usageByRole,
+    usageTotal,
+    fsImpl,
+  });
 
   // 4. Aggregate governance.jsonl (+ workflow.jsonl if present) -> strike/conference/request-window/low-battery counts ONLY
   const govData = readJsonlTolerant(path.join(teamDir, 'governance.jsonl'), fsImpl);
@@ -616,7 +760,14 @@ export function generateRedactedBugReport(options = {}) {
     for (const cFile of candidateConfigs) {
       const parsed = readJsonOptional(cFile, fsImpl);
       if (parsed) {
-        rawConfig = parsed;
+        let merged = parsed;
+        if (path.basename(cFile) === 'leaderteam.config.json') {
+          const localOverride = readJsonOptional(path.join(path.dirname(cFile), 'leaderteam.local.json'), fsImpl);
+          if (localOverride && !Array.isArray(localOverride)) {
+            merged = deepMergePlain(parsed, localOverride);
+          }
+        }
+        rawConfig = merged;
         break;
       }
     }
@@ -644,8 +795,13 @@ export function generateRedactedBugReport(options = {}) {
     dshClassification,
   };
 
+  const sessionsDshHome = options.dshHome
+    ? path.resolve(options.dshHome)
+    : (env.DSH_HOME
+      ? path.resolve(env.DSH_HOME)
+      : (options.storageRoot ? path.dirname(path.resolve(options.storageRoot)) : path.resolve(dshHome)));
   const config = sanitizeConfigSummary(rawConfig);
-  const metrics = aggregateTeamMetrics(teamDir, fsImpl, { storageRoot });
+  const metrics = aggregateTeamMetrics(teamDir, fsImpl, { storageRoot, dshHome: sessionsDshHome });
 
   const redactOpts = {
     hostname: options.hostname,

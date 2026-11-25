@@ -7,9 +7,14 @@ import crypto from 'node:crypto';
 const MAGIC = [0x28, 0xb5, 0x2f, 0xfd];
 /** Decompress every zstd frame in order. Frame boundaries are found by magic number and confirmed by decoding. */
 export function zstdFrames(buf) {
+  if (!buf || buf.length < 4 || buf[0] !== MAGIC[0] || buf[1] !== MAGIC[1] || buf[2] !== MAGIC[2] || buf[3] !== MAGIC[3]) {
+    throw new Error('not a zstd stream');
+  }
+  try {
+    return zlib.zstdDecompressSync(buf);
+  } catch {}
   const starts = [];
   for (let i = 0; i + 3 < buf.length; i++) if (buf[i] === MAGIC[0] && buf[i + 1] === MAGIC[1] && buf[i + 2] === MAGIC[2] && buf[i + 3] === MAGIC[3]) starts.push(i);
-  if (starts[0] !== 0) throw new Error('not a zstd stream');
   const out = [];
   let s = 0;
   while (s < starts.length) {

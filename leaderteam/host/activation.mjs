@@ -64,7 +64,8 @@ export function resumeAdmission(store, cfg, targetId, taskSeq) {
   const member = store.getMember(targetId);
   if (!member || member.actorRole === 'direct_exec') {
     const byName = [...store.members().values()].findLast(m => m.actorRole !== 'direct_exec' && m.name === targetId);
-    const hint = byName?.childId ? ` (pass agent_id="${byName.childId}" instead of member name "${targetId}")` : '';
+    const preferredAgent = byName?.hostAgentName ?? byName?.childId;
+    const hint = preferredAgent ? ` (pass agent="${preferredAgent}" instead of "${targetId}")` : '';
     throw new Error(`send_message target is not a member of this team${hint}`);
   }
   const autonomous = isAutonomousGovernance(cfg);

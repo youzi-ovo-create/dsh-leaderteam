@@ -3,22 +3,88 @@ import fs from 'node:fs';
 import path from 'node:path';
 import zlib from 'node:zlib';
 import { TeamStore, readJsonl } from '../core/store.mjs';
+import { resolveCanonicalRouteFromHostSelection } from './runtime.mjs';
+
+export const MAX_CACHED_SESSIONS = 32;
 const cache = new Map();
 const fields = ['inputTokens','cacheReadTokens','cacheWriteTokens','outputTokens','totalTokens'];
 const measured = usage => usage && fields.some(k => Number.isFinite(usage[k]) && usage[k] > 0);
-const nativeResponse = row => row.data?.usage || (row.type === 'assistant/message' && row.data?.message?.source?.model);
+const nativeResponse = row => row.data?.usage
+  || (row.type === 'assistant/message' && (row.data?.message?.source?.model || row.data?.source?.model))
+  || (row.type === 'compaction/summary' && row.data?.model);
+const nativeRowKey = row => row.data?.message?.id
+  ?? (row.data?.compactionId ? `compaction:${row.data.compactionId}` : null)
+  ?? `${row.type}:${row.seq ?? row.time}`;
 const sum = rows => Object.fromEntries(fields.map(k => [k, rows.reduce((n,r) => n + (r.usage?.[k] ?? (k === 'totalTokens' && r.usage ? ['inputTokens','cacheReadTokens','cacheWriteTokens','outputTokens'].reduce((n,f)=>n+(r.usage[f]??0),0) : 0)),0)]));
 
-export function summarizeTeamUsage(sessions, governance) {
+function encodeDshSegment(raw) {
+  const s = String(raw ?? '');
+  if (s.length === 0) return '~';
+  if (s === '.') return '~002E';
+  if (s === '..') return '~002E~002E';
+  let out = '';
+  for (let i = 0; i < s.length; i++) {
+    const code = s.charCodeAt(i);
+    const ch = String.fromCharCode(code);
+    out += ch !== '~' && /^[A-Za-z0-9._-]$/.test(ch) ? ch : '~' + code.toString(16).toUpperCase().padStart(4, '0');
+  }
+  return out;
+}
+
+function extractNativeRowRoute(row, fallbackRoute = null, cfg = null) {
+  const isCompaction = row.type === 'compaction/summary';
+  const rawModel = isCompaction
+    ? (row.data?.model ?? row.data?.message?.source?.model ?? null)
+    : (row.data?.message?.source?.model ?? row.data?.source?.model ?? null);
+  const rawProv = isCompaction
+    ? (row.data?.provider ?? row.data?.message?.source?.provider ?? null)
+    : (row.data?.message?.source?.provider ?? row.data?.source?.provider ?? null);
+  if (typeof rawModel === 'string' && rawModel.trim()) {
+    return cfg ? resolveCanonicalRouteFromHostSelection(cfg, rawProv, rawModel, rawModel) : rawModel.trim();
+  }
+  return fallbackRoute;
+}
+
+function decodeZstdSessionLog(buf) {
+  if (!buf || buf.length === 0) return Buffer.alloc(0);
+  try {
+    return zlib.zstdDecompressSync(buf);
+  } catch {}
+  const starts = [];
+  for (let i = 0; i + 3 < buf.length; i++) {
+    if (buf[i] === 0x28 && buf[i + 1] === 0xb5 && buf[i + 2] === 0x2f && buf[i + 3] === 0xfd) starts.push(i);
+  }
+  const parts = [];
+  let n = 0;
+  while (n < starts.length) {
+    let found = false;
+    for (let end = n + 1; end <= starts.length; end++) {
+      try {
+        parts.push(zlib.zstdDecompressSync(buf.subarray(starts[n], starts[end] ?? buf.length)));
+        n = end;
+        found = true;
+        break;
+      } catch {}
+    }
+    if (!found) {
+      if (parts.length > 0) break;
+      throw new Error('cannot decode native session log');
+    }
+  }
+  return Buffer.concat(parts);
+}
+
+export function summarizeTeamUsage(sessions, governance, cfg = null) {
   const receipts = [];
   for (const s of sessions) {
     const seen = new Set(); let route = null;
     for (const row of s.rows) {
       route = row.data?.header?.config?.model ?? (row.type === 'model/selection' ? row.data?.model : null) ?? route;
       if (!nativeResponse(row) || row.surfaceOp === 'seed') continue;
-      const key = row.data.message?.id ?? `${row.type}:${row.seq ?? row.time}`;
+      const key = nativeRowKey(row);
       if (seen.has(key)) continue; seen.add(key);
-      receipts.push({ group:s.group, session:s.id, member:s.name, route:row.data?.message?.source?.model ?? route ?? 'unknown', usage:row.data.usage });
+      const resolvedRoute = extractNativeRowRoute(row, route, cfg) ?? 'unknown';
+      receipts.push({ group:s.group, session:s.id, member:s.name, route:resolvedRoute, usage:row.data.usage });
     }
   }
   receipts.push(...governance.map(r => ({...r, group:'governance'})));
@@ -33,23 +99,63 @@ export function summarizeTeamUsage(sessions, governance) {
     notes:['包含缓存；每条消息和治理回执只计一次，不重复计 stream/chunk。','未返回的用量和外部修复 Agent 消耗未计入；费用不可用时不显示为零。'], cost:null };
 }
 
+function setBoundedSessionCache(file, entry) {
+  if (cache.has(file)) cache.delete(file);
+  while (cache.size >= MAX_CACHED_SESSIONS) {
+    const oldestKey = cache.keys().next().value;
+    if (oldestKey === undefined) break;
+    cache.delete(oldestKey);
+  }
+  cache.set(file, entry);
+}
+
+export function _observabilityCacheSizeForTest() {
+  return cache.size;
+}
+
 function durableRows(home,id) {
-  if (!home) return null;
-  const root=path.join(home,'sessions'); let dirs;
-  try { dirs=fs.readdirSync(root,{withFileTypes:true}).filter(d=>d.isDirectory()); } catch { return null; }
-  for (const dir of dirs) {
-    const file=path.join(root,dir.name,id,'session.v4.jsonl.zstd'); let stat;
+  if (!home || !id) return null;
+  const root=path.join(home,'sessions');
+  const segs=[...new Set([id, encodeDshSegment(id)])];
+  const candidates=[];
+  for (const seg of segs) candidates.push(path.join(root,seg,'session.v4.jsonl.zstd'));
+  try {
+    const dirs=fs.readdirSync(root,{withFileTypes:true}).filter(d=>d.isDirectory());
+    for (const dir of dirs) {
+      for (const seg of segs) candidates.push(path.join(root,dir.name,seg,'session.v4.jsonl.zstd'));
+    }
+  } catch {
+    if (candidates.length === 0) return null;
+  }
+  for (const file of candidates) {
+    let stat;
     try { stat=fs.statSync(file); } catch { continue; }
     const signature=`${stat.mtimeMs}:${stat.size}`;
-    if (cache.get(file)?.signature===signature) return cache.get(file).rows;
-    const buf=fs.readFileSync(file),starts=[];
-    for(let i=0;i+3<buf.length;i++)if(buf[i]===0x28&&buf[i+1]===0xb5&&buf[i+2]===0x2f&&buf[i+3]===0xfd)starts.push(i);
-    const parts=[];let n=0;
-    while(n<starts.length){let found=false;for(let end=n+1;end<=starts.length;end++){try{parts.push(zlib.zstdDecompressSync(buf.subarray(starts[n],starts[end]??buf.length)));n=end;found=true;break;}catch{}}if(!found)throw new Error('cannot decode native session log');}
-    const rows=Buffer.concat(parts).toString('utf8').split('\n').filter(Boolean).map(JSON.parse);
-    cache.set(file,{signature,rows});return rows;
+    const existing=cache.get(file);
+    if (existing?.signature===signature) {
+      cache.delete(file);
+      cache.set(file, existing);
+      return existing.rows;
+    }
+    const buf=fs.readFileSync(file);
+    const rows=decodeZstdSessionLog(buf).toString('utf8').split('\n').filter(Boolean).map(JSON.parse);
+    setBoundedSessionCache(file,{signature,rows});
+    return rows;
   }
   return null;
+}
+
+function dedupedNativeRows(rows) {
+  const out = [];
+  const seen = new Set();
+  for (const r of rows) {
+    if (!nativeResponse(r) || r.surfaceOp === 'seed') continue;
+    const k = nativeRowKey(r);
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(r);
+  }
+  return out;
 }
 
 export function teamObservability(ctx,rt,teamId) {
@@ -67,16 +173,16 @@ export function teamObservability(ctx,rt,teamId) {
     if (!rows?.some(nativeResponse)) rows=durableRows(home,s.id);
     return {...s,rows:rows??[],available:rows!==null&&rows!==undefined};
   });
+  const leaderRows=dedupedNativeRows(sessions[0].rows);
   return { teamId,governanceSha256:snapshot?.sourceSha256??null,
     roles:Object.entries(cfg.roles).map(([role,value])=>{
       const actual=governance.filter(r=>r.role===role);
-      const leaderRows=sessions[0].rows.filter(nativeResponse);
       const requestRoutes=role==='leader'?[...new Set(sessions[0].rows.filter(r=>r.type==='request/header').map(r=>r.data?.header?.config?.model).filter(Boolean))]:[];
-      return {role,configured:value,actualRoutes:role==='leader'?[...new Set(leaderRows.map(r=>r.data?.message?.source?.model).filter(Boolean))]:[...new Set(actual.map(r=>r.route))],
+      return {role,configured:value,actualRoutes:role==='leader'?[...new Set(leaderRows.map(r=>extractNativeRowRoute(r,null,cfg)).filter(Boolean))]:[...new Set(actual.map(r=>r.route))],
         requestRoutes,requested:requestRoutes.length>0,
         calls:role==='leader'?leaderRows.length:actual.length,called:role==='leader'?leaderRows.length>0:actual.length>0,
         degraded:actual.some(r=>r.degraded),missingUsage:role==='leader'?leaderRows.filter(r=>!measured(r.data.usage)).length:actual.filter(r=>!measured(r.usage)).length,tokens:role==='leader'?sum(leaderRows.map(r=>({usage:r.data.usage}))):sum(actual)};
-    }), members:members.map(m=>({id:m.childId,name:m.name,configuredModel:m.model,effort:m.effort,status:m.status})),usage:summarizeTeamUsage(sessions,governance) };
+    }), members:members.map(m=>({id:m.childId,name:m.name,configuredModel:m.model,effort:m.effort,status:m.status})),usage:summarizeTeamUsage(sessions,governance,cfg) };
 }
 
 export function recentTeamObservability(ctx,rt,limit=8) {
