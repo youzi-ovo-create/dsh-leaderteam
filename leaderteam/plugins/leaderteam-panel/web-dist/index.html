@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="zh-CN" data-lt-theme="white">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Leader Team — 工程治理与模型工作台</title>
+    <script>
+      (function bootLtTheme() {
+        try {
+          var raw = localStorage.getItem('lt-ui-preferences-v1');
+          if (!raw) return;
+          var prefs = JSON.parse(raw);
+          var theme = prefs && prefs.theme ? prefs.theme : 'white';
+          document.documentElement.setAttribute('data-lt-theme', theme);
+          if (theme === 'custom' && prefs.customTheme) {
+            var ct = prefs.customTheme;
+            var root = document.documentElement.style;
+            if (ct.canvasColor) root.setProperty('--user-bg-canvas', ct.canvasColor);
+            if (ct.surfaceColor) root.setProperty('--user-bg-surface', ct.surfaceColor);
+            if (ct.inkColor) root.setProperty('--user-fg-primary', ct.inkColor);
+            if (ct.accentColor) root.setProperty('--user-accent', ct.accentColor);
+            if (ct.dangerColor) root.setProperty('--user-danger', ct.dangerColor);
+          }
+        } catch (e) {}
+      })();
+    </script>
+    <script type="module" crossorigin src="./assets/index-DMu8yRE4.js"></script>
+    <link rel="modulepreload" crossorigin href="./assets/react-DHz4kLit.js">
+    <link rel="modulepreload" crossorigin href="./assets/echarts-ClPwX7rX.js">
+    <link rel="stylesheet" crossorigin href="./assets/index-Cr_RpfQ7.css">
+  </head>
+  <body>
+    <div id="root"></div>
+  </body>
+</html>

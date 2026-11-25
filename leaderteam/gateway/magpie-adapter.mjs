@@ -323,6 +323,36 @@ export function buildPublicProviders({
     });
   }
 
+  // 4. Backfill `unconfigured` provider descriptors for any vendor referenced by `effectiveConfig.models`
+  //    so `ModelCatalogEntry.providerId` always maintains referential integrity in `lt.public.v1`.
+  for (const [routeId, spec] of Object.entries(effectiveConfig?.models ?? {})) {
+    const hostProv = spec?.provider ?? defaultMagpieProv;
+    const isMagpie = hostProv === defaultMagpieProv;
+    const rawUpstream = spec?.upstreamModel ?? routeId;
+    const slashIdx = rawUpstream.indexOf('/');
+    const vendorPart = isMagpie
+      ? (slashIdx > 0 ? rawUpstream.slice(0, slashIdx) : 'magpie')
+      : hostProv;
+    const sourceKind = isMagpie ? 'magpie' : 'direct';
+    const providerId = `${sourceKind}:${vendorPart}`;
+    if (seenProviderIds.has(providerId)) continue;
+    seenProviderIds.add(providerId);
+    providers.push({
+      providerId,
+      sourceKind,
+      vendorId: vendorPart,
+      displayName: `${vendorPart} (${isMagpie ? 'Magpie 待接入' : '直连待配置'})`,
+      protocol: 'openai-chat',
+      endpointUrl: isMagpie ? sanitizeEndpointUrl(magpieGatewayUrl || '') : '',
+      status: 'unconfigured',
+      keyRotation: 'single',
+      sessionAffinity: false,
+      credentials: [],
+      discoveredModelCount: 0,
+      enabledModelCount: 0,
+    });
+  }
+
   // Presets catalog merging Magpie presets + Solo-Key presets
   const presetMap = new Map();
   for (const p of SOLO_PROVIDER_PRESETS) {

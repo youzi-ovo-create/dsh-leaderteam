@@ -11,7 +11,9 @@
   },
   "bin": {
     "lt-doctor": "./bin/lt-doctor.mjs",
-    "lt-bugreport": "./bin/lt-bugreport.mjs"
+    "lt-bugreport": "./bin/lt-bugreport.mjs",
+    "lt-magpie": "./bin/lt-magpie.mjs",
+    "lt-ui": "./bin/lt-ui.mjs"
   },
   "main": "./leaderteam/plugins/leaderteam-panel/index.mjs",
   "exports": {
@@ -24,6 +26,8 @@
     "./timer-archive": "./leaderteam/plugins/leaderteam-timer-archive/index.mjs",
     "./consensus": "./leaderteam/plugins/leaderteam-consensus/index.mjs",
     "./panel": "./leaderteam/plugins/leaderteam-panel/index.mjs",
+    "./gateway": "./leaderteam/gateway/index.mjs",
+    "./usage": "./leaderteam/usage/index.mjs",
     "./package.json": "./package.json",
     "./locale/*.json": "./locale/*.json"
   },
@@ -37,6 +41,7 @@
     "docs/*.md",
     "docs/HeLuoDoc/**",
     "leaderteam/**",
+    "packages/lt-usage/**",
     "scripts/configure-models.mjs",
     "scripts/plan-archive.mjs",
     "scripts/dsh-runtime.mjs",

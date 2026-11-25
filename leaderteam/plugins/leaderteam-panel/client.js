@@ -21,6 +21,8 @@
     { key: 'discussA', label: '评审 A (discussA)' },
     { key: 'discussB', label: '评审 B (discussB)' },
     { key: 'arbiter', label: '独立裁断 (arbiter)' },
+    { key: 'serialReviewer', label: '串行质询 (serialReviewer)' },
+    { key: 'directExec', label: '直接执行 (directExec)' },
   ];
   const PLUGIN_META = [
     { key: 'scheduler', label: '弹性并发调度 (leaderteam-scheduler)', desc: '设备负载感知、渐进扩缩容与对话实时限速' },
@@ -366,9 +368,47 @@
             h('div', { style: { fontSize: '11px', opacity: 0.7 } }, '上游动态模型 · 可拆卸插件 · 工程计时 · 外部计划归档与复审')
           ),
           h('div', null,
+            h(
+              'a',
+              {
+                href: './lt/',
+                style: {
+                  display: 'inline-block',
+                  padding: '5px 12px',
+                  borderRadius: '6px',
+                  border: '1px solid #9C5B2E',
+                  background: '#141619',
+                  color: '#FFFFFF',
+                  textDecoration: 'none',
+                  fontWeight: 600,
+                  fontSize: '12px',
+                  marginRight: '8px',
+                },
+                title: '切换至 LT 原生工作台（共享同一运行时与活跃团队，切换零中断）',
+              },
+              '切换至 LT 原生工作台 ↗'
+            ),
             h('button', { style: btnStyle(false), onClick: () => loadState({ forceDiscover: true }), disabled: loading }, loading ? '刷新中…' : '刷新状态'),
             h('button', { style: btnStyle(true), onClick: () => onDiscoverUpstream(true), disabled: loading }, '探测上游模型 (/v1/models)')
           )
+        ),
+        h(
+          'div',
+          {
+            style: {
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              gap: '8px',
+              padding: '8px 12px',
+              marginBottom: '12px',
+              borderLeft: '2px solid #9C5B2E',
+              background: 'rgba(156, 91, 46, 0.08)',
+              fontSize: '12px',
+            },
+          },
+          h('span', null, 'LT V2.2.x 原生工作台已就绪：提供完整网关与多 Key 管理、角色回退链配置、实时治理轴线、衡账分析及四套河洛序主题，与当前 DSH 前端共享同一会话与团队。'),
+          h('a', { href: './lt/', style: { color: '#9C5B2E', fontWeight: 600, whiteSpace: 'nowrap', textDecoration: 'none' } }, '立即进入 /lt/ →')
         ),
         error ? h('div', { style: { padding: '8px 10px', borderRadius: '6px', background: 'rgba(220,38,38,0.15)', color: '#ef4444', marginBottom: '10px', fontSize: '12px' } }, '错误：' + error) : null,
         notice ? h('div', { style: { padding: '8px 10px', borderRadius: '6px', background: 'rgba(22,163,74,0.15)', color: '#22c55e', marginBottom: '10px', fontSize: '12px' } }, notice) : null,
