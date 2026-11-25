@@ -1,12 +1,50 @@
 // Append-only JSONL team store. One directory per team (team id = leader session id). Sync fs; single writer process per team.
 import fs from 'node:fs';
 import path from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { LtError } from './constants.mjs';
 
 export function safeId(id) {
-  if (typeof id !== 'string' || !/^[A-Za-z0-9._-]{1,128}$/.test(id) || id === '.' || id === '..') throw new LtError('BAD_ID', `unsafe id: ${id}`);
+  if (typeof id !== 'string' || !/^[A-Za-z0-9._~-]{1,192}$/.test(id) || id === '.' || id === '..' || id.includes('..')) {
+    throw new LtError('BAD_ID', `unsafe id: ${id}`);
+  }
   return id;
+}
+
+export function encodeTeamStoreId(teamId, root = null) {
+  if (typeof teamId !== 'string' || teamId.length === 0 || teamId.trim().length === 0 || teamId.length > 256 || teamId.includes('\u0000')) {
+    throw new LtError('BAD_ID', `unsafe id: ${teamId}`);
+  }
+  if (/^[A-Za-z0-9._-]{1,192}$/.test(teamId) && teamId !== '.' && teamId !== '..' && !teamId.startsWith('.') && !teamId.includes('..')) {
+    return teamId;
+  }
+  if (root && /^[A-Za-z0-9._~-]{1,192}$/.test(teamId) && teamId !== '.' && teamId !== '..' && !teamId.includes('..')) {
+    try {
+      if (fs.existsSync(path.join(root, 'teams', teamId))) return teamId;
+    } catch {}
+  }
+  if (teamId === '.') return '~002E';
+  if (teamId === '..') return '~002E~002E';
+  let out = '';
+  for (let i = 0; i < teamId.length; i++) {
+    const code = teamId.charCodeAt(i);
+    const ch = teamId[i];
+    const isDotHazard = ch === '.' && (i === 0 || teamId[i - 1] === '.' || teamId[i + 1] === '.');
+    if (!isDotHazard && ch !== '~' && /^[A-Za-z0-9._-]$/.test(ch)) {
+      out += ch;
+    } else {
+      out += '~' + code.toString(16).toUpperCase().padStart(4, '0');
+    }
+  }
+  if (out.length > 192) {
+    let prefix = out.slice(0, 128);
+    const lastTilde = prefix.lastIndexOf('~');
+    if (lastTilde >= 0 && prefix.length - lastTilde < 5) prefix = prefix.slice(0, lastTilde);
+    while (prefix.endsWith('.')) prefix = prefix.slice(0, -1);
+    const digest = createHash('sha256').update(teamId).digest('hex').slice(0, 32);
+    out = `${prefix || 'sid'}~h${digest}`;
+  }
+  return safeId(out);
 }
 /**
  * A crash can leave the last line without its newline. Before appending: a complete record only gets its newline;
@@ -117,7 +155,8 @@ export function writeFilesTransactional(writes) {
 
 export class TeamStore {
   constructor(root, teamId) {
-    this.teamId = safeId(teamId);
+    this.rawTeamId = teamId;
+    this.teamId = encodeTeamStoreId(teamId, root);
     this.dir = path.join(root, 'teams', this.teamId);
     this.membersFile = path.join(this.dir, 'members.jsonl');
     this.agreementsFile = path.join(this.dir, 'agreements.jsonl');
@@ -128,7 +167,12 @@ export class TeamStore {
     this.governanceFile = path.join(this.dir, 'governance.jsonl');
   }
   static exists(root, teamId) {
-    try { return fs.existsSync(path.join(root, 'teams', safeId(teamId), 'members.jsonl')) || fs.existsSync(path.join(root, 'teams', safeId(teamId), 'team.json')); } catch { return false; }
+    try {
+      const sid = encodeTeamStoreId(teamId, root);
+      return fs.existsSync(path.join(root, 'teams', sid, 'members.jsonl')) || fs.existsSync(path.join(root, 'teams', sid, 'team.json'));
+    } catch {
+      return false;
+    }
   }
   ensure(meta) {
     fs.mkdirSync(this.dir, { recursive: true });

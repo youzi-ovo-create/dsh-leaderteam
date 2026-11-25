@@ -117,6 +117,7 @@ export default {
       // Turn 1: Team Mode
       if (runIdx === 0) {
         t.state.turn1Tools = c.tools;
+        t.state.turn1PromptText = c.text;
         if (step === 1) return PLAN;
         if (step === 2) {
           return dispatch({
@@ -171,13 +172,18 @@ export default {
             },
           };
         }
-        t.state.turn3BashOut = lastToolResult(c);
+        if (step === 6) {
+          t.state.turn3BashOut = lastToolResult(c);
+          return { content: 'PARTIAL_TRUNCATED_SINGLE_OUTPUT', finishReason: 'length' };
+        }
+        t.state.turn3RecoveryText = c.text;
         return { content: 'Updated src/greeting.js to v2 and verified SINGLE_BASH_OK:v2 directly in Single Mode.' };
       }
 
       // Turn 4: Back in Team Mode on fresh taskSeq (write/bash revoked on leader; fresh dispatch succeeds without reviving impl-t1)
       if (runIdx === 3) {
         t.state.turn4Tools = c.tools;
+        t.state.turn4PromptText = c.text;
         if (step === 1) {
           // Attempt direct write in Team mode -> must be rejected because write is revoked from leader!
           return { tool: 'write', args: { file_path: 'src/revoked.txt', content: 'should-fail' } };
@@ -226,6 +232,8 @@ export default {
       assert.ok(!t.state.turn1Tools.includes(directTool), `Turn 1 Team leader must not expose ${directTool}`);
     }
     assert.ok(t.state.turn1Tools.includes('team_dispatch'));
+    assert.ok(!t.state.turn1PromptText.includes('Check the [exit code: N] marker on every bash result'), 'Turn 1 Team prompt must shadow static tool:bash section');
+    assert.ok(!t.state.turn1PromptText.includes('Track every background job id you start'), 'Turn 1 Team prompt must shadow static tool:jobs section');
     assert.match(t.runs[0].final?.text ?? '', /DELIVERY: approved/);
 
     // Turn 2 assertions (Single mode Q&A: 1 LLM call, 0 tools, 0 team continuation hooks)
@@ -237,6 +245,10 @@ export default {
     }
     assert.match(t.state.turn2PromptText, /# LeaderTeam Single Mode: direct execution/);
     assert.ok(!t.state.turn2PromptText.includes('# LeaderTeam: you are the team leader'));
+    if (process.platform !== 'win32') {
+      assert.match(t.state.turn2PromptText, /Check the \[exit code: N\] marker on every bash result/, 'Turn 2 Single prompt must restore tool:bash section');
+    }
+    assert.match(t.state.turn2PromptText, /Track every background job id you start/, 'Turn 2 Single prompt must restore tool:jobs section');
     const turn2Calls = t.calls.slice(t.state.runCallOffsets[1], t.state.runCallOffsets[2]);
     assert.equal(turn2Calls.length, 1, 'Turn 2 Single Q&A must complete in 1 LLM call with 0 stop-review or continuation calls');
     assert.match(t.runs[1].final?.text ?? '', /src\/greeting\.js/);
@@ -248,6 +260,7 @@ export default {
     assert.match(t.state.turn3ReadOut ?? '', /export const greet = \(\) => "v1"/);
     assert.equal(read(t, 'src/greeting.js'), 'export const greet = () => "v2";\n');
     assert.match(t.state.turn3BashOut ?? '', /SINGLE_BASH_OK:v2/);
+    assert.match(t.state.turn3RecoveryText ?? '', /LeaderTeam output recovery — Single Mode/, 'Turn 3 Single max-tokens must auto-continue cleanly with exit code 0');
     assert.ok(
       (t.state.gateRequests ?? []).some(
         req => req.operation?.tool === SHELL_TOOL
@@ -261,6 +274,8 @@ export default {
     for (const revokedTool of ['write', 'edit', 'bash', 'pwsh', 'job_list', 'job_output', 'job_kill']) {
       assert.ok(!t.state.turn4Tools.includes(revokedTool), `Turn 4 Team leader must revoke ${revokedTool}`);
     }
+    assert.ok(!t.state.turn4PromptText.includes('Check the [exit code: N] marker on every bash result'), 'Turn 4 Team prompt must re-shadow tool:bash');
+    assert.ok(!t.state.turn4PromptText.includes('Track every background job id you start'), 'Turn 4 Team prompt must re-shadow tool:jobs');
     assert.equal(exists(t, 'src/revoked.txt'), false, 'revoked write in Turn 4 must never touch disk');
     assert.match(t.state.turn4RevokedWriteErr ?? '', /unknown tool|UNKNOWN_TOOL|tool-not-in-profile/i);
     assert.equal(read(t, 'src/turn4.txt'), 'TURN4_TEAM_OK\n');

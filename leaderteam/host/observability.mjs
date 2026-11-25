@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import zlib from 'node:zlib';
 import { TeamStore, readJsonl } from '../core/store.mjs';
+import { decodeSessionModeSegment } from '../core/session-mode.mjs';
 import { resolveCanonicalRouteFromHostSelection } from './runtime.mjs';
 
 export const MAX_CACHED_SESSIONS = 32;
@@ -180,6 +181,7 @@ function dedupedNativeRows(rows) {
 
 export function teamObservability(ctx,rt,teamId) {
   const store=new TeamStore(rt.storageRoot,teamId);
+  const resolvedTeamId=rt.actors.has(teamId)?teamId:decodeSessionModeSegment(teamId);
   const governance=readJsonl(path.join(store.dir,'usage.jsonl')).records;
   let snapshot;
   try { snapshot=JSON.parse(fs.readFileSync(path.join(store.dir,'governance.json'),'utf8')); } catch {}
@@ -189,7 +191,7 @@ export function teamObservability(ctx,rt,teamId) {
   home??=path.dirname(rt.storageRoot);
   const members=[...store.members().values()];
   const sessions=[
-    {id:teamId,name:'leader',group:'leader',actorRole:'leader',configuredModel:null},
+    {id:resolvedTeamId,name:'leader',group:'leader',actorRole:'leader',configuredModel:null},
     ...members.map(m=>({id:m.childId,name:m.name,group:'execution',actorRole:m.actorRole??'member',configuredModel:m.model??null})),
   ].map(s=>{
     let rows=rt.actors.get(s.id)?.agent?.session?.snapshotEvents?.();
@@ -210,7 +212,7 @@ export function teamObservability(ctx,rt,teamId) {
     const fb=extractSessionFallbackRoute(ds);
     return dedupedNativeRows(ds.rows).map(r=>({row:r,route:extractNativeRowRoute(r,fb,cfg)}));
   });
-  return { teamId,governanceSha256:snapshot?.sourceSha256??null,
+  return { teamId:resolvedTeamId,governanceSha256:snapshot?.sourceSha256??null,
     roles:Object.entries(cfg?.roles??{}).map(([role,value])=>{
       const actual=governance.filter(r=>r.role===role);
       if (role==='leader') {
@@ -252,6 +254,11 @@ export function teamObservability(ctx,rt,teamId) {
 
 export function recentTeamObservability(ctx,rt,limit=8) {
   const root=path.join(rt.storageRoot,'teams');let dirs;
-  try { dirs=fs.readdirSync(root,{withFileTypes:true}).filter(d=>d.isDirectory()).map(d=>({id:d.name,time:fs.statSync(path.join(root,d.name)).mtimeMs})).sort((a,b)=>b.time-a.time); } catch { return []; }
+  try {
+    dirs=fs.readdirSync(root,{withFileTypes:true})
+      .filter(d=>d.isDirectory() && TeamStore.exists(rt.storageRoot,d.name))
+      .map(d=>({id:d.name,time:fs.statSync(path.join(root,d.name)).mtimeMs}))
+      .sort((a,b)=>b.time-a.time);
+  } catch { return []; }
   return dirs.slice(0,limit).map(d=>{try{return teamObservability(ctx,rt,d.id);}catch(e){return{teamId:d.id,error:e.message};}});
 }

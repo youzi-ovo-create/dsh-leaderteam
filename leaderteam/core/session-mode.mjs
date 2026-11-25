@@ -1,12 +1,14 @@
 // Session-level execution mode ('team' | 'single') with DSH-safe path encoding and atomic disk persistence.
 import fs from 'node:fs';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { LtError } from './constants.mjs';
 import { writeFileAtomic, appendJsonl, readJsonl } from './store.mjs';
 import { isInside } from './paths.mjs';
 
 export const EXECUTION_MODES = Object.freeze(['team', 'single']);
 export const DEFAULT_EXECUTION_MODE = 'team';
+const MAX_SAFE_SEGMENT_CHARS = 192;
 
 export function normalizeExecutionMode(val) {
   if (typeof val !== 'string') {
@@ -20,7 +22,7 @@ export function normalizeExecutionMode(val) {
 }
 
 /**
- * Encode `sessionId` into a safe, bijective single filename segment (`[A-Za-z0-9._~-]`),
+ * Encode `sessionId` into a safe, deterministic single filename segment (`[A-Za-z0-9._~-]`, <= 192 chars),
  * escaping `.` / `..` / leading `.` / `~` / `:` / `/` / `\` / control & non-ASCII chars as `~XXXX` uppercase hex.
  */
 export function encodeSessionModeSegment(sessionId) {
@@ -46,10 +48,26 @@ export function encodeSessionModeSegment(sessionId) {
       out += '~' + code.toString(16).toUpperCase().padStart(4, '0');
     }
   }
-  if (!out || out === '.' || out === '..' || out.includes('..') || !/^[A-Za-z0-9._~-]+$/.test(out)) {
+  if (out.length > MAX_SAFE_SEGMENT_CHARS) {
+    let prefix = out.slice(0, 128);
+    // Avoid cutting in the middle of a `~XXXX` escape or leaving a trailing `.`
+    const lastTilde = prefix.lastIndexOf('~');
+    if (lastTilde >= 0 && prefix.length - lastTilde < 5) {
+      prefix = prefix.slice(0, lastTilde);
+    }
+    while (prefix.endsWith('.')) prefix = prefix.slice(0, -1);
+    const digest = createHash('sha256').update(sessionId).digest('hex').slice(0, 32);
+    out = `${prefix || 'sid'}~h${digest}`;
+  }
+  if (!out || out === '.' || out === '..' || out.includes('..') || !/^[A-Za-z0-9._~-]+$/.test(out) || out.length > MAX_SAFE_SEGMENT_CHARS) {
     throw new LtError('BAD_SESSION_ID', `encoded sessionId produced unsafe path segment: ${out}`);
   }
   return out;
+}
+
+export function decodeSessionModeSegment(segment) {
+  if (typeof segment !== 'string' || !segment || segment.includes('~h')) return segment;
+  return segment.replace(/~([0-9A-F]{4})/g, (_m, hex) => String.fromCharCode(parseInt(hex, 16)));
 }
 
 export function resolveSessionModePaths(storageRoot, sessionId, { ensureDir = false, fsImpl = fs } = {}) {
@@ -149,7 +167,12 @@ export function readSessionModeRecord(storageRoot, sessionId) {
   if (typeof parsed.sessionId === 'string' && parsed.sessionId !== sessionId) {
     throw new LtError('SESSION_MODE_CORRUPT', `session mode file sessionId mismatch (${stateFile})`);
   }
-  const mode = normalizeExecutionMode(parsed.mode);
+  let mode;
+  try {
+    mode = normalizeExecutionMode(parsed.mode);
+  } catch (err) {
+    throw new LtError('SESSION_MODE_CORRUPT', `session mode file has invalid mode (${stateFile}): ${err.message}`);
+  }
   return {
     v: 1,
     sessionId,
@@ -168,7 +191,26 @@ export function readSessionModeRecord(storageRoot, sessionId) {
 export function writeSessionModeRecord(storageRoot, sessionId, nextMode, meta = {}) {
   const mode = normalizeExecutionMode(nextMode);
   const { stateFile, historyFile } = resolveSessionModePaths(storageRoot, sessionId, { ensureDir: true });
-  const prev = readSessionModeRecord(storageRoot, sessionId);
+  let prev;
+  try {
+    prev = readSessionModeRecord(storageRoot, sessionId);
+  } catch (err) {
+    if (err?.code !== 'SESSION_MODE_CORRUPT') throw err;
+    const corruptBackup = `${stateFile}.corrupt.${Date.now()}`;
+    try {
+      if (fs.existsSync(stateFile)) fs.renameSync(stateFile, corruptBackup);
+    } catch {}
+    prev = {
+      sessionId,
+      mode: DEFAULT_EXECUTION_MODE,
+      persisted: false,
+      createdAt: null,
+      updatedAt: null,
+      switchCount: 0,
+      lastSwitchedFrom: null,
+      lastTaskSeqHint: null,
+    };
+  }
   const nowIso = typeof meta?.at === 'string' && meta.at ? meta.at : new Date().toISOString();
   const isInitial = Boolean(meta?.initial && !prev.persisted);
   const didSwitch = !isInitial && prev.mode !== mode;

@@ -592,11 +592,23 @@ export async function syncUpstreamModelsToDshSettings(ctx, modelsToEnsure = [], 
       return { synced: false, reason: 'settings-describe-failed', updatedProviders: [] };
     }
   }
-  const llmNs = (desc?.namespaces ?? []).find(n => n?.ns === 'llm-pi-ai' || (n?.data && typeof n.data === 'object' && 'providers' in n.data));
-  if (!llmNs?.ns || !llmNs.data || typeof llmNs.data !== 'object') {
+  const nsList = Array.isArray(desc) ? desc : (Array.isArray(desc?.namespaces) ? desc.namespaces : []);
+  const resolveNsPayload = entry => {
+    if (entry?.value && typeof entry.value === 'object') return entry.value;
+    if (entry?.data && typeof entry.data === 'object') return entry.data;
+    return null;
+  };
+  const llmNs = nsList.find(n => {
+    const payload = resolveNsPayload(n);
+    if (!payload) return false;
+    return n?.ns === 'llm-pi-ai' || n?.namespace === 'llm-pi-ai' || ('providers' in payload);
+  });
+  const targetNs = llmNs?.ns ?? llmNs?.namespace;
+  const curPayload = resolveNsPayload(llmNs);
+  if (!targetNs || !curPayload) {
     return { synced: false, reason: 'llm-namespace-not-found', updatedProviders: [] };
   }
-  const nextData = structuredClone(llmNs.data);
+  const nextData = structuredClone(curPayload);
   nextData.providers ??= {};
   const updatedProviders = [];
 
@@ -683,7 +695,7 @@ export async function syncUpstreamModelsToDshSettings(ctx, modelsToEnsure = [], 
     return { synced: true, changed: false, updatedProviders: [] };
   }
   try {
-    await settings.update(llmNs.ns, nextData);
+    await settings.update(targetNs, nextData);
     return { synced: true, changed: true, updatedProviders };
   } catch (e) {
     return { synced: false, reason: e instanceof Error ? e.message : String(e), updatedProviders: [] };

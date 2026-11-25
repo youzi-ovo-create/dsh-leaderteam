@@ -4,7 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadConfig, validateConfig, routeProvider } from '../core/config.mjs';
 import { hashJson, deepFreeze } from '../core/canonical.mjs';
-import { TeamStore } from '../core/store.mjs';
+import { TeamStore, encodeTeamStoreId } from '../core/store.mjs';
 import { readSessionModeRecord } from '../core/session-mode.mjs';
 import { discoverRuntimeModels, enrichConfigModelsFromCatalog, mergeUpstreamModelsIntoConfig } from '../core/upstream-models.mjs';
 import { DETACHABLE_PLUGINS } from '../core/constants.mjs';
@@ -43,20 +43,22 @@ export function baseRuntime(rt = runtime()) { return rt[BASE_RUNTIME] ?? rt; }
 export function runtimeForTeam(teamId) {
   const rt = runtime();
   if (!teamId || !rt.config || !rt.storageRoot) return rt;
+  let storeId;
+  try { storeId = encodeTeamStoreId(teamId, rt.storageRoot); } catch { return rt; }
+  const file = path.join(rt.storageRoot, 'teams', storeId, 'governance.json');
+  if (!fs.existsSync(file) && !TeamStore.exists(rt.storageRoot, teamId)) {
+    let isPureSingle = false;
+    try {
+      const cachedMode = rt.sessionModesCache?.get?.(teamId)?.mode;
+      isPureSingle = (cachedMode ?? readSessionModeRecord(rt.storageRoot, teamId).mode) === 'single';
+    } catch {}
+    if (isPureSingle) return rt;
+  }
   rt.teamConfigViews ??= new Map();
-  const key = `${rt.storageRoot}:${teamId}`;
+  const key = `${rt.storageRoot}:${storeId}`;
   let view = rt.teamConfigViews.get(key);
   if (!view) {
     const store = teamStore(teamId);
-    const file = path.join(store.dir, 'governance.json');
-    if (!fs.existsSync(file) && !TeamStore.exists(rt.storageRoot, teamId)) {
-      let isPureSingle = false;
-      try {
-        const cachedMode = rt.sessionModesCache?.get?.(teamId)?.mode;
-        isPureSingle = (cachedMode ?? readSessionModeRecord(rt.storageRoot, teamId).mode) === 'single';
-      } catch {}
-      if (isPureSingle) return rt;
-    }
     fs.mkdirSync(store.dir, { recursive: true });
     let record;
     try { record = JSON.parse(fs.readFileSync(file, 'utf8')); }
@@ -95,7 +97,7 @@ export function runtimeForTeam(teamId) {
             team: { ...fixed.team, executionPool: live.team.executionPool, maxActiveMembers: live.team.maxActiveMembers },
             scheduler: live.scheduler,
             timer: live.timer,
-            paths: { ...fixed.paths, globalRefRoots: [...new Set([...fixed.paths.globalRefRoots, currentPlanRoot(rt.storageRoot, teamId), ...((fixed.team.rollingPlanning || fixed.governance?.mode === 'autonomous') ? [fileURLToPath(new URL('../../docs/HeLuoDoc/V2.1', import.meta.url))] : [])])] },
+            paths: { ...fixed.paths, globalRefRoots: [...new Set([...fixed.paths.globalRefRoots, currentPlanRoot(rt.storageRoot, store.teamId), ...((fixed.team.rollingPlanning || fixed.governance?.mode === 'autonomous') ? [fileURLToPath(new URL('../../docs/HeLuoDoc/V2.1', import.meta.url))] : [])])] },
             derived: { ...fixed.derived, executionModels: live.models, governanceSha256: view.sourceSha256 },
           });
           view.live = target.config;
@@ -181,7 +183,11 @@ export function syncRuntimeConfig(rt = runtime()) {
 export function teamStore(teamId) {
   const rt = runtime();
   let s = rt.stores.get(teamId);
-  if (!s) { s = new TeamStore(rt.storageRoot, teamId); rt.stores.set(teamId, s); }
+  if (!s) {
+    s = new TeamStore(rt.storageRoot, teamId);
+    rt.stores.set(teamId, s);
+    if (s.teamId !== teamId) rt.stores.set(s.teamId, s);
+  }
   return s;
 }
 /** Append one LeaderTeam model-usage record (team usage.jsonl); never fails the operation. */

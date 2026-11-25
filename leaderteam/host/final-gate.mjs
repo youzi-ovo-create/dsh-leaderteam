@@ -33,7 +33,7 @@ import { replay, nextAction } from '../core/agreement.mjs';
 import { callRoleJson } from './llm.mjs';
 import { roleRouteChain } from '../core/role-routes.mjs';
 import { runtime, teamStore, recordUsage, syncRuntimeConfig, runtimeForTeam, isPluginActive, refreshUpstreamCatalog, effectiveRuntimeConfig } from './runtime.mjs';
-import { resolveActor, leaderAllowedTools, userTaskText, userMessageTexts, currentTaskSeq, reconcileStaleMembers } from './roles.mjs';
+import { resolveActor, isLeaderRoot, leaderAllowedTools, userTaskText, userMessageTexts, currentTaskSeq, reconcileStaleMembers } from './roles.mjs';
 import { getSessionExecutionMode } from './mode-controller.mjs';
 import { resumeAdmission, withMemberActivation, activationConfig, resolveSendMessageTargetId } from './activation.mjs';
 
@@ -196,7 +196,8 @@ export class Gate {
     if (known && known.agent === agent) {
       if (known.role === 'leader') {
         const mode = getSessionExecutionMode(rt, known.teamId);
-        const tools = leaderAllowedTools(runtimeForTeam(known.teamId), mode);
+        const cwd = typeof agent?.session?.header?.cwd === 'string' ? agent.session.header.cwd : known.cwd;
+        const tools = leaderAllowedTools(runtimeForTeam(known.teamId), mode, process.platform, cwd);
         known.executionMode = mode;
         known.allowedTools = tools;
         known.loadedTools = tools;
@@ -217,7 +218,18 @@ export class Gate {
     try { rt.onTeamActivity?.(this.ctx, actor.teamId, actor.cwd); } catch {}
     const taskSeq = currentTaskSeq(this.ctx, actor.teamId);
     const argsPreview = boundJson(sanitizeArguments(args ?? {}), 400, 200).text;
-    const base = { teamId: actor.teamId, taskSeq, agentId: agent.id, role: actor.role, member: actor.name ?? null, tool: name, callId, argsSha256: hashJson(args ?? {}), argsPreview };
+    const base = {
+      teamId: actor.teamId,
+      taskSeq,
+      agentId: agent.id,
+      role: actor.role,
+      ...(actor.role === 'leader' ? { executionMode: initialExecutionMode } : {}),
+      member: actor.name ?? null,
+      tool: name,
+      callId,
+      argsSha256: hashJson(args ?? {}),
+      argsPreview,
+    };
     let reviewArgs = args;
     let effectiveActor = actor;
     if (isAutonomousGovernance(cfg) && base.teamId && (actor.role === 'member' || actor.role === 'direct_exec')) {
@@ -326,7 +338,7 @@ export class Gate {
     }
     const usePatternCache = cfg.gate.enablePatternCache !== false && (actor.role === 'direct_exec' || cfg.gate.sandboxDirectAllow !== false);
     const patternCacheKey = usePatternCache
-      ? `${base.teamId ?? 'local'}:${taskSeq}:${actor.role}:${actor.stageHash ?? actor.name ?? agent.id}:${computeGatePatternKey(name, reviewArgs, base.boundaryReason ?? '')}`
+      ? `${base.teamId ?? 'local'}:${taskSeq}:${actor.role}${actor.role === 'leader' ? `:${initialExecutionMode ?? 'team'}` : ''}:${actor.stageHash ?? actor.name ?? agent.id}:${computeGatePatternKey(name, reviewArgs, base.boundaryReason ?? '')}`
       : null;
     if (patternCacheKey) {
       rt.gatePatternCache ??= new Map();
@@ -349,7 +361,14 @@ export class Gate {
       }
       const taskReceipts = receipts.filter(x => (x.taskSeq ?? 1) === taskSeq);
       if (cfg.gate.dedupeDeniedCalls) {
-        const prevDeny = taskReceipts.find(x => x.agentId === agent.id && x.tool === name && x.argsSha256 === base.argsSha256 && x.decision === 'deny' && x.by === 'model');
+        const prevDeny = taskReceipts.find(
+          x => x.agentId === agent.id
+            && x.tool === name
+            && x.argsSha256 === base.argsSha256
+            && x.decision === 'deny'
+            && x.by === 'model'
+            && (actor.role !== 'leader' || (x.executionMode ?? 'team') === (initialExecutionMode ?? 'team')),
+        );
         if (prevDeny) return this.record(base, { decision: 'deny', by: 'rule:duplicate-denied-call', reason: `identical operation was already denied by safety review: ${prevDeny.reason}` });
       }
       // Safety review unavailable N times in a row for this agent: stop calling until the cooldown has passed, so an
@@ -469,12 +488,33 @@ export class Gate {
     return verdict;
   }
 }
-/** After the core plugin is disposed: team agents may not run controlled tools; others pass through. */
+/** After the core plugin is disposed: fail closed (hide all tools and deny all executions) for every LT-governed session. */
 export class ClosedGate {
-  actorFor(agent) { return agent && runtime().actors.has(agent.id) ? runtime().actors.get(agent.id) : null; }
-  async decide({ name, actor }) {
-    const cfg = runtime().config;
-    if (cfg && classifyTool(name, cfg, actor) === 'uncontrolled') return { decision: 'allow', by: 'uncontrolled' };
+  constructor(ctx = null) { this.ctx = ctx; }
+  actorFor(agent) {
+    if (!agent) return null;
+    const rt = runtime();
+    const leaderPreset = rt.config?.profiles?.leader?.preset ?? 'leaderteam';
+    let leaderMatch = false;
+    try { leaderMatch = Boolean(isLeaderRoot(this.ctx, agent)); } catch { leaderMatch = false; }
+    if (
+      rt.actors.has(agent.id)
+      || leaderMatch
+      || agent.session?.header?.agentPreset === leaderPreset
+      || agent.session?.header?.origin === 'subagent'
+      || rt.config?.gate?.scope === 'all'
+    ) {
+      return {
+        role: 'closed',
+        agentId: agent.id,
+        teamId: agent.id,
+        allowedTools: [],
+        loadedTools: [],
+      };
+    }
+    return null;
+  }
+  async decide() {
     return { decision: 'deny', by: 'gate-closed', reason: 'the LeaderTeam core plugin is not running' };
   }
 }

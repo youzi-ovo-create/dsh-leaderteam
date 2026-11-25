@@ -179,7 +179,7 @@ export function apply(ctx, config) {
   if (!rt.cordisCompositionMode && rt.config.plugins?.scheduler !== false) {
     ctx.effect(() => hostConcurrency.startConcurrencyWatchers(ctx), { label: 'leaderteam-core concurrency' });
   }
-  ctx.effect(() => () => { disposePlanning(rt); rt.gate = new ClosedGate(); rt.startupReady = null; rt.hostAgents = null; rt.liveProcessMemberIds = null; }, { label: 'leaderteam-core gate' });
+  ctx.effect(() => () => { disposePlanning(rt); rt.gate = new ClosedGate(ctx); rt.startupReady = null; rt.hostAgents = null; rt.liveProcessMemberIds = null; }, { label: 'leaderteam-core gate' });
   const ready = Object.freeze({ coreVersion: pkg.version, modular: rt.cordisCompositionMode });
   rt.startupReady = ready;
   ctx.provide('leaderteamReady', ready);

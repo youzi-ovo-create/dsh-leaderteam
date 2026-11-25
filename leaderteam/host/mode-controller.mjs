@@ -122,16 +122,32 @@ export function getSessionExecutionMode(rt = runtime(), sessionId) {
 export function inspectSessionModeState(ctx, rt = runtime(), sessionId, options = {}) {
   encodeSessionModeSegment(sessionId);
   const baseRt = baseRuntime(rt ?? runtime());
-  const rec = baseRt?.storageRoot
-    ? readSessionModeRecord(baseRt.storageRoot, sessionId)
-    : {
+  let rec;
+  let corruptOnDisk = false;
+  if (baseRt?.storageRoot) {
+    try {
+      rec = readSessionModeRecord(baseRt.storageRoot, sessionId);
+    } catch (err) {
+      if (err?.code !== 'SESSION_MODE_CORRUPT') throw err;
+      corruptOnDisk = true;
+      rec = {
         sessionId,
-        mode: getSessionExecutionMode(baseRt, sessionId),
+        mode: DEFAULT_EXECUTION_MODE,
         persisted: false,
         updatedAt: null,
         switchCount: 0,
       };
-  if (baseRt?.storageRoot) {
+    }
+  } else {
+    rec = {
+      sessionId,
+      mode: getSessionExecutionMode(baseRt, sessionId),
+      persisted: false,
+      updatedAt: null,
+      switchCount: 0,
+    };
+  }
+  if (baseRt?.storageRoot && !corruptOnDisk) {
     const { stateFile } = resolveSessionModePaths(baseRt.storageRoot, sessionId, { ensureDir: false });
     setBoundedModeCache(baseRt, sessionId, {
       storageRoot: baseRt.storageRoot,
@@ -139,6 +155,8 @@ export function inspectSessionModeState(ctx, rt = runtime(), sessionId, options 
       mode: rec.mode,
       record: rec,
     });
+  } else if (baseRt?.storageRoot && corruptOnDisk) {
+    baseRt.sessionModesCache?.delete?.(sessionId);
   }
 
   const liveActor = baseRt?.actors?.get?.(sessionId) ?? null;
@@ -190,6 +208,8 @@ export function inspectSessionModeState(ctx, rt = runtime(), sessionId, options 
 
   let activeMembersCount = 0;
   let activeConferenceId = null;
+  let activeHumanEscalation = null;
+  let unsatisfiedDirective = null;
   if (baseRt?.storageRoot && TeamStore.exists(baseRt.storageRoot, sessionId)) {
     const store = baseRt === runtime()
       ? teamStore(sessionId)
@@ -207,6 +227,12 @@ export function inspectSessionModeState(ctx, rt = runtime(), sessionId, options 
         ?? govState.pausingConference?.conferenceId
         ?? 'conference-open';
     }
+    if (govState.activeHumanEscalation) {
+      activeHumanEscalation = govState.activeHumanEscalation;
+    }
+    unsatisfiedDirective = (govState.activeDirectives ?? []).find(
+      d => d && !d.satisfied && (d.decision === 'enforce_correction' || d.decision === 'adopt_alternative'),
+    ) ?? null;
   }
 
   const execReviews = [...(baseRt?.executionReviewJobs?.values?.() ?? [])].filter(j => j?.teamId === sessionId).length;
@@ -239,6 +265,8 @@ export function inspectSessionModeState(ctx, rt = runtime(), sessionId, options 
     && activeMembersCount === 0
     && pendingReviewsCount === 0
     && !activeConferenceId
+    && !activeHumanEscalation
+    && !unsatisfiedDirective
     && activeShellJobsCount === 0,
   );
 
@@ -254,6 +282,10 @@ export function inspectSessionModeState(ctx, rt = runtime(), sessionId, options 
           : 'Leader session is currently executing';
     } else if (activeConferenceId) {
       busyReason = `Formal governance conference "${activeConferenceId}" is open; conclude it before switching mode`;
+    } else if (activeHumanEscalation) {
+      busyReason = `Human governance escalation "${activeHumanEscalation.escalationId ?? 'escalation'}" is awaiting user resolution in Team mode`;
+    } else if (unsatisfiedDirective) {
+      busyReason = `Binding Arbiter directive from conference "${unsatisfiedDirective.conferenceId ?? 'conference'}" must be verified in Team mode before switching`;
     } else if (activeMembersCount > 0) {
       busyReason = `${activeMembersCount} team member(s) are currently active or paused at checkpoint`;
     } else if (pendingReviewsCount > 0) {
@@ -303,9 +335,17 @@ export function switchSessionExecutionMode(ctx, rt = runtime(), sessionId, targe
     );
   }
 
+  let diskCorrupt = false;
+  try {
+    readSessionModeRecord(baseRt.storageRoot, sessionId);
+  } catch (err) {
+    if (err?.code === 'SESSION_MODE_CORRUPT') diskCorrupt = true;
+    else throw err;
+  }
+
   const taskSeqHint = safeCurrentTaskSeq(ctx, sessionId);
 
-  if (state.mode === nextMode && !options.forcePersist) {
+  if (state.mode === nextMode && !options.forcePersist && !diskCorrupt) {
     if (options.persistInitial === true) {
       const rec = writeSessionModeRecord(baseRt.storageRoot, sessionId, nextMode, {
         initial: true,
