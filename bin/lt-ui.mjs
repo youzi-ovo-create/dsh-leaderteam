@@ -10,7 +10,10 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import {
+  CONTRACT_ID,
+  CONTRACT_VERSION,
   PUBLIC_API_ROUTES,
+  PUBLIC_READONLY_API_ROUTES,
   createPublicContractHandlers,
   serveLtWebStaticRequest,
 } from '../leaderteam/plugins/leaderteam-panel/public-api.mjs';
@@ -133,6 +136,7 @@ export async function startStandaloneLtUiServer({
 
   const rt = runtime();
   const handlers = createPublicContractHandlers(null, rt, {
+    dshHome,
     configPath,
     hostKindOverride: 'standalone',
   });
@@ -226,6 +230,30 @@ export async function startStandaloneLtUiServer({
         if (!isAuthed()) {
           res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
           res.end(JSON.stringify({ ok: false, error: { code: 'UNAUTHORIZED', message: 'Authentication required' } }));
+          return;
+        }
+
+        const reqMethod = String(req.method || 'GET').toUpperCase();
+        const isReadOnlyRoute = PUBLIC_READONLY_API_ROUTES.has(url.pathname);
+        const allowedMethods = isReadOnlyRoute ? ['GET', 'POST'] : ['POST'];
+        if (!allowedMethods.includes(reqMethod)) {
+          const allowHeader = allowedMethods.join(', ');
+          res.writeHead(405, {
+            'Content-Type': 'application/json; charset=utf-8',
+            'Cache-Control': 'no-store',
+            Allow: allowHeader,
+          });
+          res.end(JSON.stringify({
+            ok: false,
+            contract: CONTRACT_ID,
+            contractVersion: CONTRACT_VERSION,
+            generatedAt: new Date().toISOString(),
+            error: {
+              code: 'METHOD_NOT_ALLOWED',
+              message: `HTTP ${reqMethod} is not allowed on ${url.pathname}; use ${allowHeader}`,
+              retriable: false,
+            },
+          }));
           return;
         }
 

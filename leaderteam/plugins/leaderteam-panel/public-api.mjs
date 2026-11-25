@@ -21,8 +21,10 @@ import { inspectModelConfiguration, applyModelConfigChanges, resolveDefaultDshHo
 import { buildSoloProviderSettingsTemplates, resolveOrBootstrapConfigPath } from '../../core/solo-key.mjs';
 import { syncUpstreamModelsToDshSettings } from '../../core/upstream-models.mjs';
 import { hashJson } from '../../core/canonical.mjs';
+import { loadConfig } from '../../core/config.mjs';
 import {
   runtime,
+  bindRuntimeConfigFile,
   syncRuntimeConfig,
   activePluginsMap,
   refreshUpstreamCatalog,
@@ -69,6 +71,19 @@ export const PUBLIC_API_ROUTES = Object.freeze({
   UI_PREFERENCES: '/api/lt/v1/ui-preferences',
 });
 
+export const PUBLIC_READONLY_API_ROUTES = new Set([
+  PUBLIC_API_ROUTES.BUNDLE,
+  PUBLIC_API_ROUTES.CAPABILITIES,
+  PUBLIC_API_ROUTES.GATEWAY_STATUS,
+  PUBLIC_API_ROUTES.PROVIDERS_LIST,
+  PUBLIC_API_ROUTES.MODELS_CATALOG,
+  PUBLIC_API_ROUTES.RUNTIME_SNAPSHOT,
+  PUBLIC_API_ROUTES.WORKBENCH_SESSIONS,
+  PUBLIC_API_ROUTES.USAGE_STATUS,
+  PUBLIC_API_ROUTES.USAGE_OVERVIEW,
+  PUBLIC_API_ROUTES.USAGE_SESSIONS,
+]);
+
 export const SUPPORTED_V22_ROLES = Object.freeze([
   { roleId: 'leader', label: '主导代理 (Leader)', description: '任务拆解、滚动规划、成员分派与交付汇总', supportsFallbacks: false, maxFallbacks: 0, required: true },
   { roleId: 'gate', label: '安全门禁 (Safety Gate)', description: '高危指令与越界操作的独立模型复核', supportsFallbacks: true, maxFallbacks: 4, required: true },
@@ -112,7 +127,7 @@ function okEnvelope(data) {
   );
 }
 
-function errEnvelope(code, message, status = 200, retriable = false) {
+function errEnvelope(code, message, status = 200, retriable = false, extraHeaders = {}) {
   return Response.json(
     {
       ok: false,
@@ -121,25 +136,42 @@ function errEnvelope(code, message, status = 200, retriable = false) {
       generatedAt: new Date().toISOString(),
       error: { code, message, retriable },
     },
-    { status, headers: { 'cache-control': 'no-store' } },
+    { status, headers: { 'cache-control': 'no-store', ...extraHeaders } },
   );
 }
 
-function httpContractError(code, message, status = 400) {
+function httpContractError(code, message, status = 400, headers = null) {
   const err = new Error(message);
   err.code = code;
   err.status = status;
+  if (headers && typeof headers === 'object') {
+    err.headers = headers;
+  }
   return err;
 }
 
 function errFromException(fallbackCode, e) {
   const status = Number.isInteger(e?.status) && e.status >= 400 ? e.status : 200;
   const code = typeof e?.code === 'string' && e.code ? e.code : fallbackCode;
-  return errEnvelope(code, e instanceof Error ? e.message : String(e), status);
+  const extraHeaders = e?.headers && typeof e.headers === 'object' ? e.headers : {};
+  return errEnvelope(code, e instanceof Error ? e.message : String(e), status, false, extraHeaders);
 }
 
-async function parseJsonRequest(request) {
-  if (!request || request.method === 'GET' || request.method === 'HEAD') return {};
+async function parseJsonRequest(request, { allowGet = false } = {}) {
+  if (!request) return {};
+  const method = String(request.method || 'POST').toUpperCase();
+  if (allowGet) {
+    if (method !== 'POST' && method !== 'GET') {
+      throw httpContractError('METHOD_NOT_ALLOWED', 'Only GET and POST are allowed on this read-only endpoint', 405, {
+        Allow: 'GET, POST',
+      });
+    }
+    if (method === 'GET') return {};
+  } else if (method !== 'POST') {
+    throw httpContractError('METHOD_NOT_ALLOWED', 'Mutating API endpoint requires HTTP POST', 405, {
+      Allow: 'POST',
+    });
+  }
   const ct = String(request.headers?.get?.('content-type') || '').toLowerCase();
   const cl = request.headers?.get?.('content-length');
   const isJsonCt = ct.includes('application/json');
@@ -161,6 +193,74 @@ async function parseJsonRequest(request) {
   } catch {
     return {};
   }
+}
+
+function enrichProviderPresetsKeyOptional(presets, magpieProvidersPayload) {
+  if (!Array.isArray(presets)) return [];
+  const rawMap = new Map();
+  for (const mp of magpieProvidersPayload?.presets ?? []) {
+    if (mp?.id) rawMap.set(mp.id, mp);
+  }
+  return presets.map(pr => {
+    const mp = rawMap.get(pr.vendorId);
+    const isLoopback = /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(?::\d+)?(?:\/|$)/i.test(String(pr.defaultEndpointUrl || ''));
+    const keyOptional = Boolean(pr.keyOptional || mp?.noKey || mp?.keyOptional || isLoopback);
+    return keyOptional ? { ...pr, keyOptional: true } : pr;
+  });
+}
+
+function sanitizeDiscoveredModelsResult(raw) {
+  const src = Array.isArray(raw?.models)
+    ? raw.models
+    : (Array.isArray(raw?.provider?.models) ? raw.provider.models : []);
+  const models = src
+    .map(m => {
+      const id = typeof m === 'string' ? m.trim() : String(m?.id ?? '').trim();
+      if (!id) return null;
+      const name = typeof m === 'object' && m !== null && typeof m.name === 'string' && m.name.trim()
+        ? m.name.trim()
+        : id;
+      return { id, name };
+    })
+    .filter(Boolean);
+  return { models };
+}
+
+function sanitizeTestProviderResult(raw) {
+  const list = Array.isArray(raw?.results) ? raw.results : [];
+  return {
+    results: list.map(r => {
+      const rawLat = r?.ms ?? r?.latencyMs ?? 0;
+      const latencyMs = Number.isFinite(Number(rawLat)) ? Math.max(0, Math.round(Number(rawLat))) : 0;
+      return {
+        protocol: String(r?.protocol ?? r?.api ?? ''),
+        ok: Boolean(r?.ok),
+        status: Number.isFinite(Number(r?.status)) ? Number(r.status) : 0,
+        latencyMs,
+        ms: latencyMs,
+        model: String(r?.model ?? ''),
+        ...(r?.error ? { error: String(r.error) } : {}),
+      };
+    }),
+  };
+}
+
+function sanitizeOAuthSignInResult(raw) {
+  const url = typeof raw?.url === 'string' ? raw.url : (typeof raw?.authUrl === 'string' ? raw.authUrl : '');
+  const authUrl = typeof raw?.authUrl === 'string' ? raw.authUrl : url;
+  const state = typeof raw?.state === 'string' ? raw.state : (typeof raw?.status === 'string' ? raw.status : '');
+  const status = typeof raw?.status === 'string' ? raw.status : state;
+  return {
+    id: String(raw?.id ?? ''),
+    agent: String(raw?.agent ?? ''),
+    url,
+    authUrl,
+    state,
+    status,
+    pasteCallback: Boolean(raw?.pasteCallback),
+    code: String(raw?.code ?? ''),
+    error: String(raw?.error ?? ''),
+  };
 }
 
 function resolveDshHomeFromCtx(ctx, rt) {
@@ -915,13 +1015,21 @@ function resolveAuthorizedUsageHome(bridge, rawHome) {
 
 export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) {
   const getStorageRoot = () => {
+    if (options.dshHome) return path.join(path.resolve(options.dshHome), 'leaderteam');
     if (rt?.storageRoot) return rt.storageRoot;
     const home = resolveDshHomeFromCtx(ctx, rt) || path.join(process.cwd(), '.lt-standalone');
     return path.join(home, 'leaderteam');
   };
 
   const ensureConfigLoaded = () => {
-    if (rt?.config && rt?.configPath) {
+    if (options.dshHome) {
+      rt.storageRoot = path.join(path.resolve(options.dshHome), 'leaderteam');
+    }
+    if (options.configPath && rt?.configPath !== path.resolve(options.configPath)) {
+      rt.configPath = path.resolve(options.configPath);
+      rt.config = null;
+    }
+    if (rt?.config && rt?.configPath && fs.existsSync(rt.configPath)) {
       syncRuntimeConfig(rt);
       return;
     }
@@ -932,9 +1040,8 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
       dshHome,
       bundledDefaultConfigPath: path.join(repoRoot, 'config', 'leaderteam.config.json'),
     });
-    rt.configPath = configPath;
     rt.storageRoot = getStorageRoot();
-    syncRuntimeConfig(rt);
+    bindRuntimeConfigFile(rt, configPath, loadConfig(configPath));
   };
 
   const getGatewayMgr = () => getOrCreateGatewayManager(getStorageRoot());
@@ -954,7 +1061,7 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
   return {
     async capabilities(request) {
       try {
-        if (request) await parseJsonRequest(request);
+        if (request) await parseJsonRequest(request, { allowGet: true });
         ensureConfigLoaded();
         return okEnvelope(buildCapabilitiesPayload(ctx, rt, { hostKindOverride: options.hostKindOverride }));
       } catch (e) {
@@ -964,7 +1071,7 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
 
     async bundle(request) {
       try {
-        if (request) await parseJsonRequest(request);
+        if (request) await parseJsonRequest(request, { allowGet: true });
         ensureConfigLoaded();
         const storageRoot = getStorageRoot();
         const gwMgr = getGatewayMgr();
@@ -980,7 +1087,7 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
 
         const dshCatalog = await refreshUpstreamCatalog(ctx, rt, { force: false }).catch(() => null);
         const dshModels = dshCatalog?.models ?? [];
-        const { providers, presets } = buildPublicProviders({
+        const { providers, presets: rawPresets } = buildPublicProviders({
           magpieProvidersPayload: provPayload,
           magpieAccounts: gwAccounts,
           magpieGatewayUrl: gateway.gatewayUrl,
@@ -989,6 +1096,7 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
           magpieGatewayModels: gwModels,
           dshDiscoveredModels: dshModels,
         });
+        const presets = enrichProviderPresetsKeyOptional(rawPresets, provPayload);
         const models = buildPublicModelCatalog({
           magpieGatewayModels: gwModels,
           effectiveConfig: rt.config,
@@ -1015,7 +1123,7 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
 
     async gatewayStatus(request) {
       try {
-        if (request) await parseJsonRequest(request);
+        if (request) await parseJsonRequest(request, { allowGet: true });
         const status = await getGatewayMgr().getStatus();
         return okEnvelope(status);
       } catch (e) {
@@ -1076,7 +1184,7 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
 
     async providersList(request) {
       try {
-        if (request) await parseJsonRequest(request);
+        if (request) await parseJsonRequest(request, { allowGet: true });
         ensureConfigLoaded();
         const mgr = getGatewayMgr();
         const gwStatus = await mgr.getStatus();
@@ -1102,7 +1210,10 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
           magpieGatewayModels: gwModels,
           dshDiscoveredModels: dshCatalog?.models ?? [],
         });
-        return okEnvelope(res);
+        return okEnvelope({
+          ...res,
+          presets: enrichProviderPresetsKeyOptional(res.presets, provPayload),
+        });
       } catch (e) {
         return errFromException('PROVIDERS_LIST_FAILED', e);
       }
@@ -1124,15 +1235,18 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
         } else if (op === 'toggle-provider') {
           await client.toggleProvider(String(body.id || '').replace(/^magpie:/, ''), Boolean(body.enabled));
         } else if (op === 'discover-models') {
-          operationResult = await client.discoverProviderModels(body.probe || {});
+          const rawDisc = await client.discoverProviderModels(body.probe || {});
+          operationResult = sanitizeDiscoveredModelsResult(rawDisc);
         } else if (op === 'refresh-models') {
-          operationResult = await client.refreshSavedProviderModels(String(body.id || '').replace(/^magpie:/, ''));
+          const rawRef = await client.refreshSavedProviderModels(String(body.id || '').replace(/^magpie:/, ''));
+          operationResult = sanitizeDiscoveredModelsResult(rawRef);
         } else if (op === 'test-provider') {
-          operationResult = await client.testProvider({
+          const rawTest = await client.testProvider({
             id: String(body.id || '').replace(/^magpie:/, ''),
             account: body.account,
             models: body.models,
           });
+          operationResult = sanitizeTestProviderResult(rawTest);
         } else if (op === 'set-routing') {
           await client.setProviderRouting({
             id: String(body.id || '').replace(/^magpie:/, ''),
@@ -1141,28 +1255,39 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
           });
         } else if (op === 'mutate-key') {
           const id = String(body.providerId || body.id || '').replace(/^magpie:/, '');
-          const ref = body.credentialId ? String(body.credentialId).replace(/^key:/, '') : body.ref;
-          operationResult = await client.mutateKey(body.keyAction, {
+          const ref = body.credentialId
+            ? String(body.credentialId).replace(/^key:/, '')
+            : (body.ref !== undefined ? String(body.ref).replace(/^key:/, '') : undefined);
+          await client.mutateKey(body.keyAction, {
             id,
             ...(ref ? { ref } : {}),
-            ...(body.name ? { name: body.name } : {}),
-            ...(body.key ? { key: body.key } : {}),
+            ...(Array.isArray(body.refs) ? { refs: body.refs.map(r => String(r).replace(/^key:/, '')) } : {}),
+            ...(body.name !== undefined ? { name: body.name } : {}),
+            ...(body.key !== undefined ? { key: body.key } : {}),
             ...(body.weight !== undefined ? { weight: Number(body.weight) } : {}),
+            ...(body.protocol !== undefined ? { protocol: body.protocol } : {}),
+            ...(body.plan !== undefined ? { plan: body.plan } : {}),
           });
+          operationResult = { applied: true };
         } else if (op === 'oauth-start') {
-          operationResult = await client.startSignIn({ agent: body.agent, linkOnly: true });
+          const rawOAuth = await client.startSignIn({ agent: body.agent, linkOnly: true });
+          operationResult = sanitizeOAuthSignInResult(rawOAuth);
         } else if (op === 'oauth-status') {
-          operationResult = await client.getSignInStatus(body.signInId);
+          const rawOAuth = await client.getSignInStatus(body.signInId);
+          operationResult = sanitizeOAuthSignInResult(rawOAuth);
         } else if (op === 'oauth-callback') {
-          operationResult = await client.submitSignInCallback(body.signInId, body.callbackUrl);
+          const rawOAuth = await client.submitSignInCallback(body.signInId, body.callbackUrl);
+          operationResult = sanitizeOAuthSignInResult(rawOAuth);
         } else if (op === 'oauth-cancel') {
-          operationResult = await client.cancelSignIn(body.signInId);
+          const rawOAuth = await client.cancelSignIn(body.signInId);
+          operationResult = sanitizeOAuthSignInResult(rawOAuth);
         } else if (op === 'mutate-login') {
-          operationResult = await client.mutateLogin(body.loginAction, {
+          await client.mutateLogin(body.loginAction, {
             id: String(body.providerId || body.id || '').replace(/^magpie:/, ''),
             user: body.user,
             ...(body.login ? { login: body.login } : {}),
           });
+          operationResult = { applied: true };
         } else {
           return errEnvelope('BAD_OPERATION', `Unknown provider operation: ${op}`);
         }
@@ -1179,7 +1304,11 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
           magpieGatewayModels: gwModels,
           dshDiscoveredModels: rt.upstreamCatalog?.models ?? [],
         });
-        return okEnvelope({ operationResult, ...normalized });
+        return okEnvelope({
+          operationResult,
+          ...normalized,
+          presets: enrichProviderPresetsKeyOptional(normalized.presets, provPayload),
+        });
       } catch (e) {
         return errFromException('PROVIDERS_MUTATE_FAILED', e);
       }
@@ -1188,7 +1317,7 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
     async modelsCatalog(request) {
       try {
         ensureConfigLoaded();
-        const body = await parseJsonRequest(request);
+        const body = await parseJsonRequest(request, { allowGet: true });
         const mgr = getGatewayMgr();
         const gwStatus = await mgr.getStatus();
         const gwModels = gwStatus.state === 'running'
@@ -1278,7 +1407,7 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
 
     async runtimeSnapshot(request) {
       try {
-        if (request) await parseJsonRequest(request);
+        if (request) await parseJsonRequest(request, { allowGet: true });
         ensureConfigLoaded();
         return okEnvelope(await buildRuntimeSnapshotPayload(ctx, rt));
       } catch (e) {
@@ -1340,7 +1469,7 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
 
     async workbenchSessions(request) {
       try {
-        if (request) await parseJsonRequest(request);
+        if (request) await parseJsonRequest(request, { allowGet: true });
         ensureConfigLoaded();
         const sessionController = getHostService(ctx, 'sessionController');
         const workspaceRegistry = getHostService(ctx, 'workspaceRegistry');
@@ -1610,7 +1739,7 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
     async usageStatus(request) {
       try {
         ensureConfigLoaded();
-        const body = await parseJsonRequest(request);
+        const body = await parseJsonRequest(request, { allowGet: true });
         const bridge = getUsageBridge();
         const safeHome = resolveAuthorizedUsageHome(bridge, body.home);
         return okEnvelope(await bridge.getStatus({ home: safeHome }));
@@ -1622,7 +1751,7 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
     async usageOverview(request) {
       try {
         ensureConfigLoaded();
-        const body = await parseJsonRequest(request);
+        const body = await parseJsonRequest(request, { allowGet: true });
         const bridge = getUsageBridge();
         const safeHome = resolveAuthorizedUsageHome(bridge, body.home);
         return okEnvelope(await bridge.getOverview({ home: safeHome, syncGateway: body.syncGateway !== false }));
@@ -1634,7 +1763,7 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
     async usageSessions(request) {
       try {
         ensureConfigLoaded();
-        const body = await parseJsonRequest(request);
+        const body = await parseJsonRequest(request, { allowGet: true });
         const bridge = getUsageBridge();
         const safeHome = resolveAuthorizedUsageHome(bridge, body.home);
         return okEnvelope(await bridge.getSessions({ home: safeHome, syncGateway: Boolean(body.syncGateway) }));

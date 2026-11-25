@@ -24,7 +24,10 @@ import {
 } from '../../leaderteam/usage/index.mjs';
 import { defaultPricing, buildReport } from '../../packages/lt-usage/index.mjs';
 import { startMockMagpieServer } from '../../../lt-shared-contracts/mocks/mock-magpie-server.mjs';
-import { validateContractBundle } from '../../../lt-shared-contracts/tests/contract-validator.mjs';
+import { validateContractBundle, scanNoSecretLeakage } from '../../../lt-shared-contracts/tests/contract-validator.mjs';
+import { createPublicContractHandlers } from '../../leaderteam/plugins/leaderteam-panel/public-api.mjs';
+import { loadConfig } from '../../leaderteam/core/config.mjs';
+import { bindRuntimeConfigFile } from '../../leaderteam/host/runtime.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '..', '..');
@@ -518,13 +521,18 @@ test('Live Magpie 0.1.4731 binary verification: GW-01..06 & HZ-01 (providerJSON 
       }),
     });
     assert.equal(chatRes.status, 200);
+    await chatRes.text();
 
     const bridge = new HengzhangUsageBridge({
       storageRoot,
       dshHome: path.join(tmpDir, 'dsh-home'),
       gatewayManager: mgr,
     });
-    const liveSync1 = await bridge.triggerBackgroundMagpieSync();
+    let liveSync1 = await bridge.triggerBackgroundMagpieSync();
+    for (let wait = 0; wait < 25 && (liveSync1.totalCached ?? 0) < 1; wait++) {
+      await new Promise(r => setTimeout(r, 25));
+      liveSync1 = await bridge.triggerBackgroundMagpieSync();
+    }
     assert.equal(liveSync1.synced, true);
     assert.ok(liveSync1.totalCached >= 1);
     assert.notEqual(bridge.nextCursor, 'start');
@@ -556,8 +564,13 @@ test('Live Magpie 0.1.4731 binary verification: GW-01..06 & HZ-01 (providerJSON 
       }),
     });
     assert.equal(chatRes2.status, 200);
+    await chatRes2.text();
 
-    const liveSync2 = await bridge.triggerBackgroundMagpieSync();
+    let liveSync2 = await bridge.triggerBackgroundMagpieSync();
+    for (let wait = 0; wait < 25 && !bridge.gatewayRecords.some(r => r.sessionId === 'sess-live-02'); wait++) {
+      await new Promise(r => setTimeout(r, 25));
+      liveSync2 = await bridge.triggerBackgroundMagpieSync();
+    }
     assert.equal(liveSync2.synced, true, `Expected 410 auto-recovery, got: ${JSON.stringify(liveSync2)}`);
     assert.equal(bridge.lastSyncError, null);
     assert.ok(bridge.gatewayRecords.some(r => r.sessionId === 'sess-live-02'));
@@ -688,6 +701,251 @@ test('Live Magpie 0.1.4731 binary verification: GW-01..06 & HZ-01 (providerJSON 
     await mgr.stop().catch(() => {});
     const cliCleanupMgr = new MagpieGatewayManager({ storageRoot: cliStorageRoot });
     await cliCleanupMgr.stop().catch(() => {});
+    await relay.close().catch(() => {});
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('Stage 4 Re-Audit Fixes (S3-UIGW-01, S3-UIGW-02, S3-UIGW-03, S3-UIGW-06): live Magpie 0.1.4731 test-provider latency + scanNoSecretLeakage on providersMutate + mutate-key protocol/plan/refs + REPORT_CACHE in-place upsert invalidation + sync configure/start _stoppingPids drain', async t => {
+  const sysMagpie = discoverSystemMagpieBinary();
+  const tmpDir = fs.mkdtempSync(path.join('/tmp', 'lt-s4-uigw-gw-'));
+  const relay = await startLocalDummyUpstreamRelay();
+  const mockSrv = await startMockMagpieServer({
+    initialUsageRows: [
+      {
+        id: 'r_cache_upsert_1',
+        responseId: 'chatcmpl-cache-upsert-1',
+        t: new Date(5000).toISOString(),
+        session: 'sess-cache-1',
+        req: 'group/flagship',
+        provider: 'openai',
+        model: 'gpt-5.2',
+        in: 200,
+        out: 50,
+        tries: 1,
+        ms: 110,
+        status: 200,
+        priced: true,
+        cost: 0.01,
+      },
+    ],
+  });
+  let liveMgr = null;
+
+  try {
+    // Part A: S3-UIGW-03 — HengzhangUsageBridge + synced packages/lt-usage REPORT_CACHE invalidates on in-place feed upserts
+    const dshHome = path.join(tmpDir, 'dsh-home');
+    const mockStorage = path.join(dshHome, 'leaderteam');
+    writeZstdSession(path.join(dshHome, 'sessions', 'proj', 'sess-cache-1'), [
+      { type: 'session', version: 4, id: 'sess-cache-1', createdAt: 4900, cwd: '/tmp/proj' },
+      {
+        type: 'assistant/message',
+        time: 5000,
+        seq: 1,
+        data: {
+          message: {
+            id: 'm-cache-1',
+            source: {
+              kind: 'model',
+              provider: 'magpie',
+              model: 'group/flagship',
+              replayState: { response: { responseId: 'chatcmpl-cache-upsert-1' } },
+            },
+          },
+          usage: { inputTokens: 200, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 50, totalTokens: 250 },
+        },
+      },
+    ]);
+
+    const mockGwMgr = new MagpieGatewayManager({ storageRoot: mockStorage });
+    mockGwMgr.configure({
+      mode: 'external',
+      externalGatewayUrl: mockSrv.gatewayUrl,
+      externalWebAdminUrl: mockSrv.webUrl,
+      externalWebKey: mockSrv.webKey,
+    });
+    const bridge = new HengzhangUsageBridge({ storageRoot: mockStorage, dshHome, gatewayManager: mockGwMgr });
+
+    const repBefore = await bridge.getSessionReport({ sessionId: 'sess-cache-1', syncGateway: true });
+    const ovBefore = await bridge.getOverview({ syncGateway: false });
+    assert.equal(repBefore.report.calls[0].actualProvider, 'openai');
+    assert.equal(repBefore.report.calls[0].physicalAttempts, 1);
+    assert.equal(repBefore.report.calls[0].latencyMs, 110);
+    assert.equal(repBefore.publicRecords[0].cost.actualUsd, null);
+    assert.equal(ovBefore.overview.totals.costActualCny, null);
+
+    // Emit updated row for SAME `id: "r_cache_upsert_1"` at newer `seq` (length=1 & tail gatewayRecordId unchanged!)
+    mockSrv.upsertUsageRow({
+      id: 'r_cache_upsert_1',
+      responseId: 'chatcmpl-cache-upsert-1',
+      t: new Date(5000).toISOString(),
+      session: 'sess-cache-1',
+      req: 'group/flagship',
+      provider: 'codex',
+      model: 'gpt-6.2-sol',
+      in: 200,
+      out: 50,
+      tries: 4,
+      ms: 920,
+      status: 200,
+      priced: true,
+      cost: 0.05,
+    });
+
+    const repAfter = await bridge.getSessionReport({ sessionId: 'sess-cache-1', syncGateway: true });
+    const ovAfter = await bridge.getOverview({ syncGateway: false });
+    assert.equal(repAfter.report.calls[0].actualProvider, 'codex', 'REPORT_CACHE must invalidate on in-place seq/provider/latency upsert');
+    assert.equal(repAfter.report.calls[0].physicalAttempts, 4);
+    assert.equal(repAfter.report.calls[0].latencyMs, 920);
+    assert.ok(repAfter.publicRecords[0].cost.actualUsd > 0);
+    assert.ok(ovAfter.overview.totals.costActualCny?.total > 0, 'Overview REPORT_CACHE must also invalidate on in-place upsert');
+
+    if (!sysMagpie) {
+      return;
+    }
+
+    // Part B: Live Magpie 0.1.4731 S3-UIGW-01 + S3-UIGW-02 + S3-UIGW-06 verification
+    const liveStorage = path.join(tmpDir, 'live-storage');
+    const cfgDir = path.join(liveStorage, 'config');
+    fs.mkdirSync(cfgDir, { recursive: true });
+    const cfgFile = path.join(cfgDir, 'leaderteam.config.json');
+    fs.copyFileSync(path.join(repoRoot, 'config', 'leaderteam.config.json'), cfgFile);
+
+    liveMgr = getOrCreateGatewayManager(liveStorage);
+    await liveMgr.install({ sourceBinaryPath: sysMagpie });
+    const started1 = await liveMgr.start({ allocateDynamicPortsIfBusy: true });
+    assert.equal(started1.state, 'running');
+    const fixedGwPort = Number(new URL(started1.gatewayUrl).port);
+    const oldWebPort = Number(new URL(started1.webAdminUrl).port);
+
+    // S3-UIGW-06: Synchronous `configure({ webPort })` keeping `gatewayPort` fixed + immediate `start({ allocateDynamicPortsIfBusy: false })`
+    const freeWebServer = http.createServer();
+    await new Promise(r => freeWebServer.listen(0, '127.0.0.1', r));
+    const newWebPort = freeWebServer.address().port;
+    await new Promise(r => freeWebServer.close(r));
+    assert.notEqual(newWebPort, oldWebPort);
+
+    liveMgr.configure({ webPort: newWebPort });
+    const started2 = await liveMgr.start({ allocateDynamicPortsIfBusy: false });
+    assert.equal(started2.state, 'running');
+    assert.equal(Number(new URL(started2.gatewayUrl).port), fixedGwPort);
+    assert.equal(Number(new URL(started2.webAdminUrl).port), newWebPort);
+
+    // Wire `public-api.mjs` handlers against the running live Magpie 0.1.4731 instance
+    const rt = {
+      storageRoot: liveStorage,
+      configPath: cfgFile,
+      config: loadConfig(cfgFile),
+      plugins: {},
+      cordisCompositionMode: true,
+      stores: new Map(),
+      actors: new Map(),
+    };
+    bindRuntimeConfigFile(rt, cfgFile, rt.config);
+    const h = createPublicContractHandlers({ get: k => (k === 'profileContext' ? { home: dshHome } : null) }, rt);
+    const postJson = body =>
+      new Request('http://127.0.0.1/api/lt/v1/providers/mutate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+
+    // Save loopback dummy relay provider
+    const saveEnv = await (await h.providersMutate(postJson({
+      operation: 'save-provider',
+      spec: {
+        new: true,
+        id: 's4relay',
+        name: 'Stage 4 Relay',
+        chat: relay.baseUrl,
+        key: 'sk-s4-live-primary-111111111111',
+      },
+    }))).json();
+    assert.equal(saveEnv.ok, true);
+    assert.deepEqual(scanNoSecretLeakage(saveEnv), []);
+
+    // S3-UIGW-02: Add 2nd key forwarding `protocol` & `plan`, verify via raw Magpie `/api/providers`, then remove-many with `key:<id>` ref
+    const addKeyEnv = await (await h.providersMutate(postJson({
+      operation: 'mutate-key',
+      providerId: 'magpie:s4relay',
+      keyAction: 'add',
+      name: 'Chat Scoped Key',
+      key: 'sk-s4-live-second-222222222222',
+      protocol: 'chat',
+      plan: 'Pro',
+    }))).json();
+    assert.equal(addKeyEnv.ok, true);
+    assert.deepEqual(addKeyEnv.data.operationResult, { applied: true });
+    assert.deepEqual(scanNoSecretLeakage(addKeyEnv), []);
+
+    const rawLiveProvs = await liveMgr.createClient().listProviders();
+    const rawS4 = rawLiveProvs.providers.find(p => p.id === 's4relay');
+    assert.equal(rawS4.keyList.length, 2);
+    assert.equal(rawS4.keyList[1].protocol, 'chat');
+    const secondCredId = addKeyEnv.data.providers.find(p => p.providerId === 'magpie:s4relay').credentials[1].credentialId;
+
+    const removeManyEnv = await (await h.providersMutate(postJson({
+      operation: 'mutate-key',
+      providerId: 'magpie:s4relay',
+      keyAction: 'remove-many',
+      refs: [secondCredId],
+    }))).json();
+    assert.equal(removeManyEnv.ok, true, JSON.stringify(removeManyEnv));
+    assert.equal(removeManyEnv.data.providers.find(p => p.providerId === 'magpie:s4relay').credentials.length, 1);
+    assert.deepEqual(scanNoSecretLeakage(removeManyEnv), []);
+
+    // S3-UIGW-01 & S3-UIGW-02: Live `test-provider`, `discover-models`, `refresh-models`, and `oauth-start`/`oauth-status`/`oauth-cancel`
+    const testEnv = await (await h.providersMutate(postJson({
+      operation: 'test-provider',
+      id: 'magpie:s4relay',
+    }))).json();
+    assert.equal(testEnv.ok, true, JSON.stringify(testEnv));
+    assert.deepEqual(scanNoSecretLeakage(testEnv), []);
+    assert.equal(testEnv.data.operationResult.provider, undefined, 'Raw providerJSON must never leak in operationResult');
+    const firstTest = testEnv.data.operationResult.results[0];
+    assert.equal(firstTest.ok, true);
+    assert.equal(firstTest.status, 200);
+    assert.equal(firstTest.protocol, 'chat');
+    assert.equal(typeof firstTest.latencyMs, 'number');
+    assert.equal(typeof firstTest.ms, 'number');
+    assert.equal(Number.isNaN(firstTest.latencyMs), false);
+
+    const discEnv = await (await h.providersMutate(postJson({
+      operation: 'discover-models',
+      probe: { chat: relay.baseUrl, key: 'sk-s4-live-primary-111111111111' },
+    }))).json();
+    assert.equal(discEnv.ok, true);
+    assert.equal(discEnv.data.operationResult.models.length, 2);
+    assert.deepEqual(scanNoSecretLeakage(discEnv), []);
+
+    const refreshEnv = await (await h.providersMutate(postJson({
+      operation: 'refresh-models',
+      id: 'magpie:s4relay',
+    }))).json();
+    assert.equal(refreshEnv.ok, true);
+    assert.equal(refreshEnv.data.operationResult.provider, undefined);
+    assert.equal(refreshEnv.data.operationResult.models.length, 2);
+    assert.deepEqual(scanNoSecretLeakage(refreshEnv), []);
+
+    await liveMgr.createClient().updateSettings({ proxy: 'http://127.0.0.1:9' });
+    const oauthStartEnv = await (await h.providersMutate(postJson({
+      operation: 'oauth-start',
+      agent: 'codex',
+    }))).json();
+    assert.equal(oauthStartEnv.ok, true);
+    assert.deepEqual(scanNoSecretLeakage(oauthStartEnv), []);
+    assert.ok(oauthStartEnv.data.operationResult.id);
+    assert.ok(oauthStartEnv.data.operationResult.authUrl.includes('oauth'));
+
+    const oauthCancelEnv = await (await h.providersMutate(postJson({
+      operation: 'oauth-cancel',
+      signInId: oauthStartEnv.data.operationResult.id,
+    }))).json();
+    assert.equal(oauthCancelEnv.ok, true);
+    assert.deepEqual(scanNoSecretLeakage(oauthCancelEnv), []);
+  } finally {
+    if (liveMgr) await liveMgr.stop().catch(() => {});
+    await mockSrv.close().catch(() => {});
     await relay.close().catch(() => {});
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }

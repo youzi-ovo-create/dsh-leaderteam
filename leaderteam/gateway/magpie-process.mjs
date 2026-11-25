@@ -187,6 +187,7 @@ export class MagpieGatewayManager {
     this.recentCrashTimestamps = [];
     this.lastError = null;
     this._exitHook = null;
+    this._stoppingPids = new Set();
   }
 
   _loadConfigState() {
@@ -687,6 +688,10 @@ export class MagpieGatewayManager {
     const proc = this.child;
     this.child = null;
     if (proc && proc.exitCode === null) {
+      const childPid = proc.pid;
+      if (Number.isInteger(childPid) && childPid > 1) {
+        this._stoppingPids.add(childPid);
+      }
       try {
         if (IS_WIN) proc.kill();
         else proc.kill('SIGINT');
@@ -695,19 +700,32 @@ export class MagpieGatewayManager {
         if (proc.exitCode === null) {
           try { proc.kill('SIGKILL'); } catch {}
         }
+        if (childPid && !isPidAlive(childPid)) {
+          this._stoppingPids.delete(childPid);
+        }
       }, 2000);
       fallback.unref?.();
+      proc.once('exit', () => {
+        clearTimeout(fallback);
+        if (childPid) this._stoppingPids.delete(childPid);
+      });
     }
     const saved = this._readManagedPidRecord();
     if (saved && saved.pid !== proc?.pid) {
       const owned = this._verifyOwnedPidSync(saved);
       if (owned === true) {
+        if (isPidAlive(saved.pid)) {
+          this._stoppingPids.add(saved.pid);
+        }
         try {
           process.kill(saved.pid, IS_WIN ? 'SIGTERM' : 'SIGINT');
         } catch {}
         const fallback = setTimeout(() => {
           if (isPidAlive(saved.pid)) {
             try { process.kill(saved.pid, 'SIGKILL'); } catch {}
+          }
+          if (!isPidAlive(saved.pid)) {
+            this._stoppingPids.delete(saved.pid);
           }
         }, 2000);
         fallback.unref?.();
@@ -774,6 +792,41 @@ export class MagpieGatewayManager {
       clearTimeout(this.recoveryTimer);
       this.recoveryTimer = null;
     }
+
+    // S3-UIGW-06: Wait briefly (up to 1500ms) for any synchronously signaled managed PIDs to release ports
+    if (this._stoppingPids.size > 0) {
+      const waitDeadline = Date.now() + 1500;
+      while (this._stoppingPids.size > 0 && Date.now() < waitDeadline) {
+        for (const pid of [...this._stoppingPids]) {
+          if (!isPidAlive(pid)) {
+            this._stoppingPids.delete(pid);
+          }
+        }
+        if (this._stoppingPids.size === 0) break;
+        await new Promise(r => setTimeout(r, 25));
+        ensureNotAborted();
+      }
+      for (const pid of [...this._stoppingPids]) {
+        if (isPidAlive(pid)) {
+          try { process.kill(pid, 'SIGKILL'); } catch {}
+        } else {
+          this._stoppingPids.delete(pid);
+        }
+      }
+      if (this._stoppingPids.size > 0) {
+        const killDeadline = Date.now() + 150;
+        while (this._stoppingPids.size > 0 && Date.now() < killDeadline) {
+          for (const pid of [...this._stoppingPids]) {
+            if (!isPidAlive(pid)) this._stoppingPids.delete(pid);
+          }
+          if (this._stoppingPids.size === 0) break;
+          await new Promise(r => setTimeout(r, 20));
+          ensureNotAborted();
+        }
+        this._stoppingPids.clear();
+      }
+    }
+
     const cfg = this._loadConfigState();
     if (cfg.mode !== 'managed') {
       cfg.mode = 'managed';

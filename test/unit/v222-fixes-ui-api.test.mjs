@@ -8,6 +8,8 @@ import vm from 'node:vm';
 import zlib from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 import {
+  PUBLIC_API_ROUTES,
+  PUBLIC_READONLY_API_ROUTES,
   createPublicContractHandlers,
   encodeDshSegment,
   extractReadableMessagesFromRows,
@@ -16,6 +18,8 @@ import {
   resolveLtWebDistDir,
   serveLtWebStaticRequest,
 } from '../../leaderteam/plugins/leaderteam-panel/public-api.mjs';
+import { scanNoSecretLeakage } from '../../../lt-shared-contracts/tests/contract-validator.mjs';
+import { startMockMagpieServer } from '../../../lt-shared-contracts/mocks/mock-magpie-server.mjs';
 import { createPanelHandlers } from '../../leaderteam/plugins/leaderteam-panel/panel-api.mjs';
 import { startStandaloneLtUiServer } from '../../bin/lt-ui.mjs';
 import { loadConfig } from '../../leaderteam/core/config.mjs';
@@ -1004,4 +1008,139 @@ test('UI-09, UI-10 & UI-11: archiveAction guards, requestWindow.windowsByProvide
     if (prevStorage === undefined) delete globalThis.localStorage;
     else globalThis.localStorage = prevStorage;
   }
+});
+
+test('Stage 4 Re-Audit Fixes (S3-UIGW-01, S3-UIGW-02, S3-UIGW-04, S3-UIGW-06): lt-ui & public-api 405 GET block on mutating routes, sanitized providersMutate operationResult, and web-dist/type parity', async t => {
+  const tmpDir = makeTempDir(t, 's4-uigw');
+  const { dshHome, storageRoot, cfgFile, rt } = makeFakeRuntime(tmpDir);
+
+  const prevDshHome = process.env.DSH_HOME;
+  t.after(() => {
+    if (prevDshHome === undefined) delete process.env.DSH_HOME;
+    else process.env.DSH_HOME = prevDshHome;
+  });
+
+  const mockSrv = await startMockMagpieServer();
+  t.after(() => mockSrv.close());
+
+  const uiSrv = await startStandaloneLtUiServer({ port: 0, dshHome, configPath: cfgFile, requireAuth: true });
+  t.after(() => uiSrv.close());
+
+  const loginRes = await fetch(uiSrv.launchUrl, { redirect: 'manual' });
+  const cookiePair = (loginRes.headers.get('set-cookie') || '').split(';')[0];
+
+  // 1. S3-UIGW-04: Read-only allowlist accepts GET (200) and rejects DELETE (405 Allow: GET, POST)
+  for (const roPath of PUBLIC_READONLY_API_ROUTES) {
+    const getRes = await fetch(`${uiSrv.baseUrl}${roPath}`, {
+      method: 'GET',
+      headers: { Cookie: cookiePair },
+    });
+    assert.equal(getRes.status, 200, `Expected 200 on read-only GET ${roPath}`);
+    const getJson = await getRes.json();
+    assert.equal(getJson.ok, true, `Expected ok=true on read-only GET ${roPath}, got: ${JSON.stringify(getJson)}`);
+    const delRes = await fetch(`${uiSrv.baseUrl}${roPath}`, {
+      method: 'DELETE',
+      headers: { Cookie: cookiePair },
+    });
+    assert.equal(delRes.status, 405, `Expected 405 on DELETE ${roPath}`);
+    assert.equal(delRes.headers.get('allow'), 'GET, POST');
+  }
+
+  // 2. S3-UIGW-04: ALL non-read-only `/api/lt/v1/*` routes reject GET with 405 Allow: POST and NEVER mutate disk!
+  const allRoutes = Object.values(PUBLIC_API_ROUTES);
+  const mutatingRoutes = allRoutes.filter(p => !PUBLIC_READONLY_API_ROUTES.has(p));
+  assert.equal(mutatingRoutes.length, 14);
+
+  const bundleBefore = await (await fetch(`${uiSrv.baseUrl}/api/lt/v1/bundle`, { headers: { Cookie: cookiePair } })).json();
+  assert.equal(bundleBefore.data.usageStatus.enabled, true);
+
+  for (const mutPath of mutatingRoutes) {
+    const getMutRes = await fetch(`${uiSrv.baseUrl}${mutPath}`, {
+      method: 'GET',
+      headers: { Cookie: cookiePair },
+    });
+    assert.equal(getMutRes.status, 405, `Expected 405 on mutating GET ${mutPath}`);
+    assert.equal(getMutRes.headers.get('allow'), 'POST');
+    const errBody = await getMutRes.json();
+    assert.equal(errBody.ok, false);
+    assert.equal(errBody.error.code, 'METHOD_NOT_ALLOWED');
+  }
+
+  // Verify `GET /api/lt/v1/usage/toggle` did NOT disable usage analytics in `bundle` or on disk
+  const bundleAfter = await (await fetch(`${uiSrv.baseUrl}/api/lt/v1/bundle`, { headers: { Cookie: cookiePair } })).json();
+  assert.equal(bundleAfter.data.usageStatus.enabled, true);
+  assert.equal(fs.existsSync(path.join(storageRoot, 'ui-preferences.json')), false);
+
+  // Defense-in-depth: direct `createPublicContractHandlers` call with `method: 'GET'` also returns 405 Allow: POST
+  const h = createPublicContractHandlers({ get: k => (k === 'profileContext' ? { home: dshHome } : null) }, rt);
+  const directGetToggle = await h.usageToggle(new Request('http://127.0.0.1/api/lt/v1/usage/toggle', { method: 'GET' }));
+  assert.equal(directGetToggle.status, 405);
+  assert.equal(directGetToggle.headers.get('allow'), 'POST');
+
+  // 3. S3-UIGW-01 & S3-UIGW-02: Mock Magpie `providersMutate` sanitizes `operationResult` (`scanNoSecretLeakage` === [])
+  await h.gatewayControl(makeJsonPost({
+    action: 'configure',
+    config: {
+      mode: 'external',
+      externalGatewayUrl: mockSrv.gatewayUrl,
+      externalWebAdminUrl: mockSrv.webUrl,
+      externalWebKey: mockSrv.webKey,
+    },
+  }));
+  await h.providersMutate(makeJsonPost({
+    operation: 'save-provider',
+    spec: { new: true, preset: 'deepseek', key: 'sk-mock-secret-alpha-123456789012' },
+  }));
+
+  const testMut = await (await h.providersMutate(makeJsonPost({
+    operation: 'test-provider',
+    id: 'magpie:deepseek',
+  }))).json();
+  assert.equal(testMut.ok, true);
+  assert.deepEqual(scanNoSecretLeakage(testMut), []);
+  assert.equal(testMut.data.operationResult.provider, undefined);
+  assert.equal(testMut.data.operationResult.results[0].latencyMs, 19);
+  assert.equal(testMut.data.operationResult.results[0].ms, 19);
+  assert.equal(testMut.data.operationResult.results[0].protocol, 'chat');
+
+  const refreshMut = await (await h.providersMutate(makeJsonPost({
+    operation: 'refresh-models',
+    id: 'magpie:deepseek',
+  }))).json();
+  assert.equal(refreshMut.ok, true);
+  assert.deepEqual(scanNoSecretLeakage(refreshMut), []);
+  assert.equal(refreshMut.data.operationResult.provider, undefined);
+  assert.equal(refreshMut.data.operationResult.models.length, 2);
+
+  // Sole key `off` rejected with error (`ok: false`), then adding 2nd key with `protocol`/`plan` + `remove-many` succeeds cleanly
+  const soleOff = await (await h.providersMutate(makeJsonPost({
+    operation: 'mutate-key',
+    providerId: 'magpie:deepseek',
+    credentialId: testMut.data.providers.find(p => p.providerId === 'magpie:deepseek').credentials[0].credentialId,
+    keyAction: 'off',
+  }))).json();
+  assert.equal(soleOff.ok, false);
+
+  const addSecond = await (await h.providersMutate(makeJsonPost({
+    operation: 'mutate-key',
+    providerId: 'magpie:deepseek',
+    keyAction: 'add',
+    name: 'Key 2',
+    key: 'sk-mock-secret-bravo-987654321098',
+    protocol: 'chat',
+    plan: 'Enterprise',
+  }))).json();
+  assert.equal(addSecond.ok, true);
+  assert.deepEqual(addSecond.data.operationResult, { applied: true });
+  assert.deepEqual(scanNoSecretLeakage(addSecond), []);
+
+  // 4. S3-UIGW-06: Built `web-dist` contains single-key routing `<option value="single">`, keyless loopback check, and exact `lt-public-v1.ts` parity
+  const distDir = resolveLtWebDistDir();
+  const jsFiles = fs.readdirSync(path.join(distDir, 'assets')).filter(f => f.endsWith('.js'));
+  const combinedJs = jsFiles.map(f => fs.readFileSync(path.join(distDir, 'assets', f), 'utf8')).join('\n');
+  assert.ok(combinedJs.includes('单凭据默认 (single)'), 'web-dist must include disabled single routing option');
+
+  const sharedDts = fs.readFileSync(path.resolve(repoRoot, '..', 'lt-shared-contracts', 'types', 'lt-public-v1.d.ts'), 'utf8');
+  const webTs = fs.readFileSync(path.join(repoRoot, 'packages', 'lt-web', 'src', 'types', 'lt-public-v1.ts'), 'utf8');
+  assert.equal(webTs, sharedDts, 'lt-web lt-public-v1.ts must stay byte-for-byte synced with lt-shared-contracts');
 });

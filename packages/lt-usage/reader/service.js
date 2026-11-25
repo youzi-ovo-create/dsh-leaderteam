@@ -167,7 +167,24 @@ function pricingSignatureOf(pricing) {
 
 function gatewaySignatureOf(gatewayRecords) {
   if (!Array.isArray(gatewayRecords) || gatewayRecords.length === 0) return 'gw:0';
-  return `gw:${gatewayRecords.length}:${gatewayRecords.at(-1)?.gatewayRecordId ?? gatewayRecords.at(-1)?.seq ?? ''}`;
+  let maxSeq = 0;
+  const hash = createHash('sha1');
+  for (const r of gatewayRecords) {
+    if (!r || typeof r !== 'object') continue;
+    const seq = Number.isFinite(Number(r.seq)) ? Number(r.seq) : 0;
+    if (seq > maxSeq) maxSeq = seq;
+    const cost = r.gatewayCostUsd ?? r.cost ?? '';
+    const totalTokens = r.tokens?.totalTokens ?? r.totalTokens ?? '';
+    const actualProvider = r.actualProvider ?? r.provider ?? '';
+    const actualModel = r.actualModel ?? r.model ?? '';
+    const tries = r.physicalAttempts ?? r.tries ?? '';
+    const latencyMs = r.latencyMs ?? r.ms ?? '';
+    hash.update(
+      `${r.gatewayRecordId ?? r.id ?? ''}:${seq}:${cost}:${totalTokens}:${actualProvider}:${actualModel}:${tries}:${latencyMs}:${r.status ?? ''}|`
+    );
+  }
+  const lastId = gatewayRecords.at(-1)?.gatewayRecordId ?? gatewayRecords.at(-1)?.id ?? '';
+  return `gw:${gatewayRecords.length}:${maxSeq}:${hash.digest('hex').slice(0, 16)}:${lastId}`;
 }
 
 function getCachedOrCompute(cacheKey, compute) {

@@ -2,6 +2,18 @@ import React, { useEffect, useState } from 'react';
 import { callLtApi, type HydratedBundle } from '../lib/api';
 import type { ProviderProtocol } from '../types/lt-public-v1';
 
+function isLoopbackEndpointUrl(rawUrl: string): boolean {
+  const trimmed = rawUrl.trim();
+  if (!trimmed) return false;
+  try {
+    const parsed = new URL(trimmed);
+    const host = parsed.hostname.toLowerCase();
+    return host === '127.0.0.1' || host === 'localhost' || host === '[::1]' || host === '::1';
+  } catch {
+    return /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(?::\d+)?(?:\/|$)/i.test(trimmed);
+  }
+}
+
 export function ProvidersView({
   bundle,
   onRefreshBundle,
@@ -159,10 +171,11 @@ export function ProvidersView({
     setBusy(true);
     setError(null);
     try {
+      const trimmedKey = rawApiKey.trim();
       const probe =
         vendorPreset === 'custom'
-          ? { [customApi]: customUrl.trim(), key: rawApiKey.trim() }
-          : { preset: vendorPreset, key: rawApiKey.trim() };
+          ? { [customApi]: customUrl.trim(), ...(trimmedKey ? { key: trimmedKey } : {}) }
+          : { preset: vendorPreset, ...(trimmedKey ? { key: trimmedKey } : {}) };
       const res = await callLtApi<{ operationResult: { models: Array<{ id: string; name: string }> } }>(
         'providers/mutate',
         { operation: 'discover-models', probe },
@@ -183,6 +196,7 @@ export function ProvidersView({
     setError(null);
     setMessage(null);
     try {
+      const trimmedKey = rawApiKey.trim();
       const spec =
         vendorPreset === 'custom'
           ? {
@@ -191,12 +205,12 @@ export function ProvidersView({
               name: customName.trim() || customId.trim(),
               [customApi]: customUrl.trim(),
               baseAPI: customApi,
-              key: rawApiKey.trim(),
+              ...(trimmedKey ? { key: trimmedKey } : {}),
             }
           : {
               new: true,
               preset: vendorPreset,
-              key: rawApiKey.trim(),
+              ...(trimmedKey ? { key: trimmedKey } : {}),
             };
       await callLtApi('providers/mutate', { operation: 'save-provider', spec });
       setRawApiKey(''); // Never retain secret in input state after write
@@ -218,9 +232,10 @@ export function ProvidersView({
       const res = await callLtApi<any>('providers/mutate', { operation, ...payload });
       if (operation === 'test-provider') {
         const first = res.operationResult?.results?.[0];
+        const latency = first?.latencyMs ?? first?.ms;
         setMessage(
           first?.ok
-            ? `连通性测试通过（HTTP ${first.status} · 延迟 ${first.latencyMs}ms）`
+            ? `连通性测试通过（HTTP ${first.status} · 延迟 ${latency ?? 0}ms）`
             : `连通性测试未通过（HTTP ${first?.status ?? 'ERR'}）`,
         );
       } else {
@@ -324,6 +339,14 @@ export function ProvidersView({
   }
 
   const selectedProvider = bundle.providers.find(p => p.providerId === activeProviderId) || null;
+  const selectedPreset = bundle.providerPresets.find(p => p.vendorId === vendorPreset) || null;
+  const canOmitApiKey =
+    vendorPreset === 'custom'
+      ? isLoopbackEndpointUrl(customUrl)
+      : Boolean(
+          selectedPreset?.keyOptional ||
+          (selectedPreset?.defaultEndpointUrl && isLoopbackEndpointUrl(selectedPreset.defaultEndpointUrl)),
+        );
 
   return (
     <div>
@@ -501,7 +524,7 @@ export function ProvidersView({
               <button
                 type="button"
                 className="lt-btn"
-                disabled={busy || !gw.managementAuthenticated || !rawApiKey.trim()}
+                disabled={busy || !gw.managementAuthenticated || (!rawApiKey.trim() && !canOmitApiKey)}
                 onClick={() => void handlePreDiscover()}
               >
                 预探测上游模型
@@ -509,7 +532,7 @@ export function ProvidersView({
               <button
                 type="submit"
                 className="lt-btn lt-btn-primary"
-                disabled={busy || !gw.managementAuthenticated || !rawApiKey.trim()}
+                disabled={busy || !gw.managementAuthenticated || (!rawApiKey.trim() && !canOmitApiKey)}
               >
                 保存供应商与密钥
               </button>
@@ -685,6 +708,7 @@ export function ProvidersView({
                       })
                     }
                   >
+                    <option value="single" disabled>单凭据默认 (single)</option>
                     <option value="fill-first">顺位优先 (fill-first)</option>
                     <option value="round-robin">轮询均衡 (round-robin)</option>
                     <option value="least-used">最少调用 (least-used)</option>

@@ -8,7 +8,7 @@
  */
 
 export type ContractId = 'lt.public.v1';
-export type ContractVersion = '1.0.0';
+export type ContractVersion = '1.0.0' | '1.0.1';
 
 export interface ContractEnvelope<T> {
   ok: true;
@@ -162,6 +162,7 @@ export interface ProviderPresetDescriptor {
   defaultEndpointUrl: string;
   keyHint: string;
   keyUrl?: string;
+  keyOptional?: boolean;
   supportsDirectSoloKey: boolean;
   supportsMagpie: boolean;
 }
