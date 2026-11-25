@@ -817,6 +817,7 @@ export function applyModelConfigChanges(changes = {}, options = {}) {
         maxTokens: item.maxTokens ?? prior.maxTokens ?? DEFAULT_ROLE_LIMITS[role].maxTokens,
         timeoutMs: item.timeoutMs ?? prior.timeoutMs ?? DEFAULT_ROLE_LIMITS[role].timeoutMs,
         retries: item.retries ?? prior.retries ?? DEFAULT_ROLE_LIMITS[role].retries,
+        ...(Array.isArray(item.fallback) ? { fallback: item.fallback.map(f => ({ ...f })) } : {}),
       };
     if (role !== 'leader' && Array.isArray(nextRole.fallback)) nextRole.fallback = nextRole.fallback.filter(f => f.route !== route);
 
