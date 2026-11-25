@@ -350,6 +350,9 @@ test('progressive ramp-up waves, chat directives without bumping taskSeq, govern
   const plan = await tools.get('team_discuss').execute({ kind: 'plan', topic: 'p', proposal: 'two parallel modules' }, { agent: leaderAgent });
   assert.equal(plan.outcome.decision, 'approve');
   await tools.get('team_concurrency').execute({ pending_parallel_tasks: 2 }, { agent: leaderAgent });
+  const origSchedNow = rt.scheduler.now;
+  let schedClockMs = Date.now() - 2000;
+  rt.scheduler.now = () => schedClockMs;
 
   const baseArgs = { task: 't', acceptance: ['ok'], model: 'zcode/GLM-5.3', effort: 'high', profile: 'code', tools: ['read', 'write'], write_scope: ['src/**'], plan_id: plan.id };
   const d1 = await tools.get('team_dispatch').execute({ ...baseArgs, name: 'mod-a', write_scope: ['src/mod-a/**'] }, { agent: leaderAgent });
@@ -366,6 +369,7 @@ test('progressive ramp-up waves, chat directives without bumping taskSeq, govern
   assert.equal(currentTaskSeq(ctx, leaderAgent.id), 1, 'mid-task concurrency directive does not bump taskSeq');
   assert.equal(userTaskText(ctx, leaderAgent.id, 1000), 'Implement feature A and B');
 
+  schedClockMs += 50;
   const d2 = await tools.get('team_dispatch').execute({ ...baseArgs, name: 'mod-b', write_scope: ['src/mod-b/**'] }, { agent: leaderAgent });
   assert.equal(d2.concurrency.user_max_concurrent, 2);
   assert.equal(d2.concurrency.active_execution_members, 2);
@@ -373,6 +377,7 @@ test('progressive ramp-up waves, chat directives without bumping taskSeq, govern
   assert.equal(readTeamConcurrencyFile(storeRoot, leaderAgent.id)?.maxActiveMembers, 2, 'session chat directive persists in teams/<id>/concurrency.json');
 
   // Test CLI script set-max-members.mjs (--max 4 -> wakes idle leader when pending work exists, then --reset)
+  schedClockMs += 20;
   await tools.get('team_concurrency').execute({ pending_parallel_tasks: 1 }, { agent: leaderAgent });
   const cliPath = path.join(ROOT, 'scripts/dev/set-max-members.mjs');
   const setOut = JSON.parse(execFileSync(process.execPath, [cliPath, '--storage-root', storeRoot, '--config', cfgFile, '--max', '4'], { encoding: 'utf8', windowsHide: true }));
@@ -382,10 +387,16 @@ test('progressive ramp-up waves, chat directives without bumping taskSeq, govern
   const ext = syncExternalConcurrencyControls(rt);
   assert.equal(ext.raised, true);
   // Immediately within rampObserveMs (500ms after wave of 2 filled rampStepSize=2), progressive ramp holds off:
+  schedClockMs += 30;
   assert.equal(maybeNotifyLeaderScaleUp(ctx, leaderAgent.id, { userCapRaised: true }), false, 'holds wakeup during 500ms progressive ramp observation window');
-  await new Promise(r => setTimeout(r, 540));
   // Once observation window passes and device remains healthy, remembered scale-up wakes the idle leader:
-  const notified = maybeNotifyLeaderScaleUp(ctx, leaderAgent.id, { userCapRaised: false });
+  schedClockMs += 550;
+  let notified;
+  try {
+    notified = maybeNotifyLeaderScaleUp(ctx, leaderAgent.id, { userCapRaised: false });
+  } finally {
+    rt.scheduler.now = origSchedNow;
+  }
   assert.equal(notified, true);
   assert.equal(notices.length, 1);
   assert.equal(notices[0].source.kind, 'leaderteam-scheduler');
