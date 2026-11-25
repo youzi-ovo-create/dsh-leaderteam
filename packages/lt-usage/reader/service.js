@@ -198,6 +198,16 @@ function buildTeamResult(home, data, sessionId, pricing, options = {}) {
     if (session) memberSessions.push(session);
   }
   const sessions = [leader, ...memberSessions];
+  const seenSessionIds = new Set(sessions.filter(Boolean).map((s) => s.id));
+  for (const rootSess of [leader, ...memberSessions]) {
+    if (!rootSess) continue;
+    for (const desc of collectDescendants(data, rootSess)) {
+      if (!desc?.id || seenSessionIds.has(desc.id)) continue;
+      if (isTeam(home, desc.id)) continue;
+      seenSessionIds.add(desc.id);
+      sessions.push(desc);
+    }
+  }
   const signature = signatureOf([
     ...sessions.map((session) => `${session.file}:${session.sig}`),
     fileSignature(membersFile),
@@ -295,7 +305,23 @@ export function listSessions(home, pricing = defaultPricing, options = {}) {
     if (seen.has(session.id)) continue;
     seen.add(session.id);
     const parentSessionId = session.header?.parentSession ?? null;
-    const teamId = memberToTeam.get(session.id) ?? null;
+    let teamId = memberToTeam.get(session.id) ?? null;
+    if (!teamId && parentSessionId) {
+      let curParent = parentSessionId;
+      const visited = new Set([session.id]);
+      while (curParent && !visited.has(curParent)) {
+        visited.add(curParent);
+        if (isTeam(home, curParent)) {
+          teamId = curParent;
+          break;
+        }
+        if (memberToTeam.has(curParent)) {
+          teamId = memberToTeam.get(curParent);
+          break;
+        }
+        curParent = data.byId.get(curParent)?.header?.parentSession ?? null;
+      }
+    }
     const isChild = Boolean(teamId || (parentSessionId && data.byId.has(parentSessionId)));
     let result;
     try {

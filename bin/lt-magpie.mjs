@@ -58,6 +58,7 @@ Commands:
   check-compat  Probe live Magpie Gateway & Web Admin API compatibility
   rollback      Roll back to previously installed Magpie binary version
   configure     Set gateway mode (--mode managed|external|disabled, --gateway-url, --web-url)
+  providers     List normalized public providers from active gateway
   models        List normalized public catalog models from active gateway + LT config
   sync-to-lt    Import discovered Magpie models into LeaderTeam config & executionPool
 
@@ -78,7 +79,7 @@ export async function runLtMagpieCli(argv = process.argv.slice(2)) {
   }
 
   const storageRoot = resolveStorageRoot(opts);
-  const mgr = getOrCreateGatewayManager(storageRoot);
+  const mgr = getOrCreateGatewayManager(storageRoot, { keepAliveOnParentExit: true });
 
   let result;
   if (cmd === 'status' || cmd === 'health') {
@@ -86,15 +87,21 @@ export async function runLtMagpieCli(argv = process.argv.slice(2)) {
   } else if (cmd === 'install') {
     result = await mgr.install({ sourceBinaryPath: opts.binary || null });
   } else if (cmd === 'start') {
-    result = await mgr.start({ allocateDynamicPortsIfBusy: Boolean(opts.dynamicPorts) });
+    result = await mgr.start({
+      allocateDynamicPortsIfBusy: Boolean(opts.dynamicPorts),
+      keepAliveOnParentExit: true,
+    });
   } else if (cmd === 'stop') {
     result = await mgr.stop();
   } else if (cmd === 'restart') {
-    result = await mgr.restart({ allocateDynamicPortsIfBusy: Boolean(opts.dynamicPorts) });
+    result = await mgr.restart({
+      allocateDynamicPortsIfBusy: Boolean(opts.dynamicPorts),
+      keepAliveOnParentExit: true,
+    });
   } else if (cmd === 'check-compat') {
     result = await mgr.checkCompatibility();
   } else if (cmd === 'rollback') {
-    result = await mgr.rollback();
+    result = await mgr.rollback({ keepAliveOnParentExit: true });
   } else if (cmd === 'configure') {
     mgr.configure({
       mode: opts.mode,
@@ -106,13 +113,17 @@ export async function runLtMagpieCli(argv = process.argv.slice(2)) {
     result = await mgr.getStatus();
   } else if (cmd === 'providers') {
     const client = mgr.createClient();
-    const providersPayload = client.hasWebAdminAuth() ? await client.listProviders().catch(() => null) : null;
+    const [providersPayload, gwModels] = await Promise.all([
+      client.hasWebAdminAuth() ? client.listProviders().catch(() => null) : Promise.resolve(null),
+      client.listGatewayModels().catch(() => []),
+    ]);
     const accounts = !providersPayload ? await client.listGatewayAccounts().catch(() => []) : [];
     result = buildPublicProviders({
       magpieProvidersPayload: providersPayload,
       magpieAccounts: accounts,
       magpieGatewayUrl: mgr.getActiveEndpoints().gatewayUrl,
       externalGateways: mgr.listExternalGateways(),
+      magpieGatewayModels: gwModels,
     });
   } else if (cmd === 'models' || cmd === 'sync-to-lt') {
     const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -147,11 +158,7 @@ export async function runLtMagpieCli(argv = process.argv.slice(2)) {
     throw new Error(`Unknown lt-magpie command: ${cmd}`);
   }
 
-  if (opts.json) {
-    console.log(JSON.stringify(result, null, 2));
-  } else {
-    console.log(JSON.stringify(result, null, 2));
-  }
+  console.log(JSON.stringify(result, null, 2));
   return 0;
 }
 

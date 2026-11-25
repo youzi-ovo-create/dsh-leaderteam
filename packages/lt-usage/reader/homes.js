@@ -50,7 +50,11 @@ export function registerHome(dir) {
 }
 
 export function samePath(a, b) {
-  return path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase();
+  const ra = path.resolve(a);
+  const rb = path.resolve(b);
+  return process.platform === 'win32'
+    ? ra.toLowerCase() === rb.toLowerCase()
+    : ra === rb;
 }
 
 export function listKnownHomes(explicit) {
@@ -63,8 +67,10 @@ export function listKnownHomes(explicit) {
   };
   add(explicit);
   add(process.env.DSH_HOME);
-  add('D:\\DSH-Official-Data\\home');
-  add('D:\\DSH-Official-Data');
+  if (process.platform === 'win32') {
+    add('D:\\DSH-Official-Data\\home');
+    add('D:\\DSH-Official-Data');
+  }
   for (const dir of readRegistry()) add(dir);
   return out;
 }

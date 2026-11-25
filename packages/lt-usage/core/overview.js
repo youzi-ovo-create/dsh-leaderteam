@@ -36,19 +36,27 @@ export function aggregateOverview(reports, options = {}) {
     costActualUsd: 0,
     cacheSavingsCny: 0
   };
+  let hasKnownSucceededSessionCost = false;
   const models = new Map();
   const sessions = [];
 
   for (const report of reports ?? []) {
     const t = report?.totals ?? {};
+    const reportCallsSucceeded = t.callsSucceeded ?? 0;
+    const reportCostKnown = reportCallsSucceeded === 0 || t.costActualCny != null;
+    if (reportCallsSucceeded > 0 && t.costActualCny != null) {
+      hasKnownSucceededSessionCost = true;
+    }
     totals.callsTotal += t.callsTotal ?? 0;
-    totals.callsSucceeded += t.callsSucceeded ?? 0;
+    totals.callsSucceeded += reportCallsSucceeded;
     totals.unmeteredCalls += t.unmeteredCalls ?? 0;
     for (const field of TOKEN_FIELDS) totals[field] += t[field] ?? 0;
     totals.unpricedCalls += t.unpricedCalls ?? 0;
-    addCost(totals.costPeakCny, t.costPeakCny);
-    addCost(totals.costOffPeakCny, t.costOffPeakCny ?? t.costActualCny);
-    addCost(totals.costActualCny, t.costActualCny);
+    if (t.costPeakCny != null) addCost(totals.costPeakCny, t.costPeakCny);
+    if ((t.costOffPeakCny ?? t.costActualCny) != null) {
+      addCost(totals.costOffPeakCny, t.costOffPeakCny ?? t.costActualCny);
+    }
+    if (t.costActualCny != null) addCost(totals.costActualCny, t.costActualCny);
     totals.costPeakUsd += t.costPeakUsd ?? 0;
     totals.costOffPeakUsd += t.costOffPeakUsd ?? t.costActualUsd ?? 0;
     totals.costActualUsd += t.costActualUsd ?? 0;
@@ -69,6 +77,7 @@ export function aggregateOverview(reports, options = {}) {
           outputTokens: 0,
           totalTokens: 0,
           priced: item.priced,
+          hasKnownCost: false,
           costPeakCny: { input: 0, cacheRead: 0, cacheWrite: 0, output: 0, total: 0 },
           costOffPeakCny: { input: 0, cacheRead: 0, cacheWrite: 0, output: 0, total: 0 },
           costActualCny: { input: 0, cacheRead: 0, cacheWrite: 0, output: 0, total: 0 }
@@ -79,10 +88,15 @@ export function aggregateOverview(reports, options = {}) {
       model.callsSucceeded += item.callsSucceeded ?? 0;
       model.unmeteredCalls += item.unmeteredCalls ?? 0;
       model.priced = model.priced || item.priced;
+      if ((item.callsSucceeded ?? 0) > 0 && item.costActualCny != null) {
+        model.hasKnownCost = true;
+      }
       for (const field of TOKEN_FIELDS) model[field] += item[field] ?? 0;
-      addCost(model.costPeakCny, item.costPeakCny);
-      addCost(model.costOffPeakCny, item.costOffPeakCny ?? item.costActualCny);
-      addCost(model.costActualCny, item.costActualCny);
+      if (item.costPeakCny != null) addCost(model.costPeakCny, item.costPeakCny);
+      if ((item.costOffPeakCny ?? item.costActualCny) != null) {
+        addCost(model.costOffPeakCny, item.costOffPeakCny ?? item.costActualCny);
+      }
+      if (item.costActualCny != null) addCost(model.costActualCny, item.costActualCny);
     }
 
     const meta = report?.meta ?? {};
@@ -94,7 +108,7 @@ export function aggregateOverview(reports, options = {}) {
       startedAtMs: meta.startedAtMs ?? null,
       lastActivityMs: meta.lastActivityMs ?? null,
       callsTotal: t.callsTotal ?? 0,
-      callsSucceeded: t.callsSucceeded ?? 0,
+      callsSucceeded: reportCallsSucceeded,
       unmeteredCalls: t.unmeteredCalls ?? 0,
       inputTokens: t.inputTokens ?? 0,
       cacheReadTokens: t.cacheReadTokens ?? 0,
@@ -102,26 +116,36 @@ export function aggregateOverview(reports, options = {}) {
       outputTokens: t.outputTokens ?? 0,
       totalTokens: t.totalTokens ?? 0,
       unpricedCalls: t.unpricedCalls ?? 0,
-      costPeakCny: round4(t.costPeakCny?.total ?? 0),
-      costOffPeakCny: round4((t.costOffPeakCny ?? t.costActualCny)?.total ?? 0),
-      costActualCny: round4(t.costActualCny?.total ?? 0)
+      costPeakCny: reportCostKnown ? round4(t.costPeakCny?.total ?? 0) : null,
+      costOffPeakCny: reportCostKnown ? round4((t.costOffPeakCny ?? t.costActualCny)?.total ?? 0) : null,
+      costActualCny: reportCostKnown ? round4(t.costActualCny?.total ?? 0) : null
     });
   }
 
   const tokenDenom = totals.inputTokens + totals.cacheReadTokens;
   totals.cacheHitRatePct = tokenDenom > 0 ? round2((totals.cacheReadTokens / tokenDenom) * 100) : 0;
-  totals.costPeakCny = finalizeCost(totals.costPeakCny);
-  totals.costOffPeakCny = finalizeCost(totals.costOffPeakCny);
-  totals.costActualCny = finalizeCost(totals.costActualCny);
-  totals.costPeakUsd = round4(totals.costPeakUsd);
-  totals.costOffPeakUsd = round4(totals.costOffPeakUsd);
-  totals.costActualUsd = round4(totals.costActualUsd);
-  totals.cacheSavingsCny = round4(totals.cacheSavingsCny);
+  if (totals.callsSucceeded > 0 && !hasKnownSucceededSessionCost) {
+    totals.costPeakCny = null;
+    totals.costOffPeakCny = null;
+    totals.costActualCny = null;
+    totals.costPeakUsd = null;
+    totals.costOffPeakUsd = null;
+    totals.costActualUsd = null;
+    totals.cacheSavingsCny = 0;
+  } else {
+    totals.costPeakCny = finalizeCost(totals.costPeakCny);
+    totals.costOffPeakCny = finalizeCost(totals.costOffPeakCny);
+    totals.costActualCny = finalizeCost(totals.costActualCny);
+    totals.costPeakUsd = round4(totals.costPeakUsd);
+    totals.costOffPeakUsd = round4(totals.costOffPeakUsd);
+    totals.costActualUsd = round4(totals.costActualUsd);
+    totals.cacheSavingsCny = round4(totals.cacheSavingsCny);
+  }
 
   const byModel = [];
   for (const model of models.values()) {
     const denom = model.inputTokens + model.cacheReadTokens;
-    const costAvailable = model.priced || model.callsSucceeded === 0;
+    const costAvailable = model.callsSucceeded === 0 ? true : model.hasKnownCost;
     byModel.push({
       route: model.route,
       ...(model.label ? { label: model.label } : {}),

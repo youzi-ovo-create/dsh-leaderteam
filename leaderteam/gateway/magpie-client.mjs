@@ -10,11 +10,12 @@
  */
 
 export class MagpieApiError extends Error {
-  constructor(code, message, status = 500) {
+  constructor(code, message, status = 500, upstreamErrorCode = null) {
     super(message);
     this.name = 'MagpieApiError';
     this.code = code;
     this.status = status;
+    this.upstreamErrorCode = upstreamErrorCode;
   }
 }
 
@@ -27,6 +28,64 @@ function resolveCookiePort(webAdminUrl) {
   const u = new URL(webAdminUrl);
   if (u.port) return u.port;
   return u.protocol === 'https:' ? '443' : '80';
+}
+
+const ROUTE_TO_WIRE_MAP = {
+  'fill-first': 'order',
+  'round-robin': 'rotate',
+  'least-used': 'usage',
+  single: '',
+  order: 'order',
+  rotate: 'rotate',
+  usage: 'usage',
+  weight: 'weight',
+  '': '',
+};
+
+const OAUTH_AGENT_ALIASES = {
+  'claude-code': 'claude',
+  'gemini-cli': 'gemini',
+  cc: 'claude',
+};
+
+export function normalizeMagpieOAuthAgent(agent) {
+  const raw = String(agent || '').trim();
+  if (!raw) return '';
+  return OAUTH_AGENT_ALIASES[raw.toLowerCase()] || raw;
+}
+
+export function normalizeMagpieSignInState(raw, fallbackId = null) {
+  if (!raw || typeof raw !== 'object') {
+    return fallbackId
+      ? {
+        id: fallbackId,
+        agent: '',
+        url: '',
+        authUrl: '',
+        state: 'done',
+        status: 'done',
+        pasteCallback: false,
+        code: '',
+        error: '',
+      }
+      : null;
+  }
+  const url = typeof raw.url === 'string' ? raw.url : (typeof raw.authUrl === 'string' ? raw.authUrl : '');
+  const state = typeof raw.state === 'string' && raw.state
+    ? raw.state
+    : (typeof raw.status === 'string' && raw.status ? raw.status : 'waiting');
+  return {
+    ...raw,
+    id: raw.id ?? fallbackId ?? '',
+    agent: raw.agent ?? '',
+    url,
+    authUrl: url,
+    state,
+    status: state,
+    pasteCallback: Boolean(raw.pasteCallback),
+    code: raw.code ?? '',
+    error: raw.error ?? '',
+  };
 }
 
 export class MagpieClient {
@@ -77,6 +136,7 @@ export class MagpieClient {
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs ?? this.timeoutMs);
+    timer.unref?.();
     const started = Date.now();
     try {
       const res = await this.fetchImpl(`${baseUrl}${pathAndQuery}`, {
@@ -95,10 +155,11 @@ export class MagpieClient {
         const msg = (json && typeof json.error === 'string' && json.error)
           || (json && typeof json.error?.message === 'string' && json.error.message)
           || `Magpie HTTP ${res.status} on ${pathAndQuery}`;
+        const upstreamErrorCode = typeof json?.error?.code === 'string' ? json.error.code : null;
         const code = res.status === 401
           ? 'MAGPIE_UNAUTHORIZED'
           : (res.status === 403 ? 'MAGPIE_FORBIDDEN' : 'MAGPIE_HTTP_ERROR');
-        throw new MagpieApiError(code, msg, res.status);
+        throw new MagpieApiError(code, msg, res.status, upstreamErrorCode);
       }
       return { status: res.status, latencyMs, data: json };
     } catch (err) {
@@ -138,7 +199,7 @@ export class MagpieClient {
 
   async listGatewayQuotas() {
     const res = await this._request(this.gatewayUrl, '/v1/magpie/quotas', { method: 'GET', authKind: 'gateway' });
-    return res.data ?? {};
+    return res.data ?? { object: 'list', data: [] };
   }
 
   async fetchUsageFeed({ cursor = 'start', limit = 500 } = {}) {
@@ -150,6 +211,7 @@ export class MagpieClient {
     );
     return {
       rows: Array.isArray(res.data?.rows) ? res.data.rows : [],
+      deleted: Array.isArray(res.data?.deleted) ? res.data.deleted : [],
       nextCursor: typeof res.data?.next_cursor === 'string' ? res.data.next_cursor : cursor,
       hasMore: Boolean(res.data?.has_more),
     };
@@ -163,7 +225,23 @@ export class MagpieClient {
   }
 
   async updateSettings(patch) {
-    const res = await this._request(this.webAdminUrl, '/api/settings', { method: 'POST', body: patch, authKind: 'web' });
+    // Magpie `settingsapi.Apply` unmarshals over zero-valued Settings for `settingsapi.Keys`.
+    // Always read-modify-write so `noAutoUpdate: true`, `noStats: true`, `proxy`, etc. are preserved (`GW-06`).
+    const cur = await this.getSettings();
+    const merged = {
+      ...(cur && typeof cur === 'object' ? cur : {}),
+      ...(patch && typeof patch === 'object' ? patch : {}),
+    };
+    const res = await this._request(this.webAdminUrl, '/api/settings', { method: 'POST', body: merged, authKind: 'web' });
+    return res.data ?? {};
+  }
+
+  async setAccountDiscovery(enabled) {
+    const res = await this._request(this.webAdminUrl, '/api/settings/account-discovery', {
+      method: 'POST',
+      body: { off: !enabled },
+      authKind: 'web',
+    });
     return res.data ?? {};
   }
 
@@ -243,20 +321,29 @@ export class MagpieClient {
     return res.data;
   }
 
-  async setProviderRouting({ id, route, sessionAffinity }) {
+  async setProviderRouting({ id, route, routing, sessionAffinity, affinity }) {
     let latest = null;
-    if (route) {
+    const rawRouting = routing !== undefined ? routing : route;
+    if (rawRouting !== undefined && rawRouting !== null) {
+      const key = String(rawRouting).trim();
+      if (!Object.hasOwn(ROUTE_TO_WIRE_MAP, key)) {
+        throw new MagpieApiError('BAD_ROUTING_MODE', `Unsupported provider routing mode: ${rawRouting}`, 400);
+      }
+      const mappedRouting = ROUTE_TO_WIRE_MAP[key];
       const r = await this._request(this.webAdminUrl, '/api/provider/route', {
         method: 'POST',
-        body: { id, route },
+        body: { id, routing: mappedRouting },
         authKind: 'web',
       });
       latest = r.data;
     }
-    if (typeof sessionAffinity === 'boolean') {
+    if (typeof affinity === 'string' || typeof sessionAffinity === 'boolean') {
+      const mappedAffinity = typeof affinity === 'string'
+        ? affinity
+        : (sessionAffinity ? 'session' : 'off');
       const r = await this._request(this.webAdminUrl, '/api/provider/affinity', {
         method: 'POST',
-        body: { id, affinity: sessionAffinity },
+        body: { id, affinity: mappedAffinity },
         authKind: 'web',
       });
       latest = r.data;
@@ -288,7 +375,7 @@ export class MagpieClient {
   /* ==================== Multi-Key Pool CRUD ==================== */
 
   async mutateKey(action, payload) {
-    const allowed = new Set(['add', 'import', 'use', 'on', 'off', 'rename', 'replace', 'weight', 'remove', 'remove-many']);
+    const allowed = new Set(['add', 'import', 'use', 'on', 'off', 'rename', 'replace', 'weight', 'remove', 'remove-many', 'protocol', 'plan']);
     if (!allowed.has(action)) {
       throw new MagpieApiError('BAD_KEY_ACTION', `Unsupported Magpie key action: ${action}`, 400);
     }
@@ -300,15 +387,38 @@ export class MagpieClient {
     return res.data;
   }
 
-  /* ==================== OAuth Sign-In Passthrough ==================== */
+  /* ==================== OAuth Sign-In & Subscription Login Passthrough ==================== */
 
-  async startSignIn({ agent, linkOnly = true, proxy, site }) {
-    const res = await this._request(this.webAdminUrl, '/api/signin', {
-      method: 'POST',
-      body: { agent, linkOnly, ...(proxy ? { proxy } : {}), ...(site ? { site } : {}) },
-      authKind: 'web',
-    });
-    return res.data;
+  async startSignIn({ agent, linkOnly = true, proxy, site, user } = {}) {
+    const normalizedAgent = normalizeMagpieOAuthAgent(agent);
+    const reqBody = {
+      agent: normalizedAgent,
+      linkOnly: Boolean(linkOnly),
+      ...(proxy !== undefined ? { proxy } : {}),
+      ...(site ? { site } : {}),
+      ...(user ? { user } : {}),
+    };
+    try {
+      const res = await this._request(this.webAdminUrl, '/api/signin', {
+        method: 'POST',
+        body: reqBody,
+        authKind: 'web',
+      });
+      return normalizeMagpieSignInState(res.data);
+    } catch (err) {
+      // Sandboxed Magpie starts with `noAccountDiscovery: true` (`HOME` isolated to `sandboxHome`).
+      // Enable subscription sign-in inside the isolated sandbox and retry once (`GW-04`).
+      if (err instanceof MagpieApiError && err.status === 400 && /subscription accounts are off/i.test(err.message)) {
+        await this.setAccountDiscovery(true);
+        const retryRes = await this._request(this.webAdminUrl, '/api/signin', {
+          method: 'POST',
+          body: reqBody,
+          authKind: 'web',
+        });
+        return normalizeMagpieSignInState(retryRes.data);
+      }
+      throw err;
+    }
   }
 
   async getSignInStatus(signInId) {
@@ -316,7 +426,7 @@ export class MagpieClient {
       method: 'GET',
       authKind: 'web',
     });
-    return res.data;
+    return normalizeMagpieSignInState(res.data, signInId);
   }
 
   async submitSignInCallback(signInId, callbackUrl) {
@@ -325,13 +435,46 @@ export class MagpieClient {
       body: { url: callbackUrl },
       authKind: 'web',
     });
-    return res.data;
+    if (res.data && typeof res.data === 'object') {
+      return normalizeMagpieSignInState(res.data, signInId);
+    }
+    const latest = await this.getSignInStatus(signInId).catch(() => null);
+    return latest ?? normalizeMagpieSignInState(null, signInId);
   }
 
   async cancelSignIn(signInId) {
     const res = await this._request(this.webAdminUrl, `/api/signin/${encodeURIComponent(signInId)}/cancel`, {
       method: 'POST',
       body: {},
+      authKind: 'web',
+    });
+    if (res.data && typeof res.data === 'object') {
+      return normalizeMagpieSignInState(res.data, signInId);
+    }
+    return {
+      id: String(signInId || ''),
+      agent: '',
+      url: '',
+      authUrl: '',
+      state: 'canceled',
+      status: 'canceled',
+      pasteCallback: false,
+      code: '',
+      error: '',
+    };
+  }
+
+  async mutateLogin(action, payload = {}) {
+    const allowed = new Set(['switch', 'forget', 'on', 'off', 'access-only', 'renewed']);
+    if (!allowed.has(action)) {
+      throw new MagpieApiError('BAD_LOGIN_ACTION', `Unsupported Magpie login action: ${action}`, 400);
+    }
+    const rawAgent = payload?.agent || payload?.id || payload?.providerId || '';
+    const agent = normalizeMagpieOAuthAgent(String(rawAgent).replace(/^magpie:/, ''));
+    const user = String(payload?.user ?? payload?.login ?? '').trim();
+    const res = await this._request(this.webAdminUrl, `/api/login/${action}`, {
+      method: 'POST',
+      body: { ...payload, agent, user },
       authKind: 'web',
     });
     return res.data;

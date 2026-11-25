@@ -22,6 +22,7 @@ import {
   overviewFor,
   reportFor,
 } from '../../packages/lt-usage/index.mjs';
+import { listKnownHomes, samePath } from '../../packages/lt-usage/reader/homes.js';
 import { getOrCreateGatewayManager, normalizeMagpieUsageRow } from '../gateway/index.mjs';
 
 const MAX_CACHED_GATEWAY_RECORDS = 5000;
@@ -33,6 +34,26 @@ function readJsonSafe(file, fallback = null) {
   } catch {
     return fallback;
   }
+}
+
+function withBoundedTimeout(promise, ms) {
+  let timer = null;
+  const timeoutPromise = new Promise(resolve => {
+    timer = setTimeout(() => resolve({ timedOut: true }), ms);
+    timer.unref?.();
+  });
+  return Promise.race([promise, timeoutPromise]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
+function isCursorResetError(err) {
+  if (!err) return false;
+  if (err.status === 410) return true;
+  const code = String(err.upstreamErrorCode || '');
+  if (code.startsWith('cursor_')) return true;
+  if (err.status === 400 && /cursor/i.test(String(err.message || ''))) return true;
+  return false;
 }
 
 export class HengzhangUsageBridge {
@@ -51,8 +72,8 @@ export class HengzhangUsageBridge {
     this.gatewayManager = gatewayManager ?? getOrCreateGatewayManager(this.storageRoot, { fetchImpl });
     this.fetchImpl = fetchImpl;
 
-    this.gatewayRecords = [];
-    this.gatewayRecordIds = new Set();
+    this.gatewayRecordMap = new Map();
+    this.activeFeedGatewayUrl = null;
     this.nextCursor = 'start';
     this.syncInFlight = null;
     this.lastSyncAt = null;
@@ -60,13 +81,60 @@ export class HengzhangUsageBridge {
     this.faultInjector = null; // Test-only hook to prove fault isolation
   }
 
+  get gatewayRecords() {
+    return Array.from(this.gatewayRecordMap.values());
+  }
+
+  set gatewayRecords(records) {
+    this.gatewayRecordMap.clear();
+    if (Array.isArray(records)) {
+      for (const r of records) {
+        if (r?.gatewayRecordId) {
+          this.gatewayRecordMap.set(r.gatewayRecordId, r);
+        }
+      }
+    }
+  }
+
+  get gatewayRecordIds() {
+    return new Set(this.gatewayRecordMap.keys());
+  }
+
   resolveDshHome(overrideHome = null) {
     if (typeof overrideHome === 'string' && overrideHome.trim()) {
+      if (overrideHome.includes('\0')) {
+        throw Object.assign(new Error('Invalid DSH home path'), { code: 'FORBIDDEN_HOME', status: 400 });
+      }
       return path.resolve(overrideHome.trim());
     }
     if (this.explicitDshHome) return this.explicitDshHome;
     if (process.env.DSH_HOME?.trim()) return path.resolve(process.env.DSH_HOME.trim());
     return path.dirname(this.storageRoot);
+  }
+
+  /**
+   * Safe DSH home resolver for untrusted HTTP callers (`Shared Interface Contract #3`):
+   * rejects arbitrary filesystem directories unless `allowExternalOverride: true` OR the path
+   * matches the configured `dshHome` / registered `listKnownHomes()`.
+   */
+  resolveSafeDshHome(overrideHome = null, { allowExternalOverride = false } = {}) {
+    const baseHome = this.resolveDshHome(null);
+    if (overrideHome === null || overrideHome === undefined || (typeof overrideHome === 'string' && !overrideHome.trim())) {
+      return baseHome;
+    }
+    if (typeof overrideHome !== 'string' || overrideHome.includes('\0')) {
+      throw Object.assign(new Error('Invalid DSH home override'), { code: 'FORBIDDEN_HOME', status: 403 });
+    }
+    const candidate = path.resolve(overrideHome.trim());
+    if (allowExternalOverride) return candidate;
+    if (samePath(candidate, baseHome)) return baseHome;
+    const known = listKnownHomes(baseHome);
+    const matched = known.find(h => samePath(candidate, h));
+    if (matched) return matched;
+    throw Object.assign(
+      new Error(`Forbidden DSH home override: ${overrideHome}`),
+      { code: 'FORBIDDEN_HOME', status: 403 },
+    );
   }
 
   _loadState() {
@@ -98,6 +166,14 @@ export class HengzhangUsageBridge {
       };
     }
     return structuredClone(defaultPricing);
+  }
+
+  _getCustomRouteKeys() {
+    const custom = readJsonSafe(this.pricingFile, null);
+    if (custom && typeof custom === 'object' && custom.routes && typeof custom.routes === 'object') {
+      return new Set(Object.keys(custom.routes));
+    }
+    return new Set();
   }
 
   savePricing(nextPricing) {
@@ -149,30 +225,71 @@ export class HengzhangUsageBridge {
     if (!ep?.gatewayUrl || ep.mode === 'disabled') {
       return { synced: false, reason: 'gateway-disabled' };
     }
+    // Reset stale cursor & cache when active gateway endpoint changes (`HZ-01`)
+    if (this.activeFeedGatewayUrl && this.activeFeedGatewayUrl !== ep.gatewayUrl) {
+      this.gatewayRecordMap.clear();
+      this.nextCursor = 'start';
+    }
+    this.activeFeedGatewayUrl = ep.gatewayUrl;
+
     const client = this.gatewayManager.createClient();
     let rounds = 0;
     let added = 0;
+    let updated = 0;
+    let retriedCursorReset = false;
+
     while (rounds < 4) {
       rounds += 1;
-      const page = await client.fetchUsageFeed({ cursor: this.nextCursor, limit: 500 });
+      let page;
+      try {
+        page = await client.fetchUsageFeed({ cursor: this.nextCursor, limit: 500 });
+      } catch (err) {
+        if (!retriedCursorReset && this.nextCursor !== 'start' && isCursorResetError(err)) {
+          retriedCursorReset = true;
+          this.gatewayRecordMap.clear();
+          this.nextCursor = 'start';
+          page = await client.fetchUsageFeed({ cursor: 'start', limit: 500 });
+        } else {
+          throw err;
+        }
+      }
+
+      if (Array.isArray(page.deleted)) {
+        for (const delId of page.deleted) {
+          if (delId) this.gatewayRecordMap.delete(String(delId));
+        }
+      }
+
       for (const rawRow of page.rows) {
+        const rawId = String(rawRow?.id || rawRow?.rid || '').trim();
         const norm = normalizeMagpieUsageRow(rawRow);
-        if (!norm || this.gatewayRecordIds.has(norm.gatewayRecordId)) continue;
-        this.gatewayRecordIds.add(norm.gatewayRecordId);
-        this.gatewayRecords.push(norm);
-        added += 1;
+        if (!norm) {
+          if (rawId) this.gatewayRecordMap.delete(rawId);
+          continue;
+        }
+        const existed = this.gatewayRecordMap.has(norm.gatewayRecordId);
+        if (existed) {
+          this.gatewayRecordMap.delete(norm.gatewayRecordId);
+          updated += 1;
+        } else {
+          added += 1;
+        }
+        this.gatewayRecordMap.set(norm.gatewayRecordId, norm);
       }
-      if (this.gatewayRecords.length > MAX_CACHED_GATEWAY_RECORDS) {
-        const overflow = this.gatewayRecords.length - MAX_CACHED_GATEWAY_RECORDS;
-        const evicted = this.gatewayRecords.splice(0, overflow);
-        for (const ev of evicted) this.gatewayRecordIds.delete(ev.gatewayRecordId);
+
+      while (this.gatewayRecordMap.size > MAX_CACHED_GATEWAY_RECORDS) {
+        const oldestKey = this.gatewayRecordMap.keys().next().value;
+        if (oldestKey === undefined) break;
+        this.gatewayRecordMap.delete(oldestKey);
       }
+
       this.nextCursor = page.nextCursor || this.nextCursor;
       if (!page.hasMore || page.rows.length === 0) break;
     }
+
     this.lastSyncAt = new Date().toISOString();
     this.lastSyncError = null;
-    return { synced: true, added, totalCached: this.gatewayRecords.length };
+    return { synced: true, added, updated, totalCached: this.gatewayRecordMap.size };
   }
 
   _guardEnabledAndHealthy() {
@@ -185,45 +302,42 @@ export class HengzhangUsageBridge {
     return { active: true, reason: null, error: null };
   }
 
-  async getStatus({ home = null } = {}) {
+  async getStatus({ home = null, allowExternalOverride = true } = {}) {
     try {
       const check = this._guardEnabledAndHealthy();
-      const resolvedHome = this.resolveDshHome(home);
+      const resolvedHome = this.resolveSafeDshHome(home, { allowExternalOverride });
       return {
         enabled: check.active,
         healthy: true,
         dshHome: resolvedHome,
         homeExists: fs.existsSync(path.join(resolvedHome, 'sessions')),
-        cachedGatewayRecords: this.gatewayRecords.length,
+        cachedGatewayRecords: this.gatewayRecordMap.size,
         lastSyncAt: this.lastSyncAt,
         lastSyncError: this.lastSyncError,
       };
     } catch (e) {
+      if (e?.code === 'FORBIDDEN_HOME') throw e;
       return {
         enabled: this.isEnabled(),
         healthy: false,
         dshHome: null,
         homeExists: false,
-        cachedGatewayRecords: this.gatewayRecords.length,
+        cachedGatewayRecords: this.gatewayRecordMap.size,
         lastSyncAt: this.lastSyncAt,
         lastSyncError: e instanceof Error ? e.message : String(e),
       };
     }
   }
 
-  async getOverview({ home = null, syncGateway = true } = {}) {
+  async getOverview({ home = null, syncGateway = true, allowExternalOverride = true } = {}) {
     const check = this._guardEnabledAndHealthy();
     if (!check.active) {
       return { enabled: false, overview: null };
     }
+    const resolvedHome = this.resolveSafeDshHome(home, { allowExternalOverride });
     if (syncGateway) {
-      // Bounded best-effort sync; failures are swallowed inside triggerBackgroundMagpieSync
-      await Promise.race([
-        this.triggerBackgroundMagpieSync(),
-        new Promise(r => setTimeout(r, 1200)),
-      ]);
+      await withBoundedTimeout(this.triggerBackgroundMagpieSync(), 1200);
     }
-    const resolvedHome = this.resolveDshHome(home);
     const pricing = this.getPricing();
     const overview = fs.existsSync(path.join(resolvedHome, 'sessions'))
       ? overviewFor(resolvedHome, pricing, { gatewayRecords: this.gatewayRecords })
@@ -254,18 +368,15 @@ export class HengzhangUsageBridge {
     return { enabled: true, dshHome: resolvedHome, pricing, pricingCatalog, overview };
   }
 
-  async getSessions({ home = null, syncGateway = false } = {}) {
+  async getSessions({ home = null, syncGateway = false, allowExternalOverride = true } = {}) {
     const check = this._guardEnabledAndHealthy();
     if (!check.active) {
       return { enabled: false, sessions: [] };
     }
+    const resolvedHome = this.resolveSafeDshHome(home, { allowExternalOverride });
     if (syncGateway) {
-      await Promise.race([
-        this.triggerBackgroundMagpieSync(),
-        new Promise(r => setTimeout(r, 1000)),
-      ]);
+      await withBoundedTimeout(this.triggerBackgroundMagpieSync(), 1000);
     }
-    const resolvedHome = this.resolveDshHome(home);
     if (!fs.existsSync(path.join(resolvedHome, 'sessions'))) {
       return { enabled: true, dshHome: resolvedHome, sessions: [] };
     }
@@ -273,7 +384,7 @@ export class HengzhangUsageBridge {
     return { enabled: true, dshHome: resolvedHome, sessions };
   }
 
-  async getSessionReport({ sessionId, home = null, syncGateway = true } = {}) {
+  async getSessionReport({ sessionId, home = null, syncGateway = true, allowExternalOverride = true } = {}) {
     const check = this._guardEnabledAndHealthy();
     if (!check.active) {
       return { enabled: false, report: null };
@@ -281,39 +392,71 @@ export class HengzhangUsageBridge {
     if (!sessionId || typeof sessionId !== 'string') {
       throw new Error('sessionId is required');
     }
+    const resolvedHome = this.resolveSafeDshHome(home, { allowExternalOverride });
     if (syncGateway) {
-      await Promise.race([
-        this.triggerBackgroundMagpieSync(),
-        new Promise(r => setTimeout(r, 1200)),
-      ]);
+      await withBoundedTimeout(this.triggerBackgroundMagpieSync(), 1200);
     }
-    const resolvedHome = this.resolveDshHome(home);
     const pricing = this.getPricing();
     const res = reportFor(resolvedHome, sessionId, pricing, { gatewayRecords: this.gatewayRecords });
     if (!res) return { enabled: true, report: null, signature: null };
+    const customRoutes = this._getCustomRouteKeys();
     return {
       enabled: true,
       dshHome: resolvedHome,
       signature: res.signature,
       report: res.report,
-      publicRecords: toPublicLogicalUsageRecords(res.report, pricing),
+      publicRecords: toPublicLogicalUsageRecords(res.report, pricing, { customRoutes }),
     };
   }
+}
+
+function isCustomPriceRoute(matchedRoute, pricing, customRoutes = null) {
+  if (!matchedRoute) return false;
+  if (customRoutes instanceof Set && customRoutes.has(matchedRoute)) {
+    const defEntry = defaultPricing.routes?.[matchedRoute];
+    const curEntry = pricing?.routes?.[matchedRoute];
+    if (!defEntry) return true;
+    return JSON.stringify(curEntry) !== JSON.stringify(defEntry);
+  }
+  const curEntry = pricing?.routes?.[matchedRoute];
+  const defEntry = defaultPricing.routes?.[matchedRoute];
+  if (!curEntry) return false;
+  if (!defEntry) return true;
+  return JSON.stringify(curEntry) !== JSON.stringify(defEntry);
 }
 
 /**
  * Convert a Hengzhang `UsageReport` into `lt.public.v1` `LogicalUsageRecord[]`,
  * strictly enforcing `unknown != 0`, 4-bucket cache identity, and logical vs physical attempts separation.
  */
-export function toPublicLogicalUsageRecords(report, pricing = defaultPricing) {
+export function toPublicLogicalUsageRecords(report, pricing = defaultPricing, options = {}) {
   if (!report || !Array.isArray(report.calls)) return [];
   const teamId = report.meta?.kind === 'team' ? (report.team?.teamId ?? report.meta?.sessionId ?? null) : null;
   const usdToCny = Number(pricing?.usdToCny) > 0 ? Number(pricing.usdToCny) : 6.71;
+  const customRoutes = options?.customRoutes ?? null;
 
   return report.calls.map(call => {
     const metered = !call.unmetered;
     const costKnown = call.costActualCny !== null && call.costActualCny !== undefined;
     const actualUsd = costKnown ? Number((call.costActualCny / usdToCny).toFixed(6)) : null;
+
+    const sourceKind = call.group === 'governance'
+      ? 'lt-governance'
+      : (call.gatewayMatched
+        ? 'magpie'
+        : ((call.hostProvider && call.hostProvider !== 'magpie') || String(call.route || '').includes('@direct')
+          ? 'direct'
+          : 'dsh-session'));
+
+    const matchedRoute = call.matchedPriceRoute || call.route || '';
+    const priceSource = !costKnown
+      ? 'unknown'
+      : (isCustomPriceRoute(matchedRoute, pricing, customRoutes) ? 'custom' : 'catalog');
+
+    const reasoningTokens =
+      metered && Number.isInteger(call.reasoningTokens) && call.reasoningTokens >= 0
+        ? Math.min(call.reasoningTokens, call.outputTokens ?? call.reasoningTokens)
+        : null;
 
     return {
       logicalRequestId: `${report.meta?.sessionId ?? 'sess'}:n${call.n}:${call.responseId || call.step}`,
@@ -322,7 +465,7 @@ export function toPublicLogicalUsageRecords(report, pricing = defaultPricing) {
       requestedRoute: call.route || 'unknown',
       actualProvider: call.actualProvider || 'unknown',
       actualModel: call.actualModel || 'unknown',
-      sourceKind: call.responseId ? 'magpie' : (call.group === 'governance' ? 'lt-governance' : 'dsh-session'),
+      sourceKind,
       physicalAttemptCount: Number.isInteger(call.physicalAttempts) ? call.physicalAttempts : null,
       latencyMs: Number.isFinite(call.latencyMs) ? call.latencyMs : null,
       ttftMs: Number.isFinite(call.ttftMs) ? call.ttftMs : null,
@@ -332,17 +475,17 @@ export function toPublicLogicalUsageRecords(report, pricing = defaultPricing) {
         cacheReadTokens: metered ? call.cacheReadTokens : null,
         cacheWriteTokens: metered ? call.cacheWriteTokens : null,
         outputTokens: metered ? call.outputTokens : null,
-        reasoningTokens: null,
+        reasoningTokens,
         totalTokens: metered ? call.totalTokens : null,
       },
       cost: {
         known: costKnown,
         currency: costKnown ? 'CNY' : null,
         actualCny: costKnown ? Number(call.costActualCny.toFixed(6)) : null,
-        peakCny: call.costPeakCny != null ? Number(call.costPeakCny.toFixed(6)) : null,
-        offPeakCny: call.costOffPeakCny != null ? Number(call.costOffPeakCny.toFixed(6)) : null,
+        peakCny: costKnown && call.costPeakCny != null ? Number(call.costPeakCny.toFixed(6)) : null,
+        offPeakCny: costKnown && call.costOffPeakCny != null ? Number(call.costOffPeakCny.toFixed(6)) : null,
         actualUsd,
-        priceSource: costKnown ? 'catalog' : 'unknown',
+        priceSource,
       },
       attribution: {
         sessionId: call.sessionId ?? null,
@@ -366,6 +509,10 @@ export function getOrCreateHengzhangBridge(storageRoot, options = {}) {
   if (!bridge) {
     bridge = new HengzhangUsageBridge({ storageRoot: key, ...options });
     BRIDGE_CACHE.set(key, bridge);
+  } else if (options && typeof options === 'object') {
+    if (options.fetchImpl) bridge.fetchImpl = options.fetchImpl;
+    if (options.dshHome) bridge.explicitDshHome = path.resolve(options.dshHome);
+    if (options.gatewayManager) bridge.gatewayManager = options.gatewayManager;
   }
   return bridge;
 }

@@ -183,9 +183,9 @@ function createGatewayMatcher(gatewayRecords) {
       if (cand.sessionId && spec.sessionId && cand.sessionId !== spec.sessionId) continue;
       const candTotal = cand.tokens?.totalTokens;
       if (Number.isFinite(candTotal) && usage.totalTokens > 0 && candTotal !== usage.totalTokens) continue;
-      const reqNorm = normalizeRoute(cand.requestedRoute || '');
-      const specNorm = normalizeRoute(spec.route || '');
-      if (reqNorm && specNorm && reqNorm !== specNorm && !reqNorm.startsWith('group/')) continue;
+      const reqNorm = normalizeRoute(cand.requestedRoute || '').replace(/^magpie\//i, '');
+      const specNorm = normalizeRoute(spec.route || '').replace(/^magpie\//i, '');
+      if (reqNorm && specNorm && reqNorm !== specNorm && !reqNorm.startsWith('group/') && !specNorm.startsWith('group/')) continue;
       if (delta < bestDelta) {
         bestDelta = delta;
         bestIdx = i;
@@ -269,6 +269,21 @@ function makeLedgerRow(spec, pricing, issues, matchGateway = null) {
     }
   }
 
+  const rawReasoning =
+    gw?.tokens?.reasoningTokens ??
+    spec.usage?.reasoningTokens ??
+    spec.usage?.outputTokensDetails?.reasoningTokens ??
+    spec.usage?.completion_tokens_details?.reasoning_tokens;
+  let reasoningTokens =
+    rawReasoning !== null && rawReasoning !== undefined && rawReasoning !== '' && Number.isFinite(Number(rawReasoning))
+      ? Math.max(0, Math.trunc(Number(rawReasoning)))
+      : null;
+  if (!ok || unmetered) {
+    reasoningTokens = null;
+  } else if (reasoningTokens !== null && reasoningTokens > usage.outputTokens) {
+    reasoningTokens = usage.outputTokens;
+  }
+
   return {
     timeMs: Number.isFinite(spec.timeMs) ? spec.timeMs : null,
     group: spec.group,
@@ -279,6 +294,9 @@ function makeLedgerRow(spec, pricing, issues, matchGateway = null) {
     sessionId: spec.sessionId,
     agentKey: spec.agentKey,
     route,
+    hostProvider: spec.hostProvider ?? null,
+    gatewayMatched: Boolean(gw),
+    matchedPriceRoute: resolved?.matchedRoute ?? null,
     actualProvider,
     actualModel,
     latencyMs,
@@ -289,6 +307,7 @@ function makeLedgerRow(spec, pricing, issues, matchGateway = null) {
     unmetered,
     degraded: !!spec.degraded,
     usage,
+    reasoningTokens,
     priced: resolved !== null,
     costKnown: !ok || (!unmetered && resolved !== null),
     cnyPeak,
@@ -310,6 +329,7 @@ function aggregateRows(rows) {
   let offPeakCnyTotal = 0;
   let actualCnyTotal = 0;
   let savingsTotal = 0;
+  let knownSucceededCount = 0;
 
   for (const row of rows) {
     agg.callsTotal++;
@@ -321,6 +341,7 @@ function aggregateRows(rows) {
       continue;
     }
     if (!row.costKnown) continue;
+    if (row.ok) knownSucceededCount++;
     for (const field of COST_FIELDS) {
       peak[field] += row.cnyPeak[field];
       offPeak[field] += row.cnyOffPeak[field];
@@ -336,6 +357,17 @@ function aggregateRows(rows) {
   }
 
   agg.cacheHitRatePct = cacheHitRate(agg);
+  if (agg.callsSucceeded > 0 && knownSucceededCount === 0) {
+    agg.costPeakCny = null;
+    agg.costOffPeakCny = null;
+    agg.costActualCny = null;
+    agg.costPeakUsd = null;
+    agg.costOffPeakUsd = null;
+    agg.costActualUsd = null;
+    agg.cacheSavingsCny = 0;
+    return agg;
+  }
+
   agg.costPeakCny = {
     input: round4(peak.input),
     cacheRead: round4(peak.cacheRead),
@@ -394,6 +426,9 @@ function toCall(row) {
     taskSeq: row.taskSeq ?? null,
     step: row.step,
     route: row.route,
+    hostProvider: row.hostProvider ?? null,
+    gatewayMatched: Boolean(row.gatewayMatched),
+    matchedPriceRoute: row.matchedPriceRoute ?? null,
     actualProvider: row.actualProvider ?? 'unknown',
     actualModel: row.actualModel ?? 'unknown',
     latencyMs: row.latencyMs ?? null,
@@ -404,6 +439,7 @@ function toCall(row) {
     unmetered: row.unmetered,
     degraded: row.degraded,
     ...row.usage,
+    reasoningTokens: row.reasoningTokens ?? null,
     costPeakCny: row.costKnown ? row.cnyPeak.total : null,
     costOffPeakCny: row.costKnown ? row.cnyOffPeak.total : null,
     costActualCny: row.costKnown ? row.cnyActual.total : null,
@@ -488,8 +524,8 @@ function buildByModel(ledger, pricing, grandTotalTokens) {
     const found = lookupPricingEntry(route, pricing);
     const entry = found?.entry;
     const hasRate = Boolean(entry?.peak);
-    const zeroOnlyFailed = !hasRate && agg.callsSucceeded === 0;
-    const costAvailable = hasRate || zeroOnlyFailed;
+    const hasKnownSucceeded = rows.some((r) => r.ok && r.costKnown);
+    const costAvailable = agg.callsSucceeded === 0 ? true : hasKnownSucceeded;
     const item = { route };
     if (entry?.label) item.label = entry.label;
     if (entry?.vendor) item.vendor = entry.vendor;
@@ -505,7 +541,7 @@ function buildByModel(ledger, pricing, grandTotalTokens) {
       cacheHitRatePct: agg.cacheHitRatePct,
       shareOfTotalTokensPct:
         grandTotalTokens > 0 ? round2((agg.totalTokens / grandTotalTokens) * 100) : 0,
-      priced: hasRate,
+      priced: hasRate || hasKnownSucceeded,
       costPeakCny: costAvailable ? agg.costPeakCny : null,
       costOffPeakCny: costAvailable ? agg.costOffPeakCny : null,
       costActualCny: costAvailable ? agg.costActualCny : null
@@ -570,9 +606,9 @@ function buildAgents(ledger, specs) {
       cacheHitRatePct: agg.cacheHitRatePct,
       durationSec:
         times.length > 1 ? Math.round((Math.max(...times) - Math.min(...times)) / 1000) : 0,
-      costPeakCny: agg.costPeakCny.total,
-      costOffPeakCny: agg.costOffPeakCny.total,
-      costActualCny: agg.costActualCny.total
+      costPeakCny: agg.costPeakCny ? agg.costPeakCny.total : null,
+      costOffPeakCny: agg.costOffPeakCny ? agg.costOffPeakCny.total : null,
+      costActualCny: agg.costActualCny ? agg.costActualCny.total : null
     });
     return item;
   });
@@ -603,7 +639,7 @@ function buildByProvider(ledger, grandTotalTokens) {
       outputTokens: agg.outputTokens,
       totalTokens: agg.totalTokens,
       shareOfTotalTokensPct: grandTotalTokens > 0 ? round2((agg.totalTokens / grandTotalTokens) * 100) : 0,
-      costActualCny: costAvailable ? agg.costActualCny.total : null
+      costActualCny: costAvailable && agg.costActualCny ? agg.costActualCny.total : null
     });
   }
   return out;
@@ -626,7 +662,7 @@ function buildByTask(ledger) {
       callsTotal: agg.callsTotal,
       callsSucceeded: agg.callsSucceeded,
       totalTokens: agg.totalTokens,
-      costActualCny: costAvailable ? agg.costActualCny.total : null
+      costActualCny: costAvailable && agg.costActualCny ? agg.costActualCny.total : null
     });
   }
   return out;
@@ -728,6 +764,53 @@ function buildTeamReport(input, notes, issues, matchGateway) {
       stageId: member.stageId ?? null,
       sessionId: childId,
       status: member.status
+    });
+  }
+
+  // Include any native DSH subagent descendants (via parentSession) not listed in members.jsonl
+  const handledSessionIds = new Set([
+    leader.id,
+    ...Array.from(members?.values?.() ?? [], (m) => m.childId).filter(Boolean)
+  ]);
+  for (const extra of sessions.slice(1)) {
+    if (!extra?.id || handledSessionIds.has(extra.id)) continue;
+    handledSessionIds.add(extra.id);
+    const name = catalog.get(extra.id) ?? shortId(extra.id);
+    const actorRole = 'subagent';
+    const agentKey = `execution|${extra.id}|${name}`;
+    const receipts = extractReceipts(extra.rows ?? []);
+    for (const receipt of receipts.receipts) {
+      ledger.push(
+        makeLedgerRow(
+          {
+            timeMs: receipt.timeMs,
+            group: 'execution',
+            actor: name,
+            role: actorRole,
+            stageId: null,
+            taskSeq: receipt.taskSeq ?? null,
+            sessionId: extra.id,
+            agentKey,
+            route: receipt.route,
+            hostProvider: receipt.hostProvider,
+            responseId: receipt.responseId,
+            latencyMs: receipt.latencyMs,
+            usage: receipt.usage,
+            ok: receipt.ok
+          },
+          pricing,
+          issues,
+          matchGateway
+        )
+      );
+    }
+    specs.push({
+      agentKey,
+      group: 'execution',
+      name,
+      actorRole,
+      stageId: null,
+      sessionId: extra.id
     });
   }
 

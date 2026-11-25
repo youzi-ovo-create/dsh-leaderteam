@@ -3,7 +3,16 @@ import path from 'node:path';
 import zlib from 'node:zlib';
 import { decodeSessionBytes } from '../core/index.js';
 
+export const MAX_DECODE_CACHE_ENTRIES = 64;
 const cache = new Map();
+
+export function getDecodeCacheSize() {
+  return cache.size;
+}
+
+export function clearDecodeCache() {
+  cache.clear();
+}
 
 export function decompressZstd(bytes) {
   return zlib.zstdDecompressSync(bytes);
@@ -25,7 +34,12 @@ export function readSessionFile(file) {
   }
   const sig = `${stat.mtimeMs}:${stat.size}`;
   const hit = cache.get(file);
-  if (hit && hit.sig === sig) return hit;
+  if (hit && hit.sig === sig) {
+    // Refresh LRU order
+    cache.delete(file);
+    cache.set(file, hit);
+    return hit;
+  }
   let entry;
   try {
     const rows = decodeSessionBytes(fs.readFileSync(file), decompressZstd);
@@ -47,6 +61,12 @@ export function readSessionFile(file) {
       id: path.basename(path.dirname(file)),
       error: err
     };
+  }
+  if (cache.has(file)) cache.delete(file);
+  while (cache.size >= MAX_DECODE_CACHE_ENTRIES) {
+    const oldestKey = cache.keys().next().value;
+    if (oldestKey === undefined) break;
+    cache.delete(oldestKey);
   }
   cache.set(file, entry);
   return entry;

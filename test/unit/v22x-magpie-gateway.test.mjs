@@ -86,7 +86,7 @@ test('Magpie adapter & client: provider CRUD, multi-key pool, discovery, non-mer
       name: 'Secondary Key',
       key: 'sk-bravo-secret-0987654321',
     });
-    const secondaryRef = afterAddKey.providers[0].keys.find(k => !k.primary).id;
+    const secondaryRef = afterAddKey.providers[0].keyList.find(k => !k.active).id;
     await client.mutateKey('weight', { id: 'deepseek', ref: secondaryRef, weight: 3 });
     await client.setProviderRouting({ id: 'deepseek', route: 'round-robin', sessionAffinity: true });
     const testRes = await client.testProvider({ id: 'deepseek' });
@@ -120,6 +120,17 @@ test('Magpie adapter & client: provider CRUD, multi-key pool, discovery, non-mer
       env: { DEEPSEEK_API_KEY: 'sk-direct-env-secret-9999999999' },
       effectiveConfig: loadedBefore,
     });
+    const dsMagpieProv = pubProviders.providers.find(p => p.providerId === 'magpie:deepseek');
+    assert.ok(dsMagpieProv);
+    assert.equal(dsMagpieProv.status, 'ready');
+    assert.equal(dsMagpieProv.keyRotation, 'round-robin');
+    assert.equal(dsMagpieProv.sessionAffinity, true);
+    assert.equal(dsMagpieProv.credentials.length, 2);
+    assert.equal(dsMagpieProv.discoveredModelCount, 2);
+    assert.equal(dsMagpieProv.enabledModelCount, 2);
+    const dsPreset = pubProviders.presets.find(pr => pr.vendorId === 'deepseek');
+    assert.equal(dsPreset.keyUrl, 'https://platform.deepseek.com/api_keys');
+
     const serializedProviders = JSON.stringify(pubProviders);
     assert.ok(!serializedProviders.includes('sk-alpha-secret'));
     assert.ok(!serializedProviders.includes('sk-bravo-secret'));

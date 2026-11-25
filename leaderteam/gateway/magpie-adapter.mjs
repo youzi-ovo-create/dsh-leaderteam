@@ -16,14 +16,46 @@ import { DSH_EFFORTS } from '../core/constants.mjs';
 
 const CANONICAL_DSH_THINKING_ORDER = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
 
+const SAFE_MASKED_TAG_RE = /^(?:oauth:[A-Za-z0-9._+-]{1,32}|env:[A-Z0-9_]{2,64}(?:\s*\([^)]+\))?|pin:[A-Za-z0-9._-]{1,24}|configured)$/;
+const SAFE_MASKED_SECRET_RE = /^([^*.\u2026]{0,6})(?:\*{2,}|\u2026|\.\.\.)([^*.\u2026]{0,6})$/;
+
 export function sanitizeMaskedPreview(rawMasked, fallbackKind = 'api_key') {
   const s = typeof rawMasked === 'string' ? rawMasked.trim() : '';
   if (!s) return fallbackKind === 'oauth' ? 'oauth:connected' : 'configured';
-  // Guard against any accidental unmasked secret (>16 chars without ellipsis or asterisks)
-  if (s.length >= 16 && !s.includes('...') && !s.includes('*')) {
-    return `${s.slice(0, 3)}****${s.slice(-4)}`;
+  if (SAFE_MASKED_TAG_RE.test(s) && !/[?&]k=|\bsk-[A-Za-z0-9_-]{8,}/.test(s)) {
+    return s;
   }
-  return s;
+  const maskedMatch = SAFE_MASKED_SECRET_RE.exec(s);
+  if (maskedMatch && (maskedMatch[1].length + maskedMatch[2].length) <= 8) {
+    return s;
+  }
+  if (s.length <= 8) return '****';
+  return `${s.slice(0, 3)}****${s.slice(-4)}`;
+}
+
+/**
+ * Map Magpie wire `routing` ("order"|"rotate"|"usage"|"weight"|"") to LT `keyRotation`.
+ */
+export function mapMagpieRoutingToPublic(rawRouting, legacyRoute, credentialCount = 0) {
+  const r = typeof rawRouting === 'string' ? rawRouting.trim() : '';
+  if (r === 'order') return 'fill-first';
+  if (r === 'rotate' || r === 'weight') return 'round-robin';
+  if (r === 'usage') return 'least-used';
+  const legacy = typeof legacyRoute === 'string' ? legacyRoute.trim() : '';
+  if (legacy === 'fill-first' || legacy === 'round-robin' || legacy === 'least-used') {
+    return legacy;
+  }
+  return credentialCount > 1 ? 'fill-first' : 'single';
+}
+
+export function mapMagpieAffinityToPublic(rawAffinity, legacySessionAffinity) {
+  if (typeof rawAffinity === 'string') {
+    return rawAffinity.trim() !== 'off';
+  }
+  if (typeof legacySessionAffinity === 'boolean') {
+    return legacySessionAffinity;
+  }
+  return true;
 }
 
 /**
@@ -108,15 +140,23 @@ function sanitizeEndpointUrl(rawUrl) {
 export function buildPublicProviders({
   magpieProvidersPayload = null,
   magpieAccounts = [],
+  magpieAccountsPayload = null,
   magpieGatewayUrl = null,
   env = process.env,
   effectiveConfig = null,
   externalGateways = [],
+  magpieGatewayModels = [],
+  dshDiscoveredModels = [],
 } = {}) {
   const providers = [];
   const seenProviderIds = new Set();
+  const resolvedMagpieAccounts = Array.isArray(magpieAccountsPayload)
+    ? magpieAccountsPayload
+    : (Array.isArray(magpieAccountsPayload?.data)
+      ? magpieAccountsPayload.data
+      : (Array.isArray(magpieAccounts) ? magpieAccounts : []));
 
-  // 1. Magpie Providers (rich Web Admin payload when authenticated)
+  // 1. Magpie Providers (rich Web Admin payload when authenticated — parses real Magpie 0.1.4731 `providerJSON`)
   if (Array.isArray(magpieProvidersPayload?.providers)) {
     for (const p of magpieProvidersPayload.providers) {
       const rawId = String(p?.id || '').trim();
@@ -125,89 +165,126 @@ export function buildPublicProviders({
       seenProviderIds.add(providerId);
 
       const credentials = [];
-      if (p.kind === 'login') {
-        const accounts = Array.isArray(p.accounts) ? p.accounts : [];
-        if (accounts.length > 0) {
-          for (const acc of accounts) {
-            const uid = String(acc.user || acc.email || 'account');
+      const acct = p.account && typeof p.account === 'object' ? p.account : null;
+      const isSubscription = Boolean(acct || p.kind === 'login');
+
+      if (isSubscription) {
+        const logins = Array.isArray(acct?.logins)
+          ? acct.logins
+          : (Array.isArray(p.accounts) ? p.accounts : []);
+        if (logins.length > 0) {
+          for (const [idx, acc] of logins.entries()) {
+            const uid = String(acc.user || acc.email || acc.id || `account-${idx + 1}`);
+            const enabled = typeof acc.on === 'boolean' ? acc.on : (!acc.disabled && !acc.expired);
+            const primary = typeof acc.active === 'boolean'
+              ? acc.active
+              : (acct?.user ? acct.user === acc.user : idx === 0);
+            const plan = acc.plan || acct?.plan || null;
             credentials.push({
               credentialId: `oauth:${rawId}:${uid}`,
               kind: 'oauth',
-              label: acc.email || uid,
-              maskedPreview: `oauth:${acc.plan || 'account'}`,
-              enabled: !acc.disabled && !acc.expired,
-              primary: Boolean(acc.active),
-              weight: 1,
-              accountPlan: acc.plan || null,
+              label: acc.email || acc.name || uid,
+              maskedPreview: sanitizeMaskedPreview(`oauth:${plan || 'account'}`, 'oauth'),
+              enabled,
+              primary,
+              weight: Number.isFinite(acc.weight) && acc.weight > 0 ? acc.weight : 1,
+              accountPlan: plan,
             });
           }
-        } else if (p.loggedIn) {
+        } else if ((acct && (acct.user || acct.email || p.ready)) || p.loggedIn) {
+          const uid = String(acct?.user || acct?.email || p.user || 'default');
+          const plan = acct?.plan || p.plan || null;
           credentials.push({
-            credentialId: `oauth:${rawId}:default`,
+            credentialId: `oauth:${rawId}:${uid}`,
             kind: 'oauth',
-            label: p.user || p.name || rawId,
-            maskedPreview: `oauth:${p.plan || 'active'}`,
+            label: acct?.email || acct?.user || p.user || acct?.agentName || p.name || rawId,
+            maskedPreview: sanitizeMaskedPreview(`oauth:${plan || 'active'}`, 'oauth'),
             enabled: true,
             primary: true,
             weight: 1,
-            accountPlan: p.plan || null,
+            accountPlan: plan,
           });
         }
-      } else if (Array.isArray(p.keys) && p.keys.length > 0) {
-        for (const k of p.keys) {
+      } else {
+        const keyList = Array.isArray(p.keyList)
+          ? p.keyList
+          : (Array.isArray(p.keys) ? p.keys : []);
+        if (keyList.length > 0) {
+          for (const [idx, k] of keyList.entries()) {
+            const enabled = typeof k.on === 'boolean' ? k.on : !k.disabled;
+            const primary = typeof k.active === 'boolean'
+              ? k.active
+              : (typeof k.primary === 'boolean' ? k.primary : idx === 0);
+            credentials.push({
+              credentialId: `key:${k.id || idx + 1}`,
+              kind: 'api_key',
+              label: k.name || (primary ? 'Primary' : `Key ${idx + 1}`),
+              maskedPreview: sanitizeMaskedPreview(k.masked, 'api_key'),
+              enabled,
+              primary,
+              weight: Number.isFinite(k.weight) && k.weight > 0 ? k.weight : 1,
+              accountPlan: k.plan || null,
+            });
+          }
+        } else if (p.key?.set || p.hasKey) {
           credentials.push({
-            credentialId: `key:${k.id}`,
+            credentialId: `key:${p.keyId || 'primary'}`,
             kind: 'api_key',
-            label: k.name || 'API Key',
-            maskedPreview: sanitizeMaskedPreview(k.masked, 'api_key'),
-            enabled: !k.disabled,
-            primary: Boolean(k.primary),
-            weight: Number.isFinite(k.weight) && k.weight > 0 ? k.weight : 1,
-            accountPlan: k.plan || null,
+            label: p.keyName || 'Primary',
+            maskedPreview: sanitizeMaskedPreview(p.key?.masked ?? p.maskedKey, 'api_key'),
+            enabled: !p.keyDisabled,
+            primary: true,
+            weight: Number.isFinite(p.keyWeight) && p.keyWeight > 0 ? p.keyWeight : 1,
+            accountPlan: null,
           });
         }
-      } else if (p.hasKey) {
-        credentials.push({
-          credentialId: `key:${p.keyId || 'primary'}`,
-          kind: 'api_key',
-          label: p.keyName || 'Primary',
-          maskedPreview: sanitizeMaskedPreview(p.maskedKey, 'api_key'),
-          enabled: !p.keyDisabled,
-          primary: true,
-          weight: Number.isFinite(p.keyWeight) && p.keyWeight > 0 ? p.keyWeight : 1,
-        });
       }
 
+      const isOff = Boolean(p.off ?? p.disabled);
+      const keyOptional = Boolean(p.key?.optional);
       const usableCreds = credentials.filter(c => c.enabled).length;
-      const status = p.disabled
+      const isReady = typeof p.ready === 'boolean'
+        ? (p.ready && !isOff)
+        : (!isOff && (usableCreds > 0 || keyOptional));
+
+      const status = isOff
         ? 'disabled'
-        : (usableCreds > 0 ? 'ready' : (p.kind === 'login' ? 'auth_required' : 'unconfigured'));
+        : (isReady || usableCreds > 0 || keyOptional
+          ? 'ready'
+          : (isSubscription ? 'auth_required' : 'unconfigured'));
 
       const endpoint = sanitizeEndpointUrl(p.chat || p.responses || p.anthropic || p.gemini || magpieGatewayUrl || '');
-      const discoveredCount = Array.isArray(p.listed) ? p.listed.length : 0;
-      const enabledCount = Array.isArray(p.models) && p.models.length > 0 ? p.models.length : discoveredCount;
+      const modelObjs = Array.isArray(p.models) && p.models.some(m => m && typeof m === 'object')
+        ? p.models
+        : null;
+      const discoveredCount = modelObjs
+        ? modelObjs.length
+        : (Array.isArray(p.listed) ? p.listed.length : (Array.isArray(p.models) ? p.models.length : 0));
+      const enabledCount = Number.isInteger(p.exposed)
+        ? p.exposed
+        : (modelObjs
+          ? modelObjs.filter(m => m.on !== false).length
+          : (Array.isArray(p.models) && p.models.length > 0 ? p.models.length : discoveredCount));
 
       providers.push({
         providerId,
         sourceKind: 'magpie',
-        vendorId: p.preset || p.loginAgent || rawId,
+        vendorId: p.preset || acct?.agent || p.loginAgent || rawId,
         displayName: `${p.name || rawId} (Magpie)`,
         protocol: mapMagpieProtocol(p.baseAPI, p),
         endpointUrl: endpoint,
         status,
-        keyRotation: p.route === 'round-robin' || p.route === 'least-used' || p.route === 'fill-first'
-          ? p.route
-          : (credentials.length > 1 ? 'fill-first' : 'single'),
-        sessionAffinity: p.sessionAffinity !== false,
+        keyRotation: mapMagpieRoutingToPublic(p.routing, p.route, credentials.length),
+        sessionAffinity: mapMagpieAffinityToPublic(p.affinity, p.sessionAffinity),
         credentials,
         discoveredModelCount: discoveredCount,
-        enabledModelCount: p.disabled ? 0 : enabledCount,
+        enabledModelCount: isOff ? 0 : enabledCount,
       });
     }
-  } else if (Array.isArray(magpieAccounts) && magpieAccounts.length > 0) {
+  } else if (resolvedMagpieAccounts.length > 0) {
     // Read-only fallback from loopback `/v1/magpie/accounts?models=1` when Web Admin key is not supplied
     const grouped = new Map();
-    for (const acc of magpieAccounts) {
+    for (const acc of resolvedMagpieAccounts) {
       const rawId = String(acc?.provider || '').trim();
       if (!rawId) continue;
       if (!grouped.has(rawId)) {
@@ -219,14 +296,19 @@ export function buildPublicProviders({
         });
       }
       const g = grouped.get(rawId);
+      const isOAuth = acc.kind === 'account' || acc.kind === 'login';
+      const accRef = String(acc.id || acc.user || g.creds.length + 1);
       g.creds.push({
-        credentialId: `${acc.kind === 'login' ? 'oauth' : 'key'}:${acc.id || g.creds.length + 1}`,
-        kind: acc.kind === 'login' ? 'oauth' : 'api_key',
-        label: acc.label || rawId,
-        maskedPreview: acc.kind === 'login' ? 'oauth:active' : `pin:${acc.id || 'key'}`,
-        enabled: Boolean(acc.on),
+        credentialId: isOAuth ? `oauth:${rawId}:${accRef}` : `key:${accRef}`,
+        kind: isOAuth ? 'oauth' : 'api_key',
+        label: acc.label || acc.user || rawId,
+        maskedPreview: isOAuth
+          ? sanitizeMaskedPreview(`oauth:${acc.plan || 'active'}`, 'oauth')
+          : sanitizeMaskedPreview(`pin:${acc.id || 'key'}`, 'api_key'),
+        enabled: acc.on !== undefined ? Boolean(acc.on) : true,
         primary: g.creds.length === 0,
         weight: 1,
+        ...(isOAuth ? { accountPlan: acc.plan || null } : {}),
       });
       for (const m of acc.models || []) g.models.add(m);
     }
@@ -323,7 +405,39 @@ export function buildPublicProviders({
     });
   }
 
-  // 4. Backfill `unconfigured` provider descriptors for any vendor referenced by `effectiveConfig.models`
+  // 4. Backfill providers from live Magpie `/v1/models` (including `magpie:group` routing groups!)
+  if (Array.isArray(magpieGatewayModels) && magpieGatewayModels.length > 0) {
+    const gwCountsByVendor = new Map();
+    for (const raw of magpieGatewayModels) {
+      const fullId = typeof raw?.id === 'string' ? raw.id.trim() : '';
+      if (!fullId) continue;
+      const slashIdx = fullId.indexOf('/');
+      const vendorPart = slashIdx > 0 ? fullId.slice(0, slashIdx) : (raw.owned_by || 'magpie');
+      gwCountsByVendor.set(vendorPart, (gwCountsByVendor.get(vendorPart) ?? 0) + 1);
+    }
+    for (const [vendorPart, count] of gwCountsByVendor.entries()) {
+      const providerId = `magpie:${vendorPart}`;
+      if (seenProviderIds.has(providerId)) continue;
+      seenProviderIds.add(providerId);
+      const isGroup = vendorPart === 'group';
+      providers.push({
+        providerId,
+        sourceKind: 'magpie',
+        vendorId: vendorPart,
+        displayName: isGroup ? 'Magpie Routing Groups (路由组)' : `${vendorPart} (Magpie)`,
+        protocol: 'multi',
+        endpointUrl: sanitizeEndpointUrl(magpieGatewayUrl || ''),
+        status: 'ready',
+        keyRotation: isGroup ? 'round-robin' : 'single',
+        sessionAffinity: true,
+        credentials: [],
+        discoveredModelCount: count,
+        enabledModelCount: count,
+      });
+    }
+  }
+
+  // 5. Backfill `unconfigured` provider descriptors for any vendor referenced by `effectiveConfig.models`
   //    so `ModelCatalogEntry.providerId` always maintains referential integrity in `lt.public.v1`.
   for (const [routeId, spec] of Object.entries(effectiveConfig?.models ?? {})) {
     const hostProv = spec?.provider ?? defaultMagpieProv;
@@ -353,6 +467,43 @@ export function buildPublicProviders({
     });
   }
 
+  // 6. Backfill any DSH host-discovered model providers so `models[].providerId` has 100% referential integrity
+  if (Array.isArray(dshDiscoveredModels) && dshDiscoveredModels.length > 0) {
+    const hostCounts = new Map();
+    for (const dm of dshDiscoveredModels) {
+      if (!dm?.route || !dm?.provider) continue;
+      const isMagpie = dm.provider === defaultMagpieProv;
+      const rawUpstream = dm.upstreamModel || dm.route;
+      const slashIdx = rawUpstream.indexOf('/');
+      const vendorPart = isMagpie
+        ? (slashIdx > 0 ? rawUpstream.slice(0, slashIdx) : 'magpie')
+        : dm.provider;
+      const sourceKind = isMagpie ? 'magpie' : 'direct';
+      const providerId = `${sourceKind}:${vendorPart}`;
+      const cur = hostCounts.get(providerId) || { providerId, sourceKind, vendorPart, isMagpie, count: 0 };
+      cur.count += 1;
+      hostCounts.set(providerId, cur);
+    }
+    for (const info of hostCounts.values()) {
+      if (seenProviderIds.has(info.providerId)) continue;
+      seenProviderIds.add(info.providerId);
+      providers.push({
+        providerId: info.providerId,
+        sourceKind: info.sourceKind,
+        vendorId: info.vendorPart,
+        displayName: info.isMagpie ? `${info.vendorPart} (Magpie)` : `${info.vendorPart} (DSH Host)`,
+        protocol: 'openai-chat',
+        endpointUrl: info.isMagpie ? sanitizeEndpointUrl(magpieGatewayUrl || '') : '',
+        status: 'ready',
+        keyRotation: 'single',
+        sessionAffinity: false,
+        credentials: [],
+        discoveredModelCount: info.count,
+        enabledModelCount: info.count,
+      });
+    }
+  }
+
   // Presets catalog merging Magpie presets + Solo-Key presets
   const presetMap = new Map();
   for (const p of SOLO_PROVIDER_PRESETS) {
@@ -369,13 +520,14 @@ export function buildPublicProviders({
   for (const mp of magpieProvidersPayload?.presets ?? []) {
     if (!mp?.id) continue;
     const prev = presetMap.get(mp.id);
+    const keyUrl = mp.keysUrl ?? mp.keyUrl;
     presetMap.set(mp.id, {
       vendorId: mp.id,
       displayName: mp.name || prev?.displayName || mp.id,
       protocol: mapMagpieProtocol(mp.responses ? 'responses' : 'chat', mp),
       defaultEndpointUrl: sanitizeEndpointUrl(mp.chat || mp.responses || prev?.defaultEndpointUrl || ''),
       keyHint: mp.keyHint || 'sk-...',
-      ...(mp.keyUrl ? { keyUrl: mp.keyUrl } : {}),
+      ...(keyUrl ? { keyUrl } : {}),
       supportsDirectSoloKey: Boolean(prev?.supportsDirectSoloKey),
       supportsMagpie: true,
     });
@@ -452,7 +604,7 @@ export function buildPublicModelCatalog({
       upstreamModelId,
       magpieModelId: fullId,
       providerId,
-      providerDisplayName: `${vendorPart} (Magpie)`,
+      providerDisplayName: vendorPart === 'group' ? 'Magpie Routing Groups (路由组)' : `${vendorPart} (Magpie)`,
       credentialScope: 'provider-pool',
       sourceKind: 'magpie',
       displayName: existingSpec?.label || raw.display_name || fullId,
@@ -632,6 +784,11 @@ export function buildModelUpsertsFromCatalogEntries(entries, {
  */
 export function normalizeMagpieUsageRow(raw) {
   if (!raw || typeof raw !== 'object') return null;
+  // Filter out intermediate failover handoffs, local session-log imports, and rejected probes (`HZ-01`)
+  if (raw.handed_on === true || raw.handedOn === true) return null;
+  if (raw.origin === 'session' || raw.source === 'log') return null;
+  if (raw.rejected === true) return null;
+
   const id = String(raw.id || raw.rid || `magpie-seq-${raw.seq ?? ''}`).trim();
   if (!id) return null;
   const timeMs = typeof raw.t === 'string' ? Date.parse(raw.t) : Number(raw.timeMs || 0);
@@ -649,9 +806,10 @@ export function normalizeMagpieUsageRow(raw) {
   const totalTokens = metered ? (uncachedIn + cacheRead + cacheWrite + out) : null;
 
   const ttftRaw = raw.ttftMs ?? raw.ttft_ms;
-  const gatewayCostUsd = typeof raw.cost === 'number' && Number.isFinite(raw.cost) && raw.cost > 0
-    ? raw.cost
-    : null;
+  const gatewayCostUsd =
+    typeof raw.cost === 'number' && Number.isFinite(raw.cost) && raw.cost >= 0
+      ? (raw.priced === true ? raw.cost : (raw.cost > 0 ? raw.cost : null))
+      : null;
 
   return {
     gatewayRecordId: id,
@@ -674,6 +832,7 @@ export function normalizeMagpieUsageRow(raw) {
     ttftMs: Number.isFinite(ttftRaw) && ttftRaw >= 0 ? Math.round(ttftRaw) : null,
     effort: typeof raw.effort === 'string' && raw.effort.trim() ? raw.effort.trim() : null,
     metered,
+    priced: raw.priced === true,
     tokens: {
       uncachedInputTokens: metered ? uncachedIn : null,
       cacheReadTokens: metered ? cacheRead : null,
