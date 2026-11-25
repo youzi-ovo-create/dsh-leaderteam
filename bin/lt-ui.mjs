@@ -16,8 +16,8 @@ import {
 } from '../leaderteam/plugins/leaderteam-panel/public-api.mjs';
 import { runtime } from '../leaderteam/host/runtime.mjs';
 
-const LOOPBACK_HOST_RE = /^(127\.0\.0\.1|localhost|\[::1\])(?::(\d{1,5}))?$/i;
-const COOKIE_NAME = 'lt_workbench_sid';
+export const MAX_BODY_BYTES = 2 * 1024 * 1024;
+const COOKIE_PREFIX = 'lt_workbench_sid';
 
 function safeEqual(a, b) {
   if (typeof a !== 'string' || typeof b !== 'string') return false;
@@ -26,13 +26,99 @@ function safeEqual(a, b) {
   return ba.length === bb.length && crypto.timingSafeEqual(ba, bb);
 }
 
+function isAllowedLoopbackHost(hostHeader, boundPort) {
+  if (typeof hostHeader !== 'string' || !hostHeader || !boundPort) return false;
+  const lower = hostHeader.trim().toLowerCase();
+  return (
+    lower === `127.0.0.1:${boundPort}` ||
+    lower === `localhost:${boundPort}` ||
+    lower === `[::1]:${boundPort}`
+  );
+}
+
+function isAllowedApiOrigin(originHeader, hostHeader) {
+  if (originHeader === undefined) return true;
+  if (typeof originHeader !== 'string') return false;
+  const trimmed = originHeader.trim();
+  if (!trimmed || trimmed.toLowerCase() === 'null') return false;
+  try {
+    const originUrl = new URL(trimmed);
+    if (originUrl.protocol !== 'http:') return false;
+    return originUrl.host.toLowerCase() === String(hostHeader || '').trim().toLowerCase();
+  } catch {
+    return false;
+  }
+}
+
 function parseCookies(raw) {
   const out = {};
   for (const part of String(raw || '').split(';')) {
     const idx = part.indexOf('=');
-    if (idx > 0) out[part.slice(0, idx).trim()] = decodeURIComponent(part.slice(idx + 1).trim());
+    if (idx > 0) {
+      const key = part.slice(0, idx).trim();
+      if (!key) continue;
+      const rawVal = part.slice(idx + 1).trim();
+      try {
+        out[key] = decodeURIComponent(rawVal);
+      } catch {
+        out[key] = rawVal;
+      }
+    }
   }
   return out;
+}
+
+function readBoundedBody(req, maxBytes = MAX_BODY_BYTES) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let total = 0;
+    let settled = false;
+    const onData = chunk => {
+      if (settled) return;
+      total += chunk.length;
+      if (total > maxBytes) {
+        settled = true;
+        req.pause();
+        req.removeListener('data', onData);
+        resolve({ tooLarge: true, buffer: null });
+        return;
+      }
+      chunks.push(chunk);
+    };
+    req.on('data', onData);
+    req.on('end', () => {
+      if (settled) return;
+      settled = true;
+      resolve({ tooLarge: false, buffer: Buffer.concat(chunks) });
+    });
+    req.on('error', err => {
+      if (settled) return;
+      settled = true;
+      reject(err);
+    });
+  });
+}
+
+function sendPayloadTooLargeAndDestroy(req, res, maxBytes = MAX_BODY_BYTES) {
+  const timer = setTimeout(() => {
+    try { req.destroy(); } catch {}
+  }, 50);
+  timer.unref?.();
+  res.writeHead(413, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Cache-Control': 'no-store',
+    Connection: 'close',
+  });
+  res.end(
+    JSON.stringify({
+      ok: false,
+      error: { code: 'PAYLOAD_TOO_LARGE', message: `Request body exceeds ${maxBytes} bytes` },
+    }),
+    () => {
+      clearTimeout(timer);
+      try { req.destroy(); } catch {}
+    },
+  );
 }
 
 export async function startStandaloneLtUiServer({
@@ -81,29 +167,33 @@ export async function startStandaloneLtUiServer({
   const server = http.createServer(async (req, res) => {
     try {
       const host = String(req.headers.host || '');
-      if (!LOOPBACK_HOST_RE.test(host)) {
+      if (!isAllowedLoopbackHost(host, boundPort)) {
         res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
-        res.end('Forbidden host (DNS rebinding guard)');
+        res.end('Forbidden host (DNS rebinding & port-mismatch guard)');
         return;
       }
-      if (req.headers['sec-fetch-site'] === 'cross-site') {
+      const secFetchSite = String(req.headers['sec-fetch-site'] || '').trim().toLowerCase();
+      if (secFetchSite === 'cross-site') {
         res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
         res.end('Cross-site request refused');
         return;
       }
 
+      const cookieName = `${COOKIE_PREFIX}_${boundPort}`;
       const url = new URL(req.url || '/', `http://127.0.0.1:${boundPort}`);
       if (req.method === 'GET' && url.searchParams.has('token')) {
         const tok = url.searchParams.get('token') || '';
         if (!safeEqual(tok, launchToken)) {
-          res.writeHead(401, { 'Content-Type': 'text/plain; charset=utf-8' });
+          res.writeHead(401, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });
           res.end('Invalid launch token');
           return;
         }
         url.searchParams.delete('token');
         res.writeHead(302, {
           Location: url.pathname + (url.search || ''),
-          'Set-Cookie': `${COOKIE_NAME}=${sessionSecret}; Path=/; HttpOnly; SameSite=Strict`,
+          'Set-Cookie': `${cookieName}=${sessionSecret}; Path=/; HttpOnly; SameSite=Strict`,
+          'Cache-Control': 'no-store',
+          'Referrer-Policy': 'no-referrer',
         });
         res.end();
         return;
@@ -112,26 +202,67 @@ export async function startStandaloneLtUiServer({
       const isAuthed = () => {
         if (!requireAuth) return true;
         const cookies = parseCookies(req.headers.cookie);
-        if (cookies[COOKIE_NAME] && safeEqual(cookies[COOKIE_NAME], sessionSecret)) return true;
+        if (cookies[cookieName] && safeEqual(cookies[cookieName], sessionSecret)) return true;
         const auth = String(req.headers.authorization || '');
         if (auth.startsWith('Bearer ') && safeEqual(auth.slice(7).trim(), launchToken)) return true;
         return false;
       };
 
       const apiHandler = routeMap.get(url.pathname);
-      if (apiHandler) {
+      if (apiHandler || url.pathname.startsWith('/api/')) {
+        if (secFetchSite === 'same-site' || !isAllowedApiOrigin(req.headers.origin, host)) {
+          res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+          res.end(JSON.stringify({
+            ok: false,
+            error: { code: 'FORBIDDEN_ORIGIN', message: 'Cross-origin or cross-port API request refused' },
+          }));
+          return;
+        }
+        if (!apiHandler) {
+          res.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+          res.end(JSON.stringify({ ok: false, error: { code: 'NOT_FOUND', message: 'API route not found' } }));
+          return;
+        }
         if (!isAuthed()) {
-          res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
           res.end(JSON.stringify({ ok: false, error: { code: 'UNAUTHORIZED', message: 'Authentication required' } }));
           return;
         }
-        const chunks = [];
-        for await (const c of req) chunks.push(c);
-        const bodyBuf = Buffer.concat(chunks);
+
+        const declaredLen = req.headers['content-length'] !== undefined ? Number(req.headers['content-length']) : null;
+        if (declaredLen !== null && Number.isFinite(declaredLen) && declaredLen > MAX_BODY_BYTES) {
+          sendPayloadTooLargeAndDestroy(req, res, MAX_BODY_BYTES);
+          return;
+        }
+
+        let bodyBuf = Buffer.alloc(0);
+        if (req.method !== 'GET' && req.method !== 'HEAD') {
+          const readRes = await readBoundedBody(req, MAX_BODY_BYTES);
+          if (readRes.tooLarge) {
+            sendPayloadTooLargeAndDestroy(req, res, MAX_BODY_BYTES);
+            return;
+          }
+          bodyBuf = readRes.buffer;
+
+          const ct = String(req.headers['content-type'] || '').toLowerCase();
+          const isJsonCt = ct.includes('application/json');
+          if (!isJsonCt) {
+            const allowEmpty = bodyBuf.length === 0 && ct === '' && req.headers['content-length'] === '0';
+            if (!allowEmpty) {
+              res.writeHead(415, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+              res.end(JSON.stringify({
+                ok: false,
+                error: { code: 'UNSUPPORTED_MEDIA_TYPE', message: 'POST API requests require Content-Type: application/json' },
+              }));
+              return;
+            }
+          }
+        }
+
         const fetchReq = new Request(url.toString(), {
           method: req.method,
           headers: req.headers,
-          body: req.method === 'GET' || req.method === 'HEAD' ? undefined : bodyBuf,
+          body: req.method === 'GET' || req.method === 'HEAD' || bodyBuf.length === 0 ? undefined : bodyBuf,
         });
         const fetchRes = await apiHandler(fetchReq);
         const outBuf = Buffer.from(await fetchRes.arrayBuffer());

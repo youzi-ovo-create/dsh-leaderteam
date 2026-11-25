@@ -194,11 +194,13 @@ test('Standalone lt-ui server enforces loopback Host/Sec-Fetch-Site fences, toke
     });
     assert.equal(crossSite.status, 403);
 
-    // 3. Launch token exchanges for HttpOnly cookie (302)
+    // 3. Launch token exchanges for port-scoped HttpOnly cookie (302) with no-store & no-referrer
     const loginRes = await fetch(uiSrv.launchUrl, { redirect: 'manual' });
     assert.equal(loginRes.status, 302);
+    assert.equal(loginRes.headers.get('cache-control'), 'no-store');
+    assert.equal(loginRes.headers.get('referrer-policy'), 'no-referrer');
     const setCookie = loginRes.headers.get('set-cookie') || '';
-    assert.match(setCookie, /lt_workbench_sid=/);
+    assert.match(setCookie, new RegExp(`^lt_workbench_sid_${uiSrv.port}=`));
     const cookiePair = setCookie.split(';')[0];
 
     // 4. Authenticated index and `/api/lt/v1/capabilities` succeed

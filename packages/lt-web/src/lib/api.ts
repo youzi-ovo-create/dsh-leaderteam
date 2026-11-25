@@ -12,6 +12,14 @@ import type {
   UiPreferences,
 } from '../types/lt-public-v1';
 
+export interface LocalOverridesSummary {
+  exists: boolean;
+  models: string[];
+  executionPool: boolean;
+  leaderModelPolicy: boolean;
+  roles: string[];
+}
+
 export interface HydratedBundle {
   capabilities: BackendCapabilities;
   gateway: GatewayStatus;
@@ -22,6 +30,7 @@ export interface HydratedBundle {
     activePlugins?: Record<string, boolean>;
     configuredModelsMap?: Record<string, unknown>;
     leaderModelPolicy?: string;
+    localOverrides?: LocalOverridesSummary;
     planArchive?: {
       enabled: boolean;
       root: string | null;
@@ -44,13 +53,15 @@ export interface HydratedBundle {
 const LOCAL_PREFS_KEY = 'lt-ui-preferences-v1';
 
 export function resolveApiPrefix(): string {
-  if (typeof window === 'undefined') return 'api/lt/v1';
+  if (typeof window === 'undefined') return '/api/lt/v1';
   const pathname = window.location.pathname || '/';
-  // When mounted at `/lt/` inside DSH webServer, `/api/lt/v1/*` lives at `../api/lt/v1/*`
-  if (/\/lt(?:\/|$)/.test(pathname)) {
-    return '../api/lt/v1';
+  // Compute exact mount root when mounted at `/lt` or `/<prefix>/lt/*` so nested SPA paths never resolve to `/lt/api/lt/v1`
+  const ltMountMatch = pathname.match(/^(.*?)\/lt(?:\/|$)/);
+  if (ltMountMatch) {
+    const mountRoot = ltMountMatch[1] || '';
+    return `${mountRoot}/api/lt/v1`;
   }
-  return './api/lt/v1';
+  return '/api/lt/v1';
 }
 
 export async function callLtApi<T = any>(endpoint: string, body: Record<string, unknown> = {}): Promise<T> {
@@ -106,13 +117,13 @@ export function computeContrastRatio(hexA: string, hexB: string): number {
 export function applyThemeToDom(theme: ThemePresetId, customTheme: CustomThemeSeeds): void {
   if (typeof document === 'undefined') return;
   const html = document.documentElement;
+  const st = html.style;
   html.setAttribute('data-lt-theme', theme);
-  html.setAttribute('data-lt-heading', customTheme.headingFontMode || 'serif');
-  html.setAttribute('data-lt-corners', customTheme.cornerStyle || 'balanced');
-  html.setAttribute('data-lt-density', customTheme.density || 'standard');
 
   if (theme === 'custom') {
-    const st = html.style;
+    html.setAttribute('data-lt-heading', customTheme.headingFontMode || 'serif');
+    html.setAttribute('data-lt-corners', customTheme.cornerStyle || 'balanced');
+    html.setAttribute('data-lt-density', customTheme.density || 'standard');
     st.setProperty('--user-bg-canvas', customTheme.canvasColor);
     st.setProperty('--user-bg-surface', customTheme.surfaceColor);
     st.setProperty('--user-fg-primary', customTheme.inkColor);
@@ -124,7 +135,16 @@ export function applyThemeToDom(theme: ThemePresetId, customTheme: CustomThemeSe
     const surfRgb = hexToRgb(customTheme.surfaceColor);
     st.colorScheme = surfRgb && relativeLuminance(surfRgb) < 0.25 ? 'dark' : 'light';
   } else {
-    html.style.removeProperty('color-scheme');
+    html.removeAttribute('data-lt-heading');
+    html.removeAttribute('data-lt-corners');
+    html.removeAttribute('data-lt-density');
+    st.removeProperty('--user-bg-canvas');
+    st.removeProperty('--user-bg-surface');
+    st.removeProperty('--user-fg-primary');
+    st.removeProperty('--user-accent');
+    st.removeProperty('--user-danger');
+    st.removeProperty('--user-fg-on-ink');
+    st.removeProperty('color-scheme');
   }
 
   try {

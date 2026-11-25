@@ -1,5 +1,6 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { callLtApi, type HydratedBundle } from '../lib/api';
+import type { ProviderProtocol } from '../types/lt-public-v1';
 
 export function ProvidersView({
   bundle,
@@ -17,6 +18,21 @@ export function ProvidersView({
   const [extGwUrl, setExtGwUrl] = useState(gw.gatewayUrl || 'http://127.0.0.1:3425');
   const [extWebUrl, setExtWebUrl] = useState(gw.webAdminUrl || 'http://127.0.0.1:3430');
   const [extWebKey, setExtWebKey] = useState('');
+  const [extUrlsDirty, setExtUrlsDirty] = useState(false);
+
+  // External OpenAI-compatible gateways (`save-external` / `remove-external`)
+  const [extRelayId, setExtRelayId] = useState('');
+  const [extRelayName, setExtRelayName] = useState('');
+  const [extRelayEndpoint, setExtRelayEndpoint] = useState('');
+  const [extRelayProtocol, setExtRelayProtocol] = useState<ProviderProtocol>('openai-chat');
+  const [extRelayKey, setExtRelayKey] = useState('');
+  const [extRelayKeyOptional, setExtRelayKeyOptional] = useState(false);
+
+  useEffect(() => {
+    if (extUrlsDirty) return;
+    if (gw.gatewayUrl) setExtGwUrl(gw.gatewayUrl);
+    if (gw.webAdminUrl) setExtWebUrl(gw.webAdminUrl);
+  }, [gw.gatewayUrl, gw.webAdminUrl, extUrlsDirty]);
 
   // Add Provider form
   const [vendorPreset, setVendorPreset] = useState(bundle.providerPresets[0]?.vendorId || 'deepseek');
@@ -34,8 +50,78 @@ export function ProvidersView({
 
   // OAuth passthrough
   const [oauthAgent, setOauthAgent] = useState('codex');
-  const [oauthSession, setOauthSession] = useState<{ id: string; authUrl?: string; status?: string } | null>(null);
+  const [oauthSession, setOauthSession] = useState<{
+    id: string;
+    authUrl?: string;
+    state?: string;
+    code?: string;
+    pasteCallback?: boolean;
+  } | null>(null);
   const [oauthCallbackUrl, setOauthCallbackUrl] = useState('');
+
+  useEffect(() => {
+    if (!oauthSession?.id) return;
+    const st = oauthSession.state || 'waiting';
+    if (st !== 'waiting' && st !== 'installing' && st !== 'pending') return;
+
+    let cancelled = false;
+    const timer = setInterval(async () => {
+      try {
+        const res = await callLtApi<{
+          operationResult?: {
+            id?: string;
+            url?: string;
+            authUrl?: string;
+            state?: string;
+            status?: string;
+            code?: string;
+            pasteCallback?: boolean;
+            error?: string;
+          };
+        }>('providers/mutate', {
+          operation: 'oauth-status',
+          signInId: oauthSession.id,
+        });
+        if (cancelled) return;
+        const op = res.operationResult;
+        if (!op) return;
+        const nextState = op.state || op.status || st;
+        const nextUrl = op.url || op.authUrl;
+        if (nextState === 'done' || nextState === 'completed' || nextState === 'authenticated' || nextState === 'ok') {
+          setOauthSession(null);
+          setOauthCallbackUrl('');
+          setMessage('Magpie OAuth 登录已完成并同步凭据');
+          await onRefreshBundle();
+          return;
+        }
+        if (nextState === 'cancelled' || nextState === 'canceled') {
+          setOauthSession(null);
+          return;
+        }
+        if (nextState === 'error' || nextState === 'failed') {
+          setOauthSession(prev => (prev ? { ...prev, state: nextState } : null));
+          if (op.error) setError(`OAuth 授权失败：${op.error}`);
+          return;
+        }
+        setOauthSession(prev =>
+          prev
+            ? {
+                ...prev,
+                authUrl: nextUrl || prev.authUrl,
+                state: nextState,
+                code: op.code || prev.code,
+                pasteCallback: op.pasteCallback ?? prev.pasteCallback,
+              }
+            : null,
+        );
+      } catch {}
+    }, 2000);
+
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [oauthSession?.id, oauthSession?.state, onRefreshBundle]);
 
   async function runGatewayAction(action: string, extra: Record<string, unknown> = {}) {
     setBusy(true);
@@ -52,9 +138,14 @@ export function ProvidersView({
         );
       } else if (action === 'rollback') {
         setMessage(`已回退至版本 ${res.rollback?.rolledBackTo}`);
+      } else if (action === 'save-external') {
+        setMessage('已保存外部兼容网关（明文密钥仅写入服务端隔离凭据库）');
+      } else if (action === 'remove-external') {
+        setMessage('已移除外部兼容网关');
       } else {
         setMessage(`网关操作「${action}」已完成（当前状态：${res.status?.state}）`);
       }
+      if (action === 'configure') setExtUrlsDirty(false);
       setExtWebKey('');
       await onRefreshBundle();
     } catch (e: any) {
@@ -148,18 +239,67 @@ export function ProvidersView({
     setBusy(true);
     setError(null);
     try {
-      const res = await callLtApi<{ operationResult: { id: string; authUrl?: string; url?: string; status?: string } }>(
-        'providers/mutate',
-        { operation: 'oauth-start', agent: oauthAgent },
-      );
+      const res = await callLtApi<{
+        operationResult: {
+          id: string;
+          url?: string;
+          authUrl?: string;
+          state?: string;
+          status?: string;
+          code?: string;
+          pasteCallback?: boolean;
+        };
+      }>('providers/mutate', { operation: 'oauth-start', agent: oauthAgent });
       const op = res.operationResult;
-      setOauthSession({ id: op.id, authUrl: op.authUrl || op.url, status: op.status });
+      setOauthSession({
+        id: op.id,
+        authUrl: op.url || op.authUrl,
+        state: op.state || op.status || 'waiting',
+        code: op.code,
+        pasteCallback: op.pasteCallback,
+      });
       setMessage(`已通过 Magpie 原生机制发起 ${oauthAgent} 登录引导`);
     } catch (e: any) {
       setError(`发起 OAuth 失败：${e.message}`);
     } finally {
       setBusy(false);
     }
+  }
+
+  async function handleCancelOAuth() {
+    if (!oauthSession) return;
+    const signInId = oauthSession.id;
+    setOauthSession(null);
+    setOauthCallbackUrl('');
+    setBusy(true);
+    setError(null);
+    try {
+      await callLtApi('providers/mutate', { operation: 'oauth-cancel', signInId });
+      setMessage('已取消当前 OAuth 登录流程');
+    } catch (e: any) {
+      setError(`取消 OAuth 失败：${e.message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleSaveExternalGateway(e: React.FormEvent) {
+    e.preventDefault();
+    if (!extRelayId.trim() || !extRelayEndpoint.trim()) return;
+    await runGatewayAction('save-external', {
+      gateway: {
+        id: extRelayId.trim(),
+        displayName: extRelayName.trim() || extRelayId.trim(),
+        endpointUrl: extRelayEndpoint.trim(),
+        protocol: extRelayProtocol,
+        keyOptional: extRelayKeyOptional,
+        ...(extRelayKey.trim() ? { apiKey: extRelayKey.trim() } : {}),
+      },
+    });
+    setExtRelayId('');
+    setExtRelayName('');
+    setExtRelayEndpoint('');
+    setExtRelayKey('');
   }
 
   async function handleSubmitOAuthCallback() {
@@ -257,8 +397,24 @@ export function ProvidersView({
             切换接入模式（接入本机已有 Magpie / 外部网关 / 停用网关）
           </summary>
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: 8, marginTop: 10 }}>
-            <input className="lt-input lt-mono" placeholder="外部网关 URL (如 http://127.0.0.1:3425)" value={extGwUrl} onChange={e => setExtGwUrl(e.target.value)} />
-            <input className="lt-input lt-mono" placeholder="外部管理 URL (可选 http://127.0.0.1:3430)" value={extWebUrl} onChange={e => setExtWebUrl(e.target.value)} />
+            <input
+              className="lt-input lt-mono"
+              placeholder="外部网关 URL (如 http://127.0.0.1:3425)"
+              value={extGwUrl}
+              onChange={e => {
+                setExtUrlsDirty(true);
+                setExtGwUrl(e.target.value);
+              }}
+            />
+            <input
+              className="lt-input lt-mono"
+              placeholder="外部管理 URL (可选 http://127.0.0.1:3430)"
+              value={extWebUrl}
+              onChange={e => {
+                setExtUrlsDirty(true);
+                setExtWebUrl(e.target.value);
+              }}
+            />
             <input
               type="password"
               className="lt-input lt-mono"
@@ -378,19 +534,30 @@ export function ProvidersView({
             <div style={{ fontWeight: 600, fontSize: 12.5, marginBottom: 6 }}>
               复用 Magpie 既有订阅 / OAuth 登录（无需重复建设独立 OAuth）
             </div>
-            <div style={{ display: 'flex', gap: 8 }}>
-              <select className="lt-select" style={{ width: 180 }} value={oauthAgent} onChange={e => setOauthAgent(e.target.value)}>
-                <option value="codex">OpenAI Codex 订阅</option>
-                <option value="claude-code">Claude Code 订阅</option>
-                <option value="copilot">GitHub Copilot</option>
-                <option value="gemini-cli">Gemini CLI</option>
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+              <select className="lt-select" style={{ width: 190 }} value={oauthAgent} onChange={e => setOauthAgent(e.target.value)}>
+                <option value="codex">OpenAI Codex 订阅 (codex)</option>
+                <option value="claude">Anthropic Claude 订阅 (claude)</option>
+                <option value="gemini">Google Gemini 订阅 (gemini)</option>
+                <option value="copilot">GitHub Copilot (copilot)</option>
               </select>
               <button type="button" className="lt-btn" disabled={busy || !gw.managementAuthenticated} onClick={() => void handleStartOAuth()}>
                 获取 Magpie 登录链接
               </button>
+              {oauthSession && (
+                <button type="button" className="lt-btn lt-btn-danger" disabled={busy} onClick={() => void handleCancelOAuth()}>
+                  取消登录
+                </button>
+              )}
             </div>
             {oauthSession && (
               <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 6, fontSize: 12 }}>
+                <div>
+                  状态：<span className="lt-tag lt-mono">{oauthSession.state || 'waiting'}</span>
+                  {oauthSession.code && (
+                    <span className="lt-mono" style={{ marginLeft: 8 }}>设备码：{oauthSession.code}</span>
+                  )}
+                </div>
                 {oauthSession.authUrl && (
                   <div>
                     授权地址：<a href={oauthSession.authUrl} target="_blank" rel="noreferrer" className="lt-mono">{oauthSession.authUrl}</a>
@@ -479,6 +646,19 @@ export function ProvidersView({
                               移除
                             </button>
                           </div>
+                        )}
+                        {p.sourceKind === 'external-gateway' && bundle.capabilities.features.externalGateways && (
+                          <button
+                            className="lt-btn lt-btn-sm lt-btn-danger"
+                            disabled={busy}
+                            onClick={() =>
+                              void runGatewayAction('remove-external', {
+                                id: p.providerId.replace(/^ext:/, ''),
+                              })
+                            }
+                          >
+                            移除
+                          </button>
                         )}
                       </td>
                     </tr>
@@ -573,6 +753,48 @@ export function ProvidersView({
                       </button>
                     </div>
                   )}
+                  {selectedProvider.sourceKind === 'magpie' && cred.kind === 'oauth' && gw.managementAuthenticated && (
+                    <div style={{ display: 'flex', gap: 4 }}>
+                      {!cred.primary && (
+                        <button
+                          className="lt-btn lt-btn-sm"
+                          onClick={() =>
+                            void handleMutateProvider('mutate-login', {
+                              providerId: selectedProvider.providerId,
+                              loginAction: 'switch',
+                              user: cred.label,
+                            })
+                          }
+                        >
+                          设为当前账号
+                        </button>
+                      )}
+                      <button
+                        className="lt-btn lt-btn-sm"
+                        onClick={() =>
+                          void handleMutateProvider('mutate-login', {
+                            providerId: selectedProvider.providerId,
+                            loginAction: cred.enabled ? 'off' : 'on',
+                            user: cred.label,
+                          })
+                        }
+                      >
+                        {cred.enabled ? '停用' : '启用'}
+                      </button>
+                      <button
+                        className="lt-btn lt-btn-sm lt-btn-danger"
+                        onClick={() =>
+                          void handleMutateProvider('mutate-login', {
+                            providerId: selectedProvider.providerId,
+                            loginAction: 'forget',
+                            user: cred.label,
+                          })
+                        }
+                      >
+                        退出
+                      </button>
+                    </div>
+                  )}
                 </div>
               ))}
 
@@ -609,6 +831,73 @@ export function ProvidersView({
                 </div>
               )}
             </div>
+          )}
+          {bundle.capabilities.features.externalGateways && (
+            <form
+              onSubmit={handleSaveExternalGateway}
+              style={{ marginTop: 16, paddingTop: 12, borderTop: '1px solid var(--lt-border-subtle)' }}
+            >
+              <div style={{ fontWeight: 600, fontSize: 12.5, marginBottom: 8 }}>
+                登记独立 OpenAI/Anthropic 兼容外部网关 (externalGateways)
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6, marginBottom: 6 }}>
+                <input
+                  className="lt-input lt-mono"
+                  placeholder="网关标识 (如 local-vllm)"
+                  value={extRelayId}
+                  onChange={e => setExtRelayId(e.target.value)}
+                  required
+                />
+                <input
+                  className="lt-input"
+                  placeholder="显示名称 (可选)"
+                  value={extRelayName}
+                  onChange={e => setExtRelayName(e.target.value)}
+                />
+                <input
+                  className="lt-input lt-mono"
+                  placeholder="接口地址 (如 http://127.0.0.1:8000/v1)"
+                  value={extRelayEndpoint}
+                  onChange={e => setExtRelayEndpoint(e.target.value)}
+                  required
+                />
+                <select
+                  className="lt-select"
+                  value={extRelayProtocol}
+                  onChange={e => setExtRelayProtocol(e.target.value as ProviderProtocol)}
+                >
+                  <option value="openai-chat">openai-chat</option>
+                  <option value="openai-responses">openai-responses</option>
+                  <option value="anthropic-messages">anthropic-messages</option>
+                  <option value="google-gemini">google-gemini</option>
+                </select>
+              </div>
+              <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                <input
+                  type="password"
+                  className="lt-input lt-mono"
+                  style={{ flex: 1, minWidth: 160 }}
+                  placeholder="可选：网关 API Key（单向加密落盘）"
+                  value={extRelayKey}
+                  onChange={e => setExtRelayKey(e.target.value)}
+                />
+                <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: 11.5 }}>
+                  <input
+                    type="checkbox"
+                    checked={extRelayKeyOptional}
+                    onChange={e => setExtRelayKeyOptional(e.target.checked)}
+                  />
+                  免密钥内网网关
+                </label>
+                <button
+                  type="submit"
+                  className="lt-btn"
+                  disabled={busy || !extRelayId.trim() || !extRelayEndpoint.trim()}
+                >
+                  保存外部网关
+                </button>
+              </div>
+            </form>
           )}
         </div>
       </div>

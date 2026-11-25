@@ -31,6 +31,29 @@
     { key: 'panel', label: 'DSH 内置控制台 (leaderteam-panel)', desc: 'DSH 内部模型/角色/归档可视化面板' },
   ];
 
+  let activeHostConnection = null;
+
+  function isHttpWebSurface() {
+    if (typeof window === 'undefined' || !window || !window.location) return false;
+    const proto = window.location.protocol;
+    return proto === 'http:' || proto === 'https:';
+  }
+
+  function isFileDesktopSurface() {
+    if (typeof window === 'undefined' || !window || !window.location) return false;
+    return window.location.protocol === 'file:';
+  }
+
+  function summarizeLocalOverrideParts(ov) {
+    if (!ov || !ov.exists) return [];
+    const parts = [];
+    if (ov.executionPool) parts.push('team.executionPool');
+    if (ov.leaderModelPolicy) parts.push('team.leaderModelPolicy');
+    if (Array.isArray(ov.roles) && ov.roles.length > 0) parts.push('roles(' + ov.roles.join(', ') + ')');
+    if (Array.isArray(ov.models) && ov.models.length > 0) parts.push('models(' + ov.models.join(', ') + ')');
+    return parts;
+  }
+
   function formatMs(ms) {
     if (typeof ms !== 'number' || !Number.isFinite(ms) || ms < 0) return '0s';
     const sec = Math.floor(ms / 1000);
@@ -43,11 +66,36 @@
   }
 
   async function postApi(route, body) {
-    const res = await fetch(route, {
+    const reqInit = {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(body || {}),
-    });
+    };
+    const absPath = '/' + String(route || '').replace(/^\/+/, '');
+    const customConn =
+      (activeHostConnection && typeof activeHostConnection.fetch === 'function' ? activeHostConnection : null) ||
+      (typeof window !== 'undefined' && window && window.__DSH_CONNECTION__ && typeof window.__DSH_CONNECTION__.fetch === 'function'
+        ? window.__DSH_CONNECTION__
+        : null) ||
+      (typeof window !== 'undefined' && window && window.__DSH_TRANSPORT__ && typeof window.__DSH_TRANSPORT__.fetch === 'function'
+        ? window.__DSH_TRANSPORT__
+        : null);
+
+    let res;
+    if (customConn) {
+      res = await customConn.fetch(absPath, reqInit);
+    } else if (isFileDesktopSurface()) {
+      if (typeof fetch !== 'function') {
+        throw new Error('当前处于 DSH Desktop (file://) 本地宿主模式；请在终端运行 npx lt-ui 或 dsh web 打开工作台。');
+      }
+      try {
+        res = await fetch(route, reqInit);
+      } catch {
+        throw new Error('当前处于 DSH Desktop (file://) 本地宿主模式，相对 HTTP 面板路由不可达；请在终端运行 npx lt-ui 或 dsh web 打开工作台。');
+      }
+    } else {
+      res = await fetch(route, reqInit);
+    }
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const json = await res.json();
     if (!json || json.ok !== true) {
@@ -95,8 +143,10 @@
       const [data, setData] = useState(null);
       const [loading, setLoading] = useState(false);
       const [notice, setNotice] = useState(null);
+      const [warningMsg, setWarningMsg] = useState(null);
       const [error, setError] = useState(null);
       const [saveTarget, setSaveTarget] = useState('local');
+      const [isDirty, setIsDirty] = useState(false);
 
       // Draft edits for roles & pool
       const [draftRoles, setDraftRoles] = useState({});
@@ -114,16 +164,21 @@
       const [cleanPreview, setCleanPreview] = useState(null);
       const [cleanDays, setCleanDays] = useState('');
 
-      const hydrateFromState = useCallback((snap) => {
+      const hydrateFromState = useCallback((snap, opts) => {
         setData(snap);
-        if (snap && snap.configSnapshot) {
+        const keepDrafts = Boolean(opts && opts.preserveDirty);
+        if (snap && snap.configSnapshot && !keepDrafts) {
           const rMap = {};
           ROLE_META.forEach(({ key }) => {
             const cur = snap.configSnapshot.roles && snap.configSnapshot.roles[key];
-            if (cur) rMap[key] = { route: cur.route, effort: cur.effort };
+            if (cur) rMap[key] = structuredClone ? structuredClone(cur) : JSON.parse(JSON.stringify(cur));
           });
           setDraftRoles(rMap);
           setDraftPool(Array.isArray(snap.configSnapshot.executionPool) ? snap.configSnapshot.executionPool.slice() : []);
+          setIsDirty(false);
+        } else if (keepDrafts && opts && opts.addedPoolRoute) {
+          const r = opts.addedPoolRoute;
+          setDraftPool(prev => (prev.includes(r) ? prev : prev.concat([r])));
         }
         if (snap && snap.archive && Array.isArray(snap.archive.recentPlans)) {
           setArchivePlans(snap.archive.recentPlans);
@@ -135,7 +190,7 @@
         setError(null);
         try {
           const snap = await postApi(ROUTES.STATE, opts || {});
-          hydrateFromState(snap);
+          hydrateFromState(snap, { preserveDirty: false });
         } catch (e) {
           setError(e && e.message ? e.message : String(e));
         } finally {
@@ -153,9 +208,9 @@
         setNotice(null);
         try {
           const res = await postApi(ROUTES.DISCOVER, { probeEndpoints: Boolean(probeEndpoints) });
-          hydrateFromState(res.state);
+          hydrateFromState(res.state, { preserveDirty: isDirty });
           const count = (res.catalog && Array.isArray(res.catalog.models)) ? res.catalog.models.length : 0;
-          setNotice('已同步 DSH 上游模型目录，共发现 ' + count + ' 个上游模型。');
+          setNotice('已同步 DSH 上游模型目录，共发现 ' + count + ' 个上游模型' + (isDirty ? '（已保留当前未保存的角色草稿）' : '') + '。');
         } catch (e) {
           setError(e && e.message ? e.message : String(e));
         } finally {
@@ -167,12 +222,18 @@
         setLoading(true);
         setError(null);
         setNotice(null);
+        setWarningMsg(null);
         try {
-          const setRoles = ROLE_META.map(({ key }) => ({
-            role: key,
-            route: draftRoles[key] && draftRoles[key].route,
-            effort: draftRoles[key] && draftRoles[key].effort,
-          })).filter(x => x.route && x.effort);
+          const setRoles = ROLE_META.map(({ key }) => {
+            const cur = draftRoles[key];
+            if (!cur || !cur.route || !cur.effort) return null;
+            return {
+              ...cur,
+              role: key,
+              route: cur.route,
+              effort: cur.effort,
+            };
+          }).filter(Boolean);
           const res = await postApi(ROUTES.APPLY, {
             target: saveTarget,
             changes: {
@@ -180,8 +241,38 @@
               poolSet: draftPool,
             },
           });
-          hydrateFromState(res.state);
+          hydrateFromState(res.state, { preserveDirty: false });
+          const shadowed = (res && Array.isArray(res.shadowedByLocal) && res.shadowedByLocal.length > 0)
+            ? res.shadowedByLocal
+            : (res && res.applyResult && Array.isArray(res.applyResult.shadowedByLocal) ? res.applyResult.shadowedByLocal : []);
+          const warns = (res && Array.isArray(res.warnings) && res.warnings.length > 0)
+            ? res.warnings
+            : (res && res.applyResult && Array.isArray(res.applyResult.warnings) ? res.applyResult.warnings : []);
+          if (shadowed.length > 0) {
+            setWarningMsg('基础配置已写入磁盘，但当前被本机覆盖文件 leaderteam.local.json 遮蔽的字段未在运行时生效：[' + shadowed.join(', ') + ']。可点击右侧「清除本机覆盖」立即生效。');
+          } else if (warns.length > 0) {
+            setWarningMsg(warns.join('；'));
+          }
           setNotice('已保存：成员池下一次派发生效；治理角色与策略在新建团队／新会话生效。');
+        } catch (e) {
+          setError(e && e.message ? e.message : String(e));
+        } finally {
+          setLoading(false);
+        }
+      };
+
+      const onClearLocalOverrides = async () => {
+        setLoading(true);
+        setError(null);
+        setNotice(null);
+        setWarningMsg(null);
+        try {
+          const res = await postApi(ROUTES.APPLY, {
+            target: 'local',
+            changes: { clearLocalOverrides: true },
+          });
+          hydrateFromState(res.state, { preserveDirty: false });
+          setNotice('已清除本机覆盖 (leaderteam.local.json 中的模型、执行池与角色覆盖)，正式基础配置已恢复生效。');
         } catch (e) {
           setError(e && e.message ? e.message : String(e));
         } finally {
@@ -210,7 +301,7 @@
               }],
             },
           });
-          hydrateFromState(res.state);
+          hydrateFromState(res.state, { preserveDirty: isDirty, addedPoolRoute: route });
           setNewModelRoute('');
           setNotice('已登记模型 ' + route + ' 并加入成员执行池。');
         } catch (e) {
@@ -295,14 +386,22 @@
       };
 
       const onCleanArchive = async (confirmExecute) => {
+        const trimmedDays = cleanDays.trim();
+        let daysNum;
+        if (trimmedDays !== '') {
+          daysNum = Number(trimmedDays);
+          if (!Number.isFinite(daysNum) || daysNum < 0) {
+            setError('清理天数必须为大于等于 0 的有效数字');
+            return;
+          }
+        }
         setLoading(true);
         setError(null);
         try {
-          const daysNum = cleanDays.trim() !== '' ? Number(cleanDays) : undefined;
-          const hasFilter = Boolean(catFilter || (typeof daysNum === 'number' && !Number.isNaN(daysNum)));
+          const hasFilter = Boolean(catFilter || typeof daysNum === 'number');
           const res = await postApi(ROUTES.CLEAN, {
             category: catFilter || undefined,
-            olderThanDays: (typeof daysNum === 'number' && !Number.isNaN(daysNum)) ? daysNum : undefined,
+            olderThanDays: typeof daysNum === 'number' ? daysNum : undefined,
             all: !hasFilter,
             dryRun: !confirmExecute,
             confirm: Boolean(confirmExecute),
@@ -368,26 +467,28 @@
             h('div', { style: { fontSize: '11px', opacity: 0.7 } }, '上游动态模型 · 可拆卸插件 · 工程计时 · 外部计划归档与复审')
           ),
           h('div', null,
-            h(
-              'a',
-              {
-                href: './lt/',
-                style: {
-                  display: 'inline-block',
-                  padding: '5px 12px',
-                  borderRadius: '6px',
-                  border: '1px solid #9C5B2E',
-                  background: '#141619',
-                  color: '#FFFFFF',
-                  textDecoration: 'none',
-                  fontWeight: 600,
-                  fontSize: '12px',
-                  marginRight: '8px',
+            isHttpWebSurface()
+              ? h(
+                'a',
+                {
+                  href: './lt/',
+                  style: {
+                    display: 'inline-block',
+                    padding: '5px 12px',
+                    borderRadius: '6px',
+                    border: '1px solid #9C5B2E',
+                    background: '#141619',
+                    color: '#FFFFFF',
+                    textDecoration: 'none',
+                    fontWeight: 600,
+                    fontSize: '12px',
+                    marginRight: '8px',
+                  },
+                  title: '切换至 LT 原生工作台（共享同一运行时与活跃团队，切换零中断）',
                 },
-                title: '切换至 LT 原生工作台（共享同一运行时与活跃团队，切换零中断）',
-              },
-              '切换至 LT 原生工作台 ↗'
-            ),
+                '切换至 LT 原生工作台 ↗'
+              )
+              : null,
             h('button', { style: btnStyle(false), onClick: () => loadState({ forceDiscover: true }), disabled: loading }, loading ? '刷新中…' : '刷新状态'),
             h('button', { style: btnStyle(true), onClick: () => onDiscoverUpstream(true), disabled: loading }, '探测上游模型 (/v1/models)')
           )
@@ -408,9 +509,40 @@
             },
           },
           h('span', null, 'LT V2.2.x 原生工作台已就绪：提供完整网关与多 Key 管理、角色回退链配置、实时治理轴线、衡账分析及四套河洛序主题，与当前 DSH 前端共享同一会话与团队。'),
-          h('a', { href: './lt/', style: { color: '#9C5B2E', fontWeight: 600, whiteSpace: 'nowrap', textDecoration: 'none' } }, '立即进入 /lt/ →')
+          isHttpWebSurface()
+            ? h('a', { href: './lt/', style: { color: '#9C5B2E', fontWeight: 600, whiteSpace: 'nowrap', textDecoration: 'none' } }, '立即进入 /lt/ →')
+            : h('span', { style: { color: '#9C5B2E', fontWeight: 600, whiteSpace: 'nowrap' } }, '终端运行 npx lt-ui 打开独立工作台')
         ),
         error ? h('div', { style: { padding: '8px 10px', borderRadius: '6px', background: 'rgba(220,38,38,0.15)', color: '#ef4444', marginBottom: '10px', fontSize: '12px' } }, '错误：' + error) : null,
+        (() => {
+          const localOvParts = summarizeLocalOverrideParts(data && data.configSnapshot && data.configSnapshot.localOverrides);
+          if (!warningMsg && localOvParts.length === 0) return null;
+          return h(
+            'div',
+            {
+              style: {
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                gap: '8px',
+                padding: '8px 10px',
+                borderRadius: '6px',
+                background: 'rgba(245,158,11,0.15)',
+                border: '1px solid rgba(245,158,11,0.45)',
+                marginBottom: '10px',
+                fontSize: '12px',
+              },
+            },
+            h(
+              'span',
+              null,
+              warningMsg || ('当前存在本机覆盖 (leaderteam.local.json)：' + localOvParts.join('、') + (saveTarget === 'base' ? ' — 写入基础配置时同名字段将被本机覆盖遮蔽。' : ''))
+            ),
+            localOvParts.length > 0
+              ? h('button', { style: btnStyle(false), onClick: onClearLocalOverrides, disabled: loading }, '清除本机覆盖 (Clear Local Overrides)')
+              : null
+          );
+        })(),
         notice ? h('div', { style: { padding: '8px 10px', borderRadius: '6px', background: 'rgba(22,163,74,0.15)', color: '#22c55e', marginBottom: '10px', fontSize: '12px' } }, notice) : null,
         // Navigation Tabs
         h(
@@ -461,7 +593,8 @@
                       const nextRoute = e.target.value;
                       const sp = models.find(m => m.route === nextRoute);
                       const nextEff = sp ? (sp.defaultEffort || sp.efforts[0] || 'none') : 'none';
-                      setDraftRoles(prev => ({ ...prev, [key]: { route: nextRoute, effort: nextEff } }));
+                      setIsDirty(true);
+                      setDraftRoles(prev => ({ ...prev, [key]: { ...cur, route: nextRoute, effort: nextEff } }));
                     },
                   },
                   models.map(m => h('option', { key: m.route, value: m.route }, m.route + ' [' + m.provider + ' · ' + m.family + ']'))
@@ -471,14 +604,18 @@
                   {
                     style: { ...inputStyle, width: '95px' },
                     value: cur.effort,
-                    onChange: e => setDraftRoles(prev => ({ ...prev, [key]: { ...cur, effort: e.target.value } })),
+                    onChange: e => {
+                      setIsDirty(true);
+                      setDraftRoles(prev => ({ ...prev, [key]: { ...cur, effort: e.target.value } }));
+                    },
                   },
                   efforts.map(ef => h('option', { key: ef, value: ef }, ef))
                 )
               );
             }),
-            h('div', { style: { marginTop: '10px' } },
-              h('button', { style: btnStyle(true), onClick: onSaveModelsAndRoles, disabled: loading }, '保存角色与成员池')
+            h('div', { style: { marginTop: '10px', display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } },
+              h('button', { style: btnStyle(true), onClick: onSaveModelsAndRoles, disabled: loading }, '保存角色与成员池'),
+              isDirty ? h('span', { style: { fontSize: '11px', opacity: 0.75 } }, '● 有未保存的角色或执行池修改') : null
             )
           ),
           h('div', { style: cardStyle },
@@ -494,6 +631,7 @@
                     checked,
                     onChange: e => {
                       const on = e.target.checked;
+                      setIsDirty(true);
                       setDraftPool(prev => on ? (prev.includes(m.route) ? prev : prev.concat([m.route])) : prev.filter(x => x !== m.route));
                     },
                   }),
@@ -689,6 +827,9 @@
 
     function apply(ctx) {
       if (!ctx || !ctx.slots) return;
+      try {
+        activeHostConnection = ctx.connection || (typeof ctx.get === 'function' ? ctx.get('connection') : null) || null;
+      } catch {}
       ctx.effect(() => {
         const disposers = [];
         const own = d => { if (typeof d === 'function') disposers.push(d); };

@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { HeluoxuMark } from './components/HeluoxuMark';
 import { applyThemeToDom, callLtApi, type HydratedBundle } from './lib/api';
 import { WorkbenchView } from './views/WorkbenchView';
@@ -26,16 +26,19 @@ export function App() {
   const [theme, setTheme] = useState<ThemePresetId>('white');
   const [customTheme, setCustomTheme] = useState<CustomThemeSeeds>(DEFAULT_SEEDS);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const previewingUnsavedThemeRef = useRef(false);
 
   const refreshBundle = useCallback(async () => {
     try {
       const data = await callLtApi<HydratedBundle>('bundle');
       setBundle(data);
       setLoadError(null);
-      if (data.uiPreferences) {
-        setTheme(data.uiPreferences.theme || 'white');
-        setCustomTheme(data.uiPreferences.customTheme || DEFAULT_SEEDS);
-        applyThemeToDom(data.uiPreferences.theme || 'white', data.uiPreferences.customTheme || DEFAULT_SEEDS);
+      if (data.uiPreferences && !previewingUnsavedThemeRef.current) {
+        const nextTheme = data.uiPreferences.theme || 'white';
+        const nextCustom = data.uiPreferences.customTheme || DEFAULT_SEEDS;
+        setTheme(nextTheme);
+        setCustomTheme(nextCustom);
+        applyThemeToDom(nextTheme, nextCustom);
       }
     } catch (e: any) {
       setLoadError(e.message || '加载工作台状态失败');
@@ -46,7 +49,15 @@ export function App() {
     void refreshBundle();
   }, [refreshBundle]);
 
+  const handlePreviewTheme = useCallback((nextTheme: ThemePresetId, nextSeeds: CustomThemeSeeds) => {
+    previewingUnsavedThemeRef.current = true;
+    setTheme(nextTheme);
+    setCustomTheme(nextSeeds);
+    applyThemeToDom(nextTheme, nextSeeds);
+  }, []);
+
   async function handleThemeChange(nextTheme: ThemePresetId, nextSeeds: CustomThemeSeeds) {
+    previewingUnsavedThemeRef.current = false;
     setTheme(nextTheme);
     setCustomTheme(nextSeeds);
     applyThemeToDom(nextTheme, nextSeeds);
@@ -203,13 +214,19 @@ export function App() {
           <ModelsRolesView bundle={bundle} onRefreshBundle={refreshBundle} />
         )}
         {activeTab === 'hengzhang' && (
-          <HengzhangView bundle={bundle} onRefreshBundle={refreshBundle} />
+          <HengzhangView
+            bundle={bundle}
+            theme={theme}
+            customTheme={customTheme}
+            onRefreshBundle={refreshBundle}
+          />
         )}
         {activeTab === 'system' && (
           <SystemAppearanceView
             bundle={bundle}
             theme={theme}
             customTheme={customTheme}
+            onPreviewTheme={handlePreviewTheme}
             onChangeTheme={handleThemeChange}
             onRefreshBundle={refreshBundle}
           />

@@ -38,14 +38,23 @@ export function GovernanceView({
   }
 
   async function handleCleanArchive(confirm: boolean) {
+    const rawDays = cleanDays.trim();
+    let parsedDays: number | null = null;
+    if (rawDays !== '') {
+      const n = Number(rawDays);
+      if (!Number.isFinite(n) || n < 0) {
+        setArchiveMsg('清理失败：清理天数必须为大于等于 0 的有效数字');
+        return;
+      }
+      parsedDays = n;
+    }
     setBusy(true);
     setArchiveMsg(null);
     try {
-      const days = cleanDays.trim() ? Number(cleanDays.trim()) : undefined;
       const res = await callLtApi<{ dryRun: boolean; matchedCount: number; removedCount: number }>('archive/action', {
         action: 'clean',
-        olderThanDays: Number.isFinite(days) ? days : null,
-        all: !cleanDays.trim(),
+        olderThanDays: parsedDays,
+        all: rawDays === '',
         dryRun: !confirm,
         confirm,
       });
@@ -324,7 +333,7 @@ export function GovernanceView({
                       <td className="lt-mono">{String(p.planId).slice(0, 16)}</td>
                       <td><span className="lt-tag">{p.category || 'general'}</span></td>
                       <td><span className="lt-tag">{p.lifecycleState || 'archived'}</span></td>
-                      <td style={{ fontSize: 12 }}>{p.title || p.summary || p.projectKey || '—'}</td>
+                      <td style={{ fontSize: 12 }}>{p.topic || p.title || p.summary || p.projectKey || '—'}</td>
                       <td className="lt-right">
                         <button className="lt-btn lt-btn-sm" disabled={busy} onClick={() => void handleRetrospect(p.planId)}>
                           生成复盘

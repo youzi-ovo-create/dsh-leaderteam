@@ -6,25 +6,63 @@
     <title>Leader Team — 工程治理与模型工作台</title>
     <script>
       (function bootLtTheme() {
+        function hexToRgb(hex) {
+          var m = String(hex || '').trim().replace(/^#/, '');
+          if (m.length === 3) {
+            return [parseInt(m[0] + m[0], 16), parseInt(m[1] + m[1], 16), parseInt(m[2] + m[2], 16)];
+          }
+          if (m.length >= 6) {
+            return [parseInt(m.slice(0, 2), 16), parseInt(m.slice(2, 4), 16), parseInt(m.slice(4, 6), 16)];
+          }
+          return null;
+        }
+        function relLum(rgb) {
+          if (!rgb) return null;
+          var norm = rgb.map(function (v) {
+            var c = v / 255;
+            return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+          });
+          return 0.2126 * norm[0] + 0.7152 * norm[1] + 0.0722 * norm[2];
+        }
         try {
           var raw = localStorage.getItem('lt-ui-preferences-v1');
           if (!raw) return;
           var prefs = JSON.parse(raw);
-          var theme = prefs && prefs.theme ? prefs.theme : 'white';
-          document.documentElement.setAttribute('data-lt-theme', theme);
+          var allowed = ['white', 'dark', 'heluoxu', 'custom'];
+          var theme = prefs && allowed.indexOf(prefs.theme) >= 0 ? prefs.theme : 'white';
+          var html = document.documentElement;
+          var root = html.style;
+          html.setAttribute('data-lt-theme', theme);
           if (theme === 'custom' && prefs.customTheme) {
             var ct = prefs.customTheme;
-            var root = document.documentElement.style;
+            html.setAttribute('data-lt-heading', ct.headingFontMode === 'sans' ? 'sans' : 'serif');
+            html.setAttribute(
+              'data-lt-corners',
+              ['sharp', 'balanced', 'pill-cta'].indexOf(ct.cornerStyle) >= 0 ? ct.cornerStyle : 'balanced'
+            );
+            html.setAttribute(
+              'data-lt-density',
+              ['compact', 'standard', 'comfortable'].indexOf(ct.density) >= 0 ? ct.density : 'standard'
+            );
             if (ct.canvasColor) root.setProperty('--user-bg-canvas', ct.canvasColor);
             if (ct.surfaceColor) root.setProperty('--user-bg-surface', ct.surfaceColor);
             if (ct.inkColor) root.setProperty('--user-fg-primary', ct.inkColor);
             if (ct.accentColor) root.setProperty('--user-accent', ct.accentColor);
             if (ct.dangerColor) root.setProperty('--user-danger', ct.dangerColor);
+            var inkLum = relLum(hexToRgb(ct.inkColor));
+            root.setProperty('--user-fg-on-ink', inkLum !== null && inkLum > 0.45 ? '#141619' : '#FFFFFF');
+            var surfLum = relLum(hexToRgb(ct.surfaceColor));
+            root.colorScheme = surfLum !== null && surfLum < 0.25 ? 'dark' : 'light';
+          } else {
+            html.removeAttribute('data-lt-heading');
+            html.removeAttribute('data-lt-corners');
+            html.removeAttribute('data-lt-density');
+            root.removeProperty('color-scheme');
           }
         } catch (e) {}
       })();
     </script>
-    <script type="module" crossorigin src="./assets/index-DMu8yRE4.js"></script>
+    <script type="module" crossorigin src="./assets/index-C0_uDxKv.js"></script>
     <link rel="modulepreload" crossorigin href="./assets/react-DHz4kLit.js">
     <link rel="modulepreload" crossorigin href="./assets/echarts-ClPwX7rX.js">
     <link rel="stylesheet" crossorigin href="./assets/index-Cr_RpfQ7.css">

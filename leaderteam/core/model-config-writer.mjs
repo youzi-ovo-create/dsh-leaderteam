@@ -324,7 +324,10 @@ export function inspectDesktopSync(effectiveCfg, options = {}) {
 
   const activeSet = new Set([
     ...effectiveCfg.team.executionPool,
-    ...ROLE_KEYS.map(k => effectiveCfg.roles[k]?.route).filter(Boolean),
+    ...ROLE_KEYS.flatMap(k => [
+      effectiveCfg.roles[k]?.route,
+      ...(effectiveCfg.roles[k]?.fallback ?? []).map(f => f?.route),
+    ]).filter(Boolean),
   ]);
   const defaultProvider = effectiveCfg.magpie?.provider ?? 'magpie';
 
@@ -534,7 +537,24 @@ export function applyModelConfigChanges(changes = {}, options = {}) {
     leaderModelPolicy: false,
   };
 
-  // 1. Optional clearLocal operations (local target only)
+  let localClearedInBaseMode = false;
+
+  // 1. Optional clearLocal / clearLocalOverrides / clearLocalRolesAndPool operations
+  if (changes.clearLocalOverrides === true || changes.clearLocalRolesAndPool === true) {
+    if (changes.clearLocalOverrides === true) {
+      delete nextLocal.models;
+    }
+    delete nextLocal.roles;
+    if (isPlainObj(nextLocal.team)) {
+      delete nextLocal.team.executionPool;
+      delete nextLocal.team.leaderModelPolicy;
+    }
+    pruneEmptyObjects(nextLocal);
+    if (target === 'base' && hasExistingLocal) {
+      localClearedInBaseMode = true;
+    }
+  }
+
   if (changes.clearLocal) {
     if (target !== 'local') {
       throw new LtError('BAD_CONFIG', 'clearLocal options require target="local" (--local)');
@@ -572,13 +592,27 @@ export function applyModelConfigChanges(changes = {}, options = {}) {
   const requestedAutoRoutes = new Set([
     ...(changes.poolSet ?? []),
     ...(changes.poolEnable ?? []),
-    ...(changes.setRoles ?? []).map(r => r?.route).filter(Boolean),
+    ...(changes.setRoles ?? []).flatMap(r => [
+      r?.route,
+      ...(Array.isArray(r?.fallback) ? r.fallback.map(f => f?.route) : []),
+    ]).filter(Boolean),
   ]);
   const explicitUpsertRoutes = new Set((changes.upsertModels ?? []).map(x => x?.route?.trim()).filter(Boolean));
   const autoUpserts = [];
   for (const r of requestedAutoRoutes) {
     if (explicitUpsertRoutes.has(r)) continue;
-    if (Object.hasOwn(nextBase.models ?? {}, r) || Object.hasOwn(nextLocal.models ?? {}, r)) continue;
+    if (target === 'base') {
+      if (Object.hasOwn(nextBase.models ?? {}, r)) continue;
+      if (isPlainObj(nextLocal.models?.[r])) {
+        const localSpec = structuredClone(nextLocal.models[r]);
+        delete localSpec.enableInPool;
+        delete localSpec.disableInPool;
+        autoUpserts.push({ route: r, ...localSpec });
+        continue;
+      }
+    } else {
+      if (Object.hasOwn(nextBase.models ?? {}, r) || Object.hasOwn(nextLocal.models ?? {}, r)) continue;
+    }
     const dm = discoveredMap.get(r);
     if (dm) {
       autoUpserts.push({
@@ -589,12 +623,14 @@ export function applyModelConfigChanges(changes = {}, options = {}) {
         label: dm.label,
         efforts: dm.efforts,
         defaultEffort: dm.defaultEffort,
+        ...(isPlainObj(dm.reasoningEfforts) ? { reasoningEfforts: { ...dm.reasoningEfforts } } : {}),
         strengths: dm.strengths,
         ...(typeof dm.vision === 'boolean' ? { vision: dm.vision } : {}),
         ...(Number.isInteger(dm.contextWindow) && dm.contextWindow > 0 ? { contextWindow: dm.contextWindow } : {}),
         ...(Number.isInteger(dm.maxTokens ?? dm.defaultMaxTokens) && (dm.maxTokens ?? dm.defaultMaxTokens) > 0
           ? { maxTokens: dm.maxTokens ?? dm.defaultMaxTokens }
           : {}),
+        ...(Array.isArray(dm.quotaWindows) && dm.quotaWindows.length > 0 ? { quotaWindows: [...dm.quotaWindows] } : {}),
       });
     }
   }
@@ -808,17 +844,29 @@ export function applyModelConfigChanges(changes = {}, options = {}) {
       effort = prior.effort;
     }
 
+    const leaderMaxTokens = (item.clearMaxTokens || item.maxTokens === null)
+      ? undefined
+      : (item.maxTokens ?? prior.maxTokens);
+    const nonLeaderMaxTokens = (item.clearMaxTokens || item.maxTokens === null)
+      ? DEFAULT_ROLE_LIMITS[role]?.maxTokens
+      : (item.maxTokens ?? prior.maxTokens ?? DEFAULT_ROLE_LIMITS[role]?.maxTokens);
+
     const nextRole = role === 'leader'
-      ? { route, effort }
+      ? {
+        route,
+        effort,
+        ...(leaderMaxTokens !== undefined ? { maxTokens: leaderMaxTokens } : {}),
+      }
       : {
         ...prior,
         route,
         effort,
-        maxTokens: item.maxTokens ?? prior.maxTokens ?? DEFAULT_ROLE_LIMITS[role].maxTokens,
+        ...(nonLeaderMaxTokens !== undefined ? { maxTokens: nonLeaderMaxTokens } : {}),
         timeoutMs: item.timeoutMs ?? prior.timeoutMs ?? DEFAULT_ROLE_LIMITS[role].timeoutMs,
         retries: item.retries ?? prior.retries ?? DEFAULT_ROLE_LIMITS[role].retries,
         ...(Array.isArray(item.fallback) ? { fallback: item.fallback.map(f => ({ ...f })) } : {}),
       };
+    if (role !== 'leader' && nonLeaderMaxTokens === undefined) delete nextRole.maxTokens;
     if (role !== 'leader' && Array.isArray(nextRole.fallback)) nextRole.fallback = nextRole.fallback.filter(f => f.route !== route);
 
     if (target === 'base') {
@@ -906,7 +954,18 @@ export function applyModelConfigChanges(changes = {}, options = {}) {
   const targetFile = target === 'base' ? configFile : localFile;
   const serializedTarget = JSON.stringify(target === 'base' ? nextBase : nextLocal, null, 2) + '\n';
   const prevTargetText = fs.existsSync(targetFile) ? fs.readFileSync(targetFile, 'utf8') : null;
-  const targetChanged = prevTargetText === null || prevTargetText.replace(/\r\n/g, '\n') !== serializedTarget.replace(/\r\n/g, '\n');
+  const targetChanged = (target === 'local' && !hasExistingLocal && Object.keys(nextLocal).length === 0)
+    ? false
+    : (prevTargetText === null || prevTargetText.replace(/\r\n/g, '\n') !== serializedTarget.replace(/\r\n/g, '\n'));
+
+  const prevLocalText = localClearedInBaseMode && fs.existsSync(localFile) ? fs.readFileSync(localFile, 'utf8') : null;
+  const serializedLocalInBaseMode = localClearedInBaseMode ? (JSON.stringify(nextLocal, null, 2) + '\n') : null;
+  const sidecarLocalChanged = Boolean(
+    localClearedInBaseMode &&
+    prevLocalText !== null &&
+    serializedLocalInBaseMode !== null &&
+    prevLocalText.replace(/\r\n/g, '\n') !== serializedLocalInBaseMode.replace(/\r\n/g, '\n'),
+  );
 
   const patchWrites = [];
   if (target === 'base' && options.syncPatches !== false) {
@@ -922,7 +981,7 @@ export function applyModelConfigChanges(changes = {}, options = {}) {
     }
   }
 
-  const changed = targetChanged || patchWrites.length > 0;
+  const changed = targetChanged || sidecarLocalChanged || patchWrites.length > 0;
   const beforeGovernance = governanceSettings(target === 'base' ? baseRaw : localRaw);
   const afterGovernance = governanceSettings(target === 'base' ? nextBase : nextLocal);
   const governanceChanged = hashJson(beforeGovernance) !== hashJson(afterGovernance);
@@ -932,7 +991,10 @@ export function applyModelConfigChanges(changes = {}, options = {}) {
   let auditId = null;
   if (!dryRun && changed) {
     if (options.backupDir) {
-      backupPath = backupFiles([targetFile, ...patchWrites.map(w => w.file)], path.resolve(options.backupDir));
+      backupPath = backupFiles(
+        [targetFile, ...(sidecarLocalChanged ? [localFile] : []), ...patchWrites.map(w => w.file)],
+        path.resolve(options.backupDir),
+      );
     }
     if (governanceChanged) {
       auditId = randomUUID();
@@ -945,6 +1007,7 @@ export function applyModelConfigChanges(changes = {}, options = {}) {
     }
     const plannedWrites = [
       ...(targetChanged ? [{ file: targetFile, content: serializedTarget }] : []),
+      ...(sidecarLocalChanged ? [{ file: localFile, content: serializedLocalInBaseMode }] : []),
       ...patchWrites,
     ];
     writeFilesTransactional(plannedWrites);

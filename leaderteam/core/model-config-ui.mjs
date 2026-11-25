@@ -11,16 +11,22 @@ const MAX_BODY_BYTES = 256 * 1024;
 
 function isAllowedLoopbackHost(hostHeader, port) {
   if (typeof hostHeader !== 'string' || !hostHeader) return false;
-  const expectedA = `127.0.0.1:${port}`;
-  const expectedB = `localhost:${port}`;
   const lower = hostHeader.trim().toLowerCase();
-  return lower === expectedA || lower === expectedB;
+  return (
+    lower === `127.0.0.1:${port}` ||
+    lower === `localhost:${port}` ||
+    lower === `[::1]:${port}`
+  );
 }
 
 function isAllowedOrigin(originHeader, port) {
   if (originHeader === undefined) return true; // same-origin GET or local non-browser client with token
   const lower = String(originHeader).trim().toLowerCase();
-  return lower === `http://127.0.0.1:${port}` || lower === `http://localhost:${port}`;
+  return (
+    lower === `http://127.0.0.1:${port}` ||
+    lower === `http://localhost:${port}` ||
+    lower === `http://[::1]:${port}`
+  );
 }
 
 function readJsonBody(req) {
@@ -270,6 +276,7 @@ const ROLE_META = {
   discussB: '双盲讨论评审 B（计划与交付审阅）',
   arbiter: '独立裁断者（评审分歧时终局裁断）',
   serialReviewer: '串行方案辩护复核（充分、真实地说明为何选择串行；理由不足退回双评审）',
+  directExec: '受控单步轻量直接执行代理（严格沙箱锁定与独立安全门复核）',
 };
 const STD_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
 
@@ -442,7 +449,9 @@ function renderModels() {
     delBtn.textContent = '移除';
     delBtn.style.padding = '3px 8px';
     delBtn.onclick = () => {
-      const usedBy = Object.entries(draft.roles).filter(([, r]) => r.route === m.route).map(([k]) => k);
+      const usedBy = Object.entries(draft.roles)
+        .filter(([, r]) => r && (r.route === m.route || (Array.isArray(r.fallback) && r.fallback.some(f => f && f.route === m.route))))
+        .map(([k]) => k);
       if (usedBy.length > 0) {
         log('无法移除 ' + m.route + '：当前仍被角色 [' + usedBy.join(', ') + '] 使用，请先切换对应角色模型。');
         return;
@@ -508,14 +517,33 @@ function renderRoles() {
 
     ['maxTokens', 'timeoutMs', 'retries'].forEach(field => {
       const td = document.createElement('td');
-      if (roleKey === 'leader') {
+      if (roleKey === 'leader' && field !== 'maxTokens') {
         td.textContent = '—';
       } else {
         const inp = document.createElement('input');
         inp.type = 'number';
         inp.style.width = '95px';
-        inp.value = r[field];
-        inp.oninput = () => { r[field] = Number.parseInt(inp.value, 10); };
+        inp.value = Number.isFinite(r[field]) ? String(r[field]) : '';
+        if (roleKey === 'leader' || (roleKey === 'directExec' && field === 'maxTokens')) {
+          inp.placeholder = '默认';
+        }
+        inp.oninput = () => {
+          const trimmed = inp.value.trim();
+          if (!trimmed) {
+            delete r[field];
+            if (field === 'maxTokens' && (roleKey === 'leader' || roleKey === 'directExec')) {
+              r.clearMaxTokens = true;
+            }
+            return;
+          }
+          const parsed = Number.parseInt(trimmed, 10);
+          if (Number.isFinite(parsed)) {
+            r[field] = parsed;
+            if (field === 'maxTokens') delete r.clearMaxTokens;
+          } else {
+            delete r[field];
+          }
+        };
         td.appendChild(inp);
       }
       tr.appendChild(td);
@@ -541,11 +569,34 @@ function buildChangesPayload() {
     ...(m.quotaWindows ? { quotaWindows: m.quotaWindows } : { clearQuotaWindows: true }),
   }));
   const poolSet = draft.models.filter(m => m.inPool).map(m => m.route);
-  const setRoles = Object.entries(draft.roles).map(([role, spec]) => ({ role, ...spec }));
+  const setRoles = Object.entries(draft.roles).map(([role, spec]) => {
+    const clean = { role };
+    for (const [k, v] of Object.entries(spec || {})) {
+      if (k === 'maxTokens' || k === 'timeoutMs' || k === 'retries') {
+        if (Number.isFinite(v)) clean[k] = v;
+      } else if (v !== undefined) {
+        clean[k] = v;
+      }
+    }
+    return clean;
+  });
+  const persistedRemoved = draft.removedRoutes.filter(r =>
+    state && Array.isArray(state.models) && state.models.some(x => x.route === r),
+  );
+  const localClearModels = target === 'local'
+    ? persistedRemoved.filter(r => {
+      const orig = state.models.find(x => x.route === r);
+      return Boolean(orig && !orig.onlyInLocal && orig.overriddenInLocal);
+    })
+    : [];
+  const removeModels = target === 'local'
+    ? persistedRemoved.filter(r => !localClearModels.includes(r))
+    : persistedRemoved;
   return {
     target,
     changes: {
-      ...(target === 'base' && draft.removedRoutes.length ? { removeModels: draft.removedRoutes, prunePool: true } : {}),
+      ...(localClearModels.length ? { clearLocal: { models: localClearModels } } : {}),
+      ...(removeModels.length ? { removeModels, prunePool: true } : {}),
       upsertModels,
       poolSet,
       setRoles,

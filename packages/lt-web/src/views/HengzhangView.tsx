@@ -1,34 +1,164 @@
-import React, { useEffect, useRef, useState, useCallback } from 'react';
+import React, { useEffect, useMemo, useRef, useState, useCallback } from 'react';
 import * as echarts from 'echarts';
 import { decompress as fzstdDecompress } from 'fzstd';
 // @ts-expect-error Pure JS ESM shared core
 import { decodeSessionBytes, parseJsonl, buildReport, defaultPricing } from '@lt-usage-core';
 import { callLtApi, formatCny, formatNumber, formatDurationMs, type HydratedBundle } from '../lib/api';
+import type { CustomThemeSeeds, ThemePresetId } from '../types/lt-public-v1';
+
+function parseHexRgb(hex: string, fallback: [number, number, number] = [20, 22, 25]): [number, number, number] {
+  const m = String(hex || '').trim().replace(/^#/, '');
+  if (/^[0-9A-Fa-f]{3}$/.test(m)) {
+    return [parseInt(m[0] + m[0], 16), parseInt(m[1] + m[1], 16), parseInt(m[2] + m[2], 16)];
+  }
+  if (/^[0-9A-Fa-f]{6,8}$/.test(m)) {
+    return [parseInt(m.slice(0, 2), 16), parseInt(m.slice(2, 4), 16), parseInt(m.slice(4, 6), 16)];
+  }
+  return fallback;
+}
+
+function rgbToHex([r, g, b]: [number, number, number]): string {
+  const to2 = (v: number) => Math.max(0, Math.min(255, Math.round(v))).toString(16).padStart(2, '0');
+  return `#${to2(r)}${to2(g)}${to2(b)}`.toUpperCase();
+}
+
+function mixHex(hexA: string, hexB: string, weightA = 0.5): string {
+  const a = parseHexRgb(hexA);
+  const b = parseHexRgb(hexB);
+  const w = Math.max(0, Math.min(1, weightA));
+  return rgbToHex([
+    a[0] * w + b[0] * (1 - w),
+    a[1] * w + b[1] * (1 - w),
+    a[2] * w + b[2] * (1 - w),
+  ]);
+}
+
+function rgbaFromHex(hex: string, alpha: number): string {
+  const [r, g, b] = parseHexRgb(hex);
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+}
+
+function luminanceOfHex(hex: string): number {
+  const rgb = parseHexRgb(hex);
+  const norm = rgb.map(v => {
+    const c = v / 255;
+    return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+  });
+  return 0.2126 * norm[0] + 0.7152 * norm[1] + 0.0722 * norm[2];
+}
+
+interface ChartPalette {
+  fg: string;
+  muted: string;
+  accent: string;
+  info: string;
+  success: string;
+  tooltipBg: string;
+  tooltipBorder: string;
+  splitLine: string;
+  pieColors: string[];
+}
+
+export function resolveHengzhangChartPalette(theme: ThemePresetId, customTheme?: CustomThemeSeeds): ChartPalette {
+  if (theme === 'dark') {
+    return {
+      fg: '#ECEFF4',
+      muted: '#A5AEBC',
+      accent: '#D29A68',
+      info: '#6CB2CE',
+      success: '#63B692',
+      tooltipBg: '#222731',
+      tooltipBorder: '#3B4352',
+      splitLine: 'rgba(236, 239, 244, 0.12)',
+      pieColors: ['#6CB2CE', '#D29A68', '#63B692', '#E0AD56', '#D98A82', '#9EA8F0'],
+    };
+  }
+  if (theme === 'heluoxu') {
+    return {
+      fg: '#1A1916',
+      muted: '#6F6B63',
+      accent: '#9C5B2E',
+      info: '#2A657C',
+      success: '#39755E',
+      tooltipBg: '#FAF8F4',
+      tooltipBorder: '#8A867D',
+      splitLine: 'rgba(26, 25, 22, 0.12)',
+      pieColors: ['#9C5B2E', '#2A657C', '#39755E', '#9A6C19', '#92544E', '#55524B'],
+    };
+  }
+  if (theme === 'custom' && customTheme) {
+    const surface = rgbToHex(parseHexRgb(customTheme.surfaceColor, [255, 255, 255]));
+    const fg = rgbToHex(parseHexRgb(customTheme.inkColor, [20, 22, 25]));
+    const accent = rgbToHex(parseHexRgb(customTheme.accentColor, [156, 91, 46]));
+    const danger = rgbToHex(parseHexRgb(customTheme.dangerColor, [163, 38, 63]));
+    const isDark = luminanceOfHex(surface) < 0.25;
+    const info = isDark ? '#6CB2CE' : '#2A657C';
+    const success = isDark ? '#63B692' : '#2F6F55';
+    return {
+      fg,
+      muted: mixHex(fg, surface, 0.56),
+      accent,
+      info,
+      success,
+      tooltipBg: surface,
+      tooltipBorder: mixHex(fg, surface, 0.34),
+      splitLine: rgbaFromHex(fg, 0.12),
+      pieColors: [accent, info, success, isDark ? '#E0AD56' : '#9A6715', danger, mixHex(fg, accent, 0.5)],
+    };
+  }
+  return {
+    fg: '#141619',
+    muted: '#6E7681',
+    accent: '#9C5B2E',
+    info: '#2A657C',
+    success: '#2F6F55',
+    tooltipBg: '#FFFFFF',
+    tooltipBorder: '#C8CFD8',
+    splitLine: 'rgba(20, 22, 25, 0.09)',
+    pieColors: ['#2A657C', '#9C5B2E', '#2F6F55', '#9A6715', '#92544E', '#4A5058'],
+  };
+}
 
 function EChartBox({ option, height = 240 }: { option: echarts.EChartsCoreOption; height?: number }) {
   const ref = useRef<HTMLDivElement | null>(null);
+  const chartRef = useRef<echarts.ECharts | null>(null);
+
   useEffect(() => {
     const el = ref.current;
     if (!el) return;
     const chart = echarts.init(el);
-    chart.setOption(option);
+    chartRef.current = chart;
     const ro = new ResizeObserver(() => chart.resize());
     ro.observe(el);
     return () => {
       ro.disconnect();
       chart.dispose();
+      chartRef.current = null;
     };
+  }, []);
+
+  useEffect(() => {
+    if (chartRef.current) {
+      chartRef.current.setOption(option, { notMerge: true });
+    }
   }, [option]);
+
   return <div ref={ref} style={{ width: '100%', height }} />;
 }
 
 export function HengzhangView({
   bundle,
+  theme: propTheme,
+  customTheme: propCustomTheme,
   onRefreshBundle,
 }: {
   bundle: HydratedBundle;
+  theme?: ThemePresetId;
+  customTheme?: CustomThemeSeeds;
   onRefreshBundle: () => Promise<void>;
 }) {
+  const activeTheme = propTheme || bundle.uiPreferences?.theme || 'white';
+  const activeCustomTheme = propCustomTheme || bundle.uiPreferences?.customTheme;
   const [overviewData, setOverviewData] = useState<any>(null);
   const [selectedSessionId, setSelectedSessionId] = useState<string>('');
   const [report, setReport] = useState<any>(null);
@@ -169,10 +299,15 @@ export function HengzhangView({
   function exportJson() {
     if (!report) return;
     const blob = new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' });
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = `hengzhang-${report.meta?.sessionId || 'report'}.json`;
-    a.click();
+    const objUrl = URL.createObjectURL(blob);
+    try {
+      const a = document.createElement('a');
+      a.href = objUrl;
+      a.download = `hengzhang-${report.meta?.sessionId || 'report'}.json`;
+      a.click();
+    } finally {
+      setTimeout(() => URL.revokeObjectURL(objUrl), 0);
+    }
   }
 
   function exportCsv() {
@@ -209,70 +344,94 @@ export function HengzhangView({
       ].join(','));
     }
     const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8' });
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = `hengzhang-${report.meta?.sessionId || 'calls'}.csv`;
-    a.click();
+    const objUrl = URL.createObjectURL(blob);
+    try {
+      const a = document.createElement('a');
+      a.href = objUrl;
+      a.download = `hengzhang-${report.meta?.sessionId || 'calls'}.csv`;
+      a.click();
+    } finally {
+      setTimeout(() => URL.revokeObjectURL(objUrl), 0);
+    }
   }
 
-  const fgColor = typeof document !== 'undefined'
-    ? getComputedStyle(document.documentElement).getPropertyValue('--lt-fg-primary').trim() || '#141619'
-    : '#141619';
-  const mutedColor = typeof document !== 'undefined'
-    ? getComputedStyle(document.documentElement).getPropertyValue('--lt-fg-muted').trim() || '#6E7681'
-    : '#6E7681';
-  const accentColor = typeof document !== 'undefined'
-    ? getComputedStyle(document.documentElement).getPropertyValue('--lt-accent').trim() || '#9C5B2E'
-    : '#9C5B2E';
+  const palette = useMemo(
+    () => resolveHengzhangChartPalette(activeTheme, activeCustomTheme),
+    [activeTheme, activeCustomTheme],
+  );
 
-  const groupBarOption: echarts.EChartsCoreOption = {
-    tooltip: { trigger: 'axis' },
-    grid: { left: 90, right: 24, top: 20, bottom: 28 },
-    xAxis: { type: 'value', axisLabel: { color: mutedColor } },
-    yAxis: {
-      type: 'category',
-      data: (report?.groups || []).map((g: any) => g.label),
-      axisLabel: { color: fgColor },
-    },
-    series: [
-      {
-        name: '未缓存输入',
-        type: 'bar',
-        stack: 'tok',
-        itemStyle: { color: '#2A657C' },
-        data: (report?.groups || []).map((g: any) => g.inputTokens),
+  const groupBarOption = useMemo<echarts.EChartsCoreOption>(
+    () => ({
+      tooltip: {
+        trigger: 'axis',
+        backgroundColor: palette.tooltipBg,
+        borderColor: palette.tooltipBorder,
+        borderWidth: 1,
+        textStyle: { color: palette.fg, fontSize: 12 },
       },
-      {
-        name: '缓存读取',
-        type: 'bar',
-        stack: 'tok',
-        itemStyle: { color: accentColor },
-        data: (report?.groups || []).map((g: any) => g.cacheReadTokens),
+      grid: { left: 90, right: 24, top: 20, bottom: 28 },
+      xAxis: {
+        type: 'value',
+        axisLabel: { color: palette.muted },
+        splitLine: { lineStyle: { color: palette.splitLine } },
       },
-      {
-        name: '输出 (含推理)',
-        type: 'bar',
-        stack: 'tok',
-        itemStyle: { color: '#2F6F55' },
-        data: (report?.groups || []).map((g: any) => g.outputTokens),
+      yAxis: {
+        type: 'category',
+        data: (report?.groups || []).map((g: any) => g.label),
+        axisLabel: { color: palette.fg },
+        axisLine: { lineStyle: { color: palette.splitLine } },
       },
-    ],
-  };
+      series: [
+        {
+          name: '未缓存输入',
+          type: 'bar',
+          stack: 'tok',
+          itemStyle: { color: palette.info },
+          data: (report?.groups || []).map((g: any) => g.inputTokens),
+        },
+        {
+          name: '缓存读取',
+          type: 'bar',
+          stack: 'tok',
+          itemStyle: { color: palette.accent },
+          data: (report?.groups || []).map((g: any) => g.cacheReadTokens),
+        },
+        {
+          name: '输出 (含推理)',
+          type: 'bar',
+          stack: 'tok',
+          itemStyle: { color: palette.success },
+          data: (report?.groups || []).map((g: any) => g.outputTokens),
+        },
+      ],
+    }),
+    [report, palette],
+  );
 
-  const modelDonutOption: echarts.EChartsCoreOption = {
-    tooltip: { trigger: 'item' },
-    series: [
-      {
-        type: 'pie',
-        radius: ['45%', '72%'],
-        label: { color: fgColor, fontSize: 11 },
-        data: (report?.byModel || []).map((m: any) => ({
-          name: m.route,
-          value: m.totalTokens,
-        })),
+  const modelDonutOption = useMemo<echarts.EChartsCoreOption>(
+    () => ({
+      color: palette.pieColors,
+      tooltip: {
+        trigger: 'item',
+        backgroundColor: palette.tooltipBg,
+        borderColor: palette.tooltipBorder,
+        borderWidth: 1,
+        textStyle: { color: palette.fg, fontSize: 12 },
       },
-    ],
-  };
+      series: [
+        {
+          type: 'pie',
+          radius: ['45%', '72%'],
+          label: { color: palette.fg, fontSize: 11 },
+          data: (report?.byModel || []).map((m: any) => ({
+            name: m.route,
+            value: m.totalTokens,
+          })),
+        },
+      ],
+    }),
+    [report, palette],
+  );
 
   const filteredCalls = (report?.calls || []).filter((c: any) => {
     if (callFilterGroup !== 'all' && c.group !== callFilterGroup) return false;

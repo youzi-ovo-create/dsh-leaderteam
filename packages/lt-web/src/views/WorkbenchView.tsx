@@ -38,9 +38,11 @@ export function WorkbenchView({
 }) {
   const [liveHost, setLiveHost] = useState(false);
   const [workspaces, setWorkspaces] = useState<Array<{ workspaceId: string; path: string; title?: string }>>([]);
+  const [selectedWorkspaceId, setSelectedWorkspaceId] = useState<string>('');
   const [sessions, setSessions] = useState<WorkbenchSessionItem[]>([]);
   const [selectedSessionId, setSelectedSessionId] = useState<string>('');
   const [messages, setMessages] = useState<ReadableMessage[]>([]);
+  const [passiveRunning, setPassiveRunning] = useState(false);
   const [newCwd, setNewCwd] = useState('');
   const [promptText, setPromptText] = useState('');
   const [promptMode, setPromptMode] = useState<'queue' | 'steer'>('queue');
@@ -55,7 +57,11 @@ export function WorkbenchView({
         sessions: WorkbenchSessionItem[];
       }>('workbench/sessions');
       setLiveHost(data.liveHost);
-      setWorkspaces(data.workspaces || []);
+      const wsList = data.workspaces || [];
+      setWorkspaces(wsList);
+      if (!selectedWorkspaceId && wsList.length > 0) {
+        setSelectedWorkspaceId(wsList[0].workspaceId);
+      }
       setSessions(data.sessions || []);
       if (!selectedSessionId && data.sessions?.length > 0) {
         setSelectedSessionId(data.sessions[0].sessionId);
@@ -63,17 +69,27 @@ export function WorkbenchView({
     } catch (e: any) {
       setFeedback(e.message);
     }
-  }, [selectedSessionId]);
+  }, [selectedSessionId, selectedWorkspaceId]);
 
   const loadTranscript = useCallback(async (sid: string) => {
     if (!sid) {
       setMessages([]);
+      setPassiveRunning(false);
       return;
     }
     try {
-      const res = await callLtApi<{ messages: ReadableMessage[] }>('workbench/transcript', { sessionId: sid });
+      const res = await callLtApi<{
+        messages: ReadableMessage[];
+        passiveState?: { running?: boolean; busy?: boolean; turnRunning?: boolean; status?: string } | null;
+      }>('workbench/transcript', { sessionId: sid });
       setMessages(res.messages || []);
-    } catch {}
+      const ps = res.passiveState;
+      setPassiveRunning(
+        Boolean(ps && (ps.running === true || ps.busy === true || ps.turnRunning === true || ps.status === 'running')),
+      );
+    } catch {
+      setPassiveRunning(false);
+    }
   }, []);
 
   useEffect(() => {
@@ -98,9 +114,19 @@ export function WorkbenchView({
     setBusy(true);
     setFeedback(null);
     try {
-      const ws = workspaces[0];
+      const trimmedCwd = newCwd.trim();
+      const matchedWs = trimmedCwd
+        ? workspaces.find(w => w.path === trimmedCwd)
+        : workspaces.find(w => w.workspaceId === selectedWorkspaceId) || workspaces[0];
+      const locationSpec = matchedWs && (!trimmedCwd || matchedWs.path === trimmedCwd) && selectedWorkspaceId !== '__custom__'
+        ? { workspaceId: matchedWs.workspaceId }
+        : trimmedCwd
+          ? { cwd: trimmedCwd }
+          : matchedWs
+            ? { workspaceId: matchedWs.workspaceId }
+            : {};
       const created = await callLtApi<{ sessionId: string }>('workbench/create', {
-        ...(newCwd.trim() ? { cwd: newCwd.trim() } : ws ? { workspaceId: ws.workspaceId } : {}),
+        ...locationSpec,
         agentPreset: 'leaderteam',
       });
       await loadSessions();
@@ -165,12 +191,33 @@ export function WorkbenchView({
 
           {bundle.capabilities.features.liveSessionRpc ? (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 6, paddingBottom: 10, borderBottom: '1px solid var(--lt-border-subtle)' }}>
-              <input
-                className="lt-input"
-                placeholder={workspaces[0]?.path || '可选：工作区绝对路径'}
-                value={newCwd}
-                onChange={e => setNewCwd(e.target.value)}
-              />
+              {workspaces.length > 0 && (
+                <select
+                  className="lt-select"
+                  aria-label="选择已注册工作区"
+                  value={selectedWorkspaceId}
+                  onChange={e => {
+                    const nextId = e.target.value;
+                    setSelectedWorkspaceId(nextId);
+                    if (nextId !== '__custom__') setNewCwd('');
+                  }}
+                >
+                  {workspaces.map(w => (
+                    <option key={w.workspaceId} value={w.workspaceId}>
+                      {w.title ? `${w.title} (${w.path})` : w.path}
+                    </option>
+                  ))}
+                  <option value="__custom__">自定义目录路径 (cwd)…</option>
+                </select>
+              )}
+              {(workspaces.length === 0 || selectedWorkspaceId === '__custom__') && (
+                <input
+                  className="lt-input"
+                  placeholder={workspaces[0]?.path || '可选：工作区绝对路径'}
+                  value={newCwd}
+                  onChange={e => setNewCwd(e.target.value)}
+                />
+              )}
               <button className="lt-btn lt-btn-primary" disabled={busy} onClick={() => void handleCreateSession()}>
                 + 新建 LeaderTeam 会话
               </button>
@@ -237,7 +284,12 @@ export function WorkbenchView({
                   </a>
                 )}
                 {liveHost && selectedSessionId && (
-                  <button className="lt-btn lt-btn-sm lt-btn-danger" disabled={busy} onClick={() => void handleCancelTurn()}>
+                  <button
+                    className="lt-btn lt-btn-sm lt-btn-danger"
+                    disabled={busy || !passiveRunning}
+                    title={passiveRunning ? '中断当前正在执行的推理回合' : '当前会话处于空闲状态，无运行中回合'}
+                    onClick={() => void handleCancelTurn()}
+                  >
                     中断当前回合
                   </button>
                 )}

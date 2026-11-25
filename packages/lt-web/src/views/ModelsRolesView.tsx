@@ -16,15 +16,29 @@ export function ModelsRolesView({
   const [draftPool, setDraftPool] = useState<string[]>([]);
   const [draftRoles, setDraftRoles] = useState<Record<string, RoleAssignment>>({});
   const [leaderPolicy, setLeaderPolicy] = useState<string>('warn');
+  const [isDirty, setIsDirty] = useState(false);
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
+  const [warnings, setWarnings] = useState<string[]>([]);
+  const [shadowedByLocal, setShadowedByLocal] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
+    if (isDirty) return;
     setDraftPool([...(bundle.runtime.modelPool.executionPool || [])]);
     setDraftRoles(structuredClone(bundle.runtime.roleAssignments || {}));
     setLeaderPolicy(bundle.runtime.leaderModelPolicy || 'warn');
-  }, [bundle]);
+  }, [bundle, isDirty]);
+
+  const localOverrides = bundle.runtime.localOverrides || (bundle.runtime.syncState as any)?.localOverrides || null;
+  const activeLocalOverrideItems: string[] = [];
+  if (localOverrides?.exists) {
+    if (localOverrides.executionPool) activeLocalOverrideItems.push('team.executionPool');
+    if (localOverrides.leaderModelPolicy) activeLocalOverrideItems.push('team.leaderModelPolicy');
+    if (localOverrides.roles?.length) activeLocalOverrideItems.push(`roles(${localOverrides.roles.join(', ')})`);
+    if (localOverrides.models?.length) activeLocalOverrideItems.push(`models(${localOverrides.models.join(', ')})`);
+  }
+  const hasActiveLocalOverrides = activeLocalOverrideItems.length > 0;
 
   const filteredModels = bundle.models.filter(m => {
     if (sourceFilter !== 'all' && m.sourceKind !== sourceFilter) return false;
@@ -50,6 +64,7 @@ export function ModelsRolesView({
   }
 
   function toggleExecutionPoolRoute(routeId: string) {
+    setIsDirty(true);
     setDraftPool(prev => (prev.includes(routeId) ? prev.filter(r => r !== routeId) : [...prev, routeId]));
   }
 
@@ -59,12 +74,24 @@ export function ModelsRolesView({
     setNotice(null);
     try {
       const entryIds = syncAllMagpie ? undefined : [...selectedEntries];
-      const res = await callLtApi<{ syncedCount: number }>('models/sync-pool', {
+      const res = await callLtApi<{
+        syncedCount: number;
+        warnings?: string[];
+        runtime?: { modelPool?: { executionPool?: string[] } };
+      }>('models/sync-pool', {
         entryIds,
         target: saveTarget,
         enableInExecutionPool: true,
       });
-      setNotice(`已将 ${res.syncedCount} 个模型导入 LT 模型目录与执行池（自动完成 off -> "none" 推理档位映射）`);
+      if (isDirty && res.runtime?.modelPool?.executionPool) {
+        const syncedPool = res.runtime.modelPool.executionPool;
+        setDraftPool(prev => [...new Set([...prev, ...syncedPool])]);
+      }
+      if (res.warnings?.length) setWarnings(res.warnings);
+      setNotice(
+        `已将 ${res.syncedCount} 个模型导入 LT 模型目录与执行池（自动完成 off -> "none" 推理档位映射）` +
+          (isDirty ? '；已保留当前未保存的角色草稿' : ''),
+      );
       setSelectedEntries(new Set());
       await onRefreshBundle();
     } catch (e: any) {
@@ -75,6 +102,7 @@ export function ModelsRolesView({
   }
 
   function updateRolePrimary(roleId: string, field: 'route' | 'effort', value: string) {
+    setIsDirty(true);
     setDraftRoles(prev => {
       const cur = prev[roleId] || { route: '', effort: 'none', fallback: [] };
       const next: RoleAssignment = { ...cur, [field]: value, fallback: [...(cur.fallback || [])] };
@@ -89,19 +117,28 @@ export function ModelsRolesView({
   }
 
   function addRoleFallback(roleId: string) {
-    const firstCandidate = poolModels[0]?.routeId || bundle.models[0]?.routeId || '';
-    const eff = poolModels[0]?.efforts.defaultEffort || 'none';
+    setIsDirty(true);
     setDraftRoles(prev => {
       const cur = prev[roleId];
       if (!cur) return prev;
       const fb = [...(cur.fallback || [])];
       if (fb.length >= 4) return prev;
+      const usedRoutes = new Set([cur.route, ...fb.map(f => f.route)].filter(Boolean));
+      const candidatePool = [...poolModels, ...bundle.models];
+      const chosenModel =
+        candidatePool.find(m => !usedRoutes.has(m.routeId)) ||
+        poolModels[0] ||
+        bundle.models[0] ||
+        null;
+      const firstCandidate = chosenModel?.routeId || '';
+      const eff = chosenModel?.efforts.defaultEffort || chosenModel?.efforts.supported?.[0] || 'none';
       fb.push({ route: firstCandidate, effort: eff });
       return { ...prev, [roleId]: { ...cur, fallback: fb } };
     });
   }
 
   function updateRoleFallback(roleId: string, idx: number, field: 'route' | 'effort', val: string) {
+    setIsDirty(true);
     setDraftRoles(prev => {
       const cur = prev[roleId];
       if (!cur) return prev;
@@ -119,6 +156,7 @@ export function ModelsRolesView({
   }
 
   function removeRoleFallback(roleId: string, idx: number) {
+    setIsDirty(true);
     setDraftRoles(prev => {
       const cur = prev[roleId];
       if (!cur) return prev;
@@ -130,6 +168,8 @@ export function ModelsRolesView({
     setBusy(true);
     setError(null);
     setNotice(null);
+    setWarnings([]);
+    setShadowedByLocal([]);
     try {
       const setRoles = bundle.capabilities.supportedRoles
         .map(r => {
@@ -139,12 +179,23 @@ export function ModelsRolesView({
             role: r.roleId,
             route: d.route,
             effort: d.effort || 'none',
-            ...(r.supportsFallbacks ? { fallback: d.fallback || [] } : {}),
+            ...(d.maxTokens !== undefined ? { maxTokens: d.maxTokens } : {}),
+            ...(r.supportsFallbacks
+              ? {
+                  ...(d.timeoutMs !== undefined ? { timeoutMs: d.timeoutMs } : {}),
+                  ...(d.retries !== undefined ? { retries: d.retries } : {}),
+                  fallback: d.fallback || [],
+                }
+              : {}),
           };
         })
         .filter(Boolean);
 
-      await callLtApi('runtime/configure', {
+      const res = await callLtApi<{
+        applyResult?: { shadowedByLocal?: string[]; warnings?: string[] };
+        shadowedByLocal?: string[];
+        warnings?: string[];
+      }>('runtime/configure', {
         target: saveTarget,
         changes: {
           poolSet: draftPool,
@@ -152,10 +203,38 @@ export function ModelsRolesView({
           leaderModelPolicy: leaderPolicy,
         },
       });
-      setNotice(`已事务化写入 ${saveTarget === 'local' ? 'leaderteam.local.json' : 'leaderteam.config.json + YAML 补丁'}（执行池实时生效，治理角色对新建团队生效）`);
+      const shadowed = res.shadowedByLocal ?? res.applyResult?.shadowedByLocal ?? [];
+      const warns = res.warnings ?? res.applyResult?.warnings ?? [];
+      setShadowedByLocal(shadowed);
+      setWarnings(warns);
+      setIsDirty(false);
+      setNotice(
+        `已事务化写入 ${saveTarget === 'local' ? 'leaderteam.local.json' : 'leaderteam.config.json + YAML 补丁'}（执行池实时生效，治理角色对新建团队生效）`,
+      );
       await onRefreshBundle();
     } catch (e: any) {
       setError(`保存配置失败：${e.message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleClearLocalOverrides() {
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    setWarnings([]);
+    setShadowedByLocal([]);
+    try {
+      await callLtApi('runtime/configure', {
+        target: 'local',
+        changes: { clearLocalOverrides: true },
+      });
+      setIsDirty(false);
+      setNotice('已清除本机覆盖 (leaderteam.local.json 中的模型、执行池与角色覆盖)，正式基准配置已立即生效');
+      await onRefreshBundle();
+    } catch (e: any) {
+      setError(`清除本机覆盖失败：${e.message}`);
     } finally {
       setBusy(false);
     }
@@ -181,6 +260,31 @@ export function ModelsRolesView({
             <option value="local">写入本机覆盖 (leaderteam.local.json)</option>
             <option value="base">写入基准配置 + 同步 YAML 模板</option>
           </select>
+          {hasActiveLocalOverrides && (
+            <button
+              type="button"
+              className="lt-btn lt-btn-danger"
+              disabled={busy}
+              onClick={() => void handleClearLocalOverrides()}
+            >
+              清除本机覆盖 (Clear Local Overrides)
+            </button>
+          )}
+          {isDirty && (
+            <button
+              type="button"
+              className="lt-btn"
+              disabled={busy}
+              onClick={() => {
+                setIsDirty(false);
+                setDraftPool([...(bundle.runtime.modelPool.executionPool || [])]);
+                setDraftRoles(structuredClone(bundle.runtime.roleAssignments || {}));
+                setLeaderPolicy(bundle.runtime.leaderModelPolicy || 'warn');
+              }}
+            >
+              重置未保存修改
+            </button>
+          )}
           <button className="lt-btn lt-btn-primary" disabled={busy} onClick={() => void handleSaveRuntimeConfig()}>
             {busy ? '保存中…' : '保存执行池与角色配置'}
           </button>
@@ -188,6 +292,43 @@ export function ModelsRolesView({
       </div>
 
       {error && <div className="lt-banner lt-banner-danger"><span>{error}</span><button className="lt-btn lt-btn-sm" onClick={() => setError(null)}>关闭</button></div>}
+      {(shadowedByLocal.length > 0 || warnings.length > 0 || (saveTarget === 'base' && hasActiveLocalOverrides)) && (
+        <div className="lt-banner lt-banner-warn">
+          <div>
+            {shadowedByLocal.length > 0 ? (
+              <div>
+                <strong>注意（本机覆盖遮蔽）：</strong>基准配置已更新，但当前运行时仍被 <code>leaderteam.local.json</code> 覆盖项遮蔽：
+                <code className="lt-mono" style={{ marginLeft: 4 }}>[{shadowedByLocal.join(', ')}]</code>。
+              </div>
+            ) : saveTarget === 'base' && hasActiveLocalOverrides ? (
+              <div>
+                <strong>提示：</strong>检测到 <code>leaderteam.local.json</code> 存在覆盖项（<code>{activeLocalOverrideItems.join('、')}</code>），运行时优先级高于基准配置。
+              </div>
+            ) : null}
+            {warnings.length > 0 && (
+              <div style={{ marginTop: shadowedByLocal.length > 0 ? 4 : 0 }}>{warnings.join('；')}</div>
+            )}
+          </div>
+          <div style={{ display: 'flex', gap: 6, flexShrink: 0 }}>
+            {hasActiveLocalOverrides && (
+              <button className="lt-btn lt-btn-sm lt-btn-danger" disabled={busy} onClick={() => void handleClearLocalOverrides()}>
+                清除本机覆盖 (Clear Local Overrides)
+              </button>
+            )}
+            {(shadowedByLocal.length > 0 || warnings.length > 0) && (
+              <button
+                className="lt-btn lt-btn-sm"
+                onClick={() => {
+                  setShadowedByLocal([]);
+                  setWarnings([]);
+                }}
+              >
+                关闭
+              </button>
+            )}
+          </div>
+        </div>
+      )}
       {notice && <div className="lt-banner"><span>{notice}</span><button className="lt-btn lt-btn-sm" onClick={() => setNotice(null)}>关闭</button></div>}
 
       {/* 1. 7-Role Governance & Execution Matrix */}
@@ -196,7 +337,15 @@ export function ModelsRolesView({
           <span>角色模型与多级故障回退链 ({bundle.capabilities.supportedRoles.length} 席角色)</span>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, fontWeight: 400 }}>
             <span>Leader 模型策略:</span>
-            <select className="lt-select" style={{ width: 150, height: 28 }} value={leaderPolicy} onChange={e => setLeaderPolicy(e.target.value)}>
+            <select
+              className="lt-select"
+              style={{ width: 150, height: 28 }}
+              value={leaderPolicy}
+              onChange={e => {
+                setIsDirty(true);
+                setLeaderPolicy(e.target.value);
+              }}
+            >
               <option value="warn">提醒 (warn)</option>
               <option value="enforce">强制一致 (enforce)</option>
               <option value="off">不限制 (off)</option>

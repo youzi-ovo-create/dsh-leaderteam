@@ -35,7 +35,8 @@ import {
   buildModelUpsertsFromCatalogEntries,
 } from '../../gateway/index.mjs';
 import { getOrCreateHengzhangBridge } from '../../usage/index.mjs';
-import { readSessionFile } from '../../../packages/lt-usage/index.mjs';
+import { readSessionFile, parseJsonl } from '../../../packages/lt-usage/index.mjs';
+import { listKnownHomes } from '../../../packages/lt-usage/reader/homes.js';
 import pkg from '../../../package.json' with { type: 'json' };
 
 export const CONTRACT_ID = 'lt.public.v1';
@@ -124,10 +125,38 @@ function errEnvelope(code, message, status = 200, retriable = false) {
   );
 }
 
+function httpContractError(code, message, status = 400) {
+  const err = new Error(message);
+  err.code = code;
+  err.status = status;
+  return err;
+}
+
+function errFromException(fallbackCode, e) {
+  const status = Number.isInteger(e?.status) && e.status >= 400 ? e.status : 200;
+  const code = typeof e?.code === 'string' && e.code ? e.code : fallbackCode;
+  return errEnvelope(code, e instanceof Error ? e.message : String(e), status);
+}
+
 async function parseJsonRequest(request) {
   if (!request || request.method === 'GET' || request.method === 'HEAD') return {};
+  const ct = String(request.headers?.get?.('content-type') || '').toLowerCase();
+  const cl = request.headers?.get?.('content-length');
+  const isJsonCt = ct.includes('application/json');
+  if (!isJsonCt) {
+    if (ct !== '') {
+      throw httpContractError('UNSUPPORTED_MEDIA_TYPE', 'POST requests must use Content-Type: application/json', 415);
+    }
+    const rawText = await request.text();
+    if (rawText.length > 0 || cl !== '0') {
+      throw httpContractError('UNSUPPORTED_MEDIA_TYPE', 'POST requests with body must include Content-Type: application/json', 415);
+    }
+    return {};
+  }
+  const rawText = await request.text();
+  if (!rawText.trim()) return {};
   try {
-    const parsed = await request.json();
+    const parsed = JSON.parse(rawText);
     return isPlainObj(parsed) ? parsed : {};
   } catch {
     return {};
@@ -492,24 +521,41 @@ export async function buildRuntimeSnapshotPayload(ctx, rt) {
 
   const requestWindows = [];
   try {
+    const rwCfg = cfg.requestWindow ?? {};
+    const defaultWinMs = Number.isFinite(rwCfg.windowMs) && rwCfg.windowMs > 0 ? rwCfg.windowMs : 5 * 3600 * 1000;
+    const softThrottlePct = Number.isFinite(rwCfg.softThrottlePct) ? rwCfg.softThrottlePct : 20;
+    const hardPausePct = Number.isFinite(rwCfg.hardPausePct) ? rwCfg.hardPausePct : 5;
+    const providerLimits = rwCfg.windowsByProvider ?? rwCfg.providers ?? {};
+    const nowTs = Date.now();
     const rwFile = path.join(rt.storageRoot, 'request-window-calls.jsonl');
-    const cutoff = Date.now() - 5 * 3600 * 1000;
     const records = fs.existsSync(rwFile) ? readJsonl(rwFile).records : [];
-    const byProv = new Map();
+    const tsByProv = new Map();
     for (const r of records) {
       const ts = typeof r.at === 'number' ? r.at : Date.parse(r.at);
-      if (Number.isFinite(ts) && ts >= cutoff) {
+      if (Number.isFinite(ts)) {
         const p = r.provider || 'unknown';
-        byProv.set(p, (byProv.get(p) ?? 0) + 1);
+        if (!tsByProv.has(p)) tsByProv.set(p, []);
+        tsByProv.get(p).push(ts);
       }
     }
-    const providerLimits = cfg.requestWindow?.providers ?? {};
-    const allProvs = new Set([...byProv.keys(), ...Object.keys(providerLimits)]);
+    const allProvs = new Set([...tsByProv.keys(), ...Object.keys(providerLimits)]);
     for (const p of allProvs) {
-      const used = byProv.get(p) ?? 0;
-      const limit = Number.isInteger(providerLimits[p]?.maxRequests) ? providerLimits[p].maxRequests : null;
-      const remRatio = limit && limit > 0 ? Math.max(0, (limit - used) / limit) : 1;
-      const tier = limit ? (remRatio <= 0.05 ? 'paused' : (remRatio <= 0.2 ? 'throttled' : 'normal')) : 'unbounded';
+      const entry = providerLimits[p];
+      const winMs = (Number.isFinite(entry?.windowMs) && entry.windowMs > 0) ? entry.windowMs : defaultWinMs;
+      const cutoff = nowTs - winMs;
+      const used = (tsByProv.get(p) ?? []).filter(t => t >= cutoff && t <= nowTs + 2000).length;
+      const limit = typeof entry === 'number' && Number.isInteger(entry) && entry > 0
+        ? entry
+        : (Number.isInteger(entry?.maxRequests) && entry.maxRequests > 0 ? entry.maxRequests : null);
+      let tier = 'unbounded';
+      if (limit && limit > 0) {
+        if (rwCfg.enabled === false) {
+          tier = 'normal';
+        } else {
+          const remPct = Math.max(0, ((limit - used) / limit) * 100);
+          tier = remPct <= hardPausePct ? 'paused' : (remPct <= softThrottlePct ? 'throttled' : 'normal');
+        }
+      }
       requestWindows.push({ provider: p, used5h: used, limit5h: limit, tier });
     }
   } catch {}
@@ -543,6 +589,7 @@ export async function buildRuntimeSnapshotPayload(ctx, rt) {
     },
     configuredModelsMap: structuredClone(cfg.models ?? {}),
     leaderModelPolicy: cfg.team?.leaderModelPolicy ?? 'warn',
+    localOverrides: configSnap.localOverrides,
     roleAssignments,
     syncState: {
       dshSettingsSynced: Boolean(configSnap.desktopSync?.inSync ?? true),
@@ -550,6 +597,7 @@ export async function buildRuntimeSnapshotPayload(ctx, rt) {
       governanceHash: govHash,
       desktopSync: configSnap.desktopSync,
       patchSync: configSnap.patchSync,
+      localOverrides: configSnap.localOverrides,
     },
     scheduler: {
       maxActiveMembers: cfg.team?.maxActiveMembers ?? 6,
@@ -570,21 +618,69 @@ export async function buildRuntimeSnapshotPayload(ctx, rt) {
   };
 }
 
-function extractReadableMessagesFromRows(rows = []) {
+export function encodeDshSegment(value) {
+  const s = String(value ?? '');
+  if (s === '.') return '~002E';
+  if (s === '..') return '~002E~002E';
+  return s.replace(/[^A-Za-z0-9._-]/g, ch => `~${ch.charCodeAt(0).toString(16).toUpperCase().padStart(4, '0')}`);
+}
+
+export function extractReadableMessagesFromRows(rows = []) {
   const messages = [];
   const seenMsgIds = new Set();
-  for (const row of rows) {
-    if (!row || row.surfaceOp === 'seed') continue;
+  for (let rowIdx = 0; rowIdx < rows.length; rowIdx++) {
+    const row = rows[rowIdx];
+    if (!row) continue;
+    const seq = Number.isInteger(row.seq) ? row.seq : rowIdx;
+    const surfaceOp = row.surfaceOp ?? row.data?.surfaceOp ?? null;
+    if (surfaceOp === 'seed' || surfaceOp?.op === 'seed') continue;
+
+    if (surfaceOp?.op === 'replace') {
+      const startSeq = Number.isInteger(surfaceOp.startSeq) ? surfaceOp.startSeq : 0;
+      const endSeq = Number.isInteger(surfaceOp.endSeq) ? surfaceOp.endSeq : seq - 1;
+      for (let i = messages.length - 1; i >= 0; i--) {
+        if (messages[i]._seq >= startSeq && messages[i]._seq <= endSeq) {
+          seenMsgIds.delete(messages[i].id);
+          messages.splice(i, 1);
+        }
+      }
+      const msg = row.data?.message ?? row.data;
+      const blocks = Array.isArray(msg?.content) ? msg.content : [];
+      const repText = blocks.length > 0
+        ? blocks.map(b => (typeof b?.text === 'string' ? b.text : '')).filter(Boolean).join('\n')
+        : (typeof msg?.summary === 'string' ? msg.summary : (typeof msg?.text === 'string' ? msg.text : ''));
+      if (repText) {
+        const repId = msg?.id || row.data?.compactionId || `compact-${seq}`;
+        if (!seenMsgIds.has(repId)) {
+          seenMsgIds.add(repId);
+          const isRealUser = msg?.source?.kind === 'user';
+          messages.push({
+            _seq: seq,
+            id: repId,
+            role: isRealUser ? 'user' : 'assistant',
+            timeMs: row.time ?? null,
+            text: repText,
+            model: isRealUser ? null : (msg?.source?.model ?? row.data?.model ?? 'compaction'),
+            toolCalls: [],
+          });
+        }
+      }
+      continue;
+    }
+
     if (row.type === 'user/message') {
       const msg = row.data?.message ?? row.data;
-      const id = msg?.id || `u-${row.seq ?? row.time ?? messages.length}`;
+      if (msg?.source?.kind && msg.source.kind !== 'user') continue;
+      const id = msg?.id || `u-${seq}`;
       if (seenMsgIds.has(id)) continue;
-      seenMsgIds.add(id);
       const blocks = Array.isArray(msg?.content) ? msg.content : [];
       const text = blocks.length > 0
         ? blocks.map(b => (typeof b?.text === 'string' ? b.text : '')).filter(Boolean).join('\n')
         : (typeof msg?.text === 'string' ? msg.text : '');
+      if (!text && blocks.length === 0) continue;
+      seenMsgIds.add(id);
       messages.push({
+        _seq: seq,
         id,
         role: 'user',
         timeMs: row.time ?? null,
@@ -594,7 +690,7 @@ function extractReadableMessagesFromRows(rows = []) {
       });
     } else if (row.type === 'assistant/message') {
       const msg = row.data?.message;
-      const id = msg?.id || `a-${row.seq ?? row.time ?? messages.length}`;
+      const id = msg?.id || `a-${seq}`;
       if (seenMsgIds.has(id)) continue;
       seenMsgIds.add(id);
       const content = Array.isArray(msg?.content) ? msg.content : [];
@@ -613,6 +709,7 @@ function extractReadableMessagesFromRows(rows = []) {
         }
       }
       messages.push({
+        _seq: seq,
         id,
         role: 'assistant',
         timeMs: row.time ?? null,
@@ -624,24 +721,196 @@ function extractReadableMessagesFromRows(rows = []) {
       });
     }
   }
-  return messages;
+  return messages.map(({ _seq, ...rest }) => rest);
 }
 
-function findDurableSessionRows(dshHome, sessionId) {
-  if (!dshHome || !sessionId) return null;
-  const sessionsRoot = path.join(dshHome, 'sessions');
+export function findDurableSessionRows(dshHome, sessionId) {
+  if (!dshHome || typeof sessionId !== 'string' || !sessionId || sessionId.includes('\0')) return null;
+  const sessionsRoot = path.resolve(dshHome, 'sessions');
   if (!fs.existsSync(sessionsRoot)) return null;
+  let realRoot;
   try {
+    realRoot = fs.realpathSync(sessionsRoot);
+  } catch {
+    return null;
+  }
+
+  const encodedSeg = encodeDshSegment(sessionId);
+  const candidateSegs = [encodedSeg];
+  if (
+    !/[\\/\0]/.test(sessionId) &&
+    sessionId !== '.' &&
+    sessionId !== '..' &&
+    !sessionId.includes('..') &&
+    !candidateSegs.includes(sessionId)
+  ) {
+    candidateSegs.push(sessionId);
+  }
+
+  const tryReadFromParent = parentDir => {
+    for (const seg of candidateSegs) {
+      for (const filename of ['session.v4.jsonl.zstd', 'session.v4.jsonl']) {
+        const cand = path.resolve(parentDir, seg, filename);
+        if (!cand.startsWith(sessionsRoot + path.sep)) continue;
+        if (!fs.existsSync(cand)) continue;
+        let realCand;
+        try {
+          realCand = fs.realpathSync(cand);
+        } catch {
+          continue;
+        }
+        if (!realCand.startsWith(realRoot + path.sep)) continue;
+        let stat;
+        try {
+          stat = fs.statSync(realCand);
+        } catch {
+          continue;
+        }
+        if (!stat.isFile()) continue;
+        if (filename.endsWith('.zstd')) {
+          const decoded = readSessionFile(realCand);
+          return decoded.rows ?? [];
+        }
+        return parseJsonl(fs.readFileSync(realCand, 'utf8'));
+      }
+    }
+    return null;
+  };
+
+  try {
+    const directRows = tryReadFromParent(sessionsRoot);
+    if (directRows !== null) return directRows;
     for (const slugDir of fs.readdirSync(sessionsRoot, { withFileTypes: true })) {
       if (!slugDir.isDirectory()) continue;
-      const cand = path.join(sessionsRoot, slugDir.name, sessionId, 'session.v4.jsonl.zstd');
-      if (fs.existsSync(cand)) {
-        const decoded = readSessionFile(cand);
-        return decoded.rows ?? [];
-      }
+      const slugPath = path.resolve(sessionsRoot, slugDir.name);
+      if (!slugPath.startsWith(sessionsRoot + path.sep)) continue;
+      const found = tryReadFromParent(slugPath);
+      if (found !== null) return found;
     }
   } catch {}
   return null;
+}
+
+export async function collectCombinedDiscoveredModels(ctx, rt, gwMgr = null) {
+  const dshCatalog = await refreshUpstreamCatalog(ctx, rt, { force: false }).catch(() => null);
+  const effectiveGwMgr = gwMgr ?? (rt?.storageRoot ? getOrCreateGatewayManager(rt.storageRoot) : null);
+  let gwStatus = null;
+  let gwModels = [];
+  if (effectiveGwMgr) {
+    gwStatus = await effectiveGwMgr.getStatus().catch(() => null);
+    if (gwStatus?.state === 'running') {
+      gwModels = await effectiveGwMgr.createClient().listGatewayModels().catch(() => []);
+    }
+  }
+  const magpieEntries = gwModels.length > 0
+    ? buildPublicModelCatalog({
+      magpieGatewayModels: gwModels,
+      effectiveConfig: rt?.config,
+      dshDiscoveredModels: [],
+    }).filter(e => e.sourceKind === 'magpie')
+    : [];
+  const magpieDiscovered = buildModelUpsertsFromCatalogEntries(magpieEntries, {
+    defaultMagpieHostProvider: rt?.config?.magpie?.provider ?? 'magpie',
+    enableInExecutionPool: false,
+  });
+
+  const mergedByRoute = new Map();
+  for (const dm of dshCatalog?.models ?? []) {
+    if (dm?.route) mergedByRoute.set(dm.route, dm);
+  }
+  for (const mm of magpieDiscovered) {
+    if (!mm?.route) continue;
+    const prev = mergedByRoute.get(mm.route);
+    if (prev) {
+      mergedByRoute.set(mm.route, {
+        ...prev,
+        ...(mm.reasoningEfforts ? { reasoningEfforts: mm.reasoningEfforts } : {}),
+        contextWindow: prev.contextWindow ?? mm.contextWindow ?? null,
+        maxTokens: prev.maxTokens ?? mm.maxTokens ?? null,
+      });
+    } else {
+      mergedByRoute.set(mm.route, mm);
+    }
+  }
+  return {
+    dshCatalog,
+    gwStatus,
+    gwModels,
+    discoveredModels: [...mergedByRoute.values()],
+  };
+}
+
+export async function syncActiveModelsToDshHost(ctx, rt, effective, discoveredModels = [], gwStatus = null, extraUpserts = []) {
+  if (!ctx) return { synced: false, reason: 'no-host-context', updatedProviders: [] };
+  const magpieProv = rt?.config?.magpie?.provider ?? 'magpie';
+  const templates = buildSoloProviderSettingsTemplates(process.env);
+  const rawGwUrl = gwStatus?.gatewayUrl ?? (rt?.storageRoot ? getOrCreateGatewayManager(rt.storageRoot).getActiveEndpoints()?.gatewayUrl : null);
+  if (rawGwUrl) {
+    templates[magpieProv] = {
+      displayName: 'Magpie Gateway',
+      api: 'openai-completions',
+      baseURL: `${rawGwUrl.replace(/\/+$/, '')}/v1`,
+    };
+  }
+  const discByRoute = new Map((discoveredModels ?? []).filter(m => m?.route).map(m => [m.route, m]));
+  const activeRoutes = new Set([
+    ...(effective?.executionPool ?? []),
+    ...Object.values(effective?.roles ?? {}).flatMap(r => [
+      r?.route,
+      ...(Array.isArray(r?.fallback) ? r.fallback.map(f => f?.route) : []),
+    ]).filter(Boolean),
+  ]);
+  const byRouteToSync = new Map();
+  for (const u of extraUpserts ?? []) {
+    if (u?.route) byRouteToSync.set(u.route, u);
+  }
+  for (const route of activeRoutes) {
+    if (byRouteToSync.has(route)) continue;
+    const spec = effective?.models?.[route];
+    if (!spec) continue;
+    const dm = discByRoute.get(route);
+    byRouteToSync.set(route, {
+      route,
+      provider: spec.provider ?? magpieProv,
+      upstreamModel: spec.upstreamModel ?? route,
+      efforts: spec.efforts,
+      ...(spec.reasoningEfforts ? { reasoningEfforts: spec.reasoningEfforts } : (dm?.reasoningEfforts ? { reasoningEfforts: dm.reasoningEfforts } : {})),
+      vision: spec.vision ?? dm?.vision,
+      contextWindow: spec.contextWindow ?? dm?.upstreamContextWindow ?? dm?.contextWindow,
+      maxTokens: spec.maxTokens ?? dm?.upstreamMaxTokens ?? dm?.maxTokens ?? dm?.defaultMaxTokens,
+    });
+  }
+  return syncUpstreamModelsToDshSettings(
+    ctx,
+    [...byRouteToSync.values()],
+    magpieProv,
+    { providerTemplates: templates },
+  ).catch(err => ({
+    synced: false,
+    reason: err instanceof Error ? err.message : String(err),
+    updatedProviders: [],
+  }));
+}
+
+function resolveAuthorizedUsageHome(bridge, rawHome) {
+  const serverHome = bridge.resolveDshHome();
+  if (rawHome === undefined || rawHome === null || String(rawHome).trim() === '') {
+    return serverHome;
+  }
+  const requested = path.resolve(String(rawHome).trim());
+  const allowed = new Set([
+    path.resolve(serverHome),
+    ...listKnownHomes(serverHome).map(h => path.resolve(h)),
+  ]);
+  for (const h of [...allowed]) {
+    try { allowed.add(fs.realpathSync(h)); } catch {}
+  }
+  let requestedReal = requested;
+  try { requestedReal = fs.realpathSync(requested); } catch {}
+  if (!allowed.has(requested) && !allowed.has(requestedReal)) {
+    throw httpContractError('FORBIDDEN_HOME', 'Reading arbitrary host directory via body.home is forbidden', 403);
+  }
+  return requested;
 }
 
 export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) {
@@ -683,17 +952,19 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
   };
 
   return {
-    async capabilities() {
+    async capabilities(request) {
       try {
+        if (request) await parseJsonRequest(request);
         ensureConfigLoaded();
         return okEnvelope(buildCapabilitiesPayload(ctx, rt, { hostKindOverride: options.hostKindOverride }));
       } catch (e) {
-        return errEnvelope('CAPABILITIES_ERROR', e instanceof Error ? e.message : String(e));
+        return errFromException('CAPABILITIES_ERROR', e);
       }
     },
 
-    async bundle() {
+    async bundle(request) {
       try {
+        if (request) await parseJsonRequest(request);
         ensureConfigLoaded();
         const storageRoot = getStorageRoot();
         const gwMgr = getGatewayMgr();
@@ -708,17 +979,20 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
           : [null, [], []];
 
         const dshCatalog = await refreshUpstreamCatalog(ctx, rt, { force: false }).catch(() => null);
+        const dshModels = dshCatalog?.models ?? [];
         const { providers, presets } = buildPublicProviders({
           magpieProvidersPayload: provPayload,
           magpieAccounts: gwAccounts,
           magpieGatewayUrl: gateway.gatewayUrl,
           effectiveConfig: rt.config,
           externalGateways: gwMgr.listExternalGateways(),
+          magpieGatewayModels: gwModels,
+          dshDiscoveredModels: dshModels,
         });
         const models = buildPublicModelCatalog({
           magpieGatewayModels: gwModels,
           effectiveConfig: rt.config,
-          dshDiscoveredModels: dshCatalog?.models ?? [],
+          dshDiscoveredModels: dshModels,
         });
         const runtimeSnap = await buildRuntimeSnapshotPayload(ctx, rt);
         const uiPreferences = readUiPreferences(storageRoot);
@@ -735,16 +1009,17 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
           usageStatus,
         });
       } catch (e) {
-        return errEnvelope('BUNDLE_FAILED', e instanceof Error ? e.message : String(e));
+        return errFromException('BUNDLE_FAILED', e);
       }
     },
 
-    async gatewayStatus() {
+    async gatewayStatus(request) {
       try {
+        if (request) await parseJsonRequest(request);
         const status = await getGatewayMgr().getStatus();
         return okEnvelope(status);
       } catch (e) {
-        return errEnvelope('GATEWAY_STATUS_FAILED', e instanceof Error ? e.message : String(e));
+        return errFromException('GATEWAY_STATUS_FAILED', e);
       }
     },
 
@@ -795,32 +1070,41 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
         }
         return okEnvelope({ status: await mgr.getStatus() });
       } catch (e) {
-        return errEnvelope('GATEWAY_CONTROL_FAILED', e instanceof Error ? e.message : String(e));
+        return errFromException('GATEWAY_CONTROL_FAILED', e);
       }
     },
 
-    async providersList() {
+    async providersList(request) {
       try {
+        if (request) await parseJsonRequest(request);
         ensureConfigLoaded();
         const mgr = getGatewayMgr();
         const gwStatus = await mgr.getStatus();
         const client = mgr.createClient();
-        const provPayload = gwStatus.state === 'running' && client.hasWebAdminAuth()
-          ? await client.listProviders().catch(() => null)
-          : null;
-        const accounts = gwStatus.state === 'running' && !provPayload
-          ? await client.listGatewayAccounts().catch(() => [])
-          : [];
+        const [provPayload, gwModels, accounts, dshCatalog] = await Promise.all([
+          gwStatus.state === 'running' && client.hasWebAdminAuth()
+            ? client.listProviders().catch(() => null)
+            : Promise.resolve(null),
+          gwStatus.state === 'running'
+            ? client.listGatewayModels().catch(() => [])
+            : Promise.resolve([]),
+          gwStatus.state === 'running'
+            ? client.listGatewayAccounts().catch(() => [])
+            : Promise.resolve([]),
+          refreshUpstreamCatalog(ctx, rt, { force: false }).catch(() => null),
+        ]);
         const res = buildPublicProviders({
           magpieProvidersPayload: provPayload,
-          magpieAccounts: accounts,
+          magpieAccounts: provPayload ? [] : accounts,
           magpieGatewayUrl: gwStatus.gatewayUrl,
           effectiveConfig: rt.config,
           externalGateways: mgr.listExternalGateways(),
+          magpieGatewayModels: gwModels,
+          dshDiscoveredModels: dshCatalog?.models ?? [],
         });
         return okEnvelope(res);
       } catch (e) {
-        return errEnvelope('PROVIDERS_LIST_FAILED', e instanceof Error ? e.message : String(e));
+        return errFromException('PROVIDERS_LIST_FAILED', e);
       }
     },
 
@@ -871,20 +1155,33 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
           operationResult = await client.getSignInStatus(body.signInId);
         } else if (op === 'oauth-callback') {
           operationResult = await client.submitSignInCallback(body.signInId, body.callbackUrl);
+        } else if (op === 'oauth-cancel') {
+          operationResult = await client.cancelSignIn(body.signInId);
+        } else if (op === 'mutate-login') {
+          operationResult = await client.mutateLogin(body.loginAction, {
+            id: String(body.providerId || body.id || '').replace(/^magpie:/, ''),
+            user: body.user,
+            ...(body.login ? { login: body.login } : {}),
+          });
         } else {
           return errEnvelope('BAD_OPERATION', `Unknown provider operation: ${op}`);
         }
 
-        const provPayload = client.hasWebAdminAuth() ? await client.listProviders().catch(() => null) : null;
+        const [provPayload, gwModels] = await Promise.all([
+          client.hasWebAdminAuth() ? client.listProviders().catch(() => null) : Promise.resolve(null),
+          client.listGatewayModels().catch(() => []),
+        ]);
         const normalized = buildPublicProviders({
           magpieProvidersPayload: provPayload,
           magpieGatewayUrl: mgr.getActiveEndpoints().gatewayUrl,
           effectiveConfig: rt.config,
           externalGateways: mgr.listExternalGateways(),
+          magpieGatewayModels: gwModels,
+          dshDiscoveredModels: rt.upstreamCatalog?.models ?? [],
         });
         return okEnvelope({ operationResult, ...normalized });
       } catch (e) {
-        return errEnvelope(e?.code || 'PROVIDERS_MUTATE_FAILED', e instanceof Error ? e.message : String(e));
+        return errFromException('PROVIDERS_MUTATE_FAILED', e);
       }
     },
 
@@ -908,7 +1205,7 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
         });
         return okEnvelope({ models });
       } catch (e) {
-        return errEnvelope('MODELS_CATALOG_FAILED', e instanceof Error ? e.message : String(e));
+        return errFromException('MODELS_CATALOG_FAILED', e);
       }
     },
 
@@ -917,11 +1214,7 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
         ensureConfigLoaded();
         const body = await parseJsonRequest(request);
         const mgr = getGatewayMgr();
-        const gwStatus = await mgr.getStatus();
-        const gwModels = gwStatus.state === 'running'
-          ? await mgr.createClient().listGatewayModels().catch(() => [])
-          : [];
-        const dshCatalog = await refreshUpstreamCatalog(ctx, rt, { force: false }).catch(() => null);
+        const { dshCatalog, gwStatus, gwModels, discoveredModels } = await collectCombinedDiscoveredModels(ctx, rt, mgr);
         const fullCatalog = buildPublicModelCatalog({
           magpieGatewayModels: gwModels,
           effectiveConfig: rt.config,
@@ -943,29 +1236,26 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
         const target = body.target === 'base' ? 'base' : 'local';
         const applyResult = applyModelConfigChanges(
           { upsertModels: upserts },
-          { configFile: rt.configPath, target, discoveredModels: dshCatalog?.models ?? [] },
+          { configFile: rt.configPath, target, discoveredModels },
         );
         syncRuntimeConfig(rt);
 
-        // Also sync newly imported routes into live DSH settings if running inside DSH host
-        let dshSettingsSync = { synced: false };
-        if (ctx) {
-          const gwBaseUrl = gwStatus.gatewayUrl ? `${gwStatus.gatewayUrl.replace(/\/+$/, '')}/v1` : undefined;
-          const templates = buildSoloProviderSettingsTemplates(process.env);
-          const magpieProv = rt.config.magpie?.provider ?? 'magpie';
-          if (gwBaseUrl) {
-            templates[magpieProv] = {
-              displayName: 'Magpie Gateway',
-              api: 'openai-completions',
-              baseURL: gwBaseUrl,
-            };
-          }
-          dshSettingsSync = await syncUpstreamModelsToDshSettings(
-            ctx,
-            upserts,
-            magpieProv,
-            { providerTemplates: templates },
-          ).catch(err => ({ synced: false, error: err.message }));
+        const dshSettingsSync = await syncActiveModelsToDshHost(
+          ctx,
+          rt,
+          applyResult.effective,
+          discoveredModels,
+          gwStatus,
+          upserts,
+        );
+        const warnings = [...(applyResult.warnings ?? [])];
+        if (
+          ctx &&
+          !dshSettingsSync.synced &&
+          dshSettingsSync.reason &&
+          !['settings-service-unavailable', 'no-host-context'].includes(dshSettingsSync.reason)
+        ) {
+          warnings.push(`DSH settings live-sync warning: ${dshSettingsSync.reason}`);
         }
 
         const updatedModels = buildPublicModelCatalog({
@@ -976,20 +1266,23 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
         return okEnvelope({
           syncedCount: upserts.length,
           dshSettingsSync,
+          shadowedByLocal: applyResult.shadowedByLocal ?? [],
+          warnings,
           models: updatedModels,
           runtime: await buildRuntimeSnapshotPayload(ctx, rt),
         });
       } catch (e) {
-        return errEnvelope(e?.code || 'MODELS_SYNC_FAILED', e instanceof Error ? e.message : String(e));
+        return errFromException('MODELS_SYNC_FAILED', e);
       }
     },
 
-    async runtimeSnapshot() {
+    async runtimeSnapshot(request) {
       try {
+        if (request) await parseJsonRequest(request);
         ensureConfigLoaded();
         return okEnvelope(await buildRuntimeSnapshotPayload(ctx, rt));
       } catch (e) {
-        return errEnvelope('RUNTIME_SNAPSHOT_FAILED', e instanceof Error ? e.message : String(e));
+        return errFromException('RUNTIME_SNAPSHOT_FAILED', e);
       }
     },
 
@@ -999,57 +1292,55 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
         const body = await parseJsonRequest(request);
         const target = body.target === 'base' ? 'base' : 'local';
         const changes = isPlainObj(body.changes) ? body.changes : {};
-        const dshCatalog = await refreshUpstreamCatalog(ctx, rt, { force: false }).catch(() => null);
+        const mgr = getGatewayMgr();
+        const { gwStatus, discoveredModels } = await collectCombinedDiscoveredModels(ctx, rt, mgr);
         const applyResult = applyModelConfigChanges(changes, {
           configFile: rt.configPath,
           target,
           dryRun: Boolean(body.dryRun),
-          discoveredModels: dshCatalog?.models ?? [],
+          discoveredModels,
         });
+        let dshSettingsSync = { synced: false, reason: body.dryRun ? 'dry-run' : 'no-host-context', updatedProviders: [] };
+        const warnings = [...(applyResult.warnings ?? [])];
         if (!body.dryRun) {
           syncRuntimeConfig(rt);
           if (ctx) {
-            const activeRoutes = new Set([
-              ...(applyResult.effective?.executionPool ?? []),
-              ...Object.values(applyResult.effective?.roles ?? {}).flatMap(r => [r?.route, ...(r?.fallback ?? []).map(f => f.route)]).filter(Boolean),
-            ]);
-            const toSync = [...activeRoutes]
-              .map(route => {
-                const spec = applyResult.effective?.models?.[route];
-                if (!spec) return null;
-                return {
-                  route,
-                  provider: spec.provider ?? rt.config.magpie?.provider ?? 'magpie',
-                  upstreamModel: spec.upstreamModel ?? route,
-                  efforts: spec.efforts,
-                  reasoningEfforts: spec.reasoningEfforts,
-                  vision: spec.vision,
-                  contextWindow: spec.contextWindow,
-                  maxTokens: spec.maxTokens,
-                };
-              })
-              .filter(Boolean);
-            await syncUpstreamModelsToDshSettings(
+            dshSettingsSync = await syncActiveModelsToDshHost(
               ctx,
-              toSync,
-              rt.config.magpie?.provider ?? 'magpie',
-              { providerTemplates: buildSoloProviderSettingsTemplates(process.env) },
-            ).catch(() => {});
+              rt,
+              applyResult.effective,
+              discoveredModels,
+              gwStatus,
+            );
+            if (
+              !dshSettingsSync.synced &&
+              dshSettingsSync.reason &&
+              !['settings-service-unavailable', 'no-host-context'].includes(dshSettingsSync.reason)
+            ) {
+              warnings.push(`DSH settings live-sync warning: ${dshSettingsSync.reason}`);
+            }
           }
         }
         return okEnvelope({
-          applyResult,
+          applyResult: {
+            ...applyResult,
+            warnings,
+          },
+          dshSettingsSync,
+          shadowedByLocal: applyResult.shadowedByLocal ?? [],
+          warnings,
           runtime: await buildRuntimeSnapshotPayload(ctx, rt),
         });
       } catch (e) {
-        return errEnvelope(e?.code || 'RUNTIME_CONFIGURE_FAILED', e instanceof Error ? e.message : String(e));
+        return errFromException('RUNTIME_CONFIGURE_FAILED', e);
       }
     },
 
     /* ==================== Live Workbench / DSH Shared Session RPCs ==================== */
 
-    async workbenchSessions() {
+    async workbenchSessions(request) {
       try {
+        if (request) await parseJsonRequest(request);
         ensureConfigLoaded();
         const sessionController = getHostService(ctx, 'sessionController');
         const workspaceRegistry = getHostService(ctx, 'workspaceRegistry');
@@ -1060,24 +1351,50 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
           sessionIds: [...(w.sessionIds ?? [])].map(String),
         })) ?? [];
 
+        const rawArchived = typeof workspaceRegistry?.archivedSessionIds === 'function'
+          ? workspaceRegistry.archivedSessionIds()
+          : workspaceRegistry?.archivedSessionIds;
+        const archivedSet = new Set(
+          rawArchived && typeof rawArchived[Symbol.iterator] === 'function'
+            ? [...rawArchived].map(String)
+            : [],
+        );
+
         if (sessionController && typeof sessionController.list === 'function') {
           const ac = new AbortController();
           const listed = await sessionController.list({}, ac.signal);
-          const sessions = (listed?.items ?? []).map(item => ({
-            sessionId: String(item.sessionId ?? item.id),
-            title: item.title ?? null,
-            cwd: item.cwd ?? null,
-            agentPreset: item.agentPreset ?? null,
-            updatedAt: item.updatedAt ?? item.lastActivityAt ?? null,
-            isTeam: TeamStore.exists(rt.storageRoot, String(item.sessionId ?? item.id)),
-          }));
+          const workbenchCreatedSet = rt?.workbenchCreatedSessionIds instanceof Set
+            ? rt.workbenchCreatedSessionIds
+            : null;
+          const sessions = (listed?.items ?? [])
+            .filter(item => {
+              if (!item) return false;
+              const sid = String(item.sessionId ?? item.id ?? '');
+              if (!sid) return false;
+              if (item.origin === 'subagent') return false;
+              if (Boolean(item.parentSessionId)) return false;
+              if (item.blank === true && !workbenchCreatedSet?.has(sid)) return false;
+              if (archivedSet.has(sid)) return false;
+              return true;
+            })
+            .map(item => {
+              const sid = String(item.sessionId ?? item.id);
+              return {
+                sessionId: sid,
+                title: item.projections?.values?.title ?? item.title ?? null,
+                cwd: item.cwd ?? null,
+                agentPreset: item.projections?.values?.agentPreset ?? item.agentPreset ?? null,
+                updatedAt: item.updatedAt ?? item.lastActivityAt ?? null,
+                isTeam: TeamStore.exists(rt.storageRoot, sid),
+              };
+            });
           return okEnvelope({ liveHost: true, workspaces, sessions });
         }
 
         // Standalone fallback: list durable root sessions via Hengzhang
         const usageSessions = await getUsageBridge().getSessions();
         const sessions = (usageSessions.sessions ?? [])
-          .filter(s => !s.isChild)
+          .filter(s => !s.isChild && !archivedSet.has(String(s.id)))
           .map(s => ({
             sessionId: s.id,
             title: s.title ?? null,
@@ -1088,7 +1405,7 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
           }));
         return okEnvelope({ liveHost: false, workspaces, sessions });
       } catch (e) {
-        return errEnvelope('WORKBENCH_SESSIONS_FAILED', e instanceof Error ? e.message : String(e));
+        return errFromException('WORKBENCH_SESSIONS_FAILED', e);
       }
     },
 
@@ -1100,13 +1417,35 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
         if (!sessionId) return errEnvelope('BAD_REQUEST', 'sessionId is required');
 
         const dshHome = resolveDshHomeFromCtx(ctx, rt);
+        const sessionController = getHostService(ctx, 'sessionController');
+        const sessionsRegistry = getHostService(ctx, 'sessions');
+
         let rows = rt?.actors?.get?.(sessionId)?.agent?.session?.snapshotEvents?.() ?? null;
+        if (!rows || rows.length === 0) {
+          const liveSess = sessionsRegistry?.get?.(sessionId);
+          rows = liveSess?.snapshotEvents?.() ?? liveSess?.session?.snapshotEvents?.() ?? null;
+        }
+        if ((!rows || rows.length === 0) && sessionController && typeof sessionController.events === 'function') {
+          const ac = new AbortController();
+          try {
+            let evRes;
+            try {
+              evRes = await sessionController.events({ address: { kind: 'session', sessionId } }, ac.signal);
+            } catch {
+              evRes = await sessionController.events({ sessionId }, ac.signal);
+            }
+            if (Array.isArray(evRes)) rows = evRes;
+            else if (Array.isArray(evRes?.events)) rows = evRes.events;
+            else if (Array.isArray(evRes?.items)) rows = evRes.items;
+          } catch {} finally {
+            ac.abort();
+          }
+        }
         if (!rows || rows.length === 0) {
           rows = findDurableSessionRows(dshHome, sessionId) ?? [];
         }
 
         let passiveState = null;
-        const sessionController = getHostService(ctx, 'sessionController');
         if (sessionController && typeof sessionController.state === 'function') {
           try {
             const ac = new AbortController();
@@ -1120,34 +1459,45 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
           messages: extractReadableMessagesFromRows(rows),
         });
       } catch (e) {
-        return errEnvelope('WORKBENCH_TRANSCRIPT_FAILED', e instanceof Error ? e.message : String(e));
+        return errFromException('WORKBENCH_TRANSCRIPT_FAILED', e);
       }
     },
 
     async workbenchCreate(request) {
       try {
+        const body = await parseJsonRequest(request);
         const sessionController = getHostService(ctx, 'sessionController');
         if (!sessionController || typeof sessionController.create !== 'function') {
           return errEnvelope('HOST_UNAVAILABLE', 'Live DSH session controller is only available inside DSH web/desktop runtime');
         }
-        const body = await parseJsonRequest(request);
         const created = await sessionController.create({
           ...(body.workspaceId ? { workspaceId: body.workspaceId } : { cwd: body.cwd || process.cwd() }),
           agentPreset: body.agentPreset || 'leaderteam',
         });
+        const createdSid = String(created?.sessionId ?? created?.id ?? '').trim();
+        if (createdSid && rt && typeof rt === 'object') {
+          if (!(rt.workbenchCreatedSessionIds instanceof Set)) {
+            rt.workbenchCreatedSessionIds = new Set();
+          }
+          if (rt.workbenchCreatedSessionIds.size >= 256) {
+            const oldest = rt.workbenchCreatedSessionIds.values().next().value;
+            if (oldest !== undefined) rt.workbenchCreatedSessionIds.delete(oldest);
+          }
+          rt.workbenchCreatedSessionIds.add(createdSid);
+        }
         return okEnvelope(created);
       } catch (e) {
-        return errEnvelope('WORKBENCH_CREATE_FAILED', e instanceof Error ? e.message : String(e));
+        return errFromException('WORKBENCH_CREATE_FAILED', e);
       }
     },
 
     async workbenchPrompt(request) {
       try {
+        const body = await parseJsonRequest(request);
         const sessionController = getHostService(ctx, 'sessionController');
         if (!sessionController || typeof sessionController.prompt !== 'function') {
           return errEnvelope('HOST_UNAVAILABLE', 'Live DSH session controller is not attached');
         }
-        const body = await parseJsonRequest(request);
         const sessionId = String(body.sessionId || '').trim();
         const text = String(body.text || '').trim();
         if (!sessionId || !text) {
@@ -1165,23 +1515,23 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
         );
         return okEnvelope(res);
       } catch (e) {
-        return errEnvelope('WORKBENCH_PROMPT_FAILED', e instanceof Error ? e.message : String(e));
+        return errFromException('WORKBENCH_PROMPT_FAILED', e);
       }
     },
 
     async workbenchCancel(request) {
       try {
+        const body = await parseJsonRequest(request);
         const sessionController = getHostService(ctx, 'sessionController');
         if (!sessionController || typeof sessionController.cancel !== 'function') {
           return errEnvelope('HOST_UNAVAILABLE', 'Live DSH session controller is not attached');
         }
-        const body = await parseJsonRequest(request);
         const sessionId = String(body.sessionId || '').trim();
         if (!sessionId) return errEnvelope('BAD_REQUEST', 'sessionId is required');
         const res = await sessionController.cancel({ sessionId });
         return okEnvelope(res);
       } catch (e) {
-        return errEnvelope('WORKBENCH_CANCEL_FAILED', e instanceof Error ? e.message : String(e));
+        return errFromException('WORKBENCH_CANCEL_FAILED', e);
       }
     },
 
@@ -1206,7 +1556,7 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
           plans: archive.listPlans({ limit: Number(body.limit) || 40 }),
         });
       } catch (e) {
-        return errEnvelope('ARCHIVE_QUERY_FAILED', e instanceof Error ? e.message : String(e));
+        return errFromException('ARCHIVE_QUERY_FAILED', e);
       }
     },
 
@@ -1214,6 +1564,9 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
       try {
         ensureConfigLoaded();
         const body = await parseJsonRequest(request);
+        if (rt.config.planArchive?.enabled === false) {
+          return errEnvelope('PLAN_ARCHIVE_DISABLED', 'external plan archive is disabled');
+        }
         const root = resolvePlanArchiveRoot({ config: rt.config, storageRoot: rt.storageRoot, workspaceRoot: null });
         const archive = new PlanArchiveStore(root);
         if (body.action === 'retrospect') {
@@ -1229,60 +1582,86 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
           return okEnvelope({ retrospective, plan: archive.getPlan(planBefore.planId) });
         }
         if (body.action === 'clean') {
+          const dryRun = body.dryRun !== false;
+          if (!dryRun && body.confirm !== true) {
+            return errEnvelope('CONFIRMATION_REQUIRED', 'Destructive plan archive cleanup (dryRun=false) requires confirm=true');
+          }
+          if (body.olderThanDays !== undefined && body.olderThanDays !== null) {
+            if (typeof body.olderThanDays !== 'number' || !Number.isFinite(body.olderThanDays) || body.olderThanDays < 0) {
+              return errEnvelope('BAD_REQUEST', 'olderThanDays must be a non-negative finite number');
+            }
+          }
           const res = archive.cleanPlans({
             olderThanDays: typeof body.olderThanDays === 'number' ? body.olderThanDays : null,
             all: Boolean(body.all),
-            dryRun: body.dryRun !== false,
-            confirm: Boolean(body.confirm),
+            dryRun,
+            confirm: body.confirm === true,
           });
           return okEnvelope({ ...res, stats: archive.getStats() });
         }
         return errEnvelope('BAD_ACTION', `Unsupported archive action: ${body.action}`);
       } catch (e) {
-        return errEnvelope('ARCHIVE_ACTION_FAILED', e instanceof Error ? e.message : String(e));
+        return errFromException('ARCHIVE_ACTION_FAILED', e);
       }
     },
 
     /* ==================== Hengzhang Usage Analytics ==================== */
 
     async usageStatus(request) {
-      const body = await parseJsonRequest(request);
-      return okEnvelope(await getUsageBridge().getStatus({ home: body.home }));
+      try {
+        ensureConfigLoaded();
+        const body = await parseJsonRequest(request);
+        const bridge = getUsageBridge();
+        const safeHome = resolveAuthorizedUsageHome(bridge, body.home);
+        return okEnvelope(await bridge.getStatus({ home: safeHome }));
+      } catch (e) {
+        return errFromException('USAGE_STATUS_FAILED', e);
+      }
     },
 
     async usageOverview(request) {
       try {
+        ensureConfigLoaded();
         const body = await parseJsonRequest(request);
-        return okEnvelope(await getUsageBridge().getOverview({ home: body.home, syncGateway: body.syncGateway !== false }));
+        const bridge = getUsageBridge();
+        const safeHome = resolveAuthorizedUsageHome(bridge, body.home);
+        return okEnvelope(await bridge.getOverview({ home: safeHome, syncGateway: body.syncGateway !== false }));
       } catch (e) {
-        return errEnvelope('USAGE_OVERVIEW_FAILED', e instanceof Error ? e.message : String(e));
+        return errFromException('USAGE_OVERVIEW_FAILED', e);
       }
     },
 
     async usageSessions(request) {
       try {
+        ensureConfigLoaded();
         const body = await parseJsonRequest(request);
-        return okEnvelope(await getUsageBridge().getSessions({ home: body.home, syncGateway: Boolean(body.syncGateway) }));
+        const bridge = getUsageBridge();
+        const safeHome = resolveAuthorizedUsageHome(bridge, body.home);
+        return okEnvelope(await bridge.getSessions({ home: safeHome, syncGateway: Boolean(body.syncGateway) }));
       } catch (e) {
-        return errEnvelope('USAGE_SESSIONS_FAILED', e instanceof Error ? e.message : String(e));
+        return errFromException('USAGE_SESSIONS_FAILED', e);
       }
     },
 
     async usageReport(request) {
       try {
+        ensureConfigLoaded();
         const body = await parseJsonRequest(request);
-        return okEnvelope(await getUsageBridge().getSessionReport({
+        const bridge = getUsageBridge();
+        const safeHome = resolveAuthorizedUsageHome(bridge, body.home);
+        return okEnvelope(await bridge.getSessionReport({
           sessionId: body.sessionId,
-          home: body.home,
+          home: safeHome,
           syncGateway: body.syncGateway !== false,
         }));
       } catch (e) {
-        return errEnvelope('USAGE_REPORT_FAILED', e instanceof Error ? e.message : String(e));
+        return errFromException('USAGE_REPORT_FAILED', e);
       }
     },
 
     async usagePricing(request) {
       try {
+        ensureConfigLoaded();
         const body = await parseJsonRequest(request);
         const bridge = getUsageBridge();
         if (body.action === 'reset') {
@@ -1293,12 +1672,13 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
         }
         return okEnvelope({ pricing: bridge.getPricing() });
       } catch (e) {
-        return errEnvelope('USAGE_PRICING_FAILED', e instanceof Error ? e.message : String(e));
+        return errFromException('USAGE_PRICING_FAILED', e);
       }
     },
 
     async usageToggle(request) {
       try {
+        ensureConfigLoaded();
         const body = await parseJsonRequest(request);
         const enabled = Boolean(body.enabled);
         const storageRoot = getStorageRoot();
@@ -1307,7 +1687,7 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
         bridge.setEnabled(enabled);
         return okEnvelope(await bridge.getStatus());
       } catch (e) {
-        return errEnvelope('USAGE_TOGGLE_FAILED', e instanceof Error ? e.message : String(e));
+        return errFromException('USAGE_TOGGLE_FAILED', e);
       }
     },
 
@@ -1326,7 +1706,7 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
         }
         return okEnvelope(readUiPreferences(storageRoot));
       } catch (e) {
-        return errEnvelope('UI_PREFS_FAILED', e instanceof Error ? e.message : String(e));
+        return errFromException('UI_PREFS_FAILED', e);
       }
     },
   };
@@ -1355,7 +1735,7 @@ export async function serveLtWebStaticRequest(request, { distDir = resolveLtWebD
   const url = new URL(request.url, 'http://127.0.0.1');
   const pathname = url.pathname;
 
-  // Redirect `/lt` -> `/lt/` so relative `./assets/...` and `../api/lt/v1/...` always resolve identically
+  // Redirect `/lt` -> `/lt/` so relative `./assets/...` and `/api/lt/v1/...` always resolve identically
   if (mountPrefix && pathname === mountPrefix) {
     return new Response(null, {
       status: 302,
@@ -1363,27 +1743,65 @@ export async function serveLtWebStaticRequest(request, { distDir = resolveLtWebD
     });
   }
 
-  let relPath = mountPrefix && pathname.startsWith(`${mountPrefix}/`)
+  const rawRelPath = mountPrefix && pathname.startsWith(`${mountPrefix}/`)
     ? pathname.slice(mountPrefix.length + 1)
     : pathname.replace(/^\/+/, '');
-  relPath = decodeURIComponent(relPath);
+  let relPath;
+  try {
+    relPath = decodeURIComponent(rawRelPath);
+  } catch {
+    return new Response('Bad Request', {
+      status: 400,
+      headers: { 'content-type': 'text/plain; charset=utf-8' },
+    });
+  }
+  relPath = relPath.replace(/^\/+/, '');
+  if (relPath.includes('\0')) {
+    return new Response('Bad Request', {
+      status: 400,
+      headers: { 'content-type': 'text/plain; charset=utf-8' },
+    });
+  }
   if (!relPath || relPath === 'index.html') relPath = 'index.html';
 
   const resolvedDist = path.resolve(distDir);
+  let realDist = resolvedDist;
+  try {
+    if (fs.existsSync(resolvedDist)) realDist = fs.realpathSync(resolvedDist);
+  } catch {}
   const target = path.resolve(resolvedDist, relPath);
   if (target !== resolvedDist && !target.startsWith(resolvedDist + path.sep)) {
     return new Response('Forbidden', { status: 403 });
   }
 
-  const isIndex = relPath === 'index.html';
-  let filePath = target;
-  if (!fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {
-    // SPA fallback to index.html for client routes without extensions
-    if (!path.extname(relPath)) {
-      filePath = path.join(resolvedDist, 'index.html');
-    } else {
+  let lstat = null;
+  try {
+    lstat = fs.lstatSync(target);
+  } catch {}
+  if (lstat) {
+    let realTarget;
+    try {
+      realTarget = fs.realpathSync(target);
+    } catch {
       return new Response('Not Found', { status: 404 });
     }
+    if (realTarget !== realDist && !realTarget.startsWith(realDist + path.sep)) {
+      return new Response('Forbidden', { status: 403 });
+    }
+  }
+
+  const isIndex = relPath === 'index.html';
+  let filePath = target;
+  if (!isIndex && (!lstat || fs.statSync(filePath).isDirectory())) {
+    if (!path.extname(relPath)) {
+      // Redirect nested SPA subpaths (`/lt/<subpath>` -> `/lt/`) so relative `./assets/*` and API prefixes never break
+      const rootDest = mountPrefix ? `${mountPrefix}/${url.search}` : `/${url.search}`;
+      return new Response(null, {
+        status: 302,
+        headers: { location: rootDest },
+      });
+    }
+    return new Response('Not Found', { status: 404 });
   }
 
   if (filePath.endsWith('index.html') || isIndex) {
@@ -1394,7 +1812,16 @@ export async function serveLtWebStaticRequest(request, { distDir = resolveLtWebD
     if (!fs.existsSync(filePath)) {
       return new Response('LT Native Frontend dist is not built yet', { status: 503 });
     }
-    const html = await readFile(filePath, 'utf8');
+    let realIndex;
+    try {
+      realIndex = fs.realpathSync(filePath);
+    } catch {
+      return new Response('LT Native Frontend dist is not built yet', { status: 503 });
+    }
+    if (realIndex !== realDist && !realIndex.startsWith(realDist + path.sep)) {
+      return new Response('Forbidden', { status: 403 });
+    }
+    const html = await readFile(realIndex, 'utf8');
     return new Response(request.method === 'HEAD' ? null : html, {
       status: 200,
       headers: {
@@ -1404,12 +1831,16 @@ export async function serveLtWebStaticRequest(request, { distDir = resolveLtWebD
     });
   }
 
-  const bytes = await readFile(filePath);
+  const realFile = fs.realpathSync(filePath);
+  if (realFile !== realDist && !realFile.startsWith(realDist + path.sep)) {
+    return new Response('Forbidden', { status: 403 });
+  }
+  const bytes = await readFile(realFile);
   const etag = `W/"${crypto.createHash('sha1').update(bytes).digest('base64url')}"`;
   if (request.headers.get('if-none-match') === etag) {
     return new Response(null, { status: 304, headers: { etag, 'cache-control': 'no-cache' } });
   }
-  const mime = STATIC_MIME[path.extname(filePath).toLowerCase()] ?? 'application/octet-stream';
+  const mime = STATIC_MIME[path.extname(realFile).toLowerCase()] ?? 'application/octet-stream';
   return new Response(request.method === 'HEAD' ? null : bytes, {
     status: 200,
     headers: {
@@ -1471,13 +1902,34 @@ export function registerLtNativeFrontendStaticRoute(scopeCtx, webServer, connect
   if (!webServer?.register) return;
   const authorizeIndex = request => {
     if (!connection?.authorizeIndex) return undefined;
+    const hostHeader = typeof request.headers?.get === 'function'
+      ? request.headers.get('host')
+      : request.headers?.host;
+    const baseOrigin = hostHeader ? `http://${hostHeader}` : 'http://127.0.0.1';
+    const synthUrl = new URL(request.url || '/', baseOrigin);
+    synthUrl.pathname = '/';
+    const synthRequest = new Request(synthUrl.toString(), {
+      method: request.method || 'GET',
+      headers: request.headers,
+    });
+
     let status = 401;
-    let headers = new Headers();
+    const headers = new Headers();
     let body;
-    return connection.authorizeIndex(request, {
+    return connection.authorizeIndex(synthRequest, {
       writeHead(nextStatus, nextHeaders) {
         status = nextStatus;
-        headers = new Headers(nextHeaders);
+        if (nextHeaders instanceof Headers) {
+          nextHeaders.forEach((v, k) => headers.set(k, v));
+        } else if (nextHeaders && typeof nextHeaders === 'object') {
+          for (const [k, v] of Object.entries(nextHeaders)) {
+            if (Array.isArray(v)) {
+              for (const item of v) headers.append(k, String(item));
+            } else if (v !== undefined) {
+              headers.set(k, String(v));
+            }
+          }
+        }
       },
       end(text) {
         body = text;

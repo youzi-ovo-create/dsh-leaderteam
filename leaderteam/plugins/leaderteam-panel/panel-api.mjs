@@ -7,8 +7,6 @@ import { TeamStore } from '../../core/store.mjs';
 import { computeTimerSnapshot, resolveNowMs } from '../../core/timer.mjs';
 import { resolvePlanArchiveRoot, PlanArchiveStore } from '../../core/plan-archive.mjs';
 import { inspectModelConfiguration, applyModelConfigChanges } from '../../core/model-config-writer.mjs';
-import { buildSoloProviderSettingsTemplates } from '../../core/solo-key.mjs';
-import { syncUpstreamModelsToDshSettings } from '../../core/upstream-models.mjs';
 import { recentTeamObservability } from '../../host/observability.mjs';
 import {
   runtime,
@@ -17,6 +15,7 @@ import {
   isPluginActive,
   refreshUpstreamCatalog,
 } from '../../host/runtime.mjs';
+import { collectCombinedDiscoveredModels, syncActiveModelsToDshHost } from './public-api.mjs';
 
 export const PANEL_ROUTES = Object.freeze({
   STATE: '/api/leaderteam-panel/state',
@@ -45,8 +44,30 @@ function errReply(code, message, status = 200) {
 }
 
 async function parseBody(request) {
+  if (!request || request.method === 'GET' || request.method === 'HEAD') return {};
+  const ct = String(request.headers?.get?.('content-type') || '').toLowerCase();
+  const cl = request.headers?.get?.('content-length');
+  const isJsonCt = ct.includes('application/json');
+  if (!isJsonCt) {
+    if (ct !== '') {
+      const err = new Error('POST requests must use Content-Type: application/json');
+      err.code = 'UNSUPPORTED_MEDIA_TYPE';
+      err.status = 415;
+      throw err;
+    }
+    const rawText = await request.text();
+    if (rawText.length > 0 || cl !== '0') {
+      const err = new Error('POST requests with body must include Content-Type: application/json');
+      err.code = 'UNSUPPORTED_MEDIA_TYPE';
+      err.status = 415;
+      throw err;
+    }
+    return {};
+  }
+  const rawText = await request.text();
+  if (!rawText.trim()) return {};
   try {
-    const raw = await request.json();
+    const raw = JSON.parse(rawText);
     return isPlainObj(raw) ? raw : {};
   } catch {
     return {};
@@ -101,10 +122,13 @@ export async function buildPanelStateSnapshot(ctx, rt = runtime(), { probeEndpoi
   if (!rt?.config || !rt?.configPath) {
     throw new Error('LeaderTeam core runtime is not initialized');
   }
-  const catalog = await refreshUpstreamCatalog(ctx, rt, {
-    force: forceDiscover || probeEndpoints,
-    probeEndpoints,
-  });
+  const { dshCatalog: catalog, discoveredModels } = await collectCombinedDiscoveredModels(ctx, rt);
+  if (probeEndpoints || forceDiscover) {
+    await refreshUpstreamCatalog(ctx, rt, {
+      force: true,
+      probeEndpoints,
+    }).catch(() => null);
+  }
   const configSnapshot = inspectModelConfiguration({
     configFile: rt.configPath,
   });
@@ -127,7 +151,7 @@ export async function buildPanelStateSnapshot(ctx, rt = runtime(), { probeEndpoi
       recentPlans: [],
     };
 
-  // Merge configured models + upstream DSH discovered models into a unified selector catalog
+  // Merge configured models + upstream DSH & live Magpie discovered models into a unified selector catalog
   const byRoute = new Map();
   for (const m of configSnapshot.models) {
     byRoute.set(m.route, {
@@ -136,7 +160,7 @@ export async function buildPanelStateSnapshot(ctx, rt = runtime(), { probeEndpoi
       registeredInDsh: true,
     });
   }
-  for (const dm of catalog?.models ?? []) {
+  for (const dm of discoveredModels ?? catalog?.models ?? []) {
     const existing = byRoute.get(dm.route);
     if (existing) {
       if (existing.contextWindow == null && dm.contextWindow != null) existing.contextWindow = dm.contextWindow;
@@ -150,8 +174,9 @@ export async function buildPanelStateSnapshot(ctx, rt = runtime(), { probeEndpoi
         upstreamModel: dm.upstreamModel,
         family: dm.family,
         label: dm.label,
-        efforts: [...dm.efforts],
-        defaultEffort: dm.defaultEffort,
+        efforts: [...(dm.efforts ?? ['none'])],
+        defaultEffort: dm.defaultEffort ?? dm.efforts?.[0] ?? 'none',
+        ...(dm.reasoningEfforts ? { reasoningEfforts: { ...dm.reasoningEfforts } } : {}),
         contextWindow: dm.contextWindow ?? null,
         maxTokens: dm.maxTokens ?? dm.defaultMaxTokens ?? null,
         strengths: dm.strengths ?? '',
@@ -161,8 +186,8 @@ export async function buildPanelStateSnapshot(ctx, rt = runtime(), { probeEndpoi
         usedByRoles: [],
         overriddenInLocal: false,
         onlyInLocal: false,
-        source: dm.source,
-        registeredInDsh: dm.registeredInDsh,
+        source: dm.source ?? 'magpie',
+        registeredInDsh: Boolean(dm.registeredInDsh),
       });
     }
   }
@@ -191,7 +216,7 @@ export function createPanelHandlers(ctx, rt = runtime()) {
         });
         return okReply(snap);
       } catch (e) {
-        return errReply(e?.code ?? 'PANEL_STATE_FAILED', e instanceof Error ? e.message : String(e));
+        return errReply(e?.code ?? 'PANEL_STATE_FAILED', e instanceof Error ? e.message : String(e), e?.status ?? 200);
       }
     },
 
@@ -205,7 +230,7 @@ export function createPanelHandlers(ctx, rt = runtime()) {
         const snap = await buildPanelStateSnapshot(ctx, rt, { forceDiscover: false });
         return okReply({ catalog, state: snap });
       } catch (e) {
-        return errReply(e?.code ?? 'PANEL_DISCOVER_FAILED', e instanceof Error ? e.message : String(e));
+        return errReply(e?.code ?? 'PANEL_DISCOVER_FAILED', e instanceof Error ? e.message : String(e), e?.status ?? 200);
       }
     },
 
@@ -217,51 +242,48 @@ export function createPanelHandlers(ctx, rt = runtime()) {
           return errReply('PLUGIN_DISABLED', 'leaderteam-panel plugin is disabled');
         }
         syncRuntimeConfig(rt);
-        const catalog = await refreshUpstreamCatalog(ctx, rt, { force: false });
+        const { gwStatus, discoveredModels } = await collectCombinedDiscoveredModels(ctx, rt);
         const target = body.target === 'base' ? 'base' : 'local';
         const changes = isPlainObj(body.changes) ? body.changes : {};
         const applyResult = applyModelConfigChanges(changes, {
           configFile: rt.configPath,
           target,
           dryRun: Boolean(body.dryRun),
-          discoveredModels: catalog?.models ?? [],
+          discoveredModels,
         });
         let dshSettingsSync = { synced: false, reason: 'dry-run' };
+        const warnings = [...(applyResult.warnings ?? [])];
         if (!body.dryRun) {
           syncRuntimeConfig(rt);
-          const activeRoutes = new Set([
-            ...(applyResult.effective?.executionPool ?? []),
-            ...Object.values(applyResult.effective?.roles ?? {}).map(r => r?.route).filter(Boolean),
-          ]);
-          const discByRoute = new Map((catalog?.models ?? []).map(m => [m.route, m]));
-          const toSync = [...activeRoutes]
-            .map(route => {
-              const spec = applyResult.effective?.models?.[route];
-              if (!spec) return null;
-              const dm = discByRoute.get(route);
-              return {
-                route,
-                provider: spec.provider ?? rt.config.magpie?.provider ?? 'magpie',
-                upstreamModel: spec.upstreamModel ?? route,
-                efforts: spec.efforts,
-                vision: spec.vision ?? dm?.vision,
-                contextWindow: spec.contextWindow ?? dm?.upstreamContextWindow ?? dm?.contextWindow,
-                maxTokens: spec.maxTokens ?? dm?.upstreamMaxTokens ?? dm?.maxTokens ?? dm?.defaultMaxTokens,
-              };
-            })
-            .filter(Boolean);
-          dshSettingsSync = await syncUpstreamModelsToDshSettings(
+          dshSettingsSync = await syncActiveModelsToDshHost(
             ctx,
-            toSync,
-            rt.config.magpie?.provider ?? 'magpie',
-            { providerTemplates: buildSoloProviderSettingsTemplates(process.env) },
+            rt,
+            applyResult.effective,
+            discoveredModels,
+            gwStatus,
           );
-          await refreshUpstreamCatalog(ctx, rt, { force: true });
+          if (
+            !dshSettingsSync.synced &&
+            dshSettingsSync.reason &&
+            !['settings-service-unavailable', 'no-host-context'].includes(dshSettingsSync.reason)
+          ) {
+            warnings.push(`DSH settings live-sync warning: ${dshSettingsSync.reason}`);
+          }
+          await refreshUpstreamCatalog(ctx, rt, { force: true }).catch(() => null);
         }
         const state = await buildPanelStateSnapshot(ctx, rt);
-        return okReply({ applyResult, dshSettingsSync, state });
+        return okReply({
+          applyResult: {
+            ...applyResult,
+            warnings,
+          },
+          shadowedByLocal: applyResult.shadowedByLocal ?? [],
+          warnings,
+          dshSettingsSync,
+          state,
+        });
       } catch (e) {
-        return errReply(e?.code ?? 'PANEL_APPLY_FAILED', e instanceof Error ? e.message : String(e));
+        return errReply(e?.code ?? 'PANEL_APPLY_FAILED', e instanceof Error ? e.message : String(e), e?.status ?? 200);
       }
     },
 
@@ -290,7 +312,7 @@ export function createPanelHandlers(ctx, rt = runtime()) {
           plans,
         });
       } catch (e) {
-        return errReply(e?.code ?? 'PANEL_ARCHIVE_FAILED', e instanceof Error ? e.message : String(e));
+        return errReply(e?.code ?? 'PANEL_ARCHIVE_FAILED', e instanceof Error ? e.message : String(e), e?.status ?? 200);
       }
     },
 
@@ -319,7 +341,7 @@ export function createPanelHandlers(ctx, rt = runtime()) {
         const plan = archive.getPlan(planBefore.planId);
         return okReply({ root: archive.root, retrospective, plan });
       } catch (e) {
-        return errReply(e?.code ?? 'PANEL_RETROSPECT_FAILED', e instanceof Error ? e.message : String(e));
+        return errReply(e?.code ?? 'PANEL_RETROSPECT_FAILED', e instanceof Error ? e.message : String(e), e?.status ?? 200);
       }
     },
 
@@ -331,6 +353,14 @@ export function createPanelHandlers(ctx, rt = runtime()) {
           return errReply('PLAN_ARCHIVE_DISABLED', 'external plan archive is disabled');
         }
         const dryRun = body.dryRun !== false;
+        if (!dryRun && body.confirm !== true) {
+          return errReply('CONFIRMATION_REQUIRED', 'Destructive plan archive cleanup (dryRun=false) requires confirm=true');
+        }
+        if (body.olderThanDays !== undefined && body.olderThanDays !== null) {
+          if (typeof body.olderThanDays !== 'number' || !Number.isFinite(body.olderThanDays) || body.olderThanDays < 0) {
+            return errReply('BAD_REQUEST', 'olderThanDays must be a non-negative finite number');
+          }
+        }
         const result = archive.cleanPlans({
           projectKey: typeof body.projectKey === 'string' && body.projectKey.trim() ? body.projectKey.trim() : null,
           workspace: typeof body.workspace === 'string' && body.workspace.trim() ? body.workspace.trim() : null,
@@ -338,7 +368,7 @@ export function createPanelHandlers(ctx, rt = runtime()) {
           olderThanDays: typeof body.olderThanDays === 'number' ? body.olderThanDays : null,
           all: Boolean(body.all),
           dryRun,
-          confirm: Boolean(body.confirm),
+          confirm: body.confirm === true,
         });
         return okReply({
           ...result,
@@ -346,7 +376,7 @@ export function createPanelHandlers(ctx, rt = runtime()) {
           recentPlans: archive.listPlans({ limit: 30 }),
         });
       } catch (e) {
-        return errReply(e?.code ?? 'PANEL_CLEAN_FAILED', e instanceof Error ? e.message : String(e));
+        return errReply(e?.code ?? 'PANEL_CLEAN_FAILED', e instanceof Error ? e.message : String(e), e?.status ?? 200);
       }
     },
   };

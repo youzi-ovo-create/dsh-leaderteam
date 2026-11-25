@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   applyThemeToDom,
   callLtApi,
@@ -58,12 +58,14 @@ export function SystemAppearanceView({
   bundle,
   theme,
   customTheme,
+  onPreviewTheme,
   onChangeTheme,
   onRefreshBundle,
 }: {
   bundle: HydratedBundle;
   theme: ThemePresetId;
   customTheme: CustomThemeSeeds;
+  onPreviewTheme?: (nextTheme: ThemePresetId, nextSeeds: CustomThemeSeeds) => void;
   onChangeTheme: (nextTheme: ThemePresetId, nextSeeds: CustomThemeSeeds) => Promise<void>;
   onRefreshBundle: () => Promise<void>;
 }) {
@@ -71,12 +73,20 @@ export function SystemAppearanceView({
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
 
+  useEffect(() => {
+    setSeeds(customTheme);
+  }, [customTheme]);
+
   const contrast = computeContrastRatio(seeds.surfaceColor, seeds.inkColor);
 
   function handleLiveSeedChange<K extends keyof CustomThemeSeeds>(key: K, val: CustomThemeSeeds[K]) {
     const next = { ...seeds, [key]: val };
     setSeeds(next);
-    applyThemeToDom('custom', next);
+    if (onPreviewTheme) {
+      onPreviewTheme('custom', next);
+    } else {
+      applyThemeToDom('custom', next);
+    }
   }
 
   async function handlePersistCustomTheme() {
@@ -227,6 +237,13 @@ export function SystemAppearanceView({
               <div style={{ display: 'flex', gap: 6, marginTop: 4 }}>
                 <input type="color" value={seeds.accentColor} onChange={e => handleLiveSeedChange('accentColor', e.target.value)} />
                 <input className="lt-input lt-mono" value={seeds.accentColor} onChange={e => handleLiveSeedChange('accentColor', e.target.value)} />
+              </div>
+            </label>
+            <label style={{ fontSize: 12, gridColumn: '1 / -1' }}>
+              警示与封缄朱印色 (dangerColor)
+              <div style={{ display: 'flex', gap: 6, marginTop: 4 }}>
+                <input type="color" value={seeds.dangerColor} onChange={e => handleLiveSeedChange('dangerColor', e.target.value)} />
+                <input className="lt-input lt-mono" value={seeds.dangerColor} onChange={e => handleLiveSeedChange('dangerColor', e.target.value)} />
               </div>
             </label>
           </div>
