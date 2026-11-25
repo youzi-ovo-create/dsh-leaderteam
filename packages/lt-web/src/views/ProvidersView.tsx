@@ -22,6 +22,7 @@ export function ProvidersView({
   onRefreshBundle: () => Promise<void>;
 }) {
   const gw = bundle.gateway;
+  const presets = bundle.providerPresets ?? [];
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -47,7 +48,9 @@ export function ProvidersView({
   }, [gw.gatewayUrl, gw.webAdminUrl, extUrlsDirty]);
 
   // Add Provider form
-  const [vendorPreset, setVendorPreset] = useState(bundle.providerPresets[0]?.vendorId || 'deepseek');
+  const [vendorPreset, setVendorPreset] = useState(
+    presets[0]?.vendorId || (presets.length === 0 ? 'custom' : 'deepseek'),
+  );
   const [customId, setCustomId] = useState('');
   const [customName, setCustomName] = useState('');
   const [customUrl, setCustomUrl] = useState('');
@@ -339,7 +342,7 @@ export function ProvidersView({
   }
 
   const selectedProvider = bundle.providers.find(p => p.providerId === activeProviderId) || null;
-  const selectedPreset = bundle.providerPresets.find(p => p.vendorId === vendorPreset) || null;
+  const selectedPreset = presets.find(p => p.vendorId === vendorPreset) || null;
   const canOmitApiKey =
     vendorPreset === 'custom'
       ? isLoopbackEndpointUrl(customUrl)
@@ -485,7 +488,7 @@ export function ProvidersView({
             <div>
               <label style={{ fontSize: 11.5, color: 'var(--lt-fg-secondary)' }}>供应商预设 / 自定义协议</label>
               <select className="lt-select" value={vendorPreset} onChange={e => setVendorPreset(e.target.value)}>
-                {bundle.providerPresets.map(p => (
+                {presets.map(p => (
                   <option key={p.vendorId} value={p.vendorId}>
                     {p.displayName} ({p.defaultEndpointUrl || p.protocol})
                   </option>

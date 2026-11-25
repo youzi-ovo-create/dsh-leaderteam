@@ -19,7 +19,7 @@ import { computeTimerSnapshot, resolveNowMs } from '../../core/timer.mjs';
 import { resolvePlanArchiveRoot, PlanArchiveStore } from '../../core/plan-archive.mjs';
 import { inspectModelConfiguration, applyModelConfigChanges, resolveDefaultDshHome } from '../../core/model-config-writer.mjs';
 import { buildSoloProviderSettingsTemplates, resolveOrBootstrapConfigPath } from '../../core/solo-key.mjs';
-import { syncUpstreamModelsToDshSettings } from '../../core/upstream-models.mjs';
+import { resolveModelTarget, syncUpstreamModelsToDshSettings } from '../../core/upstream-models.mjs';
 import { hashJson } from '../../core/canonical.mjs';
 import { loadConfig } from '../../core/config.mjs';
 import {
@@ -45,6 +45,7 @@ import {
   buildPublicProviders,
   buildPublicModelCatalog,
   buildModelUpsertsFromCatalogEntries,
+  resolveMagpieGatewayHostProvider,
 } from '../../gateway/index.mjs';
 import { getOrCreateHengzhangBridge } from '../../usage/index.mjs';
 import { readSessionFile, parseJsonl } from '../../../packages/lt-usage/index.mjs';
@@ -1268,8 +1269,9 @@ export async function collectCombinedDiscoveredModels(ctx, rt, gwMgr = null) {
       dshDiscoveredModels: [],
     }).filter(e => e.sourceKind === 'magpie')
     : [];
+  const magpieHostProv = resolveMagpieGatewayHostProvider(rt?.config);
   const magpieDiscovered = buildModelUpsertsFromCatalogEntries(magpieEntries, {
-    defaultMagpieHostProvider: rt?.config?.magpie?.provider ?? 'magpie',
+    defaultMagpieHostProvider: magpieHostProv,
     enableInExecutionPool: false,
   });
 
@@ -1299,22 +1301,49 @@ export async function collectCombinedDiscoveredModels(ctx, rt, gwMgr = null) {
   };
 }
 
+export function enrichChangesWithDiscoveredProviders(changes, rtConfig, discoveredModels = []) {
+  if (!isPlainObj(changes) || !Array.isArray(changes.upsertModels) || changes.upsertModels.length === 0) {
+    return changes;
+  }
+  const discByRoute = new Map((discoveredModels ?? []).filter(m => m?.route).map(m => [m.route, m]));
+  return {
+    ...changes,
+    upsertModels: changes.upsertModels.map(item => {
+      if (!isPlainObj(item) || typeof item.route !== 'string') return item;
+      const route = item.route.trim();
+      if (!route || item.provider !== undefined || rtConfig?.models?.[route]?.provider !== undefined) {
+        return item;
+      }
+      const dm = discByRoute.get(route);
+      if (!dm?.provider) return item;
+      return {
+        ...item,
+        provider: dm.provider,
+        ...(item.upstreamModel === undefined && dm.upstreamModel ? { upstreamModel: dm.upstreamModel } : {}),
+      };
+    }),
+  };
+}
+
 export async function syncActiveModelsToDshHost(ctx, rt, effective, discoveredModels = [], gwStatus = null, extraUpserts = []) {
   if (!ctx) return { synced: false, reason: 'no-host-context', updatedProviders: [] };
-  const magpieProv = rt?.config?.magpie?.provider ?? 'magpie';
+  const magpieProv = resolveMagpieGatewayHostProvider(effective ?? rt?.config);
+  const configuredDefaultProv = effective?.magpie?.provider ?? rt?.config?.magpie?.provider ?? magpieProv;
   const templates = buildSoloProviderSettingsTemplates(process.env);
   const rawGwUrl = gwStatus?.gatewayUrl ?? (rt?.storageRoot ? getOrCreateGatewayManager(rt.storageRoot).getActiveEndpoints()?.gatewayUrl : null);
   if (rawGwUrl) {
+    const magpieHeaders = { Authorization: 'Bearer magpie-leaderteam' };
     templates[magpieProv] = {
       displayName: 'Magpie Gateway',
       api: 'openai-completions',
-      apiKeyEnv: 'MAGPIE_API_KEY',
       baseURL: `${rawGwUrl.replace(/\/+$/, '')}/v1`,
+      headers: magpieHeaders,
+      ...(magpieHeaders.Authorization ? { clearApiKeyEnv: true } : { apiKeyEnv: 'MAGPIE_API_KEY' }),
     };
   }
   const discByRoute = new Map((discoveredModels ?? []).filter(m => m?.route).map(m => [m.route, m]));
   const activeRoutes = new Set([
-    ...(effective?.executionPool ?? []),
+    ...(effective?.executionPool ?? effective?.team?.executionPool ?? []),
     ...Object.values(effective?.roles ?? {}).flatMap(r => [
       r?.route,
       ...(Array.isArray(r?.fallback) ? r.fallback.map(f => f?.route) : []),
@@ -1329,10 +1358,15 @@ export async function syncActiveModelsToDshHost(ctx, rt, effective, discoveredMo
     const spec = effective?.models?.[route];
     if (!spec) continue;
     const dm = discByRoute.get(route);
+    const resolvedProv = spec.provider ?? (route.startsWith(`${magpieProv}/`) ? magpieProv : configuredDefaultProv);
+    const resolvedUpstream = spec.upstreamModel
+      ?? (resolvedProv === magpieProv && route.startsWith(`${magpieProv}/`)
+        ? route.slice(magpieProv.length + 1)
+        : route);
     byRouteToSync.set(route, {
       route,
-      provider: spec.provider ?? magpieProv,
-      upstreamModel: spec.upstreamModel ?? route,
+      provider: resolvedProv,
+      upstreamModel: resolvedUpstream,
       efforts: spec.efforts,
       ...(spec.reasoningEfforts ? { reasoningEfforts: spec.reasoningEfforts } : (dm?.reasoningEfforts ? { reasoningEfforts: dm.reasoningEfforts } : {})),
       vision: spec.vision ?? dm?.vision,
@@ -1718,7 +1752,7 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
           : fullCatalog.filter(e => e.sourceKind === 'magpie');
 
         const upserts = buildModelUpsertsFromCatalogEntries(chosen, {
-          defaultMagpieHostProvider: rt.config.magpie?.provider ?? 'magpie',
+          defaultMagpieHostProvider: resolveMagpieGatewayHostProvider(rt.config),
           enableInExecutionPool: body.enableInExecutionPool !== false,
         });
 
@@ -1780,9 +1814,10 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
         ensureConfigLoaded();
         const body = await parseJsonRequest(request);
         const target = body.target === 'base' ? 'base' : 'local';
-        const changes = isPlainObj(body.changes) ? body.changes : {};
+        const rawChanges = isPlainObj(body.changes) ? body.changes : {};
         const mgr = getGatewayMgr();
         const { gwStatus, discoveredModels } = await collectCombinedDiscoveredModels(ctx, rt, mgr);
+        const changes = enrichChangesWithDiscoveredProviders(rawChanges, rt.config, discoveredModels);
         const applyResult = applyModelConfigChanges(changes, {
           configFile: rt.configPath,
           target,
@@ -2134,6 +2169,42 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
 
         const effectivePreset = created?.agentPreset ?? requestedPreset;
         const isLt = effectivePreset === leaderPreset;
+        if (createdSid && isLt && !body.model && rt?.config?.roles?.leader?.route) {
+          const leaderTarget = resolveModelTarget(
+            rt.config,
+            rt.config.roles.leader.route,
+            rt.config.roles.leader.effort,
+          );
+          if (leaderTarget?.provider && leaderTarget?.model) {
+            const selection = {
+              provider: leaderTarget.provider,
+              model: leaderTarget.model,
+              ...(leaderTarget.reasoningEffort ? { reasoningEffort: leaderTarget.reasoningEffort } : {}),
+            };
+            let selectedViaController = false;
+            if (typeof sessionController.selectModel === 'function') {
+              try {
+                await sessionController.selectModel({
+                  sessionId: createdSid,
+                  ...selection,
+                });
+                selectedViaController = true;
+              } catch {}
+            }
+            if (!selectedViaController) {
+              const agentsSvc = getHostService(ctx, 'agents');
+              const liveAgent =
+                agentsSvc?.get?.(createdSid)
+                ?? baseRuntime(rt)?.actors?.get?.(createdSid)?.agent
+                ?? null;
+              if (typeof liveAgent?.model?.select === 'function') {
+                try {
+                  liveAgent.model.select(selection);
+                } catch {}
+              }
+            }
+          }
+        }
         let modeState = null;
         if (createdSid) {
           if (isLt || body.executionMode !== undefined) {

@@ -16,6 +16,7 @@
 
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync, spawn } from 'node:child_process';
@@ -50,7 +51,7 @@ async function main() {
   };
 
   // ==================== 1. Tarball Pack & Contents Audit ====================
-  console.log('[1/6] Packing release tarball and auditing file manifest...');
+  console.log('[1/7] Packing release tarball and auditing file manifest...');
   const packJsonRaw = runSync('npm', ['pack', '--json', '--pack-destination', artifactsDir]);
   const packInfo = JSON.parse(packJsonRaw)[0];
   assert.equal(packInfo.version, expectedVersion, `Tarball version must match package.json (${expectedVersion})`);
@@ -64,6 +65,7 @@ async function main() {
   assert.ok(packedFiles.includes('packages/lt-usage/index.mjs'), 'Tarball includes bundled zero-dep Hengzhang core/reader');
   assert.ok(packedFiles.includes('bin/lt-magpie.mjs'), 'Tarball includes lt-magpie CLI');
   assert.ok(packedFiles.includes('bin/lt-ui.mjs'), 'Tarball includes lt-ui CLI');
+  assert.ok(packedFiles.includes('THIRD_PARTY_NOTICES.md'), 'Tarball includes root THIRD_PARTY_NOTICES.md');
   for (const pf of packedFiles) {
     assert.ok(!pf.includes('node_modules/'), `Tarball must not ship node_modules: ${pf}`);
     assert.ok(!pf.endsWith('.env'), `Tarball must not ship .env: ${pf}`);
@@ -77,7 +79,7 @@ async function main() {
   };
 
   // ==================== 2. Isolated DSH Profile Install + Doctor & Bugreport ====================
-  console.log('[2/6] Installing tarball into isolated DSH_HOME via `dsh plugin add`...');
+  console.log('[2/7] Installing tarball into isolated DSH_HOME via `dsh plugin add`...');
   const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'lt-v22x-e2e-'));
   const dshHome = path.join(tmpRoot, 'dsh-home');
   const workspaceDir = path.join(tmpRoot, 'sample-project');
@@ -123,7 +125,7 @@ async function main() {
     };
 
     // ==================== 3. Boot Real `dsh web` & Verify Seamless Dual-Frontend Switch ====================
-    console.log('[3/6] Booting real `dsh --profile web` and verifying `/` <-> `/lt/` shared runtime & session...');
+    console.log('[3/7] Booting real `dsh --profile web` and verifying `/` <-> `/lt/` shared runtime & session...');
     let launchUrl = null;
     let dshLogs = '';
     dshProc = spawn('dsh', ['--profile', 'web', '--no-open', '--port', '0'], {
@@ -291,7 +293,7 @@ async function main() {
     assert.equal(bundleCheck.ok, true, bundleCheck.errors.join('; '));
 
     // ==================== 4. Simulate Upstream Magpie Update (0.1.4731 -> 0.1.4797) ====================
-    console.log('[4/6] Verifying Magpie upstream update compatibility (0.1.4731 -> 0.1.4797)...');
+    console.log('[4/7] Verifying Magpie upstream update compatibility (0.1.4731 -> 0.1.4797)...');
     mockMagpie.state.version = '0.1.4797';
     const compatAfterUpdate = await postLt('gateway/control', { action: 'check-compatibility' });
     assert.equal(compatAfterUpdate.data.compatibility.ok, true);
@@ -314,8 +316,425 @@ async function main() {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
 
-  // ==================== 5. Standalone Hengzhang Regression ====================
-  console.log('[5/6] Verifying standalone Hengzhang (`lt-usage-plugin`) CLI & test suite...');
+  // ==================== 5. Zero-Patch Real `dsh --profile web` + Real Magpie `0.1.4731` Live Onboarding & Dual-Mode E2E ====================
+  const realMagpieBin = '/opt/magpie/releases/0.1.4731/magpie';
+  if (fs.existsSync(realMagpieBin)) {
+    console.log('[5/7] Verifying ZERO-PATCH out-of-the-box `dsh --profile web` + real Magpie `0.1.4731` -> local dummy OpenAI relay live Single & Team execution...');
+    const zpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'lt-s9-prod-zeropatch-'));
+    const zpFakeHome = path.join(zpRoot, 'isolated-user-home');
+    const zpDshHome = path.join(zpRoot, 'dsh-home');
+    const zpWorkspace = path.join(zpRoot, 'zero-patch-project');
+    fs.mkdirSync(zpFakeHome, { recursive: true });
+    fs.mkdirSync(zpDshHome, { recursive: true });
+    fs.mkdirSync(zpWorkspace, { recursive: true });
+
+    // Strip ALL provider/gateway API key env vars to prove 100% zero-env-var out-of-the-box onboarding!
+    const cleanEnv = { ...process.env, PATH: ENHANCED_PATH, DSH_HOME: zpDshHome };
+    for (const k of [
+      'DEEPSEEK_API_KEY',
+      'OPENAI_API_KEY',
+      'DASHSCOPE_API_KEY',
+      'BAILIAN_API_KEY',
+      'ZHIPU_API_KEY',
+      'GLM_API_KEY',
+      'ANTHROPIC_API_KEY',
+      'GEMINI_API_KEY',
+      'GOOGLE_API_KEY',
+      'MAGPIE_API_KEY',
+      'LEADERTEAM_MAGPIE_KEY',
+      'MAGPIE_WEB_KEY',
+      'LT_SOLO_PROVIDER',
+      'LEADERTEAM_CONFIG',
+    ]) {
+      delete cleanEnv[k];
+    }
+
+    const relayRequests = [];
+    let toolCallSeq = 0;
+    const relayServer = http.createServer((req, res) => {
+      const reqUrl = new URL(req.url || '/', 'http://127.0.0.1');
+      if (req.method === 'GET' && (reqUrl.pathname === '/v1/models' || reqUrl.pathname === '/models')) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            object: 'list',
+            data: [{ id: 'alpha-pro', object: 'model', created: 1700000000, owned_by: 'localrelay' }],
+          }),
+        );
+        return;
+      }
+      if (req.method === 'POST' && (reqUrl.pathname === '/v1/chat/completions' || reqUrl.pathname === '/chat/completions')) {
+        const chunks = [];
+        req.on('data', c => chunks.push(c));
+        req.on('end', () => {
+          const body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
+          const toolNames = (body.tools ?? [])
+            .map(t => t?.function?.name || t?.name || '')
+            .filter(Boolean);
+          const extractMsgText = m => {
+            if (!m) return '';
+            if (typeof m.content === 'string') return m.content;
+            if (Array.isArray(m.content)) {
+              return m.content.map(p => (typeof p?.text === 'string' ? p.text : '')).join('\n');
+            }
+            return '';
+          };
+          const allMessagesText = (body.messages ?? []).map(extractMsgText).join('\n');
+          const hasToolResultSinceLastPrompt = (() => {
+            const msgs = body.messages ?? [];
+            let lastTriggerIdx = -1;
+            for (let i = 0; i < msgs.length; i++) {
+              if (extractMsgText(msgs[i]).includes('ZERO_PATCH_SINGLE_TURN')) lastTriggerIdx = i;
+            }
+            if (lastTriggerIdx < 0) return false;
+            return msgs.slice(lastTriggerIdx + 1).some(m => m?.role === 'tool');
+          })();
+
+          relayRequests.push({
+            model: body.model,
+            toolNames,
+            lastRole: (body.messages ?? []).at(-1)?.role || '',
+            allMessagesText,
+          });
+
+          let assistantText = 'RELAY_PROBE_OK';
+          let toolCall = null;
+          if (toolNames.length === 0) {
+            assistantText = 'Zero-Patch Session Title';
+          } else if (allMessagesText.includes('ZERO_PATCH_TEAM_TURN')) {
+            assistantText = 'ZERO_PATCH_TEAM_FINAL_OK';
+          } else if (allMessagesText.includes('ZERO_PATCH_SINGLE_TURN')) {
+            if (!hasToolResultSinceLastPrompt) {
+              toolCallSeq += 1;
+              toolCall = {
+                id: `call_zp_write_${toolCallSeq}`,
+                type: 'function',
+                function: {
+                  name: 'write',
+                  arguments: JSON.stringify({
+                    file_path: 'zero-patch-single.txt',
+                    content: 'ZERO_PATCH_SINGLE_FILE_OK',
+                  }),
+                },
+              };
+              assistantText = '';
+            } else {
+              assistantText = 'ZERO_PATCH_SINGLE_FINAL_OK';
+            }
+          }
+
+          const respId = `chatcmpl-zp-${relayRequests.length}`;
+          const created = Math.floor(Date.now() / 1000);
+          const usage = { prompt_tokens: 80, completion_tokens: 20, total_tokens: 100 };
+
+          if (body.stream) {
+            res.writeHead(200, {
+              'Content-Type': 'text/event-stream; charset=utf-8',
+              'Cache-Control': 'no-cache',
+              Connection: 'keep-alive',
+            });
+            const firstDelta = toolCall
+              ? {
+                  role: 'assistant',
+                  content: null,
+                  tool_calls: [
+                    {
+                      index: 0,
+                      id: toolCall.id,
+                      type: 'function',
+                      function: { name: toolCall.function.name, arguments: toolCall.function.arguments },
+                    },
+                  ],
+                }
+              : { role: 'assistant', content: assistantText };
+            res.write(
+              `data: ${JSON.stringify({
+                id: respId,
+                object: 'chat.completion.chunk',
+                created,
+                model: body.model || 'alpha-pro',
+                choices: [{ index: 0, delta: firstDelta, finish_reason: null }],
+              })}\n\n`,
+            );
+            res.write(
+              `data: ${JSON.stringify({
+                id: respId,
+                object: 'chat.completion.chunk',
+                created,
+                model: body.model || 'alpha-pro',
+                choices: [{ index: 0, delta: {}, finish_reason: toolCall ? 'tool_calls' : 'stop' }],
+                usage,
+              })}\n\n`,
+            );
+            res.end('data: [DONE]\n\n');
+          } else {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(
+              JSON.stringify({
+                id: respId,
+                object: 'chat.completion',
+                created,
+                model: body.model || 'alpha-pro',
+                choices: [
+                  {
+                    index: 0,
+                    message: toolCall
+                      ? { role: 'assistant', content: null, tool_calls: [toolCall] }
+                      : { role: 'assistant', content: assistantText },
+                    finish_reason: toolCall ? 'tool_calls' : 'stop',
+                  },
+                ],
+                usage,
+              }),
+            );
+          }
+        });
+        return;
+      }
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: 'Not Found' } }));
+    });
+
+    await new Promise((resolve, reject) => {
+      relayServer.once('error', reject);
+      relayServer.listen(0, '127.0.0.1', () => resolve());
+    });
+    const relayPort = relayServer.address().port;
+    const relayBaseV1 = `http://127.0.0.1:${relayPort}/v1`;
+
+    let zpDshProc = null;
+    let managedMagpiePid = null;
+    let zpPostLt = null;
+    try {
+      // Install tarball strictly via `dsh plugin --profile web add` with ZERO manual file edits!
+      execFileSync('dsh', ['plugin', '--profile', 'web', 'add', tarballPath], {
+        encoding: 'utf8',
+        env: cleanEnv,
+        cwd: zpWorkspace,
+        timeout: 180_000,
+      });
+
+      let zpLaunchUrl = null;
+      let zpLogs = '';
+      zpDshProc = spawn('dsh', ['--profile', 'web', '--no-open', '--port', '0'], {
+        cwd: zpWorkspace,
+        env: cleanEnv,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      const onZpChunk = chunk => {
+        zpLogs += chunk.toString('utf8');
+        const m = zpLogs.match(/https?:\/\/127\.0\.0\.1:\d+\/(?:connect)?\?token=[A-Za-z0-9._~-]+/);
+        if (m && !zpLaunchUrl) zpLaunchUrl = m[0];
+      };
+      zpDshProc.stdout.on('data', onZpChunk);
+      zpDshProc.stderr.on('data', onZpChunk);
+
+      const zpDeadline = Date.now() + 30_000;
+      while (!zpLaunchUrl && Date.now() < zpDeadline) {
+        if (zpDshProc.exitCode !== null) {
+          throw new Error(`Zero-patch dsh web exited prematurely (${zpDshProc.exitCode}):\n${zpLogs}`);
+        }
+        await new Promise(r => setTimeout(r, 150));
+      }
+      assert.ok(zpLaunchUrl, `Zero-patch dsh web printed launch URL (logs: ${zpLogs.slice(-400)})`);
+
+      const zpOrigin = new URL(zpLaunchUrl).origin;
+      const zpConnRes = await fetch(zpLaunchUrl, { redirect: 'manual' });
+      const zpCookies = zpConnRes.headers.getSetCookie
+        ? zpConnRes.headers.getSetCookie()
+        : [zpConnRes.headers.get('set-cookie') || ''];
+      const zpCookieHeader = zpCookies.map(c => c.split(';')[0]).filter(Boolean).join('; ');
+      assert.ok(zpCookieHeader.length > 0);
+
+      zpPostLt = async (subpath, body = {}) => {
+        const r = await fetch(`${zpOrigin}/api/lt/v1/${subpath}`, {
+          method: 'POST',
+          headers: {
+            Cookie: zpCookieHeader,
+            Origin: zpOrigin,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(body),
+        });
+        assert.equal(r.status, 200, `Zero-patch POST /api/lt/v1/${subpath} HTTP ${r.status}`);
+        const j = await r.json();
+        assert.equal(j.ok, true, `Zero-patch API error on ${subpath}: ${JSON.stringify(j.error)}`);
+        return j;
+      };
+
+      // 1) install -> 2) start -> 3) save-provider -> 4) models/sync-pool -> 5) runtime/configure -> 6) workbench/create
+      const instRes = await zpPostLt('gateway/control', {
+        action: 'install',
+        binaryPath: realMagpieBin,
+      });
+      assert.equal(instRes.data.result.installed, true);
+
+      const startRes = await zpPostLt('gateway/control', {
+        action: 'start',
+        dynamicPorts: true,
+      });
+      assert.equal(startRes.data.status.state, 'running');
+      managedMagpiePid = startRes.data.status.health?.pid ?? null;
+
+      await zpPostLt('providers/mutate', {
+        operation: 'save-provider',
+        spec: {
+          new: true,
+          id: 'localrelay',
+          name: 'Local Dummy Relay',
+          chat: relayBaseV1,
+          baseAPI: 'chat',
+          key: 'sk-zp-dummy-relay-1234567890',
+        },
+      });
+      await zpPostLt('providers/mutate', {
+        operation: 'refresh-models',
+        id: 'magpie:localrelay',
+      });
+
+      const zpSync = await zpPostLt('models/sync-pool', {
+        target: 'local',
+        enableInExecutionPool: true,
+      });
+      assert.equal(zpSync.data.dshSettingsSync.synced, true, 'Zero-patch models/sync-pool must sync to DSH settings');
+      const alphaEntry = zpSync.data.models.find(
+        m => m.sourceKind === 'magpie' && (m.upstreamModelId === 'alpha-pro' || m.routeId.includes('alpha-pro')),
+      );
+      assert.ok(alphaEntry, 'Synced Magpie model localrelay/alpha-pro must appear in catalog');
+
+      const zpCfg = await zpPostLt('runtime/configure', {
+        target: 'local',
+        changes: {
+          setRoles: [
+            { role: 'leader', route: alphaEntry.routeId, effort: 'none' },
+            { role: 'gate', route: alphaEntry.routeId, effort: 'none' },
+            { role: 'discussA', route: alphaEntry.routeId, effort: 'none' },
+            { role: 'discussB', route: alphaEntry.routeId, effort: 'none' },
+            { role: 'arbiter', route: alphaEntry.routeId, effort: 'none' },
+          ],
+        },
+      });
+      assert.equal(zpCfg.data.dshSettingsSync.synced, true);
+
+      // Create LT session in `Single` mode with NO `model` parameter -> must auto-select `roles.leader.route`!
+      const zpCreated = await zpPostLt('workbench/create', {
+        cwd: zpWorkspace,
+        executionMode: 'single',
+      });
+      const zpSid = zpCreated.data.sessionId;
+      assert.ok(zpSid);
+      assert.equal(zpCreated.data.executionMode, 'single');
+
+      const waitForAssistantReply = async expectedSubstring => {
+        const deadline = Date.now() + 25_000;
+        let lastTx = null;
+        while (Date.now() < deadline) {
+          lastTx = await zpPostLt('workbench/transcript', { sessionId: zpSid });
+          const running = Boolean(lastTx.data.passiveState?.running);
+          const hasReply = (lastTx.data.messages ?? []).some(
+            m => m.role === 'assistant' && String(m.text || '').includes(expectedSubstring),
+          );
+          if (!running && hasReply) return lastTx;
+          await new Promise(r => setTimeout(r, 150));
+        }
+        throw new Error(
+          `Timed out waiting for "${expectedSubstring}" on ${zpSid}. Last transcript: ${JSON.stringify(lastTx?.data)}\nDSH logs tail:\n${zpLogs.slice(-800)}`,
+        );
+      };
+
+      // Live `Single` mode execution through `dsh web -> real Magpie 0.1.4731 -> local dummy OpenAI relay`!
+      await zpPostLt('workbench/prompt', {
+        sessionId: zpSid,
+        text: 'ZERO_PATCH_SINGLE_TURN: write zero-patch-single.txt now',
+      });
+      await waitForAssistantReply('ZERO_PATCH_SINGLE_FINAL_OK');
+      assert.equal(
+        fs.readFileSync(path.join(zpWorkspace, 'zero-patch-single.txt'), 'utf8'),
+        'ZERO_PATCH_SINGLE_FILE_OK',
+        'Single mode turn executed direct write tool through real DSH Web + real Magpie 0.1.4731',
+      );
+      const singleRelayHit = relayRequests.find(
+        r => r.toolNames.length > 0 && r.allMessagesText.includes('ZERO_PATCH_SINGLE_TURN'),
+      );
+      assert.ok(singleRelayHit, 'Local dummy relay received Single-mode LLM call');
+      assert.ok(singleRelayHit.toolNames.includes('write'), 'Single-mode LLM call exposed direct write tool');
+      assert.ok(singleRelayHit.toolNames.includes('bash'), 'Single-mode LLM call exposed direct bash tool');
+      assert.equal(
+        singleRelayHit.toolNames.some(n => n.startsWith('team_')),
+        false,
+        'Single-mode LLM call exposed zero team_* tools',
+      );
+
+      // Switch `Single -> Team` (0 agent LLM calls) and execute a live `Team` mode prompt!
+      const agentCallsBeforeSwitch = relayRequests.filter(r => r.toolNames.length > 0).length;
+      const switchedToTeam = await zpPostLt('workbench/mode', {
+        sessionId: zpSid,
+        mode: 'team',
+      });
+      assert.equal(switchedToTeam.data.modeState.mode, 'team');
+      assert.equal(
+        relayRequests.filter(r => r.toolNames.length > 0).length,
+        agentCallsBeforeSwitch,
+        'Mode switch must trigger 0 LLM calls',
+      );
+
+      await zpPostLt('workbench/prompt', {
+        sessionId: zpSid,
+        text: 'ZERO_PATCH_TEAM_TURN: concise greeting',
+      });
+      await waitForAssistantReply('ZERO_PATCH_TEAM_FINAL_OK');
+      const teamRelayHit = relayRequests.find(
+        r => r.toolNames.length > 0 && r.allMessagesText.includes('ZERO_PATCH_TEAM_TURN'),
+      );
+      assert.ok(teamRelayHit, 'Local dummy relay received Team-mode LLM call');
+      assert.ok(teamRelayHit.toolNames.includes('team_dispatch'), 'Team-mode LLM call exposed team_dispatch');
+      assert.ok(teamRelayHit.toolNames.includes('team_discuss'), 'Team-mode LLM call exposed team_discuss');
+      assert.equal(teamRelayHit.toolNames.includes('write'), false, 'Team-mode LLM call revoked direct write tool');
+      assert.equal(teamRelayHit.toolNames.includes('bash'), false, 'Team-mode LLM call revoked direct bash tool');
+
+      // Verify Hengzhang reconciles the real Magpie 0.1.4731 usage feed with the DSH session!
+      const zpUsage = await zpPostLt('usage/report', {
+        sessionId: zpSid,
+        syncGateway: true,
+      });
+      assert.ok(zpUsage.data.report.totals.totalTokens > 0);
+      assert.ok(
+        zpUsage.data.report.calls.some(c => c.actualProvider === 'localrelay' && c.actualModel === 'alpha-pro'),
+        'Hengzhang correlated real Magpie 0.1.4731 physical provider/model on zero-patch session',
+      );
+
+      await zpPostLt('gateway/control', { action: 'stop' }).catch(() => {});
+
+      report.steps.zeroPatchRealMagpieAndDshWeb = {
+        ok: true,
+        magpieBinary: realMagpieBin,
+        sessionId: zpSid,
+        routeId: alphaEntry.routeId,
+        relayCallsTotal: relayRequests.length,
+        singleToolCount: singleRelayHit.toolNames.length,
+        teamToolCount: teamRelayHit.toolNames.length,
+      };
+    } finally {
+      if (zpPostLt) {
+        await zpPostLt('gateway/control', { action: 'stop' }).catch(() => {});
+      }
+      if (zpDshProc && zpDshProc.exitCode === null) {
+        zpDshProc.kill('SIGTERM');
+        await new Promise(r => setTimeout(r, 400));
+        if (zpDshProc.exitCode === null) zpDshProc.kill('SIGKILL');
+      }
+      if (managedMagpiePid) {
+        try { process.kill(managedMagpiePid, 'SIGTERM'); } catch {}
+        await new Promise(r => setTimeout(r, 250));
+        try { process.kill(managedMagpiePid, 'SIGKILL'); } catch {}
+      }
+      await new Promise(resolve => relayServer.close(() => resolve()));
+      fs.rmSync(zpRoot, { recursive: true, force: true });
+    }
+  }
+
+  // ==================== 6. Standalone Hengzhang Regression ====================
+  console.log('[6/7] Verifying standalone Hengzhang (`lt-usage-plugin`) CLI & test suite...');
   const hengzhangRoot = path.join(ossRoot, 'lt-usage-plugin');
   const scanOut = runSync('npm', ['run', 'scan', '--', '--home', path.join(hengzhangRoot, 'fixtures', 'test-home')], {
     cwd: hengzhangRoot,
@@ -323,8 +742,8 @@ async function main() {
   assert.match(scanOut, /session-6f6683f1-1e59-4baf-b251-5ca16edd8463/);
   report.steps.standaloneHengzhang = { ok: true };
 
-  // ==================== 6. Source, Git History & Tarball Private/Secret Leak Audit ====================
-  console.log('[6/6] Auditing source tree, Git commit history, and tarball for any secret or private leakage...');
+  // ==================== 7. Source, Git History & Tarball Private/Secret Leak Audit ====================
+  console.log('[7/7] Auditing source tree, Git commit history, and tarball for any secret or private leakage...');
   const forbiddenPatterns = [
     { name: 'Live OpenAI/Vendor Key', re: new RegExp('\\bsk-(?:proj-|live-)[A-Za-z0-9_-]{16,}\\b') },
     { name: 'Closed-source V2.3/V2.4 private path', re: new RegExp(['closed-source', 'v2\\.x'].join('-') + '|' + ['leaderteam', 'v2\\.3', 'phase1'].join('-')) },

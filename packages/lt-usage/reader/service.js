@@ -79,11 +79,9 @@ export function encodeDshSegment(value) {
   return s.replace(/[^A-Za-z0-9._-]/g, (ch) => `~${ch.charCodeAt(0).toString(16).toUpperCase().padStart(4, '0')}`);
 }
 
-function encodeSafeTeamSegment(value) {
-  const s = String(value ?? '');
-  if (!s) return '';
-  if (s === '.') return '~002E';
-  if (s === '..') return '~002E~002E';
+const MAX_SAFE_SEGMENT_LEN = 192;
+
+function encodeRawSafeSegment(s) {
   let out = '';
   for (let i = 0; i < s.length; i++) {
     const code = s.charCodeAt(i);
@@ -98,16 +96,61 @@ function encodeSafeTeamSegment(value) {
   return out;
 }
 
+function compactEncodedSegment(encoded, rawId, sliceLen = 128) {
+  let prefix = encoded.slice(0, sliceLen);
+  const lastTilde = prefix.lastIndexOf('~');
+  if (lastTilde >= 0 && prefix.length - lastTilde < 5) {
+    prefix = prefix.slice(0, lastTilde);
+  }
+  while (prefix.endsWith('.')) prefix = prefix.slice(0, -1);
+  const digest = createHash('sha256').update(String(rawId)).digest('hex').slice(0, 32);
+  return `${prefix || 'sid'}~h${digest}`;
+}
+
+export function encodeSafeTeamSegment(value) {
+  const s = String(value ?? '');
+  if (!s) return '';
+  if (
+    s.length <= MAX_SAFE_SEGMENT_LEN
+    && !s.startsWith('.')
+    && !s.includes('..')
+    && /^(?:[A-Za-z0-9._-]|~[0-9A-F]{4})+(?:~h[0-9a-f]{32})?$/.test(s)
+  ) {
+    return s;
+  }
+  if (s === '.') return '~002E';
+  if (s === '..') return '~002E~002E';
+  const out = encodeRawSafeSegment(s);
+  if (out.length > MAX_SAFE_SEGMENT_LEN) {
+    return compactEncodedSegment(out, s, 128);
+  }
+  return out;
+}
+
 export function teamDir(home, sessionId) {
   const teamsRoot = path.resolve(home, 'leaderteam', 'teams');
   const raw = String(sessionId ?? '');
   if (!raw || raw.includes('\0')) return path.join(teamsRoot, '__invalid__');
   const candidates = [];
-  if (!/[\\/]/.test(raw) && raw !== '.' && raw !== '..' && !raw.includes('..')) {
+  if (
+    raw.length <= MAX_SAFE_SEGMENT_LEN
+    && !/[\\/]/.test(raw)
+    && raw !== '.'
+    && raw !== '..'
+    && !raw.startsWith('.')
+    && !raw.includes('..')
+  ) {
     candidates.push(raw);
   }
-  for (const seg of [encodeSafeTeamSegment(raw), encodeDshSegment(raw)]) {
-    if (seg && !candidates.includes(seg)) candidates.push(seg);
+  const safeSeg = encodeSafeTeamSegment(raw);
+  if (safeSeg && !candidates.includes(safeSeg)) candidates.push(safeSeg);
+  const rawEncoded = raw !== '.' && raw !== '..' ? encodeRawSafeSegment(raw) : '';
+  if (rawEncoded.length > MAX_SAFE_SEGMENT_LEN) {
+    const alt120 = compactEncodedSegment(rawEncoded, raw, 120);
+    if (alt120 && !candidates.includes(alt120)) candidates.push(alt120);
+  }
+  for (const seg of [encodeDshSegment(raw), !/[\\/]/.test(raw) && raw !== '.' && raw !== '..' && !raw.includes('..') ? raw : '']) {
+    if (seg && seg.length <= 255 && !candidates.includes(seg)) candidates.push(seg);
   }
   for (const seg of candidates) {
     const cand = path.resolve(teamsRoot, seg);
@@ -115,7 +158,7 @@ export function teamDir(home, sessionId) {
       return cand;
     }
   }
-  const fallbackSeg = candidates[0] || encodeSafeTeamSegment(raw) || '__invalid__';
+  const fallbackSeg = safeSeg || candidates[0] || '__invalid__';
   return path.resolve(teamsRoot, fallbackSeg);
 }
 
@@ -148,14 +191,29 @@ export function listTeamIds(home) {
   }
 }
 
-function collectMemberOwnerMap(home) {
+function collectMemberOwnerMap(home, data = null) {
   const memberToTeam = new Map();
-  for (const teamId of listTeamIds(home)) {
-    if (!isTeam(home, teamId)) continue;
+  const dirToSessionId = new Map();
+  if (data?.sessions) {
+    for (const s of data.sessions) {
+      if (!s?.id || s.header?.parentSession) continue;
+      dirToSessionId.set(teamDir(home, s.id), s.id);
+    }
+  }
+  for (const dirName of listTeamIds(home)) {
+    if (!isTeam(home, dirName)) continue;
     try {
-      const members = foldMembers(readJsonl(path.join(teamDir(home, teamId), 'members.jsonl')));
+      const dir = teamDir(home, dirName);
+      const meta = readJson(path.join(dir, 'team.json'));
+      const ownerId =
+        (typeof meta?.sessionId === 'string' && meta.sessionId.trim() ? meta.sessionId.trim() : null)
+        ?? dirToSessionId.get(dir)
+        ?? (!dirName.includes('~h')
+          ? dirName.replace(/~([0-9A-F]{4})/g, (_m, hex) => String.fromCharCode(parseInt(hex, 16)))
+          : (meta?.teamId ?? dirName));
+      const members = foldMembers(readJsonl(path.join(dir, 'members.jsonl')));
       for (const member of members.values()) {
-        if (member.childId) memberToTeam.set(member.childId, teamId);
+        if (member.childId) memberToTeam.set(member.childId, ownerId);
       }
     } catch {
       // keep scanning other teams
@@ -177,8 +235,12 @@ function teamMeta(home, sessionId) {
   const dir = teamDir(home, sessionId);
   const team = readJson(path.join(dir, 'team.json'));
   const timer = readJson(path.join(dir, 'timer.json'));
+  const resolvedTeamId =
+    (typeof team?.sessionId === 'string' && team.sessionId.trim() ? team.sessionId.trim() : null)
+    ?? (typeof team?.teamId === 'string' && !team.teamId.includes('~h') ? team.teamId : null)
+    ?? sessionId;
   return {
-    teamId: team?.teamId ?? sessionId,
+    teamId: resolvedTeamId,
     activeSec: Number.isFinite(timer?.teamActiveMs) ? Math.round(timer.teamActiveMs / 1000) : null
   };
 }
@@ -379,7 +441,7 @@ export function reportFor(home, sessionId, pricing = defaultPricing, options = {
 
 export function listSessions(home, pricing = defaultPricing, options = {}) {
   const data = loadHome(home);
-  const memberToTeam = collectMemberOwnerMap(home);
+  const memberToTeam = collectMemberOwnerMap(home, data);
   const rows = [];
   const seen = new Set();
   for (const session of data.sessions) {
@@ -456,7 +518,7 @@ export function listSessions(home, pricing = defaultPricing, options = {}) {
 
 export function overviewFor(home, pricing = defaultPricing, options = {}) {
   const data = loadHome(home);
-  const memberToTeam = collectMemberOwnerMap(home);
+  const memberToTeam = collectMemberOwnerMap(home, data);
   const reports = [];
   const errors = [];
   const signatures = new Map();

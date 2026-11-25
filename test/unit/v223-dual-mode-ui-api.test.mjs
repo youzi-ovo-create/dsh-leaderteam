@@ -984,13 +984,27 @@ test('Stage 7 Regressions (V223-UI-01, UI-02, UI-03, UI-04, UI-07, RT-07): cold 
     assert.equal(pubGate.attribution.teamId, null);
     assert.equal(pubGate.tokens.totalTokens, 145);
 
-    // 3. V223-UI-03: Newly synthesized `magpie` provider template includes `apiKeyEnv: 'MAGPIE_API_KEY'`
+    // 3. V223-UI-03 + S8-E2E-01c: Loopback Magpie provider template uses `headers.Authorization` and omits `apiKeyEnv` (zero env vars required!)
     let capturedNs = null;
     let capturedProviders = null;
     const templateProbeCtx = {
       settings: {
         describe() {
-          return [{ ns: 'llm-pi-ai', value: { providers: {} } }];
+          return [{
+            ns: 'llm-pi-ai',
+            value: {
+              providers: {
+                // Seed a stale port + stale apiKeyEnv to verify S8-E2E-01c/1d reconciliation
+                magpie: {
+                  displayName: 'Magpie Gateway',
+                  api: 'openai-completions',
+                  apiKeyEnv: 'MAGPIE_API_KEY',
+                  baseURL: 'http://127.0.0.1:19999/v1',
+                  models: [],
+                },
+              },
+            },
+          }];
         },
         async update(ns, nextData) {
           capturedNs = ns;
@@ -1012,7 +1026,8 @@ test('Stage 7 Regressions (V223-UI-01, UI-02, UI-03, UI-04, UI-07, RT-07): cold 
     assert.equal(syncRes.synced, true);
     assert.equal(capturedNs, 'llm-pi-ai');
     assert.ok(capturedProviders?.magpie);
-    assert.equal(capturedProviders.magpie.apiKeyEnv, 'MAGPIE_API_KEY');
+    assert.equal('apiKeyEnv' in capturedProviders.magpie, false, 'Loopback Magpie with Authorization header must omit apiKeyEnv');
+    assert.equal(capturedProviders.magpie.headers?.Authorization, 'Bearer magpie-leaderteam');
     assert.equal(capturedProviders.magpie.api, 'openai-completions');
     assert.equal(capturedProviders.magpie.baseURL, 'http://127.0.0.1:23190/v1');
 
@@ -1740,4 +1755,302 @@ test('Stage 7 Frontend Regressions (V223-UI-05, UI-06, UI-08): WorkbenchView HUD
     );
     assert.equal(workbenchModeCalls, 0, '1.0.0 bundle without inSessionDualMode must make 0 unsolicited /workbench/mode calls');
   }
+});
+
+test('Stage 9 Product Regressions (S8-E2E-01a/b/c, S8-E2E-02, S8-E2E-03, S8-E2E-04, S8-E2E-05): Solo-Key vs Magpie namespace isolation, workbenchCreate selectModel, >192-char Hengzhang compaction, ProvidersView without providerPresets, model-config-ui /api/sync-desktop error, and desktop.patch.yml + THIRD_PARTY_NOTICES.md', async t => {
+  const zlib = await import('node:zlib');
+  const { createRequire } = await import('node:module');
+  const webRequire = createRequire(path.join(repoRoot, 'packages', 'lt-web', 'package.json'));
+  const esbuild = webRequire('esbuild');
+  const { buildSoloKeyStarterConfig, SOLO_PROVIDER_PRESETS } = await import('../../leaderteam/core/solo-key.mjs');
+  const { startModelConfigServer } = await import('../../leaderteam/core/model-config-ui.mjs');
+  const { startMockMagpieServer } = await import('../../../lt-shared-contracts/mocks/mock-magpie-server.mjs');
+  const { buildPublicModelCatalog } = await import('../../leaderteam/gateway/index.mjs');
+
+  const tmpDir = makeTempSandbox(t, 's9-prod');
+  const { dshHome, storageRoot, cfgFile, rt } = createIsolatedRuntime(tmpDir);
+  const workspaceDir = path.join(tmpDir, 'workspace');
+  fs.mkdirSync(workspaceDir, { recursive: true });
+
+  // --- 1. S8-E2E-01a/1b/1c: Solo-Key starter (`cfg.magpie.provider === 'deepseek'`) + Magpie onboarding + `workbenchCreate` `selectModel` ---
+  const baseRaw = JSON.parse(fs.readFileSync(path.join(repoRoot, 'config', 'leaderteam.config.json'), 'utf8'));
+  const soloStarter = buildSoloKeyStarterConfig(baseRaw, { preset: SOLO_PROVIDER_PRESETS[0] });
+  assert.equal(soloStarter.magpie.provider, 'deepseek');
+  fs.writeFileSync(cfgFile, JSON.stringify(soloStarter, null, 2) + '\n');
+  bindRuntimeConfigFile(rt, cfgFile, loadConfig(cfgFile));
+
+  // Verify Solo-Key `deepseek/*` models remain `sourceKind: 'direct'` in `buildPublicModelCatalog` even when `cfg.magpie.provider === 'deepseek'`
+  const soloCatalog = buildPublicModelCatalog({
+    magpieGatewayModels: [{ id: 'localrelay/alpha-pro', owned_by: 'localrelay', reasoning_levels: ['none', 'high'] }],
+    effectiveConfig: rt.config,
+  });
+  const soloDsEntries = soloCatalog.filter(m => m.routeId.startsWith('deepseek/'));
+  assert.ok(soloDsEntries.length >= 2);
+  for (const dsEntry of soloDsEntries) {
+    assert.equal(dsEntry.sourceKind, 'direct', `Solo-Key ${dsEntry.routeId} must stay sourceKind="direct"`);
+    assert.equal(dsEntry.providerId, 'direct:deepseek');
+  }
+  const gwAlphaEntry = soloCatalog.find(m => m.routeId === 'localrelay/alpha-pro');
+  assert.ok(gwAlphaEntry);
+  assert.equal(gwAlphaEntry.sourceKind, 'magpie');
+  assert.equal(gwAlphaEntry.providerId, 'magpie:localrelay');
+
+  const mockMagpie = await startMockMagpieServer({ version: '0.1.4731' });
+  t.after(() => mockMagpie.close());
+
+  let dshSettingsState = {
+    providers: {
+      deepseek: {
+        displayName: 'DeepSeek',
+        api: 'openai-completions',
+        apiKeyEnv: 'DEEPSEEK_API_KEY',
+        baseURL: 'https://api.deepseek.com',
+        models: [{ id: 'deepseek-v4-pro', input: ['text'] }],
+      },
+    },
+  };
+  const selectModelCalls = [];
+  const fallbackAgentSelectCalls = [];
+  let simulateSelectModelUnavailable = false;
+  const hostAgents = new Map();
+
+  const s9Ctx = {
+    agents: hostAgents,
+    agentPresets: {
+      defaultId: 'standard',
+      async resolve(id) {
+        return { id };
+      },
+    },
+    sessionController: {
+      async create(req) {
+        const sid = req.sessionId || `session-s9-${selectModelCalls.length + fallbackAgentSelectCalls.length + 1}`;
+        hostAgents.set(sid, {
+          id: sid,
+          status: 'idle',
+          session: { id: sid, header: { id: sid, cwd: req.cwd || workspaceDir, agentPreset: req.agentPreset || 'leaderteam' } },
+          model: {
+            select(sel) {
+              fallbackAgentSelectCalls.push({ sessionId: sid, ...sel });
+            },
+          },
+        });
+        return { sessionId: sid, agentPreset: req.agentPreset || 'leaderteam' };
+      },
+      async selectModel(req) {
+        if (simulateSelectModelUnavailable) {
+          throw new Error('session/model-unavailable');
+        }
+        selectModelCalls.push(req);
+        return { selected: { provider: req.provider, model: req.model, ...(req.reasoningEffort ? { reasoningEffort: req.reasoningEffort } : {}) } };
+      },
+      async list() {
+        return { items: [] };
+      },
+    },
+    settings: {
+      describe() {
+        return [{ ns: 'llm-pi-ai', value: structuredClone(dshSettingsState) }];
+      },
+      async update(_ns, nextVal) {
+        dshSettingsState = structuredClone(nextVal);
+      },
+    },
+    get(k) {
+      if (k === 'profileContext') return { home: dshHome };
+      return this[k] ?? null;
+    },
+  };
+
+  await withTestRuntime(rt, async () => {
+    const h = createPublicContractHandlers(s9Ctx, rt);
+    await h.gatewayControl(makeJsonPost({
+      action: 'configure',
+      config: {
+        mode: 'external',
+        externalGatewayUrl: mockMagpie.gatewayUrl,
+        externalWebAdminUrl: mockMagpie.webUrl,
+        externalWebKey: mockMagpie.webKey,
+      },
+    }));
+    await h.providersMutate(makeJsonPost({
+      operation: 'save-provider',
+      spec: { new: true, id: 'localrelay', name: 'Local Relay', chat: 'http://127.0.0.1:19991/v1', baseAPI: 'chat', key: 'sk-relay-1234567890' },
+    }));
+    const syncPoolRes = await (await h.modelsSyncPool(makeJsonPost({ target: 'local', enableInExecutionPool: true }))).json();
+    assert.equal(syncPoolRes.ok, true);
+    assert.equal(syncPoolRes.data.dshSettingsSync.synced, true);
+
+    // Confirm `providers.deepseek` was NEVER clobbered and Magpie models synced strictly to `providers.magpie` without `apiKeyEnv`!
+    assert.equal(dshSettingsState.providers.deepseek.baseURL, 'https://api.deepseek.com');
+    assert.equal(dshSettingsState.providers.deepseek.apiKeyEnv, 'DEEPSEEK_API_KEY');
+    assert.equal(
+      dshSettingsState.providers.deepseek.models.some(m => m.id.includes('localrelay')),
+      false,
+      'Magpie models must NEVER sync into providers.deepseek',
+    );
+    assert.ok(dshSettingsState.providers.magpie, 'Magpie provider profile must be created under providers.magpie');
+    assert.equal(dshSettingsState.providers.magpie.baseURL, `${mockMagpie.gatewayUrl}/v1`);
+    assert.equal(dshSettingsState.providers.magpie.headers?.Authorization, 'Bearer magpie-leaderteam');
+    assert.equal('apiKeyEnv' in dshSettingsState.providers.magpie, false);
+
+    // Configure `roles.leader` to a synced Magpie model
+    const syncedMagpieModel = syncPoolRes.data.models.find(m => m.sourceKind === 'magpie');
+    assert.ok(syncedMagpieModel);
+    const cfgRes = await (await h.runtimeConfigure(makeJsonPost({
+      target: 'local',
+      changes: {
+        setRoles: [
+          {
+            role: 'leader',
+            route: syncedMagpieModel.routeId,
+            effort: syncedMagpieModel.efforts.defaultEffort,
+          },
+        ],
+      },
+    }))).json();
+    assert.equal(cfgRes.ok, true);
+    assert.equal(rt.config.models[syncedMagpieModel.routeId].provider, 'magpie');
+
+    // S8-E2E-01b: `workbenchCreate` immediately selects `roles.leader.route` via `sessionController.selectModel`
+    const created1 = await (await h.workbenchCreate(makeJsonPost({ cwd: workspaceDir, executionMode: 'single' }))).json();
+    assert.equal(created1.ok, true);
+    assert.equal(selectModelCalls.length, 1);
+    assert.equal(selectModelCalls[0].sessionId, created1.data.sessionId);
+    assert.equal(selectModelCalls[0].provider, 'magpie');
+    assert.equal(selectModelCalls[0].model, syncedMagpieModel.magpieModelId);
+
+    // Graceful fallback when `selectModel` rejects (e.g., route not yet registered in host)
+    simulateSelectModelUnavailable = true;
+    const created2 = await (await h.workbenchCreate(makeJsonPost({ cwd: workspaceDir }))).json();
+    assert.equal(created2.ok, true);
+    assert.equal(fallbackAgentSelectCalls.length, 1);
+    assert.equal(fallbackAgentSelectCalls[0].sessionId, created2.data.sessionId);
+    assert.equal(fallbackAgentSelectCalls[0].provider, 'magpie');
+
+    // --- 2. S8-E2E-02: Overlong >192-char pure Single session gate usage via `/api/lt/v1/usage/report` ---
+    const overlongSid = `session-overlong-single-${'x'.repeat(190)}`; // 214 chars
+    const { encodeSafeTeamSegment } = await import('../../packages/lt-usage/reader/service.js');
+    const compactedSeg = encodeSafeTeamSegment(overlongSid);
+    assert.ok(compactedSeg.length <= 192 && compactedSeg.includes('~h'));
+    const zstDir = path.join(dshHome, 'sessions', compactedSeg);
+    fs.mkdirSync(zstDir, { recursive: true });
+    const zstRows = [
+      { type: 'session', version: 4, id: overlongSid, cwd: workspaceDir, agentPreset: 'leaderteam', createdAt: 7000 },
+      {
+        type: 'assistant/message',
+        seq: 1,
+        time: 7100,
+        data: {
+          message: { id: 'm-overlong-1', source: { kind: 'model', provider: 'magpie', model: 'codex/gpt-6.1-sol' }, content: [{ type: 'text', text: 'OK' }] },
+          usage: { inputTokens: 100, outputTokens: 20, totalTokens: 120 },
+        },
+      },
+    ];
+    fs.writeFileSync(
+      path.join(zstDir, 'session.v4.jsonl.zstd'),
+      Buffer.concat(zstRows.map(r => zlib.zstdCompressSync(Buffer.from(`${JSON.stringify(r)}\n`)))),
+    );
+    const compactedTeamDir = path.join(storageRoot, 'teams', compactedSeg);
+    fs.mkdirSync(compactedTeamDir, { recursive: true });
+    appendJsonl(path.join(compactedTeamDir, 'usage.jsonl'), {
+      at: new Date(7200).toISOString(),
+      role: 'gate',
+      route: 'codex/gpt-6.1-sol',
+      ok: true,
+      attempts: 1,
+      tool: 'bash',
+      member: 'leader',
+      usage: { inputTokens: 80, outputTokens: 20, totalTokens: 100 },
+    });
+    const overlongRep = await (await h.usageReport(makeJsonPost({ sessionId: overlongSid, syncGateway: false }))).json();
+    assert.equal(overlongRep.ok, true);
+    assert.equal(overlongRep.data.report.meta.kind, 'session');
+    assert.equal(overlongRep.data.report.totals.totalTokens, 220, 'Overlong pure Single session must report 120 + 100 = 220 tokens');
+  });
+
+  // --- 3. S8-E2E-03: `ProvidersView.tsx` renders cleanly when optional `bundle.providerPresets` is omitted ---
+  const builtProvidersView = await esbuild.build({
+    entryPoints: [path.join(repoRoot, 'packages', 'lt-web', 'src', 'views', 'ProvidersView.tsx')],
+    bundle: true,
+    write: false,
+    format: 'cjs',
+    platform: 'browser',
+    jsx: 'transform',
+    tsconfigRaw: JSON.stringify({ compilerOptions: { jsx: 'react' } }),
+    external: ['react'],
+  });
+  const mockReactForProviders = {
+    Fragment: 'fragment',
+    createElement: (type, props, ...children) =>
+      typeof type === 'function' ? type(Object.assign({}, props, { children })) : { type, props: props || {}, children },
+    useState: init => [typeof init === 'function' ? init() : init, () => {}],
+    useEffect: () => {},
+  };
+  mockReactForProviders.default = mockReactForProviders;
+  const pvMod = { exports: {} };
+  new Function('require', 'module', 'exports', builtProvidersView.outputFiles[0].text)(
+    id => (id === 'react' ? mockReactForProviders : webRequire(id)),
+    pvMod,
+    pvMod.exports,
+  );
+  const mockV22Snapshot = JSON.parse(fs.readFileSync(path.join(contractsRoot, 'mocks', 'mock-v2.2-oss-snapshot.json'), 'utf8'));
+  assert.equal(mockV22Snapshot.providerPresets, undefined, 'Contract snapshot omits optional providerPresets');
+  const renderedProvidersTree = pvMod.exports.ProvidersView({
+    bundle: {
+      capabilities: mockV22Snapshot.capabilities,
+      gateway: mockV22Snapshot.gateway,
+      providers: mockV22Snapshot.providers,
+      // providerPresets intentionally omitted (`undefined`)!
+      models: mockV22Snapshot.models,
+      runtime: mockV22Snapshot.runtime,
+      uiPreferences: { theme: 'white', customTheme: {}, usageAnalyticsEnabled: true, autoRefreshMs: 3000 },
+      usageStatus: { enabled: true, healthy: true, dshHome: '/tmp', homeExists: true, cachedGatewayRecords: 0, lastSyncAt: null, lastSyncError: null },
+    },
+    onRefreshBundle: async () => {},
+  });
+  assert.ok(JSON.stringify(renderedProvidersTree).includes('自定义 OpenAI / Responses / Anthropic / Gemini 供应商'));
+
+  // --- 4. S8-E2E-04: `model-config-ui.mjs` `/api/sync-desktop` surfaces `syncRes.error` instead of generic fallback ---
+  const cfgSrv = await startModelConfigServer({
+    configFile: cfgFile,
+    dshHome,
+    projectRoot: repoRoot,
+    port: 0,
+  });
+  t.after(() => cfgSrv.close());
+
+  if (process.platform !== 'win32') {
+    const syncDesktopRes = await fetch(`${cfgSrv.url}api/sync-desktop`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-LT-Token': cfgSrv.csrfToken,
+      },
+      body: '{}',
+    });
+    assert.equal(syncDesktopRes.status, 409);
+    const syncDesktopBody = await syncDesktopRes.json();
+    assert.notEqual(syncDesktopBody.error, 'Desktop sync failed');
+    assert.match(syncDesktopBody.error, /On Linux\/macOS, dsh\.bundle syncs configured models automatically/);
+  }
+
+  // --- 5. S8-E2E-05: `config/desktop.patch.yml` & `THIRD_PARTY_NOTICES.md` parity ---
+  const desktopPatchText = fs.readFileSync(path.join(repoRoot, 'config', 'desktop.patch.yml'), 'utf8');
+  const presetLtBlock = desktopPatchText.split('- id: preset-lt-member-readonly')[0];
+  assert.equal(presetLtBlock.includes('write: false'), false, 'preset-leaderteam in desktop.patch.yml must enable write/edit for Single mode');
+  assert.ok(presetLtBlock.includes('id: tool-bash'));
+  assert.ok(presetLtBlock.includes('id: tool-pwsh'));
+  assert.ok(presetLtBlock.includes('id: tool-jobs'));
+
+  const noticesPath = path.join(repoRoot, 'THIRD_PARTY_NOTICES.md');
+  assert.equal(fs.existsSync(noticesPath), true, 'Root THIRD_PARTY_NOTICES.md must exist');
+  const noticesText = fs.readFileSync(noticesPath, 'utf8');
+  assert.match(noticesText, /Apache License, Version 2\.0/);
+  assert.match(noticesText, /yetone\/magpie/);
+  assert.match(noticesText, /MIT/);
+  assert.match(noticesText, /packages\/lt-usage\/NOTICE\.md/);
+  const rootPkg = JSON.parse(fs.readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
+  assert.equal(rootPkg.version, '2.2.3');
+  assert.ok(rootPkg.files.includes('THIRD_PARTY_NOTICES.md'));
 });

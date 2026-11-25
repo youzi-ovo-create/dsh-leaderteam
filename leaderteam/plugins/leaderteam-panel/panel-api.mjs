@@ -24,9 +24,11 @@ import {
 import {
   collectCombinedDiscoveredModels,
   collectKnownSessionModeItems,
+  enrichChangesWithDiscoveredProviders,
   resolveHostSessionModeHints,
   syncActiveModelsToDshHost,
 } from './public-api.mjs';
+import { resolveMagpieGatewayHostProvider } from '../../gateway/index.mjs';
 
 export const PANEL_ROUTES = Object.freeze({
   STATE: '/api/leaderteam-panel/state',
@@ -192,6 +194,7 @@ export async function buildPanelStateSnapshot(ctx, rt = runtime(), { probeEndpoi
     };
 
   // Merge configured models + upstream DSH & live Magpie discovered models into a unified selector catalog
+  const magpieHostProv = resolveMagpieGatewayHostProvider(rt.config);
   const byRoute = new Map();
   for (const m of configSnapshot.models) {
     byRoute.set(m.route, {
@@ -226,7 +229,7 @@ export async function buildPanelStateSnapshot(ctx, rt = runtime(), { probeEndpoi
         usedByRoles: [],
         overriddenInLocal: false,
         onlyInLocal: false,
-        source: dm.source ?? 'magpie',
+        source: dm.source ?? (dm.provider === magpieHostProv ? 'magpie' : 'dsh'),
         registeredInDsh: Boolean(dm.registeredInDsh),
       });
     }
@@ -285,7 +288,8 @@ export function createPanelHandlers(ctx, rt = runtime()) {
         syncRuntimeConfig(rt);
         const { gwStatus, discoveredModels } = await collectCombinedDiscoveredModels(ctx, rt);
         const target = body.target === 'base' ? 'base' : 'local';
-        const changes = isPlainObj(body.changes) ? body.changes : {};
+        const rawChanges = isPlainObj(body.changes) ? body.changes : {};
+        const changes = enrichChangesWithDiscoveredProviders(rawChanges, rt.config, discoveredModels);
         const applyResult = applyModelConfigChanges(changes, {
           configFile: rt.configPath,
           target,
