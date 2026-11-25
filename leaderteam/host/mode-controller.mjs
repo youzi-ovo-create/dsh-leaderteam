@@ -159,7 +159,7 @@ export function inspectSessionModeState(ctx, rt = runtime(), sessionId, options 
     }
   } else {
     const presets = getHostService(ctx, 'agentPresets');
-    const sessionsSvc = ctx?.sessions ?? getHostService(ctx, 'sessions');
+    const sessionsSvc = getHostService(ctx, 'sessions');
     const liveSession = sessionsSvc?.get?.(sessionId) ?? liveAgent?.session ?? null;
     let preset = typeof presets?.presetForSession === 'function' && liveSession
       ? presets.presetForSession(liveSession)
@@ -191,7 +191,9 @@ export function inspectSessionModeState(ctx, rt = runtime(), sessionId, options 
   let activeMembersCount = 0;
   let activeConferenceId = null;
   if (baseRt?.storageRoot && TeamStore.exists(baseRt.storageRoot, sessionId)) {
-    const store = teamStore(sessionId);
+    const store = baseRt === runtime()
+      ? teamStore(sessionId)
+      : (baseRt.stores?.get?.(sessionId) ?? new TeamStore(baseRt.storageRoot, sessionId));
     reconcileStaleMembers(baseRt, store);
     for (const m of store.members().values()) {
       if (BUSY_MEMBER_STATUSES.has(m.status) || BUSY_MEMBER_GOV_STATES.has(m.governanceState)) {
@@ -348,7 +350,10 @@ export function switchSessionExecutionMode(ctx, rt = runtime(), sessionId, targe
 
   if (nextMode === 'team' && hasLiveLeader && !TeamStore.exists(baseRt.storageRoot, sessionId)) {
     const cwd = liveActor?.cwd ?? liveAgent?.session?.header?.cwd ?? null;
-    teamStore(sessionId).ensure({ workspace: cwd, surface: baseRt.surface });
+    const store = baseRt === runtime()
+      ? teamStore(sessionId)
+      : (baseRt.stores?.get?.(sessionId) ?? new TeamStore(baseRt.storageRoot, sessionId));
+    store.ensure({ workspace: cwd, surface: baseRt.surface });
     try { baseRt.onLeaderSessionReady?.(ctx, sessionId, cwd); } catch {}
   }
 

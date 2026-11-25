@@ -1,14 +1,31 @@
 /**
  * Leader Team Public Product & Dual-Line Integration Contract
  * Contract ID: lt.public.v1
- * Version: 1.0.0
+ * Version: 1.1.0
  * License: Apache-2.0
  *
  * Strictly zero secrets and zero private Core internals.
  */
 
 export type ContractId = 'lt.public.v1';
-export type ContractVersion = '1.0.0' | '1.0.1';
+export type ContractVersion = '1.0.0' | '1.0.1' | '1.1.0';
+
+export type ExecutionMode = 'team' | 'single';
+
+export interface SessionModeSnapshot {
+  sessionId: string;
+  mode: ExecutionMode;
+  defaultMode: 'team';
+  isLtSession: boolean;
+  canSwitch: boolean;
+  busyReason: string | null;
+  activeTurn: boolean;
+  activeMembersCount: number;
+  pendingReviewsCount: number;
+  activeConferenceId: string | null;
+  updatedAt: string | null;
+  switchCount: number;
+}
 
 export interface ContractEnvelope<T> {
   ok: true;
@@ -27,6 +44,7 @@ export interface ContractErrorEnvelope {
     code: string;
     message: string;
     retriable?: boolean;
+    details?: Record<string, unknown> | null;
   };
 }
 
@@ -79,9 +97,13 @@ export interface BackendCapabilities {
     usageAnalytics: boolean;
     usageOfflineImport: boolean;
     themePersistence: boolean;
+    /** Required boolean in 1.1.0; optional in 1.0.0 / 1.0.1 for backward compatibility */
+    inSessionDualMode?: boolean;
   };
   supportedRoles: RoleSchemaDescriptor[];
 }
+
+export type CapabilityMatrix = BackendCapabilities;
 
 /* ==================== 2. Gateway Lifecycle ==================== */
 

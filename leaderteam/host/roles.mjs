@@ -186,7 +186,15 @@ function disposeLeaderPromptHandles(agent) {
 
 export function applyLeaderPromptSections(ctx, rt, actor, agent, mode = 'team') {
   disposeLeaderPromptHandles(agent);
-  const prompt = agent?.ctx?.systemPrompt;
+  let prompt = null;
+  if (agent?.ctx) {
+    if (typeof agent.ctx.get === 'function') {
+      try { prompt = agent.ctx.get('systemPrompt') ?? null; } catch {}
+    }
+    if (!prompt) {
+      try { prompt = agent.ctx.systemPrompt ?? null; } catch {}
+    }
+  }
   if (!prompt || typeof prompt.section !== 'function') {
     actor.promptAppliedMode = mode;
     return;

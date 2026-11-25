@@ -14,6 +14,7 @@
     ARCHIVE: 'api/leaderteam-panel/archive',
     RETROSPECT: 'api/leaderteam-panel/retrospect',
     CLEAN: 'api/leaderteam-panel/clean',
+    SESSION_MODE: 'api/leaderteam-panel/session-mode',
   };
   const ROLE_META = [
     { key: 'leader', label: '领队 (leader)' },
@@ -96,11 +97,21 @@
     } else {
       res = await fetch(route, reqInit);
     }
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-    const json = await res.json();
-    if (!json || json.ok !== true) {
-      const msg = (json && json.error && json.error.message) ? json.error.message : 'Request failed';
-      throw new Error(msg);
+    let json = null;
+    try {
+      json = await res.json();
+    } catch {}
+    if (!res.ok || !json || json.ok !== true) {
+      const msg = (json && json.error && json.error.message)
+        ? json.error.message
+        : ('HTTP ' + res.status);
+      const err = new Error(msg);
+      if (json && json.error) {
+        err.code = json.error.code || null;
+        err.details = json.error.details || null;
+      }
+      err.status = res.status;
+      throw err;
     }
     return json.value;
   }
@@ -155,6 +166,10 @@
       const [newModelProvider, setNewModelProvider] = useState('magpie');
       const [newModelEfforts, setNewModelEfforts] = useState('low,medium,high');
 
+      // Session execution modes (Single / Team)
+      const [sessionModes, setSessionModes] = useState([]);
+      const [switchingSessionId, setSwitchingSessionId] = useState('');
+
       // Archive filters & detail
       const [catFilter, setCatFilter] = useState('');
       const [stateFilter, setStateFilter] = useState('');
@@ -179,6 +194,9 @@
         } else if (keepDrafts && opts && opts.addedPoolRoute) {
           const r = opts.addedPoolRoute;
           setDraftPool(prev => (prev.includes(r) ? prev : prev.concat([r])));
+        }
+        if (snap && Array.isArray(snap.sessionModes)) {
+          setSessionModes(snap.sessionModes);
         }
         if (snap && snap.archive && Array.isArray(snap.archive.recentPlans)) {
           setArchivePlans(snap.archive.recentPlans);
@@ -419,6 +437,66 @@
         }
       };
 
+      const onRefreshSessionModes = async () => {
+        setError(null);
+        try {
+          const res = await postApi(ROUTES.SESSION_MODE, { action: 'list' });
+          if (res && Array.isArray(res.sessions)) {
+            setSessionModes(res.sessions);
+          }
+        } catch (e) {
+          setError(e && e.message ? e.message : String(e));
+        }
+      };
+
+      const onSwitchSessionMode = async (sid, nextMode) => {
+        if (!sid || !nextMode) return;
+        setSwitchingSessionId(sid);
+        setError(null);
+        setNotice(null);
+        try {
+          const res = await postApi(ROUTES.SESSION_MODE, {
+            action: 'set',
+            sessionId: sid,
+            mode: nextMode,
+          });
+          if (res && Array.isArray(res.sessions)) {
+            setSessionModes(res.sessions);
+          } else if (res && res.modeState) {
+            setSessionModes(prev => prev.map(s => (
+              s.sessionId === sid
+                ? Object.assign({}, s, {
+                    executionMode: res.modeState.mode,
+                    canSwitchMode: res.modeState.canSwitch,
+                    modeBusyReason: res.modeState.busyReason,
+                    modeState: res.modeState,
+                  })
+                : s
+            )));
+          }
+          setNotice('会话 ' + sid + ' 已切换为 ' + (nextMode === 'single' ? 'Single 单代理直执' : 'Team 团队协作') + ' 模式（0 次模型调用）。');
+        } catch (e) {
+          if (e && e.details && e.details.modeState) {
+            const ms = e.details.modeState;
+            setSessionModes(prev => prev.map(s => (
+              s.sessionId === sid
+                ? Object.assign({}, s, {
+                    executionMode: ms.mode,
+                    isLtSession: ms.isLtSession,
+                    canSwitchMode: ms.canSwitch,
+                    modeBusyReason: ms.busyReason,
+                    modeState: ms,
+                  })
+                : s
+            )));
+          }
+          const prefix = e && e.code === 'MODE_SWITCH_BUSY' ? '无法切换会话模式（当前忙碌）：' : '切换会话模式失败：';
+          setError(prefix + (e && e.message ? e.message : String(e)));
+        } finally {
+          setSwitchingSessionId('');
+        }
+      };
+
       const models = (data && Array.isArray(data.unifiedModels)) ? data.unifiedModels : [];
       const cardStyle = {
         border: '1px solid rgba(128,128,128,0.25)',
@@ -559,10 +637,86 @@
           )
         ),
 
-        // TAB 1: Models & Roles
+        // TAB 1: Models, Roles & In-Session Dual Mode
         tab === 'models' ? h(
           'div',
           null,
+          h('div', { style: cardStyle },
+            h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px', flexWrap: 'wrap', gap: '6px' } },
+              h('strong', null, '会话内执行模式 (Single / Team)'),
+              h('button', { style: btnStyle(false), onClick: onRefreshSessionModes, disabled: loading || Boolean(switchingSessionId) }, '刷新会话模式')
+            ),
+            h('div', { style: { fontSize: '11px', opacity: 0.78, marginBottom: '8px' } },
+              '仅在会话空闲时允许在 Team（领队编排 + 子代理并发 + 双评审）与 Single（主代理直执 + 安全门守护 · 零团队开销）之间热切换；0 次模型调用。'
+            ),
+            sessionModes.length === 0
+              ? h('div', { style: { fontSize: '12px', opacity: 0.7 } }, '暂无活跃或最近的会话记录。创建 LeaderTeam 会话后可在此一键切换 Single / Team。')
+              : sessionModes.map(s => {
+                const ms = s.modeState || {};
+                const isLt = s.isLtSession !== false && ms.isLtSession !== false;
+                const curMode = (ms.mode || s.executionMode) === 'single' ? 'single' : 'team';
+                const canSwitch = isLt && ms.canSwitch !== false && s.canSwitchMode !== false;
+                const busyReason = ms.busyReason || s.modeBusyReason || null;
+                const targetMode = curMode === 'team' ? 'single' : 'team';
+                const targetLabel = targetMode === 'single' ? '切换为 Single' : '切换为 Team';
+                const isSwitchingThis = switchingSessionId === s.sessionId;
+                return h(
+                  'div',
+                  {
+                    key: s.sessionId,
+                    style: {
+                      display: 'flex',
+                      justifyContent: 'space-between',
+                      alignItems: 'center',
+                      flexWrap: 'wrap',
+                      gap: '8px',
+                      padding: '7px 0',
+                      borderTop: '1px solid rgba(128,128,128,0.15)',
+                      fontSize: '12px',
+                    },
+                  },
+                  h('div', { style: { minWidth: '180px', flex: 1 } },
+                    h('div', { style: { display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' } },
+                      h('strong', null, s.title || s.sessionId),
+                      h(
+                        'span',
+                        {
+                          style: {
+                            padding: '1px 6px',
+                            borderRadius: '4px',
+                            border: '1px solid ' + (!isLt ? 'rgba(128,128,128,0.4)' : curMode === 'single' ? '#2563eb' : '#9C5B2E'),
+                            color: !isLt ? 'inherit' : curMode === 'single' ? '#2563eb' : '#9C5B2E',
+                            fontSize: '11px',
+                            fontWeight: 600,
+                          },
+                        },
+                        !isLt ? 'DSH 原生' : (curMode === 'single' ? 'Single' : 'Team')
+                      ),
+                      h(
+                        'span',
+                        { style: { fontSize: '11px', opacity: 0.78, color: canSwitch ? '#22c55e' : '#f59e0b' } },
+                        !isLt ? '非 LT 预设会话' : (canSwitch ? '● 空闲可切换' : '● 忙碌锁定')
+                      )
+                    ),
+                    h('div', { style: { fontSize: '11px', opacity: 0.7, fontFamily: 'monospace' } },
+                      s.sessionId + (busyReason ? ' — ' + busyReason : '')
+                    )
+                  ),
+                  isLt
+                    ? h(
+                      'button',
+                      {
+                        style: btnStyle(curMode === 'team'),
+                        disabled: loading || isSwitchingThis || !canSwitch,
+                        title: canSwitch ? ('空闲热切换会话执行模式：' + targetLabel) : (busyReason || '当前会话忙碌中，仅允许空闲时切换'),
+                        onClick: () => onSwitchSessionMode(s.sessionId, targetMode),
+                      },
+                      isSwitchingThis ? '切换中…' : targetLabel
+                    )
+                    : h('span', { style: { fontSize: '11px', opacity: 0.65 } }, '仅 LT 会话可切换')
+                );
+              })
+          ),
           h('div', { style: cardStyle },
             h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px', flexWrap: 'wrap', gap: '6px' } },
               h('strong', null, '治理角色与领队模型（支持任意 DSH 上游 Provider 与非推理模型）'),

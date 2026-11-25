@@ -27,6 +27,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '..', '..');
 const ossRoot = path.resolve(repoRoot, '..');
 const artifactsDir = path.join(ossRoot, 'artifacts');
+const rootPkg = JSON.parse(fs.readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
+const expectedVersion = rootPkg.version;
 
 const ENHANCED_PATH = `${path.join(os.homedir(), '.local', 'bin')}:${process.env.PATH || ''}`;
 
@@ -51,6 +53,7 @@ async function main() {
   console.log('[1/6] Packing release tarball and auditing file manifest...');
   const packJsonRaw = runSync('npm', ['pack', '--json', '--pack-destination', artifactsDir]);
   const packInfo = JSON.parse(packJsonRaw)[0];
+  assert.equal(packInfo.version, expectedVersion, `Tarball version must match package.json (${expectedVersion})`);
   const tarballPath = path.join(artifactsDir, packInfo.filename);
   assert.ok(fs.existsSync(tarballPath), `Tarball created at ${tarballPath}`);
 
@@ -214,13 +217,54 @@ async function main() {
       agentPreset: 'leaderteam',
     });
     assert.ok(createdSess.data.sessionId, 'Created real DSH session from /lt/ workbench');
+    assert.equal(createdSess.data.modeState?.mode, 'team', 'Default workbench session starts in team mode');
+    assert.equal(createdSess.data.modeState?.isLtSession, true);
+
+    // Live V2.2.3 dual-mode E2E check on real `dsh web`: Team -> Single -> Team (0 LLM calls) + GET read-only & GET mutating 405 guard!
+    const toSingle = await postLt('workbench/mode', {
+      action: 'set',
+      sessionId: createdSess.data.sessionId,
+      mode: 'single',
+    });
+    assert.equal(toSingle.data.changed, true);
+    assert.equal(toSingle.data.previousMode, 'team');
+    assert.equal(toSingle.data.modeState.mode, 'single');
+
+    const getReadOnlyMode = await fetch(
+      `${parsedOrigin}/api/lt/v1/workbench/mode?sessionId=${encodeURIComponent(createdSess.data.sessionId)}`,
+      { headers: { Cookie: cookieHeader, Origin: parsedOrigin } },
+    );
+    assert.equal(getReadOnlyMode.status, 200);
+    const getReadOnlyJson = await getReadOnlyMode.json();
+    assert.equal(getReadOnlyJson.ok, true);
+    assert.equal(getReadOnlyJson.data.modeState.mode, 'single');
+
+    const getMutatingMode = await fetch(
+      `${parsedOrigin}/api/lt/v1/workbench/mode?sessionId=${encodeURIComponent(createdSess.data.sessionId)}&mode=team`,
+      { headers: { Cookie: cookieHeader, Origin: parsedOrigin } },
+    );
+    assert.equal(getMutatingMode.status, 405, 'Mutating GET /api/lt/v1/workbench/mode?mode=... must return 405');
+    assert.equal(getMutatingMode.headers.get('allow'), 'POST');
+
+    const backToTeam = await postLt('workbench/mode', {
+      action: 'set',
+      sessionId: createdSess.data.sessionId,
+      mode: 'team',
+    });
+    assert.equal(backToTeam.data.changed, true);
+    assert.equal(backToTeam.data.previousMode, 'single');
+    assert.equal(backToTeam.data.modeState.mode, 'team');
+    assert.equal(backToTeam.data.modeState.switchCount, 2);
 
     // Switch back to DSH `/` and back to `/lt/workbench/sessions` -> verify session is live & uninterrupted!
     const dshCheckAgain = await fetch(`${parsedOrigin}/`, { headers: { Cookie: cookieHeader } });
     assert.equal(dshCheckAgain.status, 200);
     const listedSess = await postLt('workbench/sessions');
     assert.equal(listedSess.data.liveHost, true);
-    assert.ok(listedSess.data.sessions.some(s => s.sessionId === createdSess.data.sessionId));
+    const foundListed = listedSess.data.sessions.find(s => s.sessionId === createdSess.data.sessionId);
+    assert.ok(foundListed, 'Created session returned in workbench/sessions');
+    assert.equal(foundListed.executionMode, 'team');
+    assert.equal(foundListed.modeState?.switchCount, 2);
 
     // Verify all 4 themes + custom seeds round-trip on live DSH host
     for (const th of ['white', 'dark', 'heluoxu', 'custom']) {
@@ -229,8 +273,11 @@ async function main() {
     }
     await postLt('ui-preferences', { theme: 'white' }); // restore default white
 
-    // Verify live bundle conforms 100% to `lt.public.v1` contract
+    // Verify live bundle conforms 100% to `lt.public.v1` contract (v1.1.0 + dynamic package.json version)
     const liveBundle = await postLt('bundle');
+    assert.equal(liveBundle.contractVersion, '1.1.0');
+    assert.equal(liveBundle.data.capabilities.backendVersion, expectedVersion);
+    assert.equal(liveBundle.data.capabilities.features.inSessionDualMode, true);
     const bundleCheck = validateContractBundle({
       contract: liveBundle.contract,
       contractVersion: liveBundle.contractVersion,

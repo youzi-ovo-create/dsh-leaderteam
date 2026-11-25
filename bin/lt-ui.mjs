@@ -156,6 +156,7 @@ export async function startStandaloneLtUiServer({
     [PUBLIC_API_ROUTES.WORKBENCH_CREATE, handlers.workbenchCreate],
     [PUBLIC_API_ROUTES.WORKBENCH_PROMPT, handlers.workbenchPrompt],
     [PUBLIC_API_ROUTES.WORKBENCH_CANCEL, handlers.workbenchCancel],
+    [PUBLIC_API_ROUTES.WORKBENCH_MODE, handlers.workbenchMode],
     [PUBLIC_API_ROUTES.ARCHIVE_QUERY, handlers.archiveQuery],
     [PUBLIC_API_ROUTES.ARCHIVE_ACTION, handlers.archiveAction],
     [PUBLIC_API_ROUTES.USAGE_STATUS, handlers.usageStatus],
@@ -234,7 +235,14 @@ export async function startStandaloneLtUiServer({
         }
 
         const reqMethod = String(req.method || 'GET').toUpperCase();
-        const isReadOnlyRoute = PUBLIC_READONLY_API_ROUTES.has(url.pathname);
+        const isModeRoute = url.pathname === PUBLIC_API_ROUTES.WORKBENCH_MODE;
+        const rawModeAction = isModeRoute ? url.searchParams.get('action') : null;
+        const normModeAction = rawModeAction === null ? '' : rawModeAction.trim().toLowerCase();
+        const isMutatingModeGet =
+          isModeRoute
+          && reqMethod === 'GET'
+          && (url.searchParams.has('mode') || (normModeAction !== '' && normModeAction !== 'get' && normModeAction !== 'list'));
+        const isReadOnlyRoute = PUBLIC_READONLY_API_ROUTES.has(url.pathname) && !isMutatingModeGet;
         const allowedMethods = isReadOnlyRoute ? ['GET', 'POST'] : ['POST'];
         if (!allowedMethods.includes(reqMethod)) {
           const allowHeader = allowedMethods.join(', ');

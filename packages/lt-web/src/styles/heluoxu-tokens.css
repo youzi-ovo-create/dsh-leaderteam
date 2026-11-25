@@ -697,3 +697,86 @@ html, body {
   background: var(--lt-danger-bg);
   color: var(--lt-fg-primary);
 }
+
+/* ==================== V2.2.3 IN-SESSION DUAL-MODE SWITCHER ==================== */
+.lt-mode-segment {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px;
+  gap: 2px;
+  border: 1px solid var(--lt-border-control);
+  border-radius: var(--lt-radius-btn);
+  background: var(--lt-bg-subtle);
+}
+
+.lt-mode-segment-btn {
+  appearance: none;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--lt-fg-secondary);
+  font: 500 11.5px/1 var(--lt-font-sans);
+  height: 24px;
+  padding: 0 10px;
+  border-radius: calc(var(--lt-radius-btn) - 1px);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background var(--lt-dur-fast) var(--lt-ease-out), color var(--lt-dur-fast) var(--lt-ease-out), border-color var(--lt-dur-fast) var(--lt-ease-out);
+}
+
+.lt-mode-segment-btn:hover:not(:disabled):not([aria-pressed="true"]) {
+  color: var(--lt-fg-primary);
+  background: var(--lt-bg-hover);
+}
+
+.lt-mode-segment-btn[aria-pressed="true"] {
+  background: var(--lt-fg-primary);
+  color: var(--lt-fg-on-ink);
+  border-color: var(--lt-fg-primary);
+  font-weight: 600;
+}
+
+.lt-mode-segment-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.lt-mode-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font: 600 10.5px/1.45 var(--lt-font-sans);
+  letter-spacing: 0.03em;
+  border: 1px solid var(--lt-border-strong);
+  color: var(--lt-fg-secondary);
+}
+
+.lt-mode-badge[data-mode="team"] {
+  border-color: var(--lt-seal);
+  color: var(--lt-seal);
+}
+
+.lt-mode-badge[data-mode="single"] {
+  border-color: var(--lt-info);
+  color: var(--lt-info);
+  background: var(--lt-info-bg);
+}
+
+.lt-mode-badge[data-mode="dsh-native"] {
+  border-color: var(--lt-border-strong);
+  color: var(--lt-fg-muted);
+}
+
+.lt-mode-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  padding: 8px 11px;
+  margin-top: 8px;
+  border-radius: var(--lt-radius-sm);
+  border: 1px solid var(--lt-border-subtle);
+  background: var(--lt-bg-subtle);
+  font-size: 11.5px;
+}

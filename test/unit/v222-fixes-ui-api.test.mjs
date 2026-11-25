@@ -380,6 +380,24 @@ test('UI-03 & UI-08: DSH 0.2.2-rc.5 SessionSummary projections/filtering, live c
     agentPreset: 'leaderteam',
     updatedAt: 5000,
     isTeam: false,
+    executionMode: 'team',
+    isLtSession: true,
+    canSwitchMode: true,
+    modeBusyReason: null,
+    modeState: {
+      sessionId: 'sess-root',
+      mode: 'team',
+      defaultMode: 'team',
+      isLtSession: true,
+      canSwitch: true,
+      busyReason: null,
+      activeTurn: false,
+      activeMembersCount: 0,
+      pendingReviewsCount: 0,
+      activeConferenceId: null,
+      updatedAt: null,
+      switchCount: 0,
+    },
   });
 
   // Explicitly created workbench session appears in workbenchSessions even before first prompt (`blank: true`)

@@ -1,5 +1,5 @@
 /**
- * Leader Team Public Contract HTTP Backend (`lt.public.v1` · v1.0.0) & `/lt/` Static Asset Server
+ * Leader Team Public Contract HTTP Backend (`lt.public.v1` · v1.1.0) & `/lt/` Static Asset Server
  *
  * Kept 100% free of bare `@deepseek-ai/*` imports so all handlers run identically:
  * 1. Inside DSH (`dsh web` / Desktop) via `ctx.connection.fetch.register` & `ctx.webServer.register`
@@ -24,11 +24,21 @@ import { hashJson } from '../../core/canonical.mjs';
 import { loadConfig } from '../../core/config.mjs';
 import {
   runtime,
+  baseRuntime,
   bindRuntimeConfigFile,
   syncRuntimeConfig,
   activePluginsMap,
   refreshUpstreamCatalog,
 } from '../../host/runtime.mjs';
+import {
+  EXECUTION_MODES,
+  DEFAULT_EXECUTION_MODE,
+  inspectSessionModeState,
+  switchSessionExecutionMode,
+  normalizeExecutionMode,
+  readSessionModeRecord,
+} from '../../host/mode-controller.mjs';
+import { resolveSessionModePaths } from '../../core/session-mode.mjs';
 import { recentTeamObservability } from '../../host/observability.mjs';
 import {
   getOrCreateGatewayManager,
@@ -42,7 +52,7 @@ import { listKnownHomes } from '../../../packages/lt-usage/reader/homes.js';
 import pkg from '../../../package.json' with { type: 'json' };
 
 export const CONTRACT_ID = 'lt.public.v1';
-export const CONTRACT_VERSION = '1.0.0';
+export const CONTRACT_VERSION = '1.1.0';
 
 export const PUBLIC_API_ROUTES = Object.freeze({
   CAPABILITIES: '/api/lt/v1/capabilities',
@@ -60,6 +70,7 @@ export const PUBLIC_API_ROUTES = Object.freeze({
   WORKBENCH_CREATE: '/api/lt/v1/workbench/create',
   WORKBENCH_PROMPT: '/api/lt/v1/workbench/prompt',
   WORKBENCH_CANCEL: '/api/lt/v1/workbench/cancel',
+  WORKBENCH_MODE: '/api/lt/v1/workbench/mode',
   ARCHIVE_QUERY: '/api/lt/v1/archive/query',
   ARCHIVE_ACTION: '/api/lt/v1/archive/action',
   USAGE_STATUS: '/api/lt/v1/usage/status',
@@ -79,6 +90,7 @@ export const PUBLIC_READONLY_API_ROUTES = new Set([
   PUBLIC_API_ROUTES.MODELS_CATALOG,
   PUBLIC_API_ROUTES.RUNTIME_SNAPSHOT,
   PUBLIC_API_ROUTES.WORKBENCH_SESSIONS,
+  PUBLIC_API_ROUTES.WORKBENCH_MODE,
   PUBLIC_API_ROUTES.USAGE_STATUS,
   PUBLIC_API_ROUTES.USAGE_OVERVIEW,
   PUBLIC_API_ROUTES.USAGE_SESSIONS,
@@ -127,14 +139,21 @@ function okEnvelope(data) {
   );
 }
 
-function errEnvelope(code, message, status = 200, retriable = false, extraHeaders = {}) {
+function errEnvelope(code, message, status = 200, detailsOrRetriable = undefined, extraHeaders = {}) {
+  const retriable = typeof detailsOrRetriable === 'boolean' ? detailsOrRetriable : status === 409;
+  const hasDetails = detailsOrRetriable !== undefined && typeof detailsOrRetriable !== 'boolean';
   return Response.json(
     {
       ok: false,
       contract: CONTRACT_ID,
       contractVersion: CONTRACT_VERSION,
       generatedAt: new Date().toISOString(),
-      error: { code, message, retriable },
+      error: {
+        code,
+        message,
+        retriable,
+        ...(hasDetails ? { details: detailsOrRetriable } : {}),
+      },
     },
     { status, headers: { 'cache-control': 'no-store', ...extraHeaders } },
   );
@@ -150,11 +169,27 @@ function httpContractError(code, message, status = 400, headers = null) {
   return err;
 }
 
+const MODE_BAD_REQUEST_CODES = new Set([
+  'MODE_NOT_LT_SESSION',
+  'BAD_EXECUTION_MODE',
+  'BAD_SESSION_ID',
+  'SESSION_MODE_PATH_ESCAPE',
+]);
+
 function errFromException(fallbackCode, e) {
-  const status = Number.isInteger(e?.status) && e.status >= 400 ? e.status : 200;
   const code = typeof e?.code === 'string' && e.code ? e.code : fallbackCode;
+  let status = Number.isInteger(e?.status) && e.status >= 400 ? e.status : 200;
+  if (code === 'MODE_SWITCH_BUSY') status = 409;
+  else if (MODE_BAD_REQUEST_CODES.has(code) && status < 400) status = 400;
   const extraHeaders = e?.headers && typeof e.headers === 'object' ? e.headers : {};
-  return errEnvelope(code, e instanceof Error ? e.message : String(e), status, false, extraHeaders);
+  const includeDetails = code === 'MODE_SWITCH_BUSY' || MODE_BAD_REQUEST_CODES.has(code) || e?.details !== undefined;
+  return errEnvelope(
+    code,
+    e instanceof Error ? e.message : String(e),
+    status,
+    includeDetails ? (e?.details ?? null) : false,
+    extraHeaders,
+  );
 }
 
 async function parseJsonRequest(request, { allowGet = false } = {}) {
@@ -336,11 +371,14 @@ function writeUiPreferences(storageRoot, patch) {
 
 function getHostService(ctx, key) {
   if (!ctx) return null;
+  if (typeof ctx.get === 'function') {
+    try {
+      const val = ctx.get(key);
+      if (val !== undefined && val !== null) return val;
+    } catch {}
+  }
   try {
-    if (ctx[key]) return ctx[key];
-  } catch {}
-  try {
-    return ctx.get?.(key) ?? null;
+    return ctx[key] ?? null;
   } catch {
     return null;
   }
@@ -382,6 +420,7 @@ export function buildCapabilitiesPayload(ctx, rt, { hostKindOverride = null } = 
       usageAnalytics: true,
       usageOfflineImport: true,
       themePersistence: Boolean(rt?.storageRoot),
+      inSessionDualMode: true,
     },
     supportedRoles: SUPPORTED_V22_ROLES,
   };
@@ -889,6 +928,303 @@ export function findDurableSessionRows(dshHome, sessionId) {
     }
   } catch {}
   return null;
+}
+
+function extractSessionMetaFromRows(rows) {
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return { agentPreset: null, origin: undefined, openTurn: false };
+  }
+  let agentPreset = null;
+  let origin;
+  let openTurn = false;
+  for (const raw of rows) {
+    const ev = raw?.type === 'event' && raw.event ? raw.event : raw;
+    if (!ev || typeof ev !== 'object') continue;
+    if (ev.type === 'session') {
+      if (typeof ev.agentPreset === 'string' && ev.agentPreset.trim()) agentPreset = ev.agentPreset.trim();
+      if (typeof ev.data?.agentPreset === 'string' && ev.data.agentPreset.trim()) agentPreset = ev.data.agentPreset.trim();
+      if (ev.origin === 'subagent' || ev.data?.origin === 'subagent' || ev.parentSession || ev.data?.parentSession) {
+        origin = 'subagent';
+      }
+    } else if (ev.type === 'agent-preset/selected') {
+      const sel = ev.data?.agentPreset ?? ev.agentPreset;
+      if (typeof sel === 'string' && sel.trim()) agentPreset = sel.trim();
+    } else if (ev.type === 'turn/start') {
+      openTurn = true;
+    } else if (ev.type === 'turn/end') {
+      openTurn = false;
+    }
+  }
+  return { agentPreset, origin, openTurn };
+}
+
+export async function resolveHostSessionModeHints(ctx, rt, sessionId, dshHome = null) {
+  const hints = {
+    passiveState: null,
+    passiveRunning: false,
+    agentPreset: undefined,
+    origin: undefined,
+  };
+  if (typeof sessionId !== 'string' || !sessionId.trim()) return hints;
+
+  const sessionController = getHostService(ctx, 'sessionController');
+  if (sessionController && typeof sessionController.state === 'function') {
+    const ac = new AbortController();
+    try {
+      const ps = await sessionController.state({ sessionId }, ac.signal);
+      if (ps && typeof ps === 'object') {
+        hints.passiveState = ps;
+        hints.passiveRunning = Boolean(
+          ps.running === true || ps.busy === true || ps.turnRunning === true || ps.status === 'running',
+        );
+      }
+    } catch {} finally {
+      ac.abort();
+    }
+  }
+
+  const baseRt = baseRuntime(rt ?? runtime());
+  const liveActor = baseRt?.actors?.get?.(sessionId) ?? null;
+  const sessionsSvc = getHostService(ctx, 'sessions');
+  const liveSession = sessionsSvc?.get?.(sessionId) ?? liveActor?.agent?.session ?? null;
+  const presetsSvc = getHostService(ctx, 'agentPresets');
+  if (liveSession) {
+    const p = typeof presetsSvc?.presetForSession === 'function'
+      ? presetsSvc.presetForSession(liveSession)
+      : (liveSession.header?.agentPreset ?? null);
+    if (typeof p === 'string' && p.trim()) hints.agentPreset = p.trim();
+    if (liveSession.header?.origin === 'subagent' || liveSession.header?.parentSession) {
+      hints.origin = 'subagent';
+    }
+  }
+
+  if (hints.agentPreset === undefined && sessionController && typeof sessionController.projections === 'function') {
+    const ac = new AbortController();
+    try {
+      const proj = await sessionController.projections({ sessionId }, ac.signal);
+      const p = proj?.values?.agentPreset;
+      if (typeof p === 'string' && p.trim()) hints.agentPreset = p.trim();
+    } catch {} finally {
+      ac.abort();
+    }
+  }
+
+  if ((hints.agentPreset === undefined || hints.passiveState === null) && sessionController && typeof sessionController.list === 'function') {
+    const ac = new AbortController();
+    try {
+      const listed = await sessionController.list({}, ac.signal);
+      const hit = (listed?.items ?? []).find(it => String(it?.sessionId ?? it?.id ?? '') === sessionId);
+      if (hit) {
+        const p = hit.projections?.values?.agentPreset ?? hit.agentPreset ?? null;
+        if (hints.agentPreset === undefined && typeof p === 'string' && p.trim()) {
+          hints.agentPreset = p.trim();
+        }
+        if (hit.origin === 'subagent' || hit.parentSessionId) {
+          hints.origin = 'subagent';
+        }
+        if (hit.running === true) {
+          hints.passiveRunning = true;
+        }
+      }
+    } catch {} finally {
+      ac.abort();
+    }
+  }
+
+  if ((hints.agentPreset === undefined || hints.passiveState === null) && sessionController && typeof sessionController.events === 'function') {
+    const ac = new AbortController();
+    try {
+      let evRes;
+      try {
+        evRes = await sessionController.events({ address: { kind: 'session', sessionId } }, ac.signal);
+      } catch {
+        evRes = await sessionController.events({ sessionId }, ac.signal);
+      }
+      const evRows = Array.isArray(evRes) ? evRes : (evRes?.events ?? evRes?.records ?? evRes?.items ?? []);
+      const meta = extractSessionMetaFromRows(evRows);
+      if (hints.agentPreset === undefined && meta.agentPreset) hints.agentPreset = meta.agentPreset;
+      if (hints.origin === undefined && meta.origin) hints.origin = meta.origin;
+      if (hints.passiveState === null && meta.openTurn) hints.passiveRunning = true;
+    } catch {} finally {
+      ac.abort();
+    }
+  }
+
+  if (hints.agentPreset === undefined && dshHome) {
+    const durableRows = findDurableSessionRows(dshHome, sessionId);
+    if (durableRows) {
+      const meta = extractSessionMetaFromRows(durableRows);
+      if (meta.agentPreset) hints.agentPreset = meta.agentPreset;
+      if (hints.origin === undefined && meta.origin) hints.origin = meta.origin;
+    }
+  }
+
+  return hints;
+}
+
+function safeInspectSessionItemMode(ctx, rt, sessionId, options = {}) {
+  try {
+    return inspectSessionModeState(ctx, rt, sessionId, options);
+  } catch {
+    const leaderPreset = rt?.config?.profiles?.leader?.preset ?? 'leaderteam';
+    const isLt = options.origin === 'subagent'
+      ? false
+      : (typeof options.agentPreset === 'string' && options.agentPreset.trim()
+        ? options.agentPreset.trim() === leaderPreset
+        : options.isLtSession !== false);
+    return {
+      sessionId: String(sessionId || ''),
+      mode: DEFAULT_EXECUTION_MODE,
+      defaultMode: DEFAULT_EXECUTION_MODE,
+      isLtSession: isLt,
+      canSwitch: false,
+      busyReason: 'Invalid session identifier',
+      activeTurn: Boolean(options.passiveRunning),
+      activeMembersCount: 0,
+      pendingReviewsCount: 0,
+      activeConferenceId: null,
+      updatedAt: null,
+      switchCount: 0,
+    };
+  }
+}
+
+export async function collectKnownSessionModeItems(ctx, rt, dshHome = null) {
+  const baseRt = baseRuntime(rt ?? runtime());
+  const storageRoot = baseRt?.storageRoot ?? null;
+  const sessionController = getHostService(ctx, 'sessionController');
+  const workspaceRegistry = getHostService(ctx, 'workspaceRegistry');
+  const rawArchived = typeof workspaceRegistry?.archivedSessionIds === 'function'
+    ? workspaceRegistry.archivedSessionIds()
+    : workspaceRegistry?.archivedSessionIds;
+  const archivedSet = new Set(
+    rawArchived && typeof rawArchived[Symbol.iterator] === 'function'
+      ? [...rawArchived].map(String)
+      : [],
+  );
+
+  const byId = new Map();
+  const upsert = (sid, meta = {}) => {
+    if (!sid || typeof sid !== 'string' || archivedSet.has(sid)) return;
+    const prev = byId.get(sid) || {
+      sessionId: sid,
+      title: null,
+      cwd: null,
+      agentPreset: null,
+      origin: undefined,
+      passiveRunning: false,
+      updatedAt: null,
+    };
+    byId.set(sid, {
+      sessionId: sid,
+      title: meta.title ?? prev.title,
+      cwd: meta.cwd ?? prev.cwd,
+      agentPreset: meta.agentPreset ?? prev.agentPreset,
+      origin: meta.origin ?? prev.origin,
+      passiveRunning: Boolean(meta.passiveRunning || prev.passiveRunning),
+      updatedAt: meta.updatedAt ?? prev.updatedAt,
+    });
+  };
+
+  if (sessionController && typeof sessionController.list === 'function') {
+    const ac = new AbortController();
+    try {
+      const workbenchCreatedSet = baseRt?.workbenchCreatedSessionIds instanceof Set
+        ? baseRt.workbenchCreatedSessionIds
+        : null;
+      const listed = await sessionController.list({}, ac.signal);
+      for (const item of listed?.items ?? []) {
+        if (!item) continue;
+        const sid = String(item.sessionId ?? item.id ?? '');
+        if (!sid || item.origin === 'subagent' || Boolean(item.parentSessionId)) continue;
+        if (item.blank === true && !workbenchCreatedSet?.has(sid)) continue;
+        upsert(sid, {
+          title: item.projections?.values?.title ?? item.title ?? null,
+          cwd: item.cwd ?? null,
+          agentPreset: item.projections?.values?.agentPreset ?? item.agentPreset ?? null,
+          origin: item.origin,
+          passiveRunning: Boolean(item.running),
+          updatedAt: item.updatedAt ?? item.lastActivityAt ?? null,
+        });
+      }
+    } catch {} finally {
+      ac.abort();
+    }
+  }
+
+  for (const [sid, actor] of baseRt?.actors?.entries?.() ?? []) {
+    if (actor?.role === 'leader') {
+      upsert(sid, {
+        cwd: actor.cwd ?? actor.agent?.session?.header?.cwd ?? null,
+        agentPreset: baseRt?.config?.profiles?.leader?.preset ?? 'leaderteam',
+        passiveRunning: Boolean(actor.agent && actor.agent.status && actor.agent.status !== 'idle'),
+      });
+    }
+  }
+
+  if (storageRoot) {
+    const modesDir = path.join(storageRoot, 'session-modes');
+    if (fs.existsSync(modesDir)) {
+      try {
+        for (const f of fs.readdirSync(modesDir)) {
+          if (!f.endsWith('.json')) continue;
+          try {
+            const parsed = JSON.parse(fs.readFileSync(path.join(modesDir, f), 'utf8'));
+            if (typeof parsed?.sessionId === 'string' && parsed.sessionId.trim()) {
+              upsert(parsed.sessionId.trim(), {
+                updatedAt: parsed.updatedAt ? Date.parse(parsed.updatedAt) || parsed.updatedAt : null,
+              });
+            }
+          } catch {}
+        }
+      } catch {}
+    }
+
+    const teamsDir = path.join(storageRoot, 'teams');
+    if (fs.existsSync(teamsDir)) {
+      try {
+        for (const d of fs.readdirSync(teamsDir, { withFileTypes: true })) {
+          if (!d.isDirectory()) continue;
+          upsert(d.name, {});
+        }
+      } catch {}
+    }
+  }
+
+  const resolvedDshHome = dshHome ?? resolveDshHomeFromCtx(ctx, baseRt);
+  const out = [];
+  for (const entry of byId.values()) {
+    let preset = entry.agentPreset;
+    let origin = entry.origin;
+    if (!preset && resolvedDshHome) {
+      const durableRows = findDurableSessionRows(resolvedDshHome, entry.sessionId);
+      if (durableRows) {
+        const meta = extractSessionMetaFromRows(durableRows);
+        if (meta.agentPreset) preset = meta.agentPreset;
+        if (!origin && meta.origin) origin = meta.origin;
+      }
+    }
+    if (origin === 'subagent') continue;
+    const modeState = safeInspectSessionItemMode(ctx, baseRt, entry.sessionId, {
+      agentPreset: preset,
+      origin,
+      passiveRunning: entry.passiveRunning,
+    });
+    out.push({
+      sessionId: entry.sessionId,
+      title: entry.title,
+      cwd: entry.cwd,
+      agentPreset: preset,
+      updatedAt: entry.updatedAt ?? modeState.updatedAt,
+      isTeam: Boolean(storageRoot && TeamStore.exists(storageRoot, entry.sessionId)),
+      executionMode: modeState.mode,
+      isLtSession: modeState.isLtSession,
+      canSwitchMode: modeState.canSwitch,
+      modeBusyReason: modeState.busyReason,
+      modeState,
+    });
+  }
+  return out;
 }
 
 export async function collectCombinedDiscoveredModels(ctx, rt, gwMgr = null) {
@@ -1508,30 +1844,62 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
             })
             .map(item => {
               const sid = String(item.sessionId ?? item.id);
+              const agentPreset = item.projections?.values?.agentPreset ?? item.agentPreset ?? null;
+              const modeState = safeInspectSessionItemMode(ctx, rt, sid, {
+                agentPreset,
+                origin: item.origin,
+                passiveRunning: Boolean(item.running),
+              });
               return {
                 sessionId: sid,
                 title: item.projections?.values?.title ?? item.title ?? null,
                 cwd: item.cwd ?? null,
-                agentPreset: item.projections?.values?.agentPreset ?? item.agentPreset ?? null,
+                agentPreset,
                 updatedAt: item.updatedAt ?? item.lastActivityAt ?? null,
                 isTeam: TeamStore.exists(rt.storageRoot, sid),
+                executionMode: modeState.mode,
+                isLtSession: modeState.isLtSession,
+                canSwitchMode: modeState.canSwitch,
+                modeBusyReason: modeState.busyReason,
+                modeState,
               };
             });
           return okEnvelope({ liveHost: true, workspaces, sessions });
         }
 
         // Standalone fallback: list durable root sessions via Hengzhang
+        const dshHome = resolveDshHomeFromCtx(ctx, rt);
+        const leaderPreset = rt?.config?.profiles?.leader?.preset ?? 'leaderteam';
         const usageSessions = await getUsageBridge().getSessions();
         const sessions = (usageSessions.sessions ?? [])
           .filter(s => !s.isChild && !archivedSet.has(String(s.id)))
-          .map(s => ({
-            sessionId: s.id,
-            title: s.title ?? null,
-            cwd: s.cwd ?? null,
-            agentPreset: s.kind === 'team' ? 'leaderteam' : null,
-            updatedAt: s.lastActivityMs ?? s.startedAtMs ?? null,
-            isTeam: s.kind === 'team',
-          }));
+          .map(s => {
+            const sid = String(s.id);
+            const durableRows = dshHome ? findDurableSessionRows(dshHome, sid) : null;
+            const durableMeta = durableRows ? extractSessionMetaFromRows(durableRows) : { agentPreset: null, origin: undefined };
+            let persistedMode = false;
+            try {
+              persistedMode = Boolean(rt?.storageRoot && readSessionModeRecord(rt.storageRoot, sid).persisted);
+            } catch {}
+            const agentPreset = durableMeta.agentPreset ?? ((s.kind === 'team' || persistedMode) ? leaderPreset : null);
+            const modeState = safeInspectSessionItemMode(ctx, rt, sid, {
+              agentPreset,
+              origin: durableMeta.origin,
+            });
+            return {
+              sessionId: sid,
+              title: s.title ?? null,
+              cwd: s.cwd ?? null,
+              agentPreset,
+              updatedAt: s.lastActivityMs ?? s.startedAtMs ?? null,
+              isTeam: s.kind === 'team' || TeamStore.exists(rt.storageRoot, sid),
+              executionMode: modeState.mode,
+              isLtSession: modeState.isLtSession,
+              canSwitchMode: modeState.canSwitch,
+              modeBusyReason: modeState.busyReason,
+              modeState,
+            };
+          });
         return okEnvelope({ liveHost: false, workspaces, sessions });
       } catch (e) {
         return errFromException('WORKBENCH_SESSIONS_FAILED', e);
@@ -1565,6 +1933,7 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
             }
             if (Array.isArray(evRes)) rows = evRes;
             else if (Array.isArray(evRes?.events)) rows = evRes.events;
+            else if (Array.isArray(evRes?.records)) rows = evRes.records;
             else if (Array.isArray(evRes?.items)) rows = evRes.items;
           } catch {} finally {
             ac.abort();
@@ -1582,9 +1951,24 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
           } catch {}
         }
 
+        const rowMeta = extractSessionMetaFromRows(rows);
+        const passiveRunning = Boolean(
+          passiveState?.running === true
+          || passiveState?.busy === true
+          || passiveState?.turnRunning === true
+          || passiveState?.status === 'running',
+        );
+        const modeState = safeInspectSessionItemMode(ctx, rt, sessionId, {
+          passiveState,
+          passiveRunning,
+          ...(rowMeta.agentPreset ? { agentPreset: rowMeta.agentPreset } : {}),
+          ...(rowMeta.origin ? { origin: rowMeta.origin } : {}),
+        });
+
         return okEnvelope({
           sessionId,
           passiveState,
+          modeState,
           messages: extractReadableMessagesFromRows(rows),
         });
       } catch (e) {
@@ -1594,16 +1978,73 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
 
     async workbenchCreate(request) {
       try {
+        ensureConfigLoaded();
         const body = await parseJsonRequest(request);
+        const requestedMode = body.executionMode !== undefined
+          ? normalizeExecutionMode(body.executionMode)
+          : DEFAULT_EXECUTION_MODE;
         const sessionController = getHostService(ctx, 'sessionController');
         if (!sessionController || typeof sessionController.create !== 'function') {
           return errEnvelope('HOST_UNAVAILABLE', 'Live DSH session controller is only available inside DSH web/desktop runtime');
         }
-        const created = await sessionController.create({
-          ...(body.workspaceId ? { workspaceId: body.workspaceId } : { cwd: body.cwd || process.cwd() }),
-          agentPreset: body.agentPreset || 'leaderteam',
-        });
+
+        const leaderPreset = rt?.config?.profiles?.leader?.preset ?? 'leaderteam';
+        let requestedPreset = typeof body.agentPreset === 'string' && body.agentPreset.trim()
+          ? body.agentPreset.trim()
+          : leaderPreset;
+        const presetsSvc = getHostService(ctx, 'agentPresets');
+        let passPresetToHost = requestedPreset;
+        if (presetsSvc && typeof presetsSvc.resolve === 'function') {
+          try {
+            const resolved = await presetsSvc.resolve(requestedPreset);
+            if (resolved?.id) passPresetToHost = resolved.id;
+          } catch (presetErr) {
+            if (body.agentPreset) throw presetErr;
+            passPresetToHost = undefined;
+          }
+        }
+
+        // Pre-seed Single mode before DSH publishes the new Agent so `onAgentCreated` skips TeamStore creation (`0` team overhead).
+        let preMintedSid = null;
+        if (requestedMode === 'single' && requestedPreset === leaderPreset && !body.sessionId && rt?.storageRoot) {
+          preMintedSid = `session-${crypto.randomUUID()}`;
+          switchSessionExecutionMode(ctx, rt, preMintedSid, 'single', {
+            persistInitial: true,
+            isLtSession: true,
+            agentPreset: requestedPreset,
+            source: 'workbench-create',
+          });
+        }
+
+        let created;
+        try {
+          created = await sessionController.create({
+            ...(body.workspaceId ? { workspaceId: body.workspaceId } : { cwd: body.cwd || process.cwd() }),
+            ...(body.sessionId ? { sessionId: body.sessionId } : (preMintedSid ? { sessionId: preMintedSid } : {})),
+            ...(passPresetToHost ? { agentPreset: passPresetToHost } : {}),
+          });
+        } catch (createErr) {
+          if (preMintedSid && rt?.storageRoot) {
+            try {
+              const { stateFile, historyFile } = resolveSessionModePaths(rt.storageRoot, preMintedSid, { ensureDir: false });
+              fs.rmSync(stateFile, { force: true });
+              fs.rmSync(historyFile, { force: true });
+              baseRuntime(rt)?.sessionModesCache?.delete?.(preMintedSid);
+            } catch {}
+          }
+          throw createErr;
+        }
+
         const createdSid = String(created?.sessionId ?? created?.id ?? '').trim();
+        if (preMintedSid && createdSid !== preMintedSid && rt?.storageRoot) {
+          try {
+            const { stateFile, historyFile } = resolveSessionModePaths(rt.storageRoot, preMintedSid, { ensureDir: false });
+            fs.rmSync(stateFile, { force: true });
+            fs.rmSync(historyFile, { force: true });
+            baseRuntime(rt)?.sessionModesCache?.delete?.(preMintedSid);
+          } catch {}
+        }
+
         if (createdSid && rt && typeof rt === 'object') {
           if (!(rt.workbenchCreatedSessionIds instanceof Set)) {
             rt.workbenchCreatedSessionIds = new Set();
@@ -1614,9 +2055,105 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
           }
           rt.workbenchCreatedSessionIds.add(createdSid);
         }
-        return okEnvelope(created);
+
+        const effectivePreset = created?.agentPreset ?? requestedPreset;
+        const isLt = effectivePreset === leaderPreset;
+        let modeState = null;
+        if (createdSid) {
+          if (isLt || body.executionMode !== undefined) {
+            const switched = switchSessionExecutionMode(ctx, rt, createdSid, requestedMode, {
+              persistInitial: true,
+              isLtSession: isLt,
+              agentPreset: effectivePreset,
+              source: 'workbench-create',
+            });
+            modeState = switched.modeState;
+          } else {
+            modeState = inspectSessionModeState(ctx, rt, createdSid, {
+              isLtSession: false,
+              agentPreset: effectivePreset,
+            });
+          }
+        }
+
+        return okEnvelope({
+          ...created,
+          ...(createdSid ? { sessionId: createdSid } : {}),
+          agentPreset: effectivePreset,
+          ...(modeState ? { executionMode: modeState.mode, modeState } : {}),
+        });
       } catch (e) {
         return errFromException('WORKBENCH_CREATE_FAILED', e);
+      }
+    },
+
+    async workbenchMode(request) {
+      try {
+        const method = String(request?.method || 'POST').toUpperCase();
+        if (method === 'GET') {
+          const url = new URL(request.url || 'http://127.0.0.1/api/lt/v1/workbench/mode', 'http://127.0.0.1');
+          const rawAction = url.searchParams.get('action');
+          const normAction = rawAction === null ? '' : rawAction.trim().toLowerCase();
+          if (
+            url.searchParams.has('mode')
+            || (normAction !== '' && normAction !== 'get' && normAction !== 'list')
+          ) {
+            throw httpContractError(
+              'METHOD_NOT_ALLOWED',
+              'Mutating session execution mode requires HTTP POST',
+              405,
+              { Allow: 'POST' },
+            );
+          }
+          ensureConfigLoaded();
+          const dshHome = resolveDshHomeFromCtx(ctx, rt);
+          if (!url.searchParams.has('sessionId') || normAction === 'list') {
+            const sessions = await collectKnownSessionModeItems(ctx, rt, dshHome);
+            return okEnvelope({
+              defaultMode: DEFAULT_EXECUTION_MODE,
+              modes: [...EXECUTION_MODES],
+              sessions,
+            });
+          }
+          const sessionId = String(url.searchParams.get('sessionId') ?? '').trim();
+          const hints = sessionId ? await resolveHostSessionModeHints(ctx, rt, sessionId, dshHome) : {};
+          const modeState = inspectSessionModeState(ctx, rt, sessionId, hints);
+          return okEnvelope({ modeState });
+        }
+
+        const body = await parseJsonRequest(request, { allowGet: true });
+        ensureConfigLoaded();
+        const dshHome = resolveDshHomeFromCtx(ctx, rt);
+        const action = String(body.action || (body.mode !== undefined ? 'set' : 'get')).trim().toLowerCase();
+
+        if (action === 'list') {
+          const sessions = await collectKnownSessionModeItems(ctx, rt, dshHome);
+          return okEnvelope({
+            defaultMode: DEFAULT_EXECUTION_MODE,
+            modes: [...EXECUTION_MODES],
+            sessions,
+          });
+        }
+
+        const sessionId = typeof body.sessionId === 'string' ? body.sessionId.trim() : '';
+        if (action === 'get') {
+          const hints = sessionId ? await resolveHostSessionModeHints(ctx, rt, sessionId, dshHome) : {};
+          const modeState = inspectSessionModeState(ctx, rt, sessionId, hints);
+          return okEnvelope({ modeState });
+        }
+
+        if (action === 'set') {
+          const hints = sessionId ? await resolveHostSessionModeHints(ctx, rt, sessionId, dshHome) : {};
+          const switched = switchSessionExecutionMode(ctx, rt, sessionId, body.mode, {
+            ...hints,
+            source: 'public-api',
+          });
+          return okEnvelope(switched);
+        }
+
+        return errEnvelope('BAD_ACTION', `Unsupported workbench/mode action: ${action}`, 400, null);
+      } catch (e) {
+        return errFromException('WORKBENCH_MODE_FAILED', e);
       }
     },
 
@@ -1999,6 +2536,7 @@ export function registerPublicContractRoutes(scopeCtx, connection, rootCtx, rt =
     [PUBLIC_API_ROUTES.WORKBENCH_CREATE, h.workbenchCreate],
     [PUBLIC_API_ROUTES.WORKBENCH_PROMPT, h.workbenchPrompt],
     [PUBLIC_API_ROUTES.WORKBENCH_CANCEL, h.workbenchCancel],
+    [PUBLIC_API_ROUTES.WORKBENCH_MODE, h.workbenchMode],
     [PUBLIC_API_ROUTES.ARCHIVE_QUERY, h.archiveQuery],
     [PUBLIC_API_ROUTES.ARCHIVE_ACTION, h.archiveAction],
     [PUBLIC_API_ROUTES.USAGE_STATUS, h.usageStatus],
@@ -2014,7 +2552,7 @@ export function registerPublicContractRoutes(scopeCtx, connection, rootCtx, rt =
     const disposers = entries.map(([routePath, fetch]) =>
       connection.fetch.register({
         path: routePath,
-        methods: ['POST'],
+        methods: ['GET', 'POST'],
         requestBody: 'buffered',
         fetch,
       }),

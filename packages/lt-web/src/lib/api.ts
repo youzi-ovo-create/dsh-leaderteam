@@ -3,14 +3,40 @@ import type {
   ContractEnvelope,
   ContractErrorEnvelope,
   CustomThemeSeeds,
+  ExecutionMode,
   GatewayStatus,
   ModelCatalogEntry,
   ProviderDescriptor,
   ProviderPresetDescriptor,
   RuntimeSnapshot,
+  SessionModeSnapshot,
   ThemePresetId,
   UiPreferences,
 } from '../types/lt-public-v1';
+
+export class LtApiError extends Error {
+  readonly code: string;
+  readonly status: number;
+  readonly retriable: boolean;
+  readonly details: Record<string, any> | null;
+
+  constructor(
+    message: string,
+    opts: {
+      code?: string;
+      status?: number;
+      retriable?: boolean;
+      details?: Record<string, any> | null;
+    } = {},
+  ) {
+    super(message);
+    this.name = 'LtApiError';
+    this.code = opts.code || 'API_ERROR';
+    this.status = opts.status ?? 200;
+    this.retriable = Boolean(opts.retriable);
+    this.details = opts.details ?? null;
+  }
+}
 
 export interface LocalOverridesSummary {
   exists: boolean;
@@ -74,14 +100,52 @@ export async function callLtApi<T = any>(endpoint: string, body: Record<string, 
     body: JSON.stringify(body),
   });
   if (res.status === 401) {
-    throw new Error('未通过本地会话鉴权（401）：请使用终端输出的完整带 token 启动链接访问');
+    throw new LtApiError('未通过本地会话鉴权（401）：请使用终端输出的完整带 token 启动链接访问', {
+      code: 'UNAUTHORIZED',
+      status: 401,
+    });
   }
-  const json = (await res.json()) as ContractEnvelope<T> | ContractErrorEnvelope;
-  if (!json || json.ok !== true) {
-    const errMsg = (json as ContractErrorEnvelope)?.error?.message || `HTTP ${res.status}`;
-    throw new Error(errMsg);
+  let json: ContractEnvelope<T> | ContractErrorEnvelope | null = null;
+  try {
+    json = (await res.json()) as ContractEnvelope<T> | ContractErrorEnvelope;
+  } catch {
+    json = null;
+  }
+  if (!res.ok || !json || json.ok !== true) {
+    const errObj = (json as ContractErrorEnvelope | null)?.error;
+    const errMsg = errObj?.message || `HTTP ${res.status}`;
+    throw new LtApiError(errMsg, {
+      code: errObj?.code || `HTTP_${res.status}`,
+      status: res.status,
+      retriable: Boolean(errObj?.retriable),
+      details: (errObj?.details as Record<string, any> | null) ?? null,
+    });
   }
   return json.data;
+}
+
+export interface WorkbenchModeSetResult {
+  changed: boolean;
+  previousMode: ExecutionMode;
+  modeState: SessionModeSnapshot;
+}
+
+export async function fetchWorkbenchSessionMode(sessionId: string): Promise<{ modeState: SessionModeSnapshot }> {
+  return callLtApi<{ modeState: SessionModeSnapshot }>('workbench/mode', {
+    action: 'get',
+    sessionId,
+  });
+}
+
+export async function switchWorkbenchSessionMode(
+  sessionId: string,
+  mode: ExecutionMode,
+): Promise<WorkbenchModeSetResult> {
+  return callLtApi<WorkbenchModeSetResult>('workbench/mode', {
+    action: 'set',
+    sessionId,
+    mode,
+  });
 }
 
 function hexToRgb(hex: string): [number, number, number] | null {

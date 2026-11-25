@@ -15,7 +15,18 @@ import {
   isPluginActive,
   refreshUpstreamCatalog,
 } from '../../host/runtime.mjs';
-import { collectCombinedDiscoveredModels, syncActiveModelsToDshHost } from './public-api.mjs';
+import {
+  EXECUTION_MODES,
+  DEFAULT_EXECUTION_MODE,
+  inspectSessionModeState,
+  switchSessionExecutionMode,
+} from '../../host/mode-controller.mjs';
+import {
+  collectCombinedDiscoveredModels,
+  collectKnownSessionModeItems,
+  resolveHostSessionModeHints,
+  syncActiveModelsToDshHost,
+} from './public-api.mjs';
 
 export const PANEL_ROUTES = Object.freeze({
   STATE: '/api/leaderteam-panel/state',
@@ -24,6 +35,7 @@ export const PANEL_ROUTES = Object.freeze({
   ARCHIVE: '/api/leaderteam-panel/archive',
   RETROSPECT: '/api/leaderteam-panel/retrospect',
   CLEAN: '/api/leaderteam-panel/clean',
+  SESSION_MODE: '/api/leaderteam-panel/session-mode',
 });
 
 const isPlainObj = v => v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -36,10 +48,38 @@ function okReply(value) {
   return jsonReply({ ok: true, value });
 }
 
-function errReply(code, message, status = 200) {
+function errReply(code, message, status = 200, details = undefined) {
   return Response.json(
-    { ok: false, error: { code, message } },
+    {
+      ok: false,
+      error: {
+        code,
+        message,
+        ...(details !== undefined ? { details } : {}),
+      },
+    },
     { status, headers: { 'cache-control': 'no-store' } },
+  );
+}
+
+const PANEL_MODE_BAD_CODES = new Set([
+  'MODE_NOT_LT_SESSION',
+  'BAD_EXECUTION_MODE',
+  'BAD_SESSION_ID',
+  'SESSION_MODE_PATH_ESCAPE',
+]);
+
+function errReplyFromModeError(fallbackCode, e) {
+  const code = typeof e?.code === 'string' && e.code ? e.code : fallbackCode;
+  let status = Number.isInteger(e?.status) && e.status >= 400 ? e.status : 200;
+  if (code === 'MODE_SWITCH_BUSY') status = 409;
+  else if (PANEL_MODE_BAD_CODES.has(code) && status < 400) status = 400;
+  const includeDetails = code === 'MODE_SWITCH_BUSY' || PANEL_MODE_BAD_CODES.has(code) || e?.details !== undefined;
+  return errReply(
+    code,
+    e instanceof Error ? e.message : String(e),
+    status,
+    includeDetails ? (e?.details ?? null) : undefined,
   );
 }
 
@@ -201,6 +241,7 @@ export async function buildPanelStateSnapshot(ctx, rt = runtime(), { probeEndpoi
     upstreamCatalog: catalog ?? { discoveredAt: null, providers: [], models: [], endpointErrors: [] },
     timers: collectRecentTeamTimers(rt),
     teams: recentTeamObservability(ctx,rt),
+    sessionModes: await collectKnownSessionModeItems(ctx, rt),
     archive: archiveView,
   };
 }
@@ -379,6 +420,49 @@ export function createPanelHandlers(ctx, rt = runtime()) {
         return errReply(e?.code ?? 'PANEL_CLEAN_FAILED', e instanceof Error ? e.message : String(e), e?.status ?? 200);
       }
     },
+
+    async sessionMode(request) {
+      try {
+        syncRuntimeConfig(rt);
+        const body = await parseBody(request);
+        const rawAction = typeof body.action === 'string' && body.action.trim()
+          ? body.action.trim().toLowerCase()
+          : (body.mode !== undefined ? 'set' : (body.sessionId !== undefined ? 'get' : 'list'));
+
+        if (rawAction === 'list') {
+          const sessions = await collectKnownSessionModeItems(ctx, rt);
+          return okReply({
+            defaultMode: DEFAULT_EXECUTION_MODE,
+            modes: [...EXECUTION_MODES],
+            sessions,
+          });
+        }
+
+        const sessionId = typeof body.sessionId === 'string' ? body.sessionId.trim() : '';
+        if (rawAction === 'get') {
+          const hints = sessionId ? await resolveHostSessionModeHints(ctx, rt, sessionId) : {};
+          const modeState = inspectSessionModeState(ctx, rt, sessionId, hints);
+          return okReply({ modeState });
+        }
+
+        if (rawAction === 'set') {
+          const hints = sessionId ? await resolveHostSessionModeHints(ctx, rt, sessionId) : {};
+          const switched = switchSessionExecutionMode(ctx, rt, sessionId, body.mode, {
+            ...hints,
+            source: 'panel-api',
+          });
+          const sessions = await collectKnownSessionModeItems(ctx, rt);
+          return okReply({
+            ...switched,
+            sessions,
+          });
+        }
+
+        return errReply('BAD_ACTION', `Unsupported session-mode action: ${rawAction}`, 400, null);
+      } catch (e) {
+        return errReplyFromModeError('PANEL_SESSION_MODE_FAILED', e);
+      }
+    },
   };
 }
 
@@ -395,6 +479,7 @@ export function registerPanelRoutes(effectScope, connection, ctxForHandlers, rt 
     [PANEL_ROUTES.ARCHIVE, handlers.archive, 'leaderteam-panel:archive'],
     [PANEL_ROUTES.RETROSPECT, handlers.retrospect, 'leaderteam-panel:retrospect'],
     [PANEL_ROUTES.CLEAN, handlers.clean, 'leaderteam-panel:clean'],
+    [PANEL_ROUTES.SESSION_MODE, handlers.sessionMode, 'leaderteam-panel:session-mode'],
   ];
   for (const [routePath, fn, label] of table) {
     effectScope.effect(
