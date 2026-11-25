@@ -71,8 +71,57 @@ export function loadHome(home) {
   return { home, files, sessions, byId };
 }
 
+export function encodeDshSegment(value) {
+  const s = String(value ?? '');
+  if (!s) return '';
+  if (s === '.') return '~002E';
+  if (s === '..') return '~002E~002E';
+  return s.replace(/[^A-Za-z0-9._-]/g, (ch) => `~${ch.charCodeAt(0).toString(16).toUpperCase().padStart(4, '0')}`);
+}
+
+function encodeSafeTeamSegment(value) {
+  const s = String(value ?? '');
+  if (!s) return '';
+  if (s === '.') return '~002E';
+  if (s === '..') return '~002E~002E';
+  let out = '';
+  for (let i = 0; i < s.length; i++) {
+    const code = s.charCodeAt(i);
+    const ch = s[i];
+    const isDotHazard = ch === '.' && (i === 0 || s[i - 1] === '.' || s[i + 1] === '.');
+    if (!isDotHazard && ch !== '~' && /^[A-Za-z0-9._-]$/.test(ch)) {
+      out += ch;
+    } else {
+      out += '~' + code.toString(16).toUpperCase().padStart(4, '0');
+    }
+  }
+  return out;
+}
+
 export function teamDir(home, sessionId) {
-  return path.join(home, 'leaderteam', 'teams', sessionId);
+  const teamsRoot = path.resolve(home, 'leaderteam', 'teams');
+  const raw = String(sessionId ?? '');
+  if (!raw || raw.includes('\0')) return path.join(teamsRoot, '__invalid__');
+  const candidates = [];
+  if (!/[\\/]/.test(raw) && raw !== '.' && raw !== '..' && !raw.includes('..')) {
+    candidates.push(raw);
+  }
+  for (const seg of [encodeSafeTeamSegment(raw), encodeDshSegment(raw)]) {
+    if (seg && !candidates.includes(seg)) candidates.push(seg);
+  }
+  for (const seg of candidates) {
+    const cand = path.resolve(teamsRoot, seg);
+    if (path.dirname(cand) === teamsRoot && fs.existsSync(cand)) {
+      return cand;
+    }
+  }
+  const fallbackSeg = candidates[0] || encodeSafeTeamSegment(raw) || '__invalid__';
+  return path.resolve(teamsRoot, fallbackSeg);
+}
+
+export function readGovernanceCalls(usageFile) {
+  if (!usageFile || !fs.existsSync(usageFile)) return [];
+  return readJsonl(usageFile).filter((record) => record && typeof record === 'object' && record.role !== 'leader');
 }
 
 export function isTeam(home, sessionId) {
@@ -198,14 +247,32 @@ function getCachedOrCompute(cacheKey, compute) {
   return val;
 }
 
+export function readSignature(home, sessionId, sessions) {
+  const dir = teamDir(home, sessionId);
+  const parts = sessions.map((session) => `${session.file}:${session.sig}`);
+  if (isTeam(home, sessionId)) {
+    parts.push(
+      fileSignature(path.join(dir, 'members.jsonl')),
+      fileSignature(path.join(dir, 'usage.jsonl')),
+      fileSignature(path.join(dir, 'gate.jsonl')),
+      fileSignature(path.join(dir, 'timer.json')),
+      fileSignature(path.join(dir, 'team.json'))
+    );
+  } else {
+    const usageFile = path.join(dir, 'usage.jsonl');
+    const gateFile = path.join(dir, 'gate.jsonl');
+    if (fs.existsSync(usageFile)) parts.push(fileSignature(usageFile));
+    if (fs.existsSync(gateFile)) parts.push(fileSignature(gateFile));
+  }
+  return signatureOf(parts);
+}
+
 function buildTeamResult(home, data, sessionId, pricing, options = {}) {
   const leader = data.byId.get(sessionId);
   const dir = teamDir(home, sessionId);
   const membersFile = path.join(dir, 'members.jsonl');
   const usageFile = path.join(dir, 'usage.jsonl');
   const gateFile = path.join(dir, 'gate.jsonl');
-  const timerFile = path.join(dir, 'timer.json');
-  const teamFile = path.join(dir, 'team.json');
 
   const members = foldMembers(readJsonl(membersFile));
   const governance = readJsonl(usageFile);
@@ -225,14 +292,7 @@ function buildTeamResult(home, data, sessionId, pricing, options = {}) {
       sessions.push(desc);
     }
   }
-  const signature = signatureOf([
-    ...sessions.map((session) => `${session.file}:${session.sig}`),
-    fileSignature(membersFile),
-    fileSignature(usageFile),
-    fileSignature(gateFile),
-    fileSignature(timerFile),
-    fileSignature(teamFile)
-  ]);
+  const signature = readSignature(home, sessionId, sessions);
   const cacheKey = `team|${sessionId}|${signature}|${pricingSignatureOf(pricing)}|${gatewaySignatureOf(options.gatewayRecords)}`;
   return getCachedOrCompute(cacheKey, () => {
     const report = buildReport({
@@ -289,13 +349,17 @@ function collectDescendants(data, root) {
 function buildSessionResult(home, data, sessionId, pricing, options = {}) {
   const root = data.byId.get(sessionId);
   const sessions = collectDescendants(data, root);
-  const signature = signatureOf(sessions.map((session) => `${session.file}:${session.sig}`));
+  const dir = teamDir(home, sessionId);
+  const usageFile = path.join(dir, 'usage.jsonl');
+  const signature = readSignature(home, sessionId, sessions);
   const cacheKey = `session|${sessionId}|${signature}|${pricingSignatureOf(pricing)}|${gatewaySignatureOf(options.gatewayRecords)}`;
   return getCachedOrCompute(cacheKey, () => {
+    const governance = readGovernanceCalls(usageFile);
     const report = buildReport({
       home,
       sessionId,
       sessions,
+      governance,
       pricing,
       gatewayRecords: options.gatewayRecords,
       kind: 'session'
@@ -380,7 +444,7 @@ export function listSessions(home, pricing = defaultPricing, options = {}) {
     row.memberCount =
       report.meta.kind === 'team'
         ? (report.team?.membersTotal ?? 0)
-        : Math.max(0, report.agents.length - 1);
+        : report.agents.filter((agent) => agent.group === 'subagents').length;
     row.signature = signature;
     rows.push(row);
   }

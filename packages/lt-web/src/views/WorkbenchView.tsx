@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback } from 'react';
+import React, { useEffect, useState, useCallback, useRef } from 'react';
 import {
   LtApiError,
   callLtApi,
@@ -55,6 +55,8 @@ export function WorkbenchView({
   onRefreshBundle: () => Promise<void>;
   onNavigateTab: (tab: string) => void;
 }) {
+  const dualModeEnabled = bundle.capabilities.features.inSessionDualMode === true;
+
   const [liveHost, setLiveHost] = useState(false);
   const [workspaces, setWorkspaces] = useState<Array<{ workspaceId: string; path: string; title?: string }>>([]);
   const [selectedWorkspaceId, setSelectedWorkspaceId] = useState<string>('');
@@ -63,7 +65,7 @@ export function WorkbenchView({
   const [messages, setMessages] = useState<ReadableMessage[]>([]);
   const [passiveRunning, setPassiveRunning] = useState(false);
   const [modeState, setModeState] = useState<SessionModeSnapshot | null>(null);
-  const [switchingMode, setSwitchingMode] = useState(false);
+  const [switchingSessionIds, setSwitchingSessionIds] = useState<Record<string, boolean>>({});
   const [modeError, setModeError] = useState<string | null>(null);
   const [initialMode, setInitialMode] = useState<ExecutionMode>('team');
   const [newCwd, setNewCwd] = useState('');
@@ -72,6 +74,11 @@ export function WorkbenchView({
   const [busy, setBusy] = useState(false);
   const [sending, setSending] = useState(false);
   const [feedback, setFeedback] = useState<string | null>(null);
+
+  const selectedSessionIdRef = useRef<string>(selectedSessionId);
+  selectedSessionIdRef.current = selectedSessionId;
+  const transcriptReqSeqRef = useRef<number>(0);
+  const prevSelectedSessionRef = useRef<string>(selectedSessionId);
 
   const syncModeSnapshotIntoSessionList = useCallback((snap: SessionModeSnapshot) => {
     setSessions(prev =>
@@ -105,11 +112,13 @@ export function WorkbenchView({
       }
       const nextSessions = data.sessions || [];
       setSessions(nextSessions);
-      const activeSid = selectedSessionId || (nextSessions.length > 0 ? nextSessions[0].sessionId : '');
-      if (!selectedSessionId && activeSid) {
+      const curSelected = selectedSessionIdRef.current;
+      const activeSid = curSelected || (nextSessions.length > 0 ? nextSessions[0].sessionId : '');
+      if (!curSelected && activeSid) {
+        selectedSessionIdRef.current = activeSid;
         setSelectedSessionId(activeSid);
       }
-      if (activeSid) {
+      if (activeSid && activeSid === selectedSessionIdRef.current) {
         const matched = nextSessions.find(s => s.sessionId === activeSid);
         if (matched?.modeState) {
           setModeState(matched.modeState);
@@ -118,13 +127,16 @@ export function WorkbenchView({
     } catch (e: any) {
       setFeedback(e.message);
     }
-  }, [selectedSessionId, selectedWorkspaceId]);
+  }, [selectedWorkspaceId]);
 
   const loadTranscript = useCallback(async (sid: string) => {
+    const reqSeq = ++transcriptReqSeqRef.current;
     if (!sid) {
-      setMessages([]);
-      setPassiveRunning(false);
-      setModeState(null);
+      if (selectedSessionIdRef.current === '') {
+        setMessages([]);
+        setPassiveRunning(false);
+        setModeState(null);
+      }
       return;
     }
     try {
@@ -133,6 +145,14 @@ export function WorkbenchView({
         passiveState?: { running?: boolean; busy?: boolean; turnRunning?: boolean; status?: string } | null;
         modeState?: SessionModeSnapshot | null;
       }>('workbench/transcript', { sessionId: sid });
+
+      if (res.modeState) {
+        syncModeSnapshotIntoSessionList(res.modeState);
+      }
+      if (sid !== selectedSessionIdRef.current || reqSeq !== transcriptReqSeqRef.current) {
+        return;
+      }
+
       setMessages(res.messages || []);
       const ps = res.passiveState;
       setPassiveRunning(
@@ -140,29 +160,38 @@ export function WorkbenchView({
       );
       if (res.modeState) {
         setModeState(res.modeState);
-        syncModeSnapshotIntoSessionList(res.modeState);
-      } else {
+      } else if (dualModeEnabled) {
         try {
           const modeRes = await fetchWorkbenchSessionMode(sid);
           if (modeRes.modeState) {
-            setModeState(modeRes.modeState);
             syncModeSnapshotIntoSessionList(modeRes.modeState);
+            if (sid === selectedSessionIdRef.current && reqSeq === transcriptReqSeqRef.current) {
+              setModeState(modeRes.modeState);
+            }
           }
         } catch {}
       }
     } catch {
-      setPassiveRunning(false);
+      if (sid === selectedSessionIdRef.current && reqSeq === transcriptReqSeqRef.current) {
+        setPassiveRunning(false);
+      }
     }
-  }, [syncModeSnapshotIntoSessionList]);
+  }, [dualModeEnabled, syncModeSnapshotIntoSessionList]);
 
   useEffect(() => {
     void loadSessions();
   }, [loadSessions]);
 
   useEffect(() => {
+    selectedSessionIdRef.current = selectedSessionId;
     setModeError(null);
     const matched = sessions.find(s => s.sessionId === selectedSessionId);
-    if (matched?.modeState) {
+    if (prevSelectedSessionRef.current !== selectedSessionId) {
+      prevSelectedSessionRef.current = selectedSessionId;
+      setMessages([]);
+      setPassiveRunning(Boolean(matched?.modeState?.activeTurn));
+      setModeState(matched?.modeState ?? null);
+    } else if (matched?.modeState) {
       setModeState(matched.modeState);
     }
     void loadTranscript(selectedSessionId);
@@ -184,7 +213,10 @@ export function WorkbenchView({
       ? selectedSession.isLtSession !== false
       : true;
   const currentMode: ExecutionMode =
-    (effectiveModeState?.mode ?? selectedSession?.executionMode) === 'single' ? 'single' : 'team';
+    dualModeEnabled && (effectiveModeState?.mode ?? selectedSession?.executionMode) === 'single'
+      ? 'single'
+      : 'team';
+  const switchingMode = Boolean(selectedSessionId && switchingSessionIds[selectedSessionId]);
   const isSwitchLockedByBusy =
     sending || busy || switchingMode || passiveRunning || effectiveModeState?.canSwitch === false;
   const switchLockReason = !isLtSession
@@ -193,35 +225,49 @@ export function WorkbenchView({
       ? effectiveModeState?.busyReason || '当前回合正在执行，仅允许在空闲时切换模式'
       : null;
 
-  const matchedSessionTeam =
-    bundle.runtime.teams.find(t => t.sessionId === selectedSessionId || t.teamId === selectedSessionId) || null;
+  const matchedSessionTeam = selectedSessionId
+    ? bundle.runtime.teams.find(t => (t.sessionId || t.teamId) === selectedSessionId) || null
+    : null;
   const activeTeam =
-    matchedSessionTeam || (currentMode === 'team' ? bundle.runtime.teams[0] || null : null);
+    isLtSession && currentMode === 'team'
+      ? (matchedSessionTeam || (!selectedSessionId ? bundle.runtime.teams[0] || null : null))
+      : null;
 
   async function handleSwitchMode(targetMode: ExecutionMode) {
-    if (!selectedSessionId || !isLtSession || isSwitchLockedByBusy || targetMode === currentMode) {
+    const targetSid = selectedSessionIdRef.current || selectedSessionId;
+    if (!dualModeEnabled || !targetSid || !isLtSession || isSwitchLockedByBusy || targetMode === currentMode) {
       return;
     }
-    setSwitchingMode(true);
+    setSwitchingSessionIds(prev => ({ ...prev, [targetSid]: true }));
     setModeError(null);
     try {
-      const res = await switchWorkbenchSessionMode(selectedSessionId, targetMode);
-      setModeState(res.modeState);
+      const res = await switchWorkbenchSessionMode(targetSid, targetMode);
       syncModeSnapshotIntoSessionList(res.modeState);
-      setFeedback(
-        `已切换会话执行模式为 ${res.modeState.mode === 'single' ? 'Single 单代理直执' : 'Team 团队协作'}（0 次模型调用）`,
-      );
+      if (targetSid === selectedSessionIdRef.current) {
+        setModeState(res.modeState);
+        setFeedback(
+          `已切换会话执行模式为 ${res.modeState.mode === 'single' ? 'Single 单代理直执' : 'Team 团队协作'}（0 次模型调用）`,
+        );
+      }
     } catch (err: any) {
       const apiErr = err instanceof LtApiError ? err : null;
       const latestSnap = apiErr?.details?.modeState as SessionModeSnapshot | undefined;
-      if (latestSnap && latestSnap.sessionId === selectedSessionId) {
-        setModeState(latestSnap);
+      if (latestSnap && latestSnap.sessionId === targetSid) {
         syncModeSnapshotIntoSessionList(latestSnap);
+        if (targetSid === selectedSessionIdRef.current) {
+          setModeState(latestSnap);
+        }
       }
-      const codePrefix = apiErr?.code ? `[${apiErr.code}] ` : '';
-      setModeError(`切换执行模式失败：${codePrefix}${err?.message || '未知错误'}`);
+      if (targetSid === selectedSessionIdRef.current) {
+        const codePrefix = apiErr?.code ? `[${apiErr.code}] ` : '';
+        setModeError(`切换执行模式失败：${codePrefix}${err?.message || '未知错误'}`);
+      }
     } finally {
-      setSwitchingMode(false);
+      setSwitchingSessionIds(prev => {
+        const next = { ...prev };
+        delete next[targetSid];
+        return next;
+      });
     }
   }
 
@@ -248,17 +294,22 @@ export function WorkbenchView({
       }>('workbench/create', {
         ...locationSpec,
         agentPreset: 'leaderteam',
-        executionMode: initialMode,
+        ...(dualModeEnabled ? { executionMode: initialMode } : {}),
       });
       if (created.modeState) {
         setModeState(created.modeState);
       }
+      selectedSessionIdRef.current = created.sessionId;
       await loadSessions();
       setSelectedSessionId(created.sessionId);
-      const createdMode = created.modeState?.mode ?? created.executionMode ?? initialMode;
-      setFeedback(
-        `已创建新 LeaderTeam 会话：${created.sessionId}（初始模式：${createdMode === 'single' ? 'Single 单代理直执' : 'Team 团队协作'}）`,
-      );
+      if (dualModeEnabled) {
+        const createdMode = created.modeState?.mode ?? created.executionMode ?? initialMode;
+        setFeedback(
+          `已创建新 LeaderTeam 会话：${created.sessionId}（初始模式：${createdMode === 'single' ? 'Single 单代理直执' : 'Team 团队协作'}）`,
+        );
+      } else {
+        setFeedback(`已创建新 LeaderTeam 会话：${created.sessionId}`);
+      }
     } catch (e: any) {
       setFeedback(`创建会话失败：${e.message}`);
     } finally {
@@ -387,23 +438,27 @@ export function WorkbenchView({
                   onChange={e => setNewCwd(e.target.value)}
                 />
               )}
-              <select
-                className="lt-select"
-                aria-label="新建会话初始执行模式"
-                value={initialMode}
-                onChange={e => setInitialMode(e.target.value === 'single' ? 'single' : 'team')}
-                disabled={busy}
-              >
-                <option value="team">Team 团队协作 (默认)</option>
-                <option value="single">Single 单代理直执</option>
-              </select>
+              {dualModeEnabled && (
+                <select
+                  className="lt-select"
+                  aria-label="新建会话初始执行模式"
+                  value={initialMode}
+                  onChange={e => setInitialMode(e.target.value === 'single' ? 'single' : 'team')}
+                  disabled={busy}
+                >
+                  <option value="team">Team 团队协作 (默认)</option>
+                  <option value="single">Single 单代理直执</option>
+                </select>
+              )}
               <button className="lt-btn lt-btn-primary" disabled={busy} onClick={() => void handleCreateSession()}>
                 + 新建 LeaderTeam 会话
               </button>
             </div>
           ) : (
             <div style={{ fontSize: 11.5, color: 'var(--lt-fg-muted)', paddingBottom: 8, borderBottom: '1px solid var(--lt-border-subtle)' }}>
-              当前为独立伴侣模式（只读浏览历史会话账本并可在空闲时管理 LT 会话执行模式；在 DSH Web 中打开 <code>/lt/</code> 可直接实时对话与发令）。
+              {dualModeEnabled
+                ? <>当前为独立伴侣模式（只读浏览历史会话账本并可在空闲时管理 LT 会话执行模式；在 DSH Web 中打开 <code>/lt/</code> 可直接实时对话与发令）。</>
+                : <>当前为独立伴侣模式（只读浏览历史会话账本；在 DSH Web 中打开 <code>/lt/</code> 可直接实时对话与发令）。</>}
             </div>
           )}
 
@@ -439,7 +494,11 @@ export function WorkbenchView({
                     </div>
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 4, fontSize: 11, color: 'var(--lt-fg-muted)', gap: 6 }}>
                       <span className="lt-mono">{s.sessionId.slice(0, 12)}</span>
-                      <span className="lt-mode-badge" data-mode={badgeAttr}>{badgeText}</span>
+                      {dualModeEnabled ? (
+                        <span className="lt-mode-badge" data-mode={badgeAttr}>{badgeText}</span>
+                      ) : (
+                        s.isTeam ? <span className="lt-tag">Team</span> : null
+                      )}
                     </div>
                   </button>
                 );
@@ -452,7 +511,7 @@ export function WorkbenchView({
         <section className="lt-card lt-card-authority" style={{ display: 'flex', flexDirection: 'column', justifyContent: 'space-between', minHeight: 520 }}>
           <div>
             <div style={{ paddingBottom: 10, borderBottom: '1px solid var(--lt-border-subtle)' }}>
-              <div className="lt-card-title" style={{ marginBottom: selectedSessionId ? 6 : 0, flexWrap: 'wrap' }}>
+              <div className="lt-card-title" style={{ marginBottom: dualModeEnabled && selectedSessionId ? 6 : 0, flexWrap: 'wrap' }}>
                 <div>
                   <span>对话与工程流</span>
                   {selectedSessionId && (
@@ -462,7 +521,7 @@ export function WorkbenchView({
                   )}
                 </div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-                  {selectedSessionId && renderModeSegmentedControl('顶栏会话执行模式切换')}
+                  {dualModeEnabled && selectedSessionId && renderModeSegmentedControl('顶栏会话执行模式切换')}
                   {bundle.capabilities.frontendSwitch.available && bundle.capabilities.frontendSwitch.dshFrontendUrl && (
                     <a className="lt-btn lt-btn-sm" href={bundle.capabilities.frontendSwitch.dshFrontendUrl}>
                       在 DSH 原生前端查看同一会话 ↗
@@ -481,7 +540,7 @@ export function WorkbenchView({
                 </div>
               </div>
 
-              {selectedSessionId && (
+              {dualModeEnabled && selectedSessionId && (
                 <div className="lt-mode-bar">
                   <span style={{ color: isLtSession ? 'var(--lt-fg-secondary)' : 'var(--lt-fg-muted)' }}>
                     {isLtSession
@@ -568,7 +627,7 @@ export function WorkbenchView({
               className="lt-textarea"
               placeholder={
                 liveHost
-                  ? currentMode === 'single' && isLtSession
+                  ? dualModeEnabled && currentMode === 'single' && isLtSession
                     ? '输入单代理直执指令（主代理直接读写/命令并受 FinalGate 安全门保护，支持「允许读取 <路径>」）…'
                     : '输入工程任务、评审意见或实时控制指令（支持「最大并发 N」、「允许读取 <路径>」）…'
                   : '独立伴侣模式下仅支持只读观察；通过 dsh web 打开 /lt/ 可直接发送实时指令'
@@ -579,7 +638,7 @@ export function WorkbenchView({
             />
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 8, gap: 8, flexWrap: 'wrap' }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-                {selectedSessionId && renderModeSegmentedControl('输入栏会话执行模式切换')}
+                {dualModeEnabled && selectedSessionId && renderModeSegmentedControl('输入栏会话执行模式切换')}
                 <select
                   className="lt-select"
                   style={{ width: 150, height: 30 }}
@@ -602,7 +661,7 @@ export function WorkbenchView({
                 {sending ? '提交中…' : '发送指令'}
               </button>
             </div>
-            {selectedSessionId && switchLockReason && (
+            {dualModeEnabled && selectedSessionId && switchLockReason && (
               <div style={{ marginTop: 6, fontSize: 11.5, color: isLtSession ? 'var(--lt-warning)' : 'var(--lt-fg-muted)' }}>
                 {switchLockReason}
               </div>
@@ -618,11 +677,32 @@ export function WorkbenchView({
           </div>
 
           {!activeTeam ? (
-            <div style={{ color: 'var(--lt-fg-muted)', fontSize: 12.5 }}>
-              {isLtSession && currentMode === 'single'
-                ? '当前会话处于 Single 单代理直执模式：主代理在 FinalGate 安全门边界内直接读写文件与执行命令，不创建团队计划、子代理成员或双评审流水线（零团队开销）。空闲时可随时切回 Team 模式启动多代理协作。'
-                : '当前暂无活跃 LeaderTeam 团队目录。在 Team 模式下启动复杂工程任务后，此处将实时展示滚动规划轴线、成员写域与治理状态。'}
-            </div>
+            !isLtSession ? (
+              <div
+                style={{
+                  padding: '10px 12px',
+                  borderRadius: 'var(--lt-radius-sm)',
+                  background: 'var(--lt-bg-subtle)',
+                  border: '1px solid var(--lt-border-subtle)',
+                  color: 'var(--lt-fg-secondary)',
+                  fontSize: 12.5,
+                  lineHeight: 1.6,
+                }}
+              >
+                <div style={{ fontWeight: 600, color: 'var(--lt-fg-primary)', marginBottom: 4 }}>
+                  DSH 原生预设会话{selectedSession?.agentPreset ? ` (${selectedSession.agentPreset})` : ''}
+                </div>
+                <div>
+                  当前会话由 DSH 原生预设驱动，不启用 LeaderTeam 团队编排、子代理派发或 Single/Team 模式切换。如需使用 LeaderTeam 能力，请在左侧新建 LeaderTeam 会话。
+                </div>
+              </div>
+            ) : (
+              <div style={{ color: 'var(--lt-fg-muted)', fontSize: 12.5 }}>
+                {dualModeEnabled && currentMode === 'single'
+                  ? '当前会话处于 Single 单代理直执模式：主代理在 FinalGate 安全门边界内直接读写文件与执行命令，不创建团队计划、子代理成员或双评审流水线（零团队开销）。空闲时可随时切回 Team 模式启动多代理协作。'
+                  : '当前暂无活跃 LeaderTeam 团队目录。在 Team 模式下启动复杂工程任务后，此处将实时展示滚动规划轴线、成员写域与治理状态。'}
+              </div>
+            )
           ) : (
             <>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>

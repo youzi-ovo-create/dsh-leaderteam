@@ -768,10 +768,14 @@ export function extractReadableMessagesFromRows(rows = []) {
   const messages = [];
   const seenMsgIds = new Set();
   for (let rowIdx = 0; rowIdx < rows.length; rowIdx++) {
-    const row = rows[rowIdx];
-    if (!row) continue;
-    const seq = Number.isInteger(row.seq) ? row.seq : rowIdx;
-    const surfaceOp = row.surfaceOp ?? row.data?.surfaceOp ?? null;
+    const rawRow = rows[rowIdx];
+    const row = rawRow && rawRow.type === 'event' && rawRow.event ? rawRow.event : rawRow;
+    if (!row || typeof row !== 'object') continue;
+    const seq = Number.isInteger(row.seq)
+      ? row.seq
+      : (Number.isInteger(rawRow?.seq) ? rawRow.seq : rowIdx);
+    const surfaceOp = row.surfaceOp ?? row.data?.surfaceOp ?? rawRow?.surfaceOp ?? null;
+    const rowTime = row.time ?? rawRow?.time ?? null;
     if (surfaceOp === 'seed' || surfaceOp?.op === 'seed') continue;
 
     if (surfaceOp?.op === 'replace') {
@@ -797,7 +801,7 @@ export function extractReadableMessagesFromRows(rows = []) {
             _seq: seq,
             id: repId,
             role: isRealUser ? 'user' : 'assistant',
-            timeMs: row.time ?? null,
+            timeMs: rowTime,
             text: repText,
             model: isRealUser ? null : (msg?.source?.model ?? row.data?.model ?? 'compaction'),
             toolCalls: [],
@@ -822,7 +826,7 @@ export function extractReadableMessagesFromRows(rows = []) {
         _seq: seq,
         id,
         role: 'user',
-        timeMs: row.time ?? null,
+        timeMs: rowTime,
         text: text || '(附件或控制指令)',
         model: null,
         toolCalls: [],
@@ -851,7 +855,7 @@ export function extractReadableMessagesFromRows(rows = []) {
         _seq: seq,
         id,
         role: 'assistant',
-        timeMs: row.time ?? null,
+        timeMs: rowTime,
         text: textParts.join('\n'),
         thinkingPreview: thinkingParts.length ? thinkingParts.join('\n').slice(0, 600) : null,
         model: msg?.source?.model ?? null,
@@ -1062,23 +1066,42 @@ export async function resolveHostSessionModeHints(ctx, rt, sessionId, dshHome = 
   return hints;
 }
 
+function isLtSessionPreset(preset, rt) {
+  const leaderPreset = rt?.config?.profiles?.leader?.preset ?? 'leaderteam';
+  return typeof preset === 'string' && preset.trim() === leaderPreset;
+}
+
+function safeHasPersistedLtSession(storageRoot, sessionId) {
+  if (!storageRoot || typeof sessionId !== 'string' || !sessionId.trim()) return false;
+  try {
+    if (readSessionModeRecord(storageRoot, sessionId).persisted) return true;
+  } catch (err) {
+    if (err?.code === 'SESSION_MODE_CORRUPT') return true;
+  }
+  try {
+    if (TeamStore.exists(storageRoot, sessionId)) return true;
+  } catch {}
+  return false;
+}
+
 function safeInspectSessionItemMode(ctx, rt, sessionId, options = {}) {
   try {
     return inspectSessionModeState(ctx, rt, sessionId, options);
-  } catch {
+  } catch (err) {
     const leaderPreset = rt?.config?.profiles?.leader?.preset ?? 'leaderteam';
     const isLt = options.origin === 'subagent'
       ? false
       : (typeof options.agentPreset === 'string' && options.agentPreset.trim()
         ? options.agentPreset.trim() === leaderPreset
         : options.isLtSession !== false);
+    const errMsg = err instanceof Error && err.message ? err.message : String(err || 'Invalid session identifier');
     return {
       sessionId: String(sessionId || ''),
       mode: DEFAULT_EXECUTION_MODE,
       defaultMode: DEFAULT_EXECUTION_MODE,
       isLtSession: isLt,
       canSwitch: false,
-      busyReason: 'Invalid session identifier',
+      busyReason: errMsg,
       activeTurn: Boolean(options.passiveRunning),
       activeMembersCount: 0,
       pendingReviewsCount: 0,
@@ -1137,7 +1160,7 @@ export async function collectKnownSessionModeItems(ctx, rt, dshHome = null) {
         if (!item) continue;
         const sid = String(item.sessionId ?? item.id ?? '');
         if (!sid || item.origin === 'subagent' || Boolean(item.parentSessionId)) continue;
-        if (item.blank === true && !workbenchCreatedSet?.has(sid)) continue;
+        if (item.blank === true && !workbenchCreatedSet?.has(sid) && !safeHasPersistedLtSession(storageRoot, sid)) continue;
         upsert(sid, {
           title: item.projections?.values?.title ?? item.title ?? null,
           cwd: item.cwd ?? null,
@@ -1285,6 +1308,7 @@ export async function syncActiveModelsToDshHost(ctx, rt, effective, discoveredMo
     templates[magpieProv] = {
       displayName: 'Magpie Gateway',
       api: 'openai-completions',
+      apiKeyEnv: 'MAGPIE_API_KEY',
       baseURL: `${rawGwUrl.replace(/\/+$/, '')}/v1`,
     };
   }
@@ -1828,42 +1852,55 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
         if (sessionController && typeof sessionController.list === 'function') {
           const ac = new AbortController();
           const listed = await sessionController.list({}, ac.signal);
+          const dshHome = resolveDshHomeFromCtx(ctx, rt);
           const workbenchCreatedSet = rt?.workbenchCreatedSessionIds instanceof Set
             ? rt.workbenchCreatedSessionIds
             : null;
-          const sessions = (listed?.items ?? [])
-            .filter(item => {
-              if (!item) return false;
-              const sid = String(item.sessionId ?? item.id ?? '');
-              if (!sid) return false;
-              if (item.origin === 'subagent') return false;
-              if (Boolean(item.parentSessionId)) return false;
-              if (item.blank === true && !workbenchCreatedSet?.has(sid)) return false;
-              if (archivedSet.has(sid)) return false;
-              return true;
-            })
-            .map(item => {
-              const sid = String(item.sessionId ?? item.id);
-              const agentPreset = item.projections?.values?.agentPreset ?? item.agentPreset ?? null;
-              const modeState = safeInspectSessionItemMode(ctx, rt, sid, {
-                agentPreset,
-                origin: item.origin,
-                passiveRunning: Boolean(item.running),
-              });
-              return {
-                sessionId: sid,
-                title: item.projections?.values?.title ?? item.title ?? null,
-                cwd: item.cwd ?? null,
-                agentPreset,
-                updatedAt: item.updatedAt ?? item.lastActivityAt ?? null,
-                isTeam: TeamStore.exists(rt.storageRoot, sid),
-                executionMode: modeState.mode,
-                isLtSession: modeState.isLtSession,
-                canSwitchMode: modeState.canSwitch,
-                modeBusyReason: modeState.busyReason,
-                modeState,
-              };
+          const sessions = [];
+          for (const item of listed?.items ?? []) {
+            if (!item) continue;
+            const sid = String(item.sessionId ?? item.id ?? '');
+            if (!sid) continue;
+            if (item.origin === 'subagent') continue;
+            if (Boolean(item.parentSessionId)) continue;
+            if (item.blank === true && !workbenchCreatedSet?.has(sid) && !safeHasPersistedLtSession(rt?.storageRoot, sid)) continue;
+            if (archivedSet.has(sid)) continue;
+
+            let agentPreset = item.projections?.values?.agentPreset ?? item.agentPreset ?? null;
+            let origin = item.origin;
+            if (!agentPreset && dshHome) {
+              const durableRows = findDurableSessionRows(dshHome, sid);
+              if (durableRows) {
+                const meta = extractSessionMetaFromRows(durableRows);
+                if (meta.agentPreset) agentPreset = meta.agentPreset;
+                if (!origin && meta.origin) origin = meta.origin;
+              }
+            }
+            if (origin === 'subagent') continue;
+
+            const modeState = safeInspectSessionItemMode(ctx, rt, sid, {
+              agentPreset,
+              origin,
+              passiveRunning: Boolean(item.running),
             });
+            let isTeam = false;
+            try {
+              isTeam = Boolean(rt?.storageRoot && TeamStore.exists(rt.storageRoot, sid));
+            } catch {}
+            sessions.push({
+              sessionId: sid,
+              title: item.projections?.values?.title ?? item.title ?? null,
+              cwd: item.cwd ?? null,
+              agentPreset,
+              updatedAt: item.updatedAt ?? item.lastActivityAt ?? null,
+              isTeam,
+              executionMode: modeState.mode,
+              isLtSession: modeState.isLtSession,
+              canSwitchMode: modeState.canSwitch,
+              modeBusyReason: modeState.busyReason,
+              modeState,
+            });
+          }
           return okEnvelope({ liveHost: true, workspaces, sessions });
         }
 
@@ -1980,6 +2017,10 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
       try {
         ensureConfigLoaded();
         const body = await parseJsonRequest(request);
+        const hasExplicitExecutionMode =
+          body.executionMode !== undefined
+          && body.executionMode !== null
+          && String(body.executionMode).trim() !== '';
         const requestedMode = body.executionMode !== undefined
           ? normalizeExecutionMode(body.executionMode)
           : DEFAULT_EXECUTION_MODE;
@@ -2004,14 +2045,49 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
           }
         }
 
+        const effectiveRequestedPreset = passPresetToHost ?? requestedPreset;
+        if (
+          hasExplicitExecutionMode
+          && !isLtSessionPreset(requestedPreset, rt)
+          && !isLtSessionPreset(effectiveRequestedPreset, rt)
+        ) {
+          const notLtErr = httpContractError(
+            'MODE_NOT_LT_SESSION',
+            `Cannot set executionMode="${requestedMode}" on non-LeaderTeam preset "${effectiveRequestedPreset}"`,
+            400,
+          );
+          notLtErr.details = {
+            modeState: {
+              sessionId: typeof body.sessionId === 'string' ? body.sessionId.trim() : '',
+              mode: DEFAULT_EXECUTION_MODE,
+              defaultMode: DEFAULT_EXECUTION_MODE,
+              isLtSession: false,
+              canSwitch: false,
+              busyReason: `Session preset "${effectiveRequestedPreset}" is not a LeaderTeam session`,
+              activeTurn: false,
+              activeMembersCount: 0,
+              pendingReviewsCount: 0,
+              activeConferenceId: null,
+              updatedAt: null,
+              switchCount: 0,
+            },
+          };
+          throw notLtErr;
+        }
+
         // Pre-seed Single mode before DSH publishes the new Agent so `onAgentCreated` skips TeamStore creation (`0` team overhead).
         let preMintedSid = null;
-        if (requestedMode === 'single' && requestedPreset === leaderPreset && !body.sessionId && rt?.storageRoot) {
+        if (
+          requestedMode === 'single'
+          && (isLtSessionPreset(requestedPreset, rt) || isLtSessionPreset(effectiveRequestedPreset, rt))
+          && !body.sessionId
+          && rt?.storageRoot
+        ) {
           preMintedSid = `session-${crypto.randomUUID()}`;
           switchSessionExecutionMode(ctx, rt, preMintedSid, 'single', {
             persistInitial: true,
             isLtSession: true,
-            agentPreset: requestedPreset,
+            agentPreset: leaderPreset,
             source: 'workbench-create',
           });
         }

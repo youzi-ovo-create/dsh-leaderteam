@@ -168,7 +168,7 @@
 
       // Session execution modes (Single / Team)
       const [sessionModes, setSessionModes] = useState([]);
-      const [switchingSessionId, setSwitchingSessionId] = useState('');
+      const [switchingMap, setSwitchingMap] = useState({});
 
       // Archive filters & detail
       const [catFilter, setCatFilter] = useState('');
@@ -451,7 +451,7 @@
 
       const onSwitchSessionMode = async (sid, nextMode) => {
         if (!sid || !nextMode) return;
-        setSwitchingSessionId(sid);
+        setSwitchingMap(prev => Object.assign({}, prev || {}, { [sid]: true }));
         setError(null);
         setNotice(null);
         try {
@@ -493,7 +493,11 @@
           const prefix = e && e.code === 'MODE_SWITCH_BUSY' ? '无法切换会话模式（当前忙碌）：' : '切换会话模式失败：';
           setError(prefix + (e && e.message ? e.message : String(e)));
         } finally {
-          setSwitchingSessionId('');
+          setSwitchingMap(prev => {
+            const next = Object.assign({}, prev || {});
+            delete next[sid];
+            return next;
+          });
         }
       };
 
@@ -644,7 +648,7 @@
           h('div', { style: cardStyle },
             h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px', flexWrap: 'wrap', gap: '6px' } },
               h('strong', null, '会话内执行模式 (Single / Team)'),
-              h('button', { style: btnStyle(false), onClick: onRefreshSessionModes, disabled: loading || Boolean(switchingSessionId) }, '刷新会话模式')
+              h('button', { style: btnStyle(false), onClick: onRefreshSessionModes, disabled: loading || Object.keys(switchingMap || {}).length > 0 }, '刷新会话模式')
             ),
             h('div', { style: { fontSize: '11px', opacity: 0.78, marginBottom: '8px' } },
               '仅在会话空闲时允许在 Team（领队编排 + 子代理并发 + 双评审）与 Single（主代理直执 + 安全门守护 · 零团队开销）之间热切换；0 次模型调用。'
@@ -659,7 +663,7 @@
                 const busyReason = ms.busyReason || s.modeBusyReason || null;
                 const targetMode = curMode === 'team' ? 'single' : 'team';
                 const targetLabel = targetMode === 'single' ? '切换为 Single' : '切换为 Team';
-                const isSwitchingThis = switchingSessionId === s.sessionId;
+                const isSwitchingThis = Boolean(switchingMap && switchingMap[s.sessionId]);
                 return h(
                   'div',
                   {

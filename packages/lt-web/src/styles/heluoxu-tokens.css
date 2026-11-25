@@ -187,6 +187,18 @@
   --lt-seal: var(--lt-danger);
 }
 
+:root[data-lt-theme="custom"][style*="color-scheme: dark"] {
+  --lt-info: #6CB2CE;
+  --lt-info-bg: color-mix(in srgb, #6CB2CE 16%, var(--lt-bg-surface));
+  --lt-success: #63B692;
+  --lt-success-bg: color-mix(in srgb, #63B692 16%, var(--lt-bg-surface));
+  --lt-warning: #E0AD56;
+  --lt-warning-bg: color-mix(in srgb, #E0AD56 16%, var(--lt-bg-surface));
+  --lt-danger: #DF7A72;
+  --lt-danger-bg: color-mix(in srgb, var(--lt-danger) 16%, var(--lt-bg-surface));
+  --lt-seal: var(--lt-danger);
+}
+
 :root[data-lt-heading="sans"] { --lt-font-heading-active: var(--lt-font-sans); }
 :root[data-lt-heading="serif"] { --lt-font-heading-active: var(--lt-font-display); }
 

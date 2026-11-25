@@ -862,7 +862,7 @@ function buildTeamReport(input, notes, issues, matchGateway) {
 }
 
 function buildSessionReport(input, notes, issues, matchGateway) {
-  const { sessions, pricing } = input;
+  const { sessions, governance, pricing } = input;
   const catalog = catalogOf(sessions);
   const ledger = [];
   const specs = [];
@@ -910,7 +910,55 @@ function buildSessionReport(input, notes, issues, matchGateway) {
     });
   });
 
-  const groups = sessions.length > 1 ? ['main', 'subagents'] : ['main'];
+  const governanceRecords = (governance ?? []).filter((record) => record && record.role !== 'leader');
+  const governanceAgents = new Map();
+  for (const record of governanceRecords) {
+    const timeMs = Date.parse(record?.at);
+    if (!Number.isFinite(timeMs)) {
+      notes.push(`governance record without valid at: ${String(record?.at)}`);
+      continue;
+    }
+    const actor = governanceActor(record);
+    if (!governanceAgents.has(actor)) {
+      governanceAgents.set(actor, true);
+      specs.push({
+        agentKey: `governance|${main.id}|${actor}`,
+        group: 'governance',
+        name: actor,
+        actorRole: record.role ?? 'governance',
+        stageId: record.purpose ?? (record.role === 'gate' ? 'safety-gate' : null),
+        sessionId: main.id
+      });
+    }
+    ledger.push(
+      makeLedgerRow(
+        {
+          timeMs,
+          group: 'governance',
+          actor,
+          role: record.role ?? 'governance',
+          stageId: null,
+          taskSeq: Number.isInteger(record.taskSeq) ? record.taskSeq : null,
+          sessionId: main.id,
+          agentKey: `governance|${main.id}|${actor}`,
+          route: record.route ?? 'unknown',
+          hostProvider: record.hostProvider ?? null,
+          responseId: record.responseId ?? null,
+          attempts: Number.isInteger(record.attempts) ? record.attempts : null,
+          latencyMs: Number.isFinite(record.latencyMs) ? record.latencyMs : null,
+          usage: record.usage ?? null,
+          ok: record.ok !== false,
+          degraded: record.degraded
+        },
+        pricing,
+        issues,
+        matchGateway
+      )
+    );
+  }
+
+  const baseGroups = sessions.length > 1 ? ['main', 'subagents'] : ['main'];
+  const groups = governanceAgents.size > 0 ? [...baseGroups, 'governance'] : baseGroups;
   return { ledger, specs, groups, main };
 }
 

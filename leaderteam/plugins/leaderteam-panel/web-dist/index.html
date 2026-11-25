@@ -52,20 +52,63 @@
             var inkLum = relLum(hexToRgb(ct.inkColor));
             root.setProperty('--user-fg-on-ink', inkLum !== null && inkLum > 0.45 ? '#141619' : '#FFFFFF');
             var surfLum = relLum(hexToRgb(ct.surfaceColor));
-            root.colorScheme = surfLum !== null && surfLum < 0.25 ? 'dark' : 'light';
+            var isDarkSurf = surfLum !== null && surfLum < 0.25;
+            root.colorScheme = isDarkSurf ? 'dark' : 'light';
+            var semProps = [
+              '--lt-info',
+              '--lt-info-bg',
+              '--lt-success',
+              '--lt-success-bg',
+              '--lt-warning',
+              '--lt-warning-bg',
+              '--lt-danger',
+              '--lt-danger-bg',
+              '--lt-seal'
+            ];
+            if (isDarkSurf) {
+              var dLum = relLum(hexToRgb(ct.dangerColor));
+              var ratio =
+                dLum !== null
+                  ? (Math.max(dLum, surfLum) + 0.05) / (Math.min(dLum, surfLum) + 0.05)
+                  : 0;
+              var safeDanger = ratio >= 4.5 && ct.dangerColor ? ct.dangerColor : '#DF7A72';
+              root.setProperty('--lt-info', '#6CB2CE');
+              root.setProperty('--lt-info-bg', 'color-mix(in srgb, #6CB2CE 16%, var(--lt-bg-surface))');
+              root.setProperty('--lt-success', '#63B692');
+              root.setProperty('--lt-success-bg', 'color-mix(in srgb, #63B692 16%, var(--lt-bg-surface))');
+              root.setProperty('--lt-warning', '#E0AD56');
+              root.setProperty('--lt-warning-bg', 'color-mix(in srgb, #E0AD56 16%, var(--lt-bg-surface))');
+              root.setProperty('--lt-danger', safeDanger);
+              root.setProperty('--lt-danger-bg', 'color-mix(in srgb, ' + safeDanger + ' 16%, var(--lt-bg-surface))');
+              root.setProperty('--lt-seal', safeDanger);
+            } else {
+              for (var i = 0; i < semProps.length; i++) root.removeProperty(semProps[i]);
+            }
           } else {
             html.removeAttribute('data-lt-heading');
             html.removeAttribute('data-lt-corners');
             html.removeAttribute('data-lt-density');
+            var clearProps = [
+              '--lt-info',
+              '--lt-info-bg',
+              '--lt-success',
+              '--lt-success-bg',
+              '--lt-warning',
+              '--lt-warning-bg',
+              '--lt-danger',
+              '--lt-danger-bg',
+              '--lt-seal'
+            ];
+            for (var j = 0; j < clearProps.length; j++) root.removeProperty(clearProps[j]);
             root.removeProperty('color-scheme');
           }
         } catch (e) {}
       })();
     </script>
-    <script type="module" crossorigin src="./assets/index-5RTbK9h1.js"></script>
+    <script type="module" crossorigin src="./assets/index-DRwip1qE.js"></script>
     <link rel="modulepreload" crossorigin href="./assets/react-DHz4kLit.js">
     <link rel="modulepreload" crossorigin href="./assets/echarts-ClPwX7rX.js">
-    <link rel="stylesheet" crossorigin href="./assets/index-0oeknzK1.css">
+    <link rel="stylesheet" crossorigin href="./assets/index-BQ0MgRxN.css">
   </head>
   <body>
     <div id="root"></div>

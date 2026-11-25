@@ -178,6 +178,18 @@ export function computeContrastRatio(hexA: string, hexB: string): number {
   return Number(((lighter + 0.05) / (darker + 0.05)).toFixed(2));
 }
 
+const CUSTOM_DARK_SEMANTIC_PROPS = [
+  '--lt-info',
+  '--lt-info-bg',
+  '--lt-success',
+  '--lt-success-bg',
+  '--lt-warning',
+  '--lt-warning-bg',
+  '--lt-danger',
+  '--lt-danger-bg',
+  '--lt-seal',
+] as const;
+
 export function applyThemeToDom(theme: ThemePresetId, customTheme: CustomThemeSeeds): void {
   if (typeof document === 'undefined') return;
   const html = document.documentElement;
@@ -196,8 +208,27 @@ export function applyThemeToDom(theme: ThemePresetId, customTheme: CustomThemeSe
     const inkRgb = hexToRgb(customTheme.inkColor);
     const inkLum = inkRgb ? relativeLuminance(inkRgb) : 0.05;
     st.setProperty('--user-fg-on-ink', inkLum > 0.45 ? '#141619' : '#FFFFFF');
-    const surfRgb = hexToRgb(customTheme.surfaceColor);
-    st.colorScheme = surfRgb && relativeLuminance(surfRgb) < 0.25 ? 'dark' : 'light';
+    const surfHex = customTheme.surfaceColor || '#FFFFFF';
+    const surfRgb = hexToRgb(surfHex);
+    const isDarkSurface = Boolean(surfRgb && relativeLuminance(surfRgb) < 0.25);
+    st.colorScheme = isDarkSurface ? 'dark' : 'light';
+    if (isDarkSurface) {
+      const rawDanger = customTheme.dangerColor || '#DF7A72';
+      const safeDanger = computeContrastRatio(rawDanger, surfHex) >= 4.5 ? rawDanger : '#DF7A72';
+      st.setProperty('--lt-info', '#6CB2CE');
+      st.setProperty('--lt-info-bg', 'color-mix(in srgb, #6CB2CE 16%, var(--lt-bg-surface))');
+      st.setProperty('--lt-success', '#63B692');
+      st.setProperty('--lt-success-bg', 'color-mix(in srgb, #63B692 16%, var(--lt-bg-surface))');
+      st.setProperty('--lt-warning', '#E0AD56');
+      st.setProperty('--lt-warning-bg', 'color-mix(in srgb, #E0AD56 16%, var(--lt-bg-surface))');
+      st.setProperty('--lt-danger', safeDanger);
+      st.setProperty('--lt-danger-bg', `color-mix(in srgb, ${safeDanger} 16%, var(--lt-bg-surface))`);
+      st.setProperty('--lt-seal', safeDanger);
+    } else {
+      for (const prop of CUSTOM_DARK_SEMANTIC_PROPS) {
+        st.removeProperty(prop);
+      }
+    }
   } else {
     html.removeAttribute('data-lt-heading');
     html.removeAttribute('data-lt-corners');
@@ -208,6 +239,9 @@ export function applyThemeToDom(theme: ThemePresetId, customTheme: CustomThemeSe
     st.removeProperty('--user-accent');
     st.removeProperty('--user-danger');
     st.removeProperty('--user-fg-on-ink');
+    for (const prop of CUSTOM_DARK_SEMANTIC_PROPS) {
+      st.removeProperty(prop);
+    }
     st.removeProperty('color-scheme');
   }
 
