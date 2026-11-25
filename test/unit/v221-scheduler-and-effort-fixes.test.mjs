@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 
 import { ElasticConcurrencyScheduler } from '../../leaderteam/core/scheduler.mjs';
 import { validateConfig, loadRawConfig } from '../../leaderteam/core/config.mjs';
-import { renderMagpieModelRows, parseMagpiePatchModels } from '../../leaderteam/core/model-config-writer.mjs';
+import { renderMagpieModelRows, parseMagpiePatchModels, applyModelConfigChanges } from '../../leaderteam/core/model-config-writer.mjs';
 import { syncUpstreamModelsToDshSettings } from '../../leaderteam/core/upstream-models.mjs';
 import { TeamStore } from '../../leaderteam/core/store.mjs';
 import { runtime, teamStore } from '../../leaderteam/host/runtime.mjs';
@@ -61,20 +61,20 @@ test('V2.2.1 [1a & 1b]: awaitingSlots clears after open-slot turn end, and capac
     }),
   });
 
-  const teamId = 'team-v23-repro';
+  const teamId = 'team-sched-repro';
   const taskSeq = 1;
   const fourShell = Array.from({ length: 4 }, (_, i) => ({ id: `s-${i}`, name: `shell-${i}`, status: 'running', profile: 'shell' }));
 
-  // Reproduce seq=317: 5th shell dispatch rejected by shell_concurrency_limit -> latches awaitingSlots=true while pendingParallelTasks===0
+  // Reproduce 5th shell dispatch rejected by shell_concurrency_limit -> latches awaitingSlots=true while pendingParallelTasks===0
   const rejected = sched.checkDispatch({ teamId, taskSeq, activeMembers: fourShell, profile: 'shell' });
   assert.equal(rejected.allowed, false);
   assert.equal(sched.teamState(teamId, taskSeq).awaitingSlots, true);
 
-  // Reproduce seq=341: Leader switches to `code` profile in the same turn, succeeds, and ends Turn 1 with open slots
+  // Leader switches to `code` profile in the same turn, succeeds, and ends Turn 1 with open slots
   nowMs += 1000;
   const admittedCode = sched.admitDispatch({ teamId, taskSeq, activeMembers: fourShell, profile: 'code' });
   assert.equal(admittedCode.allowed, true);
-  const fiveActive = [...fourShell, { id: 'c-1', name: 'mapper-e2e', status: 'running', profile: 'code' }];
+  const fiveActive = [...fourShell, { id: 'c-1', name: 'code-worker', status: 'running', profile: 'code' }];
   const endSnap = sched.evaluate({ teamId, taskSeq, activeMembers: fiveActive });
   assert.equal(endSnap.controls.ramp_available_now, 1);
   sched.advanceLeaderTurn(teamId, taskSeq, endSnap);
@@ -119,7 +119,7 @@ test('V2.2.1 [1c & 1d]: rolling frontier zero-work suppression, terminal deliver
 
   const followups = [];
   let sessionEvents = [
-    { seq: 1, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'Build V2.3' }] } },
+    { seq: 1, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'Build feature' }] } },
     { seq: 2, type: 'turn/start', data: { turn: 15 } },
     { seq: 3, type: 'assistant/message', data: { turn: 15, message: { content: [{ type: 'text', text: 'All checks passed.' }] } } },
     { seq: 4, type: 'turn/end', data: { turn: 15, reason: { kind: 'completed' } } },
@@ -347,5 +347,62 @@ test('V2.2.1 [F07 & F08]: multi-team hysteresis recovery never double-counts one
     assert.equal(checkPassive(500, 300).passiveBusy, 100);
   } finally {
     os.cpus = originalCpus;
+  }
+});
+
+test('V2.2.1 [R04 & R07]: upsertModels label-only edit preserves reasoningEfforts & YAML wire mapping, and multi-file write failures leave config untouched', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'lt-v221-r04-'));
+  try {
+    const srcCfg = fileURLToPath(new URL('../../config/leaderteam.config.json', import.meta.url));
+    const srcPatch = fileURLToPath(new URL('../../config/magpie-models.patch.yml', import.meta.url));
+    const cfgFile = path.join(tmp, 'leaderteam.config.json');
+    const patchFile = path.join(tmp, 'magpie-models.patch.yml');
+
+    const raw = JSON.parse(fs.readFileSync(srcCfg, 'utf8'));
+    const route = 'codex/gpt-6.1-terra';
+    raw.models[route] = {
+      ...raw.models[route],
+      efforts: ['low', 'medium', 'high'],
+      defaultEffort: 'high',
+      reasoningEfforts: { high: 'medium' },
+    };
+    fs.writeFileSync(cfgFile, JSON.stringify(raw, null, 2) + '\n');
+    fs.copyFileSync(srcPatch, patchFile);
+
+    const res = applyModelConfigChanges(
+      { upsertModels: [{ route, label: 'Renamed for display' }] },
+      { configFile: cfgFile, patchFiles: [patchFile], dshHome: tmp },
+    );
+    assert.equal(res.saved, true);
+    assert.ok(res.patchesUpdated.includes(patchFile));
+
+    const onDisk = JSON.parse(fs.readFileSync(cfgFile, 'utf8')).models[route];
+    assert.equal(onDisk.label, 'Renamed for display');
+    assert.deepEqual(onDisk.reasoningEfforts, { high: 'medium' });
+
+    const yamlText = fs.readFileSync(patchFile, 'utf8');
+    assert.match(yamlText, /id: codex\/gpt-6\.1-terra[^\r\n]*reasoningEfforts: \{low: low, medium: medium, high: medium\}/);
+
+    // Multi-file transactional write: read-only patch directory leaves cfgFile untouched on EACCES
+    if (process.getuid?.() !== 0) {
+      const roDir = path.join(tmp, 'ro-patches');
+      fs.mkdirSync(roDir);
+      const roPatch = path.join(roDir, 'magpie-models.patch.yml');
+      fs.copyFileSync(patchFile, roPatch);
+      fs.chmodSync(roDir, 0o555);
+      try {
+        assert.throws(
+          () => applyModelConfigChanges(
+            { upsertModels: [{ route, label: 'Should Not Persist', maxTokens: 4096 }] },
+            { configFile: cfgFile, patchFiles: [roPatch], dshHome: tmp },
+          ),
+        );
+      } finally {
+        fs.chmodSync(roDir, 0o755);
+      }
+      assert.equal(JSON.parse(fs.readFileSync(cfgFile, 'utf8')).models[route].label, 'Renamed for display');
+    }
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
   }
 });

@@ -7,7 +7,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { LtError, FAMILIES, MODEL_ROUTE_RE, EFFORT_ID_RE, DSH_EFFORTS } from './constants.mjs';
 import { validateConfig, deepMergePlain, routeModel } from './config.mjs';
-import { writeFileAtomic, appendJsonl } from './store.mjs';
+import { writeFileAtomic, writeFilesTransactional, appendJsonl } from './store.mjs';
 import { hashJson } from './canonical.mjs';
 
 export const ROLE_KEYS = Object.freeze(['leader', 'gate', 'discussA', 'discussB', 'arbiter', 'serialReviewer', 'directExec']);
@@ -440,6 +440,7 @@ export function inspectModelConfiguration(options = {}) {
     label: spec.label,
     efforts: [...spec.efforts],
     defaultEffort: spec.defaultEffort,
+    reasoningEfforts: spec.reasoningEfforts ? { ...spec.reasoningEfforts } : null,
     contextWindow: spec.contextWindow ?? null,
     maxTokens: spec.maxTokens ?? null,
     strengths: spec.strengths ?? '',
@@ -631,6 +632,22 @@ export function applyModelConfigChanges(changes = {}, options = {}) {
       efforts,
       defaultEffort,
     };
+    if (item.clearReasoningEfforts || item.reasoningEfforts === null) {
+      // omit reasoningEfforts
+    } else if (isPlainObj(item.reasoningEfforts)) {
+      spec.reasoningEfforts = { ...item.reasoningEfforts };
+    } else if (isPlainObj(priorTarget?.reasoningEfforts)) {
+      const keptEfforts = {};
+      for (const [ek, ev] of Object.entries(priorTarget.reasoningEfforts)) {
+        const keyStillValid = ek === 'off'
+          ? (Array.isArray(efforts) && (efforts.includes('off') || efforts.includes('none')))
+          : (Array.isArray(efforts) && efforts.includes(ek));
+        if (keyStillValid) keptEfforts[ek] = ev;
+      }
+      if (Object.keys(keptEfforts).length > 0) {
+        spec.reasoningEfforts = keptEfforts;
+      }
+    }
     if (item.vision !== undefined || priorTarget?.vision !== undefined) spec.vision = item.vision ?? priorTarget.vision;
     if (item.contextWindow !== undefined) {
       if (item.contextWindow !== null) spec.contextWindow = item.contextWindow;
@@ -643,13 +660,15 @@ export function applyModelConfigChanges(changes = {}, options = {}) {
       spec.maxTokens = priorTarget.maxTokens;
     }
     const defaultProvider = nextBase.magpie?.provider ?? 'magpie';
-    const effProvider = item.provider ?? priorTarget?.provider;
-    if (effProvider && effProvider !== defaultProvider) {
-      spec.provider = effProvider;
+    if (item.provider !== undefined) {
+      if (item.provider && item.provider !== defaultProvider) spec.provider = item.provider;
+    } else if (priorTarget?.provider !== undefined) {
+      spec.provider = priorTarget.provider;
     }
-    const effUpstreamModel = item.upstreamModel ?? priorTarget?.upstreamModel;
-    if (effUpstreamModel && effUpstreamModel !== route) {
-      spec.upstreamModel = effUpstreamModel;
+    if (item.upstreamModel !== undefined) {
+      if (item.upstreamModel && item.upstreamModel !== route) spec.upstreamModel = item.upstreamModel;
+    } else if (priorTarget?.upstreamModel !== undefined) {
+      spec.upstreamModel = priorTarget.upstreamModel;
     }
     if (item.strengths !== undefined) {
       if (item.strengths !== '') spec.strengths = item.strengths;
@@ -892,10 +911,11 @@ export function applyModelConfigChanges(changes = {}, options = {}) {
   if (target === 'base' && options.syncPatches !== false) {
     const patchFiles = options.patchFiles ?? defaultPatchTargets(configFile);
     const rows = renderMagpieModelRows(validatedBase);
+    const forceModelPatchSync = targetChanged && (touched.models.size > 0 || touched.removedModels.size > 0);
     for (const pf of patchFiles) {
       const curYaml = fs.readFileSync(pf, 'utf8');
       const nextYaml = rewriteModelsBlock(curYaml, rows);
-      if (curYaml.replace(/\r\n/g, '\n') !== nextYaml.replace(/\r\n/g, '\n')) {
+      if (curYaml.replace(/\r\n/g, '\n') !== nextYaml.replace(/\r\n/g, '\n') || forceModelPatchSync) {
         patchWrites.push({ file: pf, content: nextYaml });
       }
     }
@@ -922,12 +942,11 @@ export function applyModelConfigChanges(changes = {}, options = {}) {
         beforeSha256: hashJson(target === 'base' ? baseRaw : localRaw),
         afterSha256: hashJson(target === 'base' ? nextBase : nextLocal) });
     }
-    if (targetChanged) {
-      writeFileAtomic(targetFile, serializedTarget);
-    }
-    for (const pw of patchWrites) {
-      writeFileAtomic(pw.file, pw.content);
-    }
+    const plannedWrites = [
+      ...(targetChanged ? [{ file: targetFile, content: serializedTarget }] : []),
+      ...patchWrites,
+    ];
+    writeFilesTransactional(plannedWrites);
     if (auditId) appendJsonl(auditFile, { v: 1, id: auditId, event: 'applied', at: new Date().toISOString() });
   }
 

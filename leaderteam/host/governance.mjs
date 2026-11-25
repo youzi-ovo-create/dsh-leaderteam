@@ -366,11 +366,19 @@ export async function resumePausedMembersAfterConference({ ctx, rt, store, leade
   const blockedTargets = ruling?.blockedTargets ?? [];
   const adjustDisputed = ruling?.memberResumePolicy === 'adjust_disputed_resume_others' || blockedTargets.length > 0;
 
-  for (const m of store.members().values()) {
+  const allMembers = [...store.members().values()];
+  const activeScopes = allMembers
+    .filter(m => ACTIVE_EXECUTION_STATUSES.has(m.status))
+    .map(m => m.writeScope ?? []);
+
+  for (const m of allMembers) {
     if ((m.taskSeq ?? 1) !== taskSeq) continue;
     if (m.actorRole === 'direct_exec') continue;
     const wasTargetedByConf = m.status === 'paused' || m.governanceState === 'pausing_for_conference' || m.governanceState === 'paused_for_conference';
     if (!wasTargetedByConf) continue;
+    if (m.pausedByConferenceId && conference?.conferenceId && m.pausedByConferenceId !== conference.conferenceId && !conference.includePriorConferencePauses) {
+      continue;
+    }
 
     if (adjustDisputed) {
       const overlapsDisputed = (m.stageId && (blockedTargets.includes(m.stageId) || conference.stageId === m.stageId))
@@ -380,6 +388,10 @@ export async function resumePausedMembersAfterConference({ ctx, rt, store, leade
         if (m.status !== 'paused') store.setMemberStatus(m.childId, 'paused');
         continue;
       }
+    }
+
+    if (activeScopes.some(scope => anyGlobOverlaps(scope, m.writeScope ?? [], process.platform))) {
+      continue;
     }
 
     const savedCheckpoint = store.loadMemberCheckpoint?.(m.childId, conference.conferenceId) ?? m.checkpoint ?? null;
@@ -410,6 +422,7 @@ export async function resumePausedMembersAfterConference({ ctx, rt, store, leade
     }
     if (delivered) {
       store.setMemberStatus(m.childId, 'running');
+      activeScopes.push(m.writeScope ?? []);
       resumed.push(m.childId);
     }
   }
@@ -1847,7 +1860,7 @@ export async function resolveHumanEscalationOnUserTurn({ ctx, rt, store, leaderA
     store,
     leaderAgent,
     taskSeq: escTaskSeq,
-    conference: { conferenceId: openEvent.escalationId, stageId: openEvent.stageId, targets: openEvent.targets },
+    conference: { conferenceId: openEvent.escalationId, stageId: openEvent.stageId, targets: openEvent.targets, includePriorConferencePauses: true },
     ruling: {
       decision: 'adopt_alternative',
       rulingSummary: `Resolved by User decision: ${truncate(String(userText ?? ''), 300)}`,

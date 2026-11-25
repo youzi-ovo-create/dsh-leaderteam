@@ -70,6 +70,51 @@ export function writeFileAtomic(file, text) {
   fs.renameSync(tmp, file);
 }
 
+/**
+ * Stage temporary files in every target directory before renaming any destination file,
+ * rolling back any already-renamed files if a subsequent rename fails.
+ */
+export function writeFilesTransactional(writes) {
+  if (!Array.isArray(writes) || writes.length === 0) return;
+  const staged = [];
+  const renamed = [];
+  try {
+    for (const { file, content } of writes) {
+      const existed = fs.existsSync(file);
+      const previousContent = existed ? fs.readFileSync(file, 'utf8') : null;
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      const tmp = `${file}.${process.pid}.${randomUUID()}.tmp`;
+      const fd = fs.openSync(tmp, 'wx');
+      try {
+        fs.writeFileSync(fd, content, 'utf8');
+        fs.fsyncSync(fd);
+      } catch (e) {
+        try { fs.closeSync(fd); } catch {}
+        try { fs.unlinkSync(tmp); } catch {}
+        throw e;
+      }
+      fs.closeSync(fd);
+      staged.push({ file, tmp, existed, previousContent });
+    }
+    for (const item of staged) {
+      fs.renameSync(item.tmp, item.file);
+      renamed.push(item);
+    }
+  } catch (err) {
+    for (let i = renamed.length - 1; i >= 0; i--) {
+      const item = renamed[i];
+      try {
+        if (item.existed) writeFileAtomic(item.file, item.previousContent);
+        else fs.unlinkSync(item.file);
+      } catch {}
+    }
+    for (const item of staged) {
+      try { if (fs.existsSync(item.tmp)) fs.unlinkSync(item.tmp); } catch {}
+    }
+    throw err;
+  }
+}
+
 export class TeamStore {
   constructor(root, teamId) {
     this.teamId = safeId(teamId);
