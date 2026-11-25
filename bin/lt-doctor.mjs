@@ -866,7 +866,7 @@ export function checkConfigurationAndSoloKey({
         disableSnippet: '"powerMonitor": { "enabled": false }',
         privacyNote: 'Reads ONLY (onBattery, batteryPct) every 12m; set "powerMonitor": { "enabled": false } to disable.',
       },
-      summary: `Legacy V2.1 profile patch conflict detected (${conflictFiles}): overrides dsh-leaderteam@2.2.2 bundle entries. Run "npx lt-doctor --clean-legacy-patch" and restart DSH.`,
+      summary: `Legacy V2.1 profile patch conflict detected (${conflictFiles}): overrides dsh-leaderteam@2.2.3 bundle entries. Run "npx lt-doctor --clean-legacy-patch" and restart DSH.`,
     };
   }
 

@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { loadConfig, validateConfig, routeProvider } from '../core/config.mjs';
 import { hashJson, deepFreeze } from '../core/canonical.mjs';
 import { TeamStore } from '../core/store.mjs';
+import { readSessionModeRecord } from '../core/session-mode.mjs';
 import { discoverRuntimeModels, enrichConfigModelsFromCatalog, mergeUpstreamModelsIntoConfig } from '../core/upstream-models.mjs';
 import { DETACHABLE_PLUGINS } from '../core/constants.mjs';
 import { currentPlanRoot } from '../core/current-plan.mjs';
@@ -47,8 +48,16 @@ export function runtimeForTeam(teamId) {
   let view = rt.teamConfigViews.get(key);
   if (!view) {
     const store = teamStore(teamId);
-    fs.mkdirSync(store.dir, { recursive: true });
     const file = path.join(store.dir, 'governance.json');
+    if (!fs.existsSync(file) && !TeamStore.exists(rt.storageRoot, teamId)) {
+      let isPureSingle = false;
+      try {
+        const cachedMode = rt.sessionModesCache?.get?.(teamId)?.mode;
+        isPureSingle = (cachedMode ?? readSessionModeRecord(rt.storageRoot, teamId).mode) === 'single';
+      } catch {}
+      if (isPureSingle) return rt;
+    }
+    fs.mkdirSync(store.dir, { recursive: true });
     let record;
     try { record = JSON.parse(fs.readFileSync(file, 'utf8')); }
     catch (error) {

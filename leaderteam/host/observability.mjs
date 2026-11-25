@@ -211,7 +211,7 @@ export function teamObservability(ctx,rt,teamId) {
     return dedupedNativeRows(ds.rows).map(r=>({row:r,route:extractNativeRowRoute(r,fb,cfg)}));
   });
   return { teamId,governanceSha256:snapshot?.sourceSha256??null,
-    roles:Object.entries(cfg.roles).map(([role,value])=>{
+    roles:Object.entries(cfg?.roles??{}).map(([role,value])=>{
       const actual=governance.filter(r=>r.role===role);
       if (role==='leader') {
         const requestRoutes=[...new Set(sessions[0].rows.filter(r=>r.type==='request/header').map(r=>r.data?.header?.config?.model).filter(Boolean))];

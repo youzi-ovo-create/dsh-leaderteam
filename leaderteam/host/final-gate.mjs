@@ -34,6 +34,7 @@ import { callRoleJson } from './llm.mjs';
 import { roleRouteChain } from '../core/role-routes.mjs';
 import { runtime, teamStore, recordUsage, syncRuntimeConfig, runtimeForTeam, isPluginActive, refreshUpstreamCatalog, effectiveRuntimeConfig } from './runtime.mjs';
 import { resolveActor, leaderAllowedTools, userTaskText, userMessageTexts, currentTaskSeq, reconcileStaleMembers } from './roles.mjs';
+import { getSessionExecutionMode } from './mode-controller.mjs';
 import { resumeAdmission, withMemberActivation, activationConfig, resolveSendMessageTargetId } from './activation.mjs';
 
 const INSTALLED = Symbol.for('leaderteam.finalGate.installed.v1');
@@ -85,6 +86,7 @@ export function installFinalGate(supportedVersions) {
     if (gate === null) return original.call(this, exec);
     const actor = gate.actorFor(agent);
     if (actor === null) return original.call(this, exec); // not governed (outside any LeaderTeam team)
+    const reviewedMode = actor.executionMode;
     const name = exec.name, parent = exec.parent, toolSet = exec.toolSet;
     let args;
     try { args = frozenJsonCopy(exec.arguments ?? {}); } catch { return denied(name, { by: 'rule:arguments-not-json', reason: 'tool arguments are not plain JSON' }); }
@@ -95,7 +97,8 @@ export function installFinalGate(supportedVersions) {
     catch (e) { verdict = { decision: 'deny', by: 'gate-error', reason: `safety gate failed: ${e instanceof Error ? e.message : String(e)}` }; }
     if (exec.signal?.aborted) return abortedBeforeDispatch();
     if (verdict.decision !== 'allow') return denied(name, verdict);
-    if (runtime().gate !== gate || exec.agent !== agent || exec.parent !== parent || exec.toolSet !== toolSet || gate.actorFor(agent) !== actor || (typeof agent?.session?.header?.cwd === 'string' && agent.session.header.cwd !== actor.cwd)) {
+    const postActor = gate.actorFor(agent);
+    if (runtime().gate !== gate || exec.agent !== agent || exec.parent !== parent || exec.toolSet !== toolSet || postActor !== actor || postActor.executionMode !== reviewedMode || (typeof agent?.session?.header?.cwd === 'string' && agent.session.header.cwd !== actor.cwd)) {
       return denied(name, { by: 'binding', reason: 'the operation changed while it was under review' });
     }
     if (typeof gate.checkHardRules === 'function') {
@@ -126,11 +129,27 @@ export function installFinalGate(supportedVersions) {
       }
     }
     const isShell = Boolean(runtimeForTeam(actor.teamId).config?.gate?.shellTools?.includes(name));
-    if (isShell) runtime().scheduler?.beginShellCall?.();
+    const sessionKey = actor.teamId ?? agent?.id ?? null;
+    if (isShell) {
+      const baseRt = runtime();
+      baseRt.scheduler?.beginShellCall?.();
+      if (sessionKey) {
+        baseRt.inFlightShellCallsBySession ??= new Map();
+        baseRt.inFlightShellCallsBySession.set(sessionKey, (baseRt.inFlightShellCallsBySession.get(sessionKey) ?? 0) + 1);
+      }
+    }
     try {
       return await original.call(this, exec);
     } finally {
-      if (isShell) runtime().scheduler?.endShellCall?.();
+      if (isShell) {
+        const baseRt = runtime();
+        baseRt.scheduler?.endShellCall?.();
+        if (sessionKey && baseRt.inFlightShellCallsBySession) {
+          const next = (baseRt.inFlightShellCallsBySession.get(sessionKey) ?? 1) - 1;
+          if (next <= 0) baseRt.inFlightShellCallsBySession.delete(sessionKey);
+          else baseRt.inFlightShellCallsBySession.set(sessionKey, next);
+        }
+      }
     }
   };
   Object.defineProperty(proto, INSTALLED, { value: true });
@@ -170,13 +189,15 @@ export class Gate {
     return undefined;
   }
   actorFor(agent) {
-    if (agent === undefined) return null;
+    if (agent === undefined || agent === null) return null;
     const rt = runtime();
     syncRuntimeConfig(rt);
     const known = rt.actors.get(agent.id);
     if (known && known.agent === agent) {
       if (known.role === 'leader') {
-        const tools = leaderAllowedTools(runtimeForTeam(known.teamId));
+        const mode = getSessionExecutionMode(rt, known.teamId);
+        const tools = leaderAllowedTools(runtimeForTeam(known.teamId), mode);
+        known.executionMode = mode;
         known.allowedTools = tools;
         known.loadedTools = tools;
       }
@@ -190,6 +211,9 @@ export class Gate {
     syncRuntimeConfig();
     const rt = runtimeForTeam(actor.teamId);
     const cfg = rt.config;
+    const initialExecutionMode = actor.role === 'leader'
+      ? (actor.executionMode ?? getSessionExecutionMode(rt, actor.teamId))
+      : undefined;
     try { rt.onTeamActivity?.(this.ctx, actor.teamId, actor.cwd); } catch {}
     const taskSeq = currentTaskSeq(this.ctx, actor.teamId);
     const argsPreview = boundJson(sanitizeArguments(args ?? {}), 400, 200).text;
@@ -218,7 +242,7 @@ export class Gate {
     }
     const hit = this.checkHardRules({ name, args, agent, actor: effectiveActor });
     if (hit) return this.record(base, { decision: 'deny', by: `rule:${hit.rule}`, reason: hit.reason });
-    if (isAutonomousGovernance(cfg) && base.teamId) {
+    if (isAutonomousGovernance(cfg) && base.teamId && !(effectiveActor.role === 'leader' && effectiveActor.executionMode === 'single')) {
       const store = teamStore(base.teamId);
       const govState = replayGovernanceState(store.governanceEvents(), taskSeq);
       const stageObj = (effectiveActor.role === 'leader' && name === 'team_dispatch' && args?.stage_id)
@@ -413,6 +437,9 @@ export class Gate {
         } catch (error) { return this.record(base, { decision: 'deny', by: 'rule:stage-changed-during-review', reason: error.message }); }
       }
       if (typeof agent?.session?.header?.cwd === 'string' && agent.session.header.cwd !== actor.cwd) {
+        return this.record(base, { decision: 'deny', by: 'binding', reason: 'the operation changed while it was under review', ...ran, attempts: r.attempts, latencyMs: r.latencyMs });
+      }
+      if (actor.role === 'leader' && actor.teamId && getSessionExecutionMode(rt, actor.teamId) !== initialExecutionMode) {
         return this.record(base, { decision: 'deny', by: 'binding', reason: 'the operation changed while it was under review', ...ran, attempts: r.attempts, latencyMs: r.latencyMs });
       }
       const postHit = this.checkHardRules({ name, args, agent, actor });

@@ -176,3 +176,16 @@ Execute concisely, verify within the workspace Sandbox, and return a compact fac
 export function directExecInitialPrompt() {
   return 'Execute the localized task in your LeaderTeam Direct Execution instructions strictly within the workspace Sandbox and report concise factual results.';
 }
+
+export function singleModeSection(config, platform = process.platform) {
+  const shellTool = platform === 'win32' ? 'pwsh' : 'bash';
+  const protectedList = (config?.paths?.protectedDirs ?? ['.leaderteam', '.git', '.agents', 'AGENTS.md']).join(', ');
+  return `# LeaderTeam Single Mode: direct execution
+This session is currently in **LeaderTeam Single Mode** (direct execution mode). Answer in the user's language.
+
+## Direct Execution Rules
+1. **Direct Context Q&A First**: Answer questions directly from existing conversation and session context whenever no tool call is required (e.g., answering file locations, summarizing prior Team-mode outputs, or explaining code already in context).
+2. **Direct Tool Execution**: When file inspection, editing, or command execution is needed, invoke \`read\`, \`glob\`, \`grep\`, \`read_image\`, \`write\`, \`edit\`, \`${shellTool}\`, \`job_list\`, \`job_output\`, \`job_kill\`, and \`todo_write\` directly.
+3. **No Team Ceremony**: Do NOT run team planning, subagent dispatch (\`team_*\`), dual review, or \`DELIVERY:\` ceremony in Single Mode.
+4. **Safety Gate Boundaries**: Every tool call still passes the independent LeaderTeam Safety Gate (workspace containment, protected paths ${protectedList}, read-only global reference roots, configured leader read roots / user \`"允许读取 "\` grants, and shell boundary inspection). Report any safety-gate denial honestly without workarounds.`;
+}

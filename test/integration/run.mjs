@@ -145,7 +145,19 @@ async function runScenario(name, scenario) {
 }
 
 const dir = path.join(path.dirname(fileURLToPath(import.meta.url)), 'scenarios');
-const wanted = process.argv.slice(2);
+const rawArgs = process.argv.slice(2);
+const wanted = [];
+for (let i = 0; i < rawArgs.length; i++) {
+  const arg = rawArgs[i];
+  if (arg === '--filter') {
+    if (rawArgs[i + 1]) wanted.push(rawArgs[++i]);
+  } else if (arg.startsWith('--filter=')) {
+    const val = arg.slice('--filter='.length);
+    if (val) wanted.push(val);
+  } else if (!arg.startsWith('--')) {
+    wanted.push(arg);
+  }
+}
 const names = fs.readdirSync(dir).filter(f => f.endsWith('.mjs')).map(f => f.slice(0, -4)).filter(n => wanted.length === 0 || wanted.some(w => n.startsWith(w))).sort();
 let failed = 0, ran = 0;
 for (const n of names) {

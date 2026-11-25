@@ -4,7 +4,9 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { runtime, baseRuntime, teamStore, runtimeForTeam, isPluginActive, activePluginsMap, effectiveRuntimeConfig, recordSessionModelRequest, resolveCanonicalRouteFromHostSelection } from './runtime.mjs';
 import { TeamStore } from '../core/store.mjs';
-import { leaderSection, memberSection, directExecSection } from '../core/prompts.mjs';
+import { leaderSection, memberSection, directExecSection, singleModeSection } from '../core/prompts.mjs';
+import { readSessionModeHistory } from '../core/session-mode.mjs';
+import { getSessionExecutionMode } from './mode-controller.mjs';
 import { resolvePath, pathKey } from '../core/paths.mjs';
 import { truncate } from '../core/redact.mjs';
 import { CAPABILITY_TOOLS } from '../core/tool-policy.mjs';
@@ -36,10 +38,53 @@ const LEGACY_TOOLS = {
 };
 const leaderPromptDisposers = new WeakMap();
 
-export function leaderAllowedTools(rt = runtime()) {
-  const cfg = rt.config;
+export const SINGLE_MODE_FORBIDDEN_TOOLS = Object.freeze([
+  'send_message',
+  'interrupt_agent',
+  'list_agents',
+  'subagent',
+  'fork_agent',
+]);
+
+export const TEAM_MODE_LEADER_FORBIDDEN_TOOLS = Object.freeze([
+  'write',
+  'edit',
+  'bash',
+  'pwsh',
+  'job_list',
+  'job_output',
+  'job_kill',
+]);
+
+export function singleModeDirectTools(platform = process.platform) {
+  return [
+    'read',
+    'read_image',
+    'glob',
+    'grep',
+    'todo_write',
+    'write',
+    'edit',
+    ...(platform === 'win32' ? ['pwsh'] : ['bash']),
+    'job_list',
+    'job_output',
+    'job_kill',
+  ];
+}
+
+export const SINGLE_MODE_DIRECT_TOOLS = Object.freeze(singleModeDirectTools(process.platform));
+
+export function leaderAllowedTools(rt = runtime(), executionMode = 'team', platform = process.platform) {
+  const cfg = rt?.config;
   if (!cfg) return [];
-  const disabledTools = new Set();
+  if (executionMode === 'single') {
+    const forbidden = new Set(SINGLE_MODE_FORBIDDEN_TOOLS);
+    const extras = (cfg.toolPolicy?.additionalTools ?? []).filter(
+      t => typeof t === 'string' && !t.startsWith('team_') && !forbidden.has(t),
+    );
+    return [...new Set([...singleModeDirectTools(platform), ...extras])];
+  }
+  const disabledTools = new Set(TEAM_MODE_LEADER_FORBIDDEN_TOOLS);
   if (!isPluginActive(rt, 'scheduler')) disabledTools.add('team_concurrency');
   if (!isPluginActive(rt, 'consensus')) {
     disabledTools.add('team_discuss');
@@ -96,19 +141,125 @@ export function resolveActor(ctx, agent) {
       }
     }
   } else if (isLeaderRoot(ctx, agent)) {
-    teamStore(agent.id).ensure({ workspace: cwd, surface: rt.surface });
-    cfg = runtimeForTeam(agent.id).config;
-    const tools = leaderAllowedTools(runtimeForTeam(agent.id));
-    actor = { role: 'leader', teamId: agent.id, agentId: agent.id, name: 'leader', profile: 'leader', allowedTools: tools, loadedTools: tools, skills: [], writeScope: [], refs: [], cwd };
+    const mode = getSessionExecutionMode(rt, agent.id);
+    if (mode === 'team') {
+      teamStore(agent.id).ensure({ workspace: cwd, surface: rt.surface });
+    }
+    const teamRt = runtimeForTeam(agent.id);
+    cfg = teamRt.config;
+    const tools = leaderAllowedTools(teamRt, mode);
+    actor = {
+      role: 'leader',
+      executionMode: mode,
+      teamId: agent.id,
+      agentId: agent.id,
+      name: 'leader',
+      profile: 'leader',
+      allowedTools: tools,
+      loadedTools: tools,
+      skills: [],
+      writeScope: [],
+      refs: [],
+      cwd,
+    };
   }
   if (actor) { actor.agent = agent; rt.actors.set(agent.id, actor); }
   return actor;
 }
-function isLeaderRoot(ctx, agent) {
+export function isLeaderRoot(ctx, agent) {
   const rt = runtime();
   if (rt.surface === 'headless') return process.env.LEADERTEAM_HEADLESS_LEADER === '1';
-  const presets = ctx.get('agentPresets');
-  return presets?.presetForSession?.(agent.session) === rt.config.profiles.leader.preset;
+  const presets = ctx?.get?.('agentPresets');
+  return presets?.presetForSession?.(agent.session) === rt.config?.profiles?.leader?.preset;
+}
+
+function disposeLeaderPromptHandles(agent) {
+  for (const dispose of leaderPromptDisposers.get(agent) ?? []) {
+    if (typeof dispose === 'function') {
+      try { dispose(); } catch {}
+    } else if (dispose && typeof dispose.dispose === 'function') {
+      try { dispose.dispose(); } catch {}
+    }
+  }
+  leaderPromptDisposers.delete(agent);
+}
+
+export function applyLeaderPromptSections(ctx, rt, actor, agent, mode = 'team') {
+  disposeLeaderPromptHandles(agent);
+  const prompt = agent?.ctx?.systemPrompt;
+  if (!prompt || typeof prompt.section !== 'function') {
+    actor.promptAppliedMode = mode;
+    return;
+  }
+  const teamRt = runtimeForTeam(actor.teamId);
+  const cfg = teamRt.config ?? rt.config;
+  const disposers = [];
+  if (mode === 'single') {
+    disposers.push(prompt.section({
+      name: 'leaderteam:role',
+      order: 9000,
+      interpolate: false,
+      text: singleModeSection(cfg, process.platform),
+    }));
+  } else {
+    disposers.push(prompt.section({
+      name: 'leaderteam:role',
+      order: 9000,
+      interpolate: false,
+      text: leaderSection(cfg, activePluginsMap(teamRt)),
+    }));
+    if (typeof prompt.context === 'function') {
+      disposers.push(prompt.context({
+        name: 'leaderteam:current-plan',
+        order: 125,
+        interpolate: false,
+        text: () => {
+          const curRt = runtimeForTeam(actor.teamId);
+          const curCfg = curRt.config ?? cfg;
+          const seq = currentTaskSeq(ctx, actor.teamId);
+          if (curCfg.team.rollingPlanning) return formatFrontierContext(teamStore(actor.teamId), seq, curCfg);
+          const plan = readCurrentPlan(curRt.storageRoot, actor.teamId, seq);
+          return `Current full task plan: ${currentPlanFile(curRt.storageRoot, actor.teamId, seq)}. ${plan ? 'Read this file after context compaction; it is the source of plan review.' : 'Write the full plan using team_note(scope="current_plan", path="plan.md").'}`;
+        },
+      }));
+      disposers.push(prompt.context({
+        name: 'leaderteam:concurrency',
+        order: 130,
+        interpolate: false,
+        text: () => baseRuntime(rt).formatLeaderContext?.(actor.teamId) ?? '',
+      }));
+    }
+  }
+  leaderPromptDisposers.set(agent, disposers);
+  actor.promptAppliedMode = mode;
+}
+
+export function syncLeaderAgentMode(ctx, rt = runtime(), sessionId) {
+  const baseRt = baseRuntime(rt);
+  if (!sessionId) return { synced: false, mode: 'team' };
+  const mode = getSessionExecutionMode(baseRt, sessionId);
+  let actor = baseRt.actors.get(sessionId);
+  const liveAgent = (actor?.role === 'leader' ? actor.agent : null) ?? baseRt.hostAgents?.get?.(sessionId) ?? null;
+  if ((!actor || (liveAgent && actor.agent !== liveAgent)) && liveAgent && isLeaderRoot(ctx, liveAgent)) {
+    actor = resolveActor(ctx, liveAgent);
+  }
+  if (!actor || actor.role !== 'leader') return { synced: false, mode };
+  if (mode === 'team' && baseRt.storageRoot) {
+    teamStore(sessionId).ensure({ workspace: actor.cwd, surface: baseRt.surface });
+    reconcileStaleMembers(runtimeForTeam(sessionId), teamStore(sessionId));
+    try { baseRt.onLeaderSessionReady?.(ctx, sessionId, actor.cwd); } catch {}
+  } else if (baseRt.storageRoot && TeamStore.exists(baseRt.storageRoot, sessionId)) {
+    reconcileStaleMembers(baseRt, teamStore(sessionId));
+  }
+  const teamRt = runtimeForTeam(sessionId);
+  const tools = leaderAllowedTools(teamRt, mode);
+  actor.executionMode = mode;
+  actor.allowedTools = tools;
+  actor.loadedTools = tools;
+  if (actor.agent) {
+    applyLeaderPromptSections(ctx, teamRt, actor, actor.agent, mode);
+  }
+  return { synced: true, mode, allowedTools: tools };
 }
 
 export function onAgentCreated(ctx, { agent }) {
@@ -116,10 +267,16 @@ export function onAgentCreated(ctx, { agent }) {
   if (!actor) return;
   const rt = runtimeForTeam(actor.teamId), cfg = rt.config;
   if (actor.role === 'leader') {
-    if (leaderPromptDisposers.has(agent)) return;
-    teamStore(actor.teamId).ensure({ workspace: actor.cwd, surface: rt.surface });
-    reconcileStaleMembers(rt, teamStore(actor.teamId));
-    try { rt.onLeaderSessionReady?.(ctx, actor.teamId, actor.cwd); } catch {}
+    const mode = actor.executionMode ?? getSessionExecutionMode(rt, actor.teamId);
+    actor.executionMode = mode;
+    if (leaderPromptDisposers.has(agent) && actor.promptAppliedMode === mode) return;
+    if (mode === 'team') {
+      teamStore(actor.teamId).ensure({ workspace: actor.cwd, surface: rt.surface });
+      reconcileStaleMembers(rt, teamStore(actor.teamId));
+      try { rt.onLeaderSessionReady?.(ctx, actor.teamId, actor.cwd); } catch {}
+    } else if (rt.storageRoot && TeamStore.exists(rt.storageRoot, actor.teamId)) {
+      reconcileStaleMembers(rt, teamStore(actor.teamId));
+    }
     // Apply the configured default only before this session has any durable or CLI-specified selection.
     // Resuming a session or passing an explicit `--model` in headless preserves its actual model/effort.
     if (agent.model?.recordedSelection?.() === null && !agent.options?.model) {
@@ -128,24 +285,8 @@ export function onAgentCreated(ctx, { agent }) {
         agent.model.select(target);
       } catch {}
     }
-    const prompt = agent.ctx.systemPrompt;
-    const disposers = [];
-    disposers.push(prompt.section({ name: 'leaderteam:role', order: 9000, interpolate: false, text: leaderSection(cfg, activePluginsMap(rt)) }));
-    disposers.push(prompt.context?.({ name: 'leaderteam:current-plan', order: 125, interpolate: false,
-      text: () => {
-        const seq = currentTaskSeq(ctx, actor.teamId);
-        if (cfg.team.rollingPlanning) return formatFrontierContext(teamStore(actor.teamId), seq, cfg);
-        const plan = readCurrentPlan(rt.storageRoot, actor.teamId, seq);
-        return `Current full task plan: ${currentPlanFile(rt.storageRoot, actor.teamId, seq)}. ${plan ? 'Read this file after context compaction; it is the source of plan review.' : 'Write the full plan using team_note(scope="current_plan", path="plan.md").'}`;
-      } }));
-    disposers.push(prompt.context?.({
-      name: 'leaderteam:concurrency',
-      order: 130,
-      interpolate: false,
-      text: () => rt.formatLeaderContext?.(actor.teamId) ?? '',
-    }));
-    leaderPromptDisposers.set(agent, disposers);
-    if (cfg.team.rollingPlanning && isPluginActive(rt, 'consensus')) {
+    applyLeaderPromptSections(ctx, rt, actor, agent, mode);
+    if (mode === 'team' && cfg.team.rollingPlanning && isPluginActive(rt, 'consensus')) {
       rt.recoverExecutionReviews?.(actor, currentTaskSeq(ctx, actor.teamId));
     }
   } else if (actor.role === 'member') {
@@ -175,10 +316,10 @@ function syncDesktopLeaderRole(ctx, agent) {
   if (rt.surface !== 'desktop' || agent.session?.header?.origin === 'subagent') return;
   if (isLeaderRoot(ctx, agent)) {
     if (!leaderPromptDisposers.has(agent)) onAgentCreated(ctx, { agent });
+    else syncLeaderAgentMode(ctx, rt, agent.id);
     return;
   }
-  for (const dispose of leaderPromptDisposers.get(agent) ?? []) if (typeof dispose === 'function') dispose();
-  leaderPromptDisposers.delete(agent);
+  disposeLeaderPromptHandles(agent);
   const actor = rt.actors.get(agent.id);
   if (actor?.agent === agent && actor.role === 'leader') rt.actors.delete(agent.id);
 }
@@ -316,7 +457,15 @@ export function onAgentStatus(ctx, { agent, status } = {}) {
   const actor = (rt.actors.get(agent.id)?.agent === agent ? rt.actors.get(agent.id) : null) ?? resolveActor(ctx, agent);
   rt = runtimeForTeam(actor?.teamId);
   if (actor?.role === 'leader') {
+    if (status === 'running') {
+      const liveMode = getSessionExecutionMode(rt, actor.teamId);
+      if (actor.executionMode !== liveMode || actor.promptAppliedMode !== liveMode) {
+        syncLeaderAgentMode(ctx, rt, actor.teamId);
+      }
+      return;
+    }
     if (status === 'idle') {
+      if (getSessionExecutionMode(rt, actor.teamId) === 'single') return;
       const notified = rt.onLeaderIdle?.(ctx, actor.teamId);
       if (!notified) maybeAutoContinueLeader(ctx, rt, actor, agent);
     }
@@ -414,6 +563,7 @@ function effectiveWorkspaceShellFailure(rt, store, cwd) {
 
 async function maybeAutoContinueLeader(ctx, rt, actor, agent) {
   try {
+    if (getSessionExecutionMode(rt, actor.teamId) === 'single') return;
     if (rt.stopReviewPending?.has(actor.teamId)) return;
     if (typeof agent.followup !== 'function') return;
     if ((agent.inbox?.nextTurn?.length ?? 0) > 0 || (agent.inbox?.nextStep?.length ?? 0) > 0) return;
@@ -876,13 +1026,17 @@ export function onSessionEvent(ctx, session, event) {
   }
   if (event.type === 'user/message' && event.data?.source?.kind === 'user') {
     const leader = [...rt.actors.values()].find(a => a.role === 'leader' && (a.agent?.session === session || a.teamId === session.id));
-    if (leader) rt.onLeaderUserMessage?.(ctx, leader.teamId);
+    if (leader && getSessionExecutionMode(rt, leader.teamId) === 'team') {
+      rt.onLeaderUserMessage?.(ctx, leader.teamId);
+    }
     return;
   }
   if (event.type !== 'turn/end') return;
   const leaderActor = [...rt.actors.values()].find(a => a.role === 'leader' && (a.agent?.session === session || a.teamId === session.id));
   if (leaderActor) {
-    rt.onLeaderTurnEnd?.(ctx, leaderActor.teamId);
+    if (getSessionExecutionMode(rt, leaderActor.teamId) === 'team') {
+      rt.onLeaderTurnEnd?.(ctx, leaderActor.teamId);
+    }
     return;
   }
   const actor = [...rt.actors.values()].find(a => (a.role === 'member' || a.role === 'direct_exec') && a.agent?.session === session)
@@ -1145,7 +1299,7 @@ export function onToolResult(exec, result) {
     return;
   }
   const errorText = (result?.content ?? []).filter(b => b.type === 'text').map(b => b.text).join('\n');
-  if (caller && caller.teamId && rt.storageRoot && exec?.name) {
+  if (caller && caller.teamId && rt.storageRoot && exec?.name && !(caller.role === 'leader' && getSessionExecutionMode(rt, caller.teamId) === 'single')) {
     try {
       const store = teamStore(caller.teamId);
       const cbState = ensureCircuitState(rt, exec.agent.id, caller.role);
@@ -1280,17 +1434,47 @@ function approvedDeliveryTimes(teamId) {
  *  - a bare "continue" resumes the task in hand while that task has no approved delivery. Once a delivery was approved
  *    before the message, "continue" means new work and starts a task like any other message. When the message time or
  *    the agreement log is unavailable, the conservative reading (new task) applies. */
+function singleToTeamBoundaries(teamId) {
+  const rt = runtime();
+  if (!rt?.storageRoot || !teamId) return [];
+  try {
+    return readSessionModeHistory(rt.storageRoot, teamId)
+      .filter(r => r && r.fromMode === 'single' && r.toMode === 'team')
+      .map(r => ({
+        atMs: typeof r.at === 'string' ? Date.parse(r.at) : NaN,
+        taskSeqHint: Number.isInteger(r.taskSeqHint) ? r.taskSeqHint : null,
+      }));
+  } catch {
+    return [];
+  }
+}
+
 export function currentTaskSeq(ctx, teamId) {
   const msgs = userMessages(ctx, teamId);
-  let seq = 1, delivered;
+  let seq = 1, delivered, modeBoundaries;
+  let lastTaskStartMs = msgs[0]?.time;
+  let consumedBoundaryIdx = -1;
   for (let i = 1; i < msgs.length; i++) {
     const m = msgs[i];
     if (isReadGrantOnlyMessage(m.text) || (!isBareContinueMessage(m.text) && isControlOnlyUserMessage(m.text))) continue;
-    if (isBareContinueMessage(m.text) && Number.isFinite(m.time)) {
+    if (modeBoundaries === undefined) modeBoundaries = singleToTeamBoundaries(teamId);
+    const crossedBoundaryIdx = modeBoundaries.findIndex((b, idx) => {
+      if (idx <= consumedBoundaryIdx) return false;
+      if (Number.isFinite(b.atMs) && Number.isFinite(m.time)) {
+        if (b.atMs <= m.time && (!Number.isFinite(lastTaskStartMs) || b.atMs >= lastTaskStartMs)) return true;
+      }
+      if (b.taskSeqHint !== null && b.taskSeqHint === seq && (!Number.isFinite(b.atMs) || !Number.isFinite(m.time) || b.atMs <= m.time)) {
+        return true;
+      }
+      return false;
+    });
+    if (crossedBoundaryIdx === -1 && isBareContinueMessage(m.text) && Number.isFinite(m.time)) {
       if (delivered === undefined) delivered = approvedDeliveryTimes(teamId);
       if (delivered !== null && !(delivered.get(seq) ?? []).some(t => t <= m.time)) continue;
     }
+    if (crossedBoundaryIdx !== -1) consumedBoundaryIdx = crossedBoundaryIdx;
     seq++;
+    if (Number.isFinite(m.time)) lastTaskStartMs = m.time;
   }
   return seq;
 }

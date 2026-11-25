@@ -2819,6 +2819,20 @@ export function evaluateHardRules(input, config) {
   if (actor.role === 'direct_exec' && !DIRECT_EXEC_ALLOWED_TOOLS.includes(tool)) {
     return { rule: 'direct-exec-tool-forbidden', reason: `direct execution model has minimum permissions and cannot invoke "${tool}"` };
   }
+  if (actor.role === 'leader') {
+    if (
+      actor.executionMode !== 'single'
+      && ['write', 'edit', ...(config.gate?.shellTools ?? []), 'job_list', 'job_output', 'job_kill'].includes(tool)
+    ) {
+      return { rule: 'tool-not-in-profile', reason: `tool "${tool}" is not granted to leader in Team mode` };
+    }
+    if (
+      actor.executionMode === 'single'
+      && (tool.startsWith('team_') || ['send_message', 'interrupt_agent', 'list_agents', 'subagent', 'fork_agent'].includes(tool))
+    ) {
+      return { rule: 'single-mode-no-team-tools', reason: `team tool "${tool}" is disabled in Single mode` };
+    }
+  }
   if (!Array.isArray(actor.allowedTools) || !actor.allowedTools.includes(tool)) return { rule: 'tool-not-in-profile', reason: `tool "${tool}" is not granted to ${actor.role} ${actor.name ?? ''}`.trim() };
   if (Array.isArray(actor.loadedTools) && !actor.loadedTools.includes(tool)) return { rule: 'tool-not-loaded', reason: `load the authorized tool "${tool}" with team_tools before using it in a later step` };
   const workspace = resolvePath(cwd, undefined, platform);
@@ -3033,7 +3047,11 @@ export function buildGateRequest(input, config) {
     },
     scope: {
       workspace_root: workspace,
-      write_scope: (actor.role === 'member' || actor.role === 'direct_exec') ? (actor.writeScope ?? []) : ['(leader has no file-write tools; team_note writes only under the project references directory)'],
+      write_scope: (actor.role === 'member' || actor.role === 'direct_exec')
+        ? (actor.writeScope ?? [])
+        : (actor.role === 'leader' && actor.executionMode === 'single')
+          ? ['**/* (Single Mode: leader direct workspace write access, excluding protected_dirs and read_only_roots)']
+          : ['(leader has no file-write tools; team_note writes only under the project references directory)'],
       read_only_roots: [...config.paths.globalRefRoots],
       project_refs_dir: config.paths.projectRefsDir,
       protected_dirs: [...config.paths.protectedDirs],

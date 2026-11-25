@@ -117,13 +117,13 @@ function makeTempDir(t, suffix = '') {
   return dir;
 }
 
-test('ISS-000: root package.json, leaderteam/package.json, and packages/lt-web/package.json align on version 2.2.2', () => {
+test('ISS-000: root package.json, leaderteam/package.json, and packages/lt-web/package.json align on version 2.2.3', () => {
   const rootPkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
   const corePkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'leaderteam', 'package.json'), 'utf8'));
   const webPkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'packages', 'lt-web', 'package.json'), 'utf8'));
-  assert.equal(rootPkg.version, '2.2.2');
-  assert.equal(corePkg.version, '2.2.2');
-  assert.equal(webPkg.version, '2.2.2');
+  assert.equal(rootPkg.version, '2.2.3');
+  assert.equal(corePkg.version, '2.2.3');
+  assert.equal(webPkg.version, '2.2.3');
 });
 
 test('CH-01 (P0): pipe-to-interpreter, herestrings (<<<), and process substitutions cannot bypass safety gate or direct_exec lock', () => {
