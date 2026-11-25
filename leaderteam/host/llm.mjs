@@ -1,7 +1,16 @@
 // Tool-less single model call with timeout, cancellation, failure classification and bounded retry.
 // Adapted from dsh-auto-review v0.15.0 runReviewInline (Apache-2.0; see ../NOTICE).
 import { BlockAssembler } from '@deepseek-ai/dsh-llm';
-const NON_RETRYABLE = new Set(['NO_ADAPTER', 'MISSING_CREDENTIAL', 'INVALID_CREDENTIAL', 'AUTH', 'CONTEXT_WINDOW_EXCEEDED', 'QUOTA', 'ACCOUNT_QUOTA', 'ABORTED']);
+const POLICY_CODES = new Set(['CONTENT_REFUSED', 'HTTP_403']);
+const NON_RETRYABLE = new Set(['NO_ADAPTER', 'MISSING_CREDENTIAL', 'INVALID_CREDENTIAL', 'AUTH', 'CONTEXT_WINDOW_EXCEEDED', 'QUOTA', 'ACCOUNT_QUOTA', 'ABORTED', ...POLICY_CODES]);
+
+function isPolicyRefusal(kind, code, message, status) {
+  if (kind === 'refusal' || kind === 'blocked') return true;
+  if (code && POLICY_CODES.has(code)) return true;
+  if (status === 403) return true;
+  if (code === 'PI_AI_ERROR' && typeof message === 'string' && /^403:\s/.test(message)) return true;
+  return false;
+}
 
 /** One request. Returns {ok:true,text,latencyMs,usage?} | {ok:false,kind,code,message,retryable,latencyMs,usage?}. Never throws.
  *  usage is the host's TokenUsage ({inputTokens, outputTokens, totalTokens?, reasoningTokens?, cacheReadTokens?, cacheWriteTokens?}) when reported. */
@@ -35,9 +44,17 @@ export async function callText(llm, req) {
     if (timedOut) return fail('timeout', 'TIMEOUT', `no answer within ${req.timeoutMs} ms`, true);
     if (finish === undefined) return fail('unavailable', 'NO_FINISH', 'stream ended without a terminal finish', true);
     const reason = finish.reason;
-    if (reason.kind === 'error' || reason.kind === 'aborted') {
-      const code = String(reason.failure?.code ?? 'UNKNOWN');
-      return fail('unavailable', code, `${reason.kind} ${code}: ${String(reason.failure?.message ?? '')}`, !NON_RETRYABLE.has(code));
+    const failureObj = reason.failure ?? reason.error;
+    const rawCode = typeof failureObj?.code === 'string' && failureObj.code.trim() ? failureObj.code.trim() : null;
+    const rawMsg = String(failureObj?.message ?? '');
+    if (reason.kind === 'aborted' || rawCode === 'ABORTED') return fail('cancelled', 'ABORTED', 'request cancelled', false);
+    if (isPolicyRefusal(reason.kind, rawCode, rawMsg, failureObj?.status)) {
+      const code = rawCode ?? String(reason.kind).toUpperCase();
+      return fail('policy', code, `${reason.kind} ${code}${rawMsg ? `: ${rawMsg}` : ''}`, false);
+    }
+    if (reason.kind === 'error') {
+      const code = rawCode ?? 'UNKNOWN';
+      return fail('unavailable', code, `${reason.kind} ${code}: ${rawMsg}`, !NON_RETRYABLE.has(code));
     }
     if (reason.kind !== 'stop') return fail('truncated', String(reason.kind).toUpperCase(), `model ended with ${reason.kind}`, false);
     const last = assembler.blocks().at(-1);
@@ -46,7 +63,18 @@ export async function callText(llm, req) {
   } catch (error) {
     if (req.signal?.aborted) return fail('cancelled', 'ABORTED', 'request cancelled', false);
     if (timedOut) return fail('timeout', 'TIMEOUT', `no answer within ${req.timeoutMs} ms`, true);
-    return fail('unavailable', 'THROWN', error instanceof Error ? error.message : String(error), true);
+    const errCode = [error?.code, error?.failure?.code, error?.error?.code, error?.cause?.code, error?.cause?.failure?.code]
+      .find(c => typeof c === 'string' && c.trim())?.trim() ?? null;
+    const errStatus = error?.status ?? error?.failure?.status ?? error?.cause?.status;
+    const errMsg = error instanceof Error ? error.message : String(error?.failure?.message ?? error);
+    if (errCode === 'ABORTED') return fail('cancelled', 'ABORTED', 'request cancelled', false);
+    if (isPolicyRefusal(error?.kind ?? error?.failure?.kind, errCode, errMsg, errStatus)) {
+      return fail('policy', errCode ?? 'CONTENT_REFUSED', errMsg, false);
+    }
+    if (errCode && NON_RETRYABLE.has(errCode)) {
+      return fail('unavailable', errCode, errMsg, false);
+    }
+    return fail('unavailable', errCode ?? 'THROWN', errMsg, true);
   } finally {
     clearTimeout(timer);
     req.signal?.removeEventListener('abort', onAbort);
@@ -122,7 +150,7 @@ export async function callRoleJson(llm, chain, req, parse, hooks = {}) {
     if (r.ok) return { ...r, attempts, target: t, tried };
     tried.push({ route: t.route, via: t.via, error: `${r.error.kind} ${r.error.code}` });
     last = { r, t };
-    if (r.error.kind === 'cancelled') break;
+    if (r.error.kind === 'cancelled' || r.error.kind === 'policy') break;
   }
   if (last) return { ...last.r, attempts, target: last.t, tried };
   return { ok: false, error: { kind: 'unavailable', code: 'NO_ROUTE', message: tried.length ? `no usable route (${tried.map(x => `${x.route}: ${x.skipped}`).join('; ')})` : 'no route configured', retryable: false }, attempts: 0, target: chain[0] ?? null, tried };

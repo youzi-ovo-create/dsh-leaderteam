@@ -40,8 +40,12 @@ registerHooks({
   },
 });
 
-const { maybeNotifyLeaderScaleUp, onLeaderTurnCompleted } = await import('../../leaderteam/host/concurrency.mjs');
-const { onAgentStatus } = await import('../../leaderteam/host/roles.mjs');
+const { maybeNotifyLeaderScaleUp, onLeaderTurnCompleted, evaluateTeamRequestWindow } = await import('../../leaderteam/host/concurrency.mjs');
+const { onAgentStatus, onSessionEvent } = await import('../../leaderteam/host/roles.mjs');
+const { callRoleJson } = await import('../../leaderteam/host/llm.mjs');
+import { roleRouteChain } from '../../leaderteam/core/role-routes.mjs';
+import { parseGateVerdict } from '../../leaderteam/core/gate-policy.mjs';
+import { recordUsage } from '../../leaderteam/host/runtime.mjs';
 
 test('V2.2.1 [1a & 1b]: awaitingSlots clears after open-slot turn end, and capacity decreases / 6<->3<->5 ping-pong never trigger redundant wakeups', () => {
   let nowMs = 10_000_000;
@@ -405,6 +409,119 @@ test('V2.2.1 [R04 & R07]: upsertModels label-only edit preserves reasoningEffort
       assert.equal(JSON.parse(fs.readFileSync(cfgFile, 'utf8')).models[route].label, 'Renamed for display');
     }
   } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('V2.2.1 [Provider Pair Fallback, Policy Refusal Stop, & 5h Retry Accounting]: leader fallback verifies (provider, upstreamModel), CONTENT_REFUSED stops without retry/fallback, and 5h window counts retries & failed attempts', async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'lt-v221-p1-p2-'));
+  const rt = runtime();
+  const prevRt = { ...rt };
+  try {
+    const srcCfg = fileURLToPath(new URL('../../config/leaderteam.config.json', import.meta.url));
+    const raw = loadRawConfig(srcCfg, { includeLocal: false });
+    raw.magpie.provider = 'magpie';
+    raw.team.leaderModelAsLastResort = true;
+    raw.models['acme/model'] = {
+      provider: 'acme',
+      upstreamModel: 'model',
+      family: 'other',
+      label: 'Direct Acme',
+      efforts: ['low', 'high'],
+      defaultEffort: 'high',
+      strengths: 'direct acme',
+    };
+    raw.models['magpie@upstream/acme/model'] = {
+      provider: 'magpie',
+      upstreamModel: 'acme/model',
+      family: 'other',
+      label: 'Magpie Acme',
+      efforts: ['low', 'high'],
+      defaultEffort: 'high',
+      strengths: 'gateway acme',
+    };
+    raw.models['acme@direct/acme/model'] = {
+      provider: 'acme',
+      upstreamModel: 'acme/model',
+      family: 'other',
+      label: 'Direct Acme Full',
+      efforts: ['low', 'high'],
+      defaultEffort: 'high',
+      strengths: 'direct acme full',
+    };
+    raw.roles.leader = { route: 'magpie@upstream/acme/model', effort: 'high' };
+    raw.roles.gate = {
+      route: 'codex/gpt-6.1-sol',
+      effort: 'high',
+      maxTokens: 512,
+      timeoutMs: 5000,
+      retries: 2,
+      fallback: [{ route: 'zcode/GLM-5.3', effort: 'high' }],
+    };
+    raw.requestWindow = { ...raw.requestWindow, enabled: true, windowsByProvider: { codex: { maxRequests: 100 }, zcode: { maxRequests: 100 } } };
+    const cfg = validateConfig(raw);
+
+    // 1. Multi-provider leader fallback pairs (provider, upstreamModel)
+    const chainMagpie = roleRouteChain(cfg, 'gate', { provider: 'magpie', model: 'acme/model', reasoningEffort: 'high' });
+    const leadMagpie = chainMagpie.find(c => c.via === 'leader');
+    assert.equal(leadMagpie?.provider, 'magpie');
+    assert.equal(leadMagpie?.route, 'magpie@upstream/acme/model');
+
+    const chainAcme = roleRouteChain(cfg, 'gate', { provider: 'acme', model: 'acme/model', reasoningEffort: 'low' });
+    const leadAcme = chainAcme.find(c => c.via === 'leader');
+    assert.equal(leadAcme?.provider, 'acme');
+    assert.equal(leadAcme?.route, 'acme@direct/acme/model');
+
+    // 2. CONTENT_REFUSED (in-band & thrown) stops without retry or model switch
+    for (const mode of ['in-band', 'thrown']) {
+      let calls = 0;
+      const llm = {
+        async *stream() {
+          calls++;
+          if (mode === 'in-band') {
+            yield { type: 'finish', reason: { kind: 'error', failure: { code: 'CONTENT_REFUSED', message: 'refused' } } };
+          } else {
+            const err = new Error('refused');
+            err.code = 'CONTENT_REFUSED';
+            throw err;
+          }
+        },
+      };
+      const res = await callRoleJson(llm, roleRouteChain(cfg, 'gate', null), { system: 's', user: '{}' }, parseGateVerdict);
+      assert.equal(res.ok, false);
+      assert.equal(res.error.kind, 'policy');
+      assert.equal(res.error.code, 'CONTENT_REFUSED');
+      assert.equal(res.error.retryable, false);
+      assert.equal(res.attempts, 1);
+      assert.equal(calls, 1);
+    }
+
+    // 3. 5h window counts usage.jsonl attempts=2 and failed assistant/attempt
+    const teamId = 'team-v221-win';
+    const store = new TeamStore(tmp, teamId);
+    store.ensure({ workspace: tmp });
+    store.addMember({ childId: 'm-1', name: 'w1', taskSeq: 1, profile: 'readonly', model: 'zcode/GLM-5.3', effort: 'high', allowedTools: ['read'], writeScope: [], refs: [], task: 't', acceptance: ['ok'], cwd: tmp });
+    const mEvents = [
+      { type: 'request/context', seq: 0, data: { provider: 'magpie', model: 'zcode/GLM-5.3' } },
+      { type: 'assistant/attempt', seq: 1, time: Date.now(), data: { turn: 1, step: 1, stream: [] } },
+      { type: 'assistant/message', seq: 2, time: Date.now(), data: { source: { provider: 'magpie', model: 'zcode/GLM-5.3' } } },
+    ];
+    const mSession = { id: 'm-1', header: { origin: 'subagent', parentSession: teamId, cwd: tmp }, snapshotEvents: () => mEvents };
+    Object.assign(rt, {
+      config: cfg,
+      storageRoot: tmp,
+      actors: new Map([['m-1', { role: 'member', teamId, agentId: 'm-1', agent: { id: 'm-1', session: mSession, model: { current: () => ({ provider: 'magpie', model: 'zcode/GLM-5.3' }) } } }]]),
+      stores: new Map([[teamId, store]]),
+      teamConfigViews: new Map(),
+    });
+    onSessionEvent({}, mSession, mEvents[1]);
+    onSessionEvent({}, mSession, mEvents[2]);
+    recordUsage(teamId, { role: 'gate', route: 'codex/gpt-6.1-sol', effort: 'none', ok: true, attempts: 2, at: new Date().toISOString() });
+
+    assert.equal(evaluateTeamRequestWindow(rt, teamId, Date.now(), { targetRoute: 'zcode/GLM-5.3' }).local_estimated_requests_5h, 2);
+    assert.equal(evaluateTeamRequestWindow(rt, teamId, Date.now(), { targetRoute: 'codex/gpt-6.1-sol' }).local_estimated_requests_5h, 2);
+  } finally {
+    Object.assign(rt, prevRt);
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 });
