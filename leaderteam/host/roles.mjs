@@ -331,6 +331,19 @@ export function syncLeaderAgentMode(ctx, rt = runtime(), sessionId) {
   return { synced: true, mode, allowedTools: tools };
 }
 
+export function shouldApplyDefaultLeaderModel(rt, agent) {
+  if (typeof agent?.model?.select !== 'function') return false;
+  if (agent.model?.recordedSelection?.() !== null) return false;
+  const opts = agent.options;
+  if (rt?.surface !== 'headless') {
+    const desc = opts && typeof opts === 'object'
+      ? Object.getOwnPropertyDescriptor(opts, 'model')
+      : undefined;
+    return typeof desc?.get === 'function' || !opts?.model;
+  }
+  return !opts?.model;
+}
+
 export function onAgentCreated(ctx, { agent }) {
   const actor = resolveActor(ctx, agent);
   if (!actor) return;
@@ -351,8 +364,10 @@ export function onAgentCreated(ctx, { agent }) {
       reconcileStaleMembers(rt, teamStore(actor.teamId));
     }
     // Apply the configured default only before this session has any durable or CLI-specified selection.
-    // Resuming a session or passing an explicit `--model` in headless preserves its actual model/effort.
-    if (agent.model?.recordedSelection?.() === null && !agent.options?.model) {
+    // On Desktop / `dsh --profile web` (`rt.surface !== 'headless'`), `sessionController.create` supplies a
+    // getter `get model()` returning DSH's host default (`deepseek-reasoner` on `deepseek-official`), whereas
+    // `dsh headless` supplies plain `{ provider, model }` values when overridden (`it17-leader-model`).
+    if (shouldApplyDefaultLeaderModel(rt, agent)) {
       try {
         const target = resolveModelTarget(cfg, cfg.roles.leader.route, cfg.roles.leader.effort);
         agent.model.select(target);

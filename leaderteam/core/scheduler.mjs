@@ -8,17 +8,17 @@ import { randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { MEMBER_TERMINAL_STATUSES } from './constants.mjs';
 import { parseReadGrants } from './gate-policy.mjs';
-import { writeFileAtomic } from './store.mjs';
+import { encodeTeamStoreId, writeFileAtomic } from './store.mjs';
 
 export function concurrencyControlPath(storageRoot) {
   return path.join(storageRoot, 'concurrency.json');
 }
 
 export function teamConcurrencyControlPath(storageRoot, teamId) {
-  if (typeof teamId !== 'string' || !teamId || /[\\/\0]|^\.\.?$/.test(teamId)) {
+  if (typeof teamId !== 'string' || teamId === '.' || teamId === '..' || /(?:^|[\\/])\.\.(?:[\\/]|$)/.test(teamId)) {
     throw new Error(`unsafe teamId for concurrency control path: ${teamId}`);
   }
-  return path.join(storageRoot, 'teams', teamId, 'concurrency.json');
+  return path.join(storageRoot, 'teams', encodeTeamStoreId(teamId, storageRoot), 'concurrency.json');
 }
 
 export function readConcurrencyControlFile(storageRoot) {

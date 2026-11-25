@@ -6,7 +6,7 @@ import { loadConfig } from './core/config.mjs';
 import { resolveOrBootstrapConfigPath, buildSoloProviderSettingsTemplates } from './core/solo-key.mjs';
 import { isPluginActive, runtimeForTeam, runtime, bindRuntimeConfigFile, refreshUpstreamCatalog, effectiveRuntimeConfig } from './host/runtime.mjs';
 import { syncUpstreamModelsToDshSettings, resolveModelTarget } from './core/upstream-models.mjs';
-import { onAgentCreated, onAgentPresetSelected, onAgentDisposed, onAgentStatus, onAgentError, onSessionEvent, onToolResult } from './host/roles.mjs';
+import { onAgentCreated, onAgentPresetSelected, onAgentDisposed, onAgentStatus, onAgentError, onSessionEvent, onToolResult, shouldApplyDefaultLeaderModel } from './host/roles.mjs';
 import { bindHostImports } from './host/host-imports.mjs';
 import { disposePlanning } from './host/planning.mjs';
 import { frontierNeedsPlanning } from './core/frontier.mjs';
@@ -202,7 +202,7 @@ export function apply(ctx, config) {
     if (syncRes?.synced) {
       for (const actor of rt.actors.values()) {
         if (actor.role !== 'leader' || !actor.agent) continue;
-        if (actor.agent.model?.recordedSelection?.() === null && !actor.agent.options?.model) {
+        if (shouldApplyDefaultLeaderModel(rt, actor.agent)) {
           try {
             const teamCfg = runtimeForTeam(actor.teamId).config;
             const target = resolveModelTarget(teamCfg, teamCfg.roles.leader.route, teamCfg.roles.leader.effort);

@@ -7,7 +7,8 @@ import os from 'node:os';
 import path from 'node:path';
 import zlib from 'node:zlib';
 import { fileURLToPath } from 'node:url';
-import { safeId } from '../leaderteam/core/store.mjs';
+import { encodeTeamStoreId } from '../leaderteam/core/store.mjs';
+import { decodeSessionModeSegment } from '../leaderteam/core/session-mode.mjs';
 import { deepMergePlain } from '../leaderteam/core/config.mjs';
 import { isInside } from '../leaderteam/core/paths.mjs';
 import { checkDshHostCompatibility } from './lt-doctor.mjs';
@@ -276,11 +277,24 @@ function sanitizeMemberStatus(rawStatus) {
 function selectTeamDirectory(storageRoot, explicitTeamId, fsImpl = fs) {
   const teamsRoot = path.join(storageRoot, 'teams');
   if (explicitTeamId) {
-    const cleanId = safeId(explicitTeamId);
-    const dir = path.join(teamsRoot, cleanId);
-    try {
-      if (fsImpl.existsSync(dir) && fsImpl.statSync(dir).isDirectory()) return dir;
-    } catch {}
+    const cleanId = encodeTeamStoreId(explicitTeamId, storageRoot);
+    const candidates = [cleanId];
+    if (
+      typeof explicitTeamId === 'string'
+      && explicitTeamId !== cleanId
+      && /^[A-Za-z0-9._~-]{1,192}$/.test(explicitTeamId)
+      && explicitTeamId !== '.'
+      && explicitTeamId !== '..'
+      && !explicitTeamId.includes('..')
+    ) {
+      candidates.push(explicitTeamId);
+    }
+    for (const cid of candidates) {
+      const dir = path.join(teamsRoot, cid);
+      try {
+        if (fsImpl.existsSync(dir) && fsImpl.statSync(dir).isDirectory()) return dir;
+      } catch {}
+    }
     return null;
   }
   let entries;
@@ -422,13 +436,19 @@ function isSafeContainedSessionFile(file, root, fsImpl) {
   }
 }
 
-function findNativeSessionZstdFile(sessionsRoots, sessionId, fsImpl) {
+function findNativeSessionZstdFile(sessionsRoots, sessionId, fsImpl, fallbackSegment = null) {
   const rawId = String(sessionId ?? '');
   if (!rawId) return null;
-  const isSafeRawSeg = /^[A-Za-z0-9._-]+$/.test(rawId) && rawId !== '.' && rawId !== '..';
+  const isSafeRawSeg = /^[A-Za-z0-9._-]+$/.test(rawId) && rawId !== '.' && rawId !== '..' && !rawId.includes('..');
+  const isSafeFallbackSeg = typeof fallbackSegment === 'string'
+    && /^[A-Za-z0-9._~-]+$/.test(fallbackSegment)
+    && fallbackSegment !== '.'
+    && fallbackSegment !== '..'
+    && !fallbackSegment.includes('..');
   const segs = [...new Set([
     ...(isSafeRawSeg ? [rawId] : []),
     encodeDshSegment(rawId),
+    ...(isSafeFallbackSeg ? [fallbackSegment] : []),
   ])];
   for (const root of sessionsRoots) {
     for (const seg of segs) {
@@ -460,7 +480,7 @@ function findNativeSessionZstdFile(sessionsRoots, sessionId, fsImpl) {
  * Fold physical 4-bucket token totals from native DSH `session.v4.jsonl.zstd` / `session.v4.jsonl` logs (`leader`, `member`, `directExec`),
  * deduplicated by `message.id` / `compactionId`. Emits numeric counts ONLY — zero message text, model URLs, or paths.
  */
-function foldNativeSessionUsage({ dshHome, storageRoot, sessionRoleMap, usageByRole, usageTotal, fsImpl }) {
+function foldNativeSessionUsage({ dshHome, storageRoot, sessionRoleMap, targetTeamName = null, usageByRole, usageTotal, fsImpl }) {
   if (!sessionRoleMap || sessionRoleMap.size === 0) return;
   const candidateHomes = [
     dshHome ? path.resolve(dshHome) : null,
@@ -471,7 +491,12 @@ function foldNativeSessionUsage({ dshHome, storageRoot, sessionRoleMap, usageByR
   if (sessionsRoots.length === 0) return;
 
   for (const [sessionId, role] of sessionRoleMap.entries()) {
-    const file = findNativeSessionZstdFile(sessionsRoots, sessionId, fsImpl);
+    const file = findNativeSessionZstdFile(
+      sessionsRoots,
+      sessionId,
+      fsImpl,
+      role === 'leader' ? targetTeamName : null,
+    );
     if (!file) continue;
     let text;
     try {
@@ -525,13 +550,16 @@ function foldNativeSessionUsage({ dshHome, storageRoot, sessionRoleMap, usageByR
   }
 }
 
-function readGlobalGuardCounts(storageRoot, targetTeamName, fsImpl = fs) {
+function readGlobalGuardCounts(storageRoot, targetTeamNames, fsImpl = fs) {
+  const allowedSet = targetTeamNames instanceof Set
+    ? targetTeamNames
+    : new Set(targetTeamNames ? [targetTeamNames] : []);
   let globalRequestWindowEvents = 0;
   const globalRwTimestamps = new Set();
   if (storageRoot) {
     const rwAudit = readJsonlTolerant(path.join(storageRoot, 'request-window-audit.jsonl'), fsImpl);
     for (const r of rwAudit.records) {
-      if (targetTeamName && r.teamId && r.teamId !== targetTeamName) continue;
+      if (allowedSet.size > 0 && r.teamId && !allowedSet.has(r.teamId)) continue;
       globalRequestWindowEvents += 1;
       if (r.atMs !== undefined && r.atMs !== null) globalRwTimestamps.add(String(r.atMs));
       else if (typeof r.at === 'string') globalRwTimestamps.add(r.at);
@@ -552,7 +580,12 @@ function readGlobalGuardCounts(storageRoot, targetTeamName, fsImpl = fs) {
 function aggregateTeamMetrics(teamDir, fsImpl = fs, options = {}) {
   const storageRoot = options.storageRoot ?? (teamDir ? path.dirname(path.dirname(teamDir)) : null);
   const targetTeamName = teamDir ? path.basename(teamDir) : null;
-  const { globalRequestWindowEvents, globalRwTimestamps, globalLowBatteryTriggerCount } = readGlobalGuardCounts(storageRoot, targetTeamName, fsImpl);
+  const preMeta = teamDir ? readJsonOptional(path.join(teamDir, 'team.json'), fsImpl) : null;
+  const preSessionId = (typeof preMeta?.sessionId === 'string' && preMeta.sessionId.trim())
+    ? preMeta.sessionId.trim()
+    : (targetTeamName ? decodeSessionModeSegment(targetTeamName) : null);
+  const targetNamesSet = new Set([targetTeamName, preSessionId].filter(Boolean));
+  const { globalRequestWindowEvents, globalRwTimestamps, globalLowBatteryTriggerCount } = readGlobalGuardCounts(storageRoot, targetNamesSet, fsImpl);
 
   if (!teamDir) {
     return {
@@ -628,9 +661,16 @@ function aggregateTeamMetrics(teamDir, fsImpl = fs, options = {}) {
   }
 
   const teamMetaForId = readJsonOptional(path.join(teamDir, 'team.json'), fsImpl);
-  const leaderSessionId = (typeof teamMetaForId?.teamId === 'string' && teamMetaForId.teamId.trim())
-    ? teamMetaForId.teamId.trim()
-    : targetTeamName;
+  const gateTeamId = gateData.records.find(r => typeof r?.teamId === 'string' && r.teamId.trim())?.teamId?.trim() ?? null;
+  const decodedMetaTeamId = (typeof teamMetaForId?.teamId === 'string' && teamMetaForId.teamId.trim() && !/~h[0-9a-f]{32}$/.test(teamMetaForId.teamId.trim()))
+    ? decodeSessionModeSegment(teamMetaForId.teamId.trim())
+    : null;
+  const leaderSessionId = (typeof teamMetaForId?.sessionId === 'string' && teamMetaForId.sessionId.trim())
+    ? teamMetaForId.sessionId.trim()
+    : (gateTeamId
+      ?? decodedMetaTeamId
+      ?? (targetTeamName ? decodeSessionModeSegment(targetTeamName) : null)
+      ?? ((typeof teamMetaForId?.teamId === 'string' && teamMetaForId.teamId.trim()) ? teamMetaForId.teamId.trim() : null));
   const sessionRoleMap = new Map();
   if (leaderSessionId) sessionRoleMap.set(leaderSessionId, 'leader');
   for (const [mId, mRole] of memberRoles.entries()) {
@@ -640,6 +680,7 @@ function aggregateTeamMetrics(teamDir, fsImpl = fs, options = {}) {
     dshHome: options.dshHome ?? null,
     storageRoot,
     sessionRoleMap,
+    targetTeamName,
     usageByRole,
     usageTotal,
     fsImpl,

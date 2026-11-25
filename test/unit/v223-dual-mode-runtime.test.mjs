@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import { registerHooks } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
+import zlib from 'node:zlib';
 
 registerHooks({
   resolve(specifier, context, nextResolve) {
@@ -91,7 +93,20 @@ registerHooks({
 const { ToolsService } = await import('@deepseek-ai/dsh-tools');
 const { ToolExecutionPipeline } = await import('@deepseek-ai/dsh-tools/pipeline');
 const { loadConfig } = await import('../../leaderteam/core/config.mjs');
-const { TeamStore, readJsonl } = await import('../../leaderteam/core/store.mjs');
+const { TeamStore, encodeTeamStoreId, readJsonl } = await import('../../leaderteam/core/store.mjs');
+const {
+  currentPlanRoot,
+  currentPlanFile,
+  writeCurrentPlan,
+  readCurrentPlan,
+} = await import('../../leaderteam/core/current-plan.mjs');
+const {
+  teamConcurrencyControlPath,
+  writeTeamConcurrencyFile,
+  readTeamConcurrencyFile,
+  resetAllTeamChatOverridesOnDisk,
+} = await import('../../leaderteam/core/scheduler.mjs');
+const { buildSoloProviderSettingsTemplates } = await import('../../leaderteam/core/solo-key.mjs');
 const {
   EXECUTION_MODES,
   DEFAULT_EXECUTION_MODE,
@@ -122,6 +137,7 @@ const {
   leaderAllowedTools,
   resolveActor,
   isLeaderRoot,
+  shouldApplyDefaultLeaderModel,
   onAgentCreated,
   onAgentStatus,
   onSessionEvent,
@@ -1613,4 +1629,444 @@ test('Stage 7 V223-RT-07, V223-RT-08 & V223-UI-03: corrupt session-mode file qua
   assert.equal(syncLegacyRes.synced, true);
   assert.equal(legacyUpdates.length, 1);
   assert.equal(legacyUpdates[0].ns, 'llm-pi-ai');
+});
+
+test('Stage 9 S8-SYS-01: cold/unattached multi-task sessions (taskSeq >= 2) enforce open conferences, Strike-3 escalations, unsatisfied Arbiter directives, and in-flight circuit-breaker investigations', t => {
+  const tmp = makeTempSandbox(t, 's9-sys01');
+  const ws = path.join(tmp, 'ws');
+  const storageRoot = path.join(tmp, 'lt-store');
+  fs.mkdirSync(ws, { recursive: true });
+  fs.mkdirSync(storageRoot, { recursive: true });
+
+  const cfgRaw = JSON.parse(fs.readFileSync(path.join(ROOT, 'config/leaderteam.config.json'), 'utf8'));
+  cfgRaw.storage = { root: storageRoot };
+  const cfgFile = path.join(tmp, 'leaderteam.config.json');
+  fs.writeFileSync(cfgFile, JSON.stringify(cfgRaw, null, 2));
+
+  const rt = resetRuntimeForTest(storageRoot, cfgFile);
+  const coldCtx = createMockCtx(); // empty sessions & agents -> simulates cold restart / standalone lt-ui
+
+  // 1. Cold session on taskSeq=2 with open Stage 3 conference -> blocked
+  const confSid = 'sess-cold-task2-conf';
+  const confStore = new TeamStore(storageRoot, confSid);
+  confStore.ensure({ workspace: ws, surface: 'desktop' });
+  confStore.appendWorkflowEvent({ type: 'stop-declared', taskSeq: 1, state: 'delivered' });
+  confStore.appendGovernanceEvent({
+    type: 'conference-opened',
+    taskSeq: 2,
+    conferenceId: 'conf-task2-open',
+    disputeId: 'disp-task2-1',
+    strike: 2,
+  });
+
+  const coldConfSnap = inspectSessionModeState(coldCtx, rt, confSid);
+  assert.equal(coldConfSnap.canSwitch, false, 'cold taskSeq=2 open conference must block Team -> Single switch');
+  assert.equal(coldConfSnap.activeConferenceId, 'conf-task2-open');
+  assert.match(coldConfSnap.busyReason ?? '', /conf-task2-open/);
+  assert.throws(
+    () => switchSessionExecutionMode(coldCtx, rt, confSid, 'single'),
+    err => err?.code === 'MODE_SWITCH_BUSY',
+  );
+
+  // Conclude with unsatisfied corrective Arbiter directive on taskSeq=2 -> still blocked when cold!
+  confStore.appendGovernanceEvent({
+    type: 'conference-concluded',
+    taskSeq: 2,
+    conferenceId: 'conf-task2-open',
+    disputeId: 'disp-task2-1',
+    ruling: {
+      decision: 'enforce_correction',
+      rulingSummary: 'Fix missing boundary check before proceeding',
+      bindingDirectives: ['Add boundary check'],
+      blockedTargets: ['src/index.js'],
+    },
+  });
+  const coldDirSnap = inspectSessionModeState(coldCtx, rt, confSid);
+  assert.equal(coldDirSnap.canSwitch, false, 'cold taskSeq=2 unsatisfied Arbiter directive must block mode switch');
+  assert.match(coldDirSnap.busyReason ?? '', /Binding Arbiter directive.*conf-task2-open/);
+  assert.throws(
+    () => switchSessionExecutionMode(coldCtx, rt, confSid, 'single'),
+    err => err?.code === 'MODE_SWITCH_BUSY',
+  );
+
+  // Satisfy directive -> now unlocked on cold session AND switchSessionExecutionMode preserves taskSeqHint=2!
+  confStore.appendGovernanceEvent({
+    type: 'arbiter-directive-satisfied',
+    taskSeq: 2,
+    disputeId: 'disp-task2-1',
+    conferenceId: 'conf-task2-open',
+  });
+  const coldUnlockedSnap = inspectSessionModeState(coldCtx, rt, confSid);
+  assert.equal(coldUnlockedSnap.canSwitch, true);
+  const swCold = switchSessionExecutionMode(coldCtx, rt, confSid, 'single', { source: 'cold-ui' });
+  assert.equal(swCold.changed, true);
+  assert.equal(readSessionModeRecord(storageRoot, confSid).lastTaskSeqHint, 2, 'cold switch must preserve durable taskSeqHint=2');
+
+  // 2. Cold session on taskSeq=3 with Strike-3 human escalation -> blocked until resolved
+  const escSid = 'sess-cold-task3-esc';
+  const escStore = new TeamStore(storageRoot, escSid);
+  escStore.ensure({ workspace: ws, surface: 'desktop' });
+  escStore.appendAgreementEvent({ id: 'agr-t2', type: 'created', kind: 'plan', taskSeq: 2 });
+  escStore.appendGovernanceEvent({
+    type: 'human-escalation-opened',
+    taskSeq: 3,
+    escalationId: 'esc-task3-strike3',
+    disputeId: 'disp-task3',
+  });
+  const coldEscSnap = inspectSessionModeState(coldCtx, rt, escSid);
+  assert.equal(coldEscSnap.canSwitch, false, 'cold taskSeq=3 Strike-3 human escalation must block switch');
+  assert.match(coldEscSnap.busyReason ?? '', /esc-task3-strike3/);
+  assert.throws(
+    () => switchSessionExecutionMode(coldCtx, rt, escSid, 'single'),
+    err => err?.code === 'MODE_SWITCH_BUSY',
+  );
+
+  escStore.appendGovernanceEvent({
+    type: 'human-escalation-resolved',
+    taskSeq: 3,
+    escalationId: 'esc-task3-strike3',
+  });
+  assert.equal(inspectSessionModeState(coldCtx, rt, escSid).canSwitch, true);
+
+  // 3. In-flight Circuit-Breaker Investigator on Leader or Team member blocks mode switch while agent is idle
+  const cbSid = 'sess-circuit-investigator';
+  const cbStore = new TeamStore(storageRoot, cbSid);
+  cbStore.ensure({ workspace: ws, surface: 'desktop' });
+  cbStore.addMember({
+    childId: 'mem-cb-1',
+    name: 'impl-cb',
+    profile: 'code',
+    model: 'zcode/GLM-5.3',
+    effort: 'high',
+    taskSeq: 2,
+    cwd: ws,
+  });
+  cbStore.setMemberStatus('mem-cb-1', 'done');
+
+  rt.circuitStates.set(cbSid, { inFlightInvestigation: true });
+  const cbLeaderSnap = inspectSessionModeState(coldCtx, rt, cbSid);
+  assert.equal(cbLeaderSnap.canSwitch, false, 'in-flight leader circuit investigation must block mode switch');
+  assert.equal(cbLeaderSnap.pendingReviewsCount, 1);
+  assert.match(cbLeaderSnap.busyReason ?? '', /circuit-breaker investigation review/i);
+  assert.throws(
+    () => switchSessionExecutionMode(coldCtx, rt, cbSid, 'single'),
+    err => err?.code === 'MODE_SWITCH_BUSY',
+  );
+
+  rt.circuitStates.set(cbSid, { inFlightInvestigation: false });
+  rt.circuitStates.set('mem-cb-1', { inFlightInvestigation: true });
+  const cbMemberSnap = inspectSessionModeState(coldCtx, rt, cbSid);
+  assert.equal(cbMemberSnap.canSwitch, false, 'in-flight member circuit investigation must block mode switch');
+  assert.equal(cbMemberSnap.pendingReviewsCount, 1);
+
+  rt.circuitStates.set('mem-cb-1', { inFlightInvestigation: false });
+  const cbClearedSnap = inspectSessionModeState(coldCtx, rt, cbSid);
+  assert.equal(cbClearedSnap.canSwitch, true);
+  assert.equal(cbClearedSnap.pendingReviewsCount, 0);
+});
+
+test('Stage 9 S8-SYS-02 & S8-SYS-03: special/overlong session-ID encoding across current-plan, scheduler, store, observability & lt-bugreport, plus configure-models --sync-desktop error clarity', async t => {
+  const tmp = makeTempSandbox(t, 's9-sys02-03');
+  const dshHome = path.join(tmp, 'dsh-home');
+  const ws = path.join(tmp, 'ws');
+  const storageRoot = path.join(dshHome, 'leaderteam');
+  fs.mkdirSync(path.join(ws, 'src'), { recursive: true });
+  fs.mkdirSync(path.join(dshHome, 'sessions'), { recursive: true });
+  fs.mkdirSync(storageRoot, { recursive: true });
+
+  const cfgRaw = JSON.parse(fs.readFileSync(path.join(ROOT, 'config/leaderteam.config.json'), 'utf8'));
+  cfgRaw.storage = { root: storageRoot };
+  cfgRaw.team.rollingPlanning = false;
+  const cfgFile = path.join(tmp, 'leaderteam.config.json');
+  fs.writeFileSync(cfgFile, JSON.stringify(cfgRaw, null, 2));
+
+  const rt = resetRuntimeForTest(storageRoot, cfgFile);
+  const ctx = createMockCtx();
+  rt.gate = new Gate(ctx);
+
+  const colonSid = 'ns:session/alpha~1';
+  const tildeSid = 'sess~tilde';
+  const longSid = `long:${'x'.repeat(235)}`;
+
+  for (const sid of [colonSid, tildeSid, longSid]) {
+    const encoded = encodeTeamStoreId(sid, storageRoot);
+    // Idempotency before and after directory creation
+    assert.equal(encodeTeamStoreId(encoded, storageRoot), encoded, `encodeTeamStoreId must be idempotent on ${sid}`);
+
+    // 1. current-plan.mjs: writeCurrentPlan + readCurrentPlan + FinalGate globalRefRoots alignment
+    const written = writeCurrentPlan(storageRoot, sid, 1, `# Plan for ${sid}\n1. Verify encoding\n`);
+    const expectedFile = currentPlanFile(storageRoot, encoded, 1);
+    assert.equal(written.path, expectedFile, `writeCurrentPlan(raw) and currentPlanFile(encoded) must match on ${sid}`);
+    assert.equal(readCurrentPlan(storageRoot, sid, 1)?.content, `# Plan for ${sid}\n1. Verify encoding\n`);
+
+    // Create leader session in Team mode and verify FinalGate allows Leader read of written plan.md (zero tilde split-brain!)
+    const promptReg = createFakePromptRegistry();
+    const agent = {
+      id: sid,
+      status: 'idle',
+      inbox: { nextTurn: [], nextStep: [] },
+      ctx: { systemPrompt: promptReg.systemPrompt, get: name => ctx.get(name) },
+      session: {
+        id: sid,
+        header: { id: sid, cwd: ws, agentPreset: 'leaderteam' },
+        snapshotEvents: () => [{ type: 'user/message', time: 1000, data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'Plan task' }] } }],
+      },
+    };
+    ctx.sessions.set(sid, agent.session);
+    ctx.agents.set(sid, agent);
+    rt.hostAgents.set(sid, agent);
+    onAgentCreated(ctx, { agent });
+
+    const planPromptText = promptReg.contexts.get('leaderteam:current-plan')?.text?.() ?? '';
+    assert.ok(planPromptText.includes(written.path), 'leaderteam:current-plan prompt path must match written plan.md');
+
+    const readDec = await rt.gate.decide({
+      name: 'read',
+      args: { file_path: written.path },
+      agent,
+      actor: rt.gate.actorFor(agent),
+      callId: `c-read-plan-${encoded.slice(0, 16)}`,
+    });
+    assert.equal(readDec.decision, 'allow', `Leader read of own plan.md must be allowed on ${sid} (got ${readDec.by})`);
+
+    // 2. scheduler.mjs: teamConcurrencyControlPath + write/readTeamConcurrencyFile
+    const concRes = writeTeamConcurrencyFile(storageRoot, sid, { maxActiveMembers: 5, lastChatDirectiveIndex: 2 });
+    assert.equal(concRes.file, path.join(storageRoot, 'teams', encoded, 'concurrency.json'));
+    assert.equal(readTeamConcurrencyFile(storageRoot, sid)?.maxActiveMembers, 5);
+
+    // 3. store.mjs: team.json persists sessionId === rawTeamId AND ensure() backfills missing sessionId on legacy team.json
+    const teamJsonFile = path.join(storageRoot, 'teams', encoded, 'team.json');
+    const teamMeta1 = JSON.parse(fs.readFileSync(teamJsonFile, 'utf8'));
+    assert.equal(teamMeta1.sessionId, sid);
+    assert.equal(teamMeta1.teamId, encoded);
+
+    delete teamMeta1.sessionId;
+    fs.writeFileSync(teamJsonFile, JSON.stringify(teamMeta1, null, 2));
+    new TeamStore(storageRoot, sid).ensure({ workspace: ws, surface: 'desktop' });
+    assert.equal(JSON.parse(fs.readFileSync(teamJsonFile, 'utf8')).sessionId, sid, 'ensure() must backfill missing sessionId');
+
+    // 4. Write native DSH zstd session log under <dshHome>/sessions/<encodeDshSegment(sid)>/session.v4.jsonl.zstd (150 tokens)
+    const dshEncodedSeg = Array.from(sid).map(ch => (ch !== '~' && /^[A-Za-z0-9._-]$/.test(ch) ? ch : `~${ch.charCodeAt(0).toString(16).toUpperCase().padStart(4, '0')}`)).join('');
+    const sessDir = path.join(dshHome, 'sessions', dshEncodedSeg);
+    fs.mkdirSync(sessDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(sessDir, 'session.v4.jsonl.zstd'),
+      zlib.zstdCompressSync(Buffer.from(
+        JSON.stringify({
+          type: 'assistant/message',
+          seq: 1,
+          data: {
+            message: { id: `msg-${encoded.slice(0, 12)}`, source: { provider: 'magpie', model: 'codex/gpt-6.1-sol' } },
+            usage: { inputTokens: 100, cacheReadTokens: 20, outputTokens: 30, totalTokens: 150 },
+          },
+        }) + '\n',
+        'utf8',
+      )),
+    );
+  }
+
+  // Verify resetAllTeamChatOverridesOnDisk clears encoded team concurrency overrides cleanly
+  assert.equal(resetAllTeamChatOverridesOnDisk(storageRoot), 3);
+  assert.equal(readTeamConcurrencyFile(storageRoot, colonSid)?.maxActiveMembers, null);
+
+  // Verify backward-compatibility when a legacy unencoded `teams/legacy~tilde` directory already exists on disk
+  const legacyTildeSid = 'legacy~tilde';
+  fs.mkdirSync(path.join(storageRoot, 'teams', legacyTildeSid), { recursive: true });
+  assert.equal(encodeTeamStoreId(legacyTildeSid, storageRoot), legacyTildeSid);
+  assert.equal(currentPlanRoot(storageRoot, legacyTildeSid), path.join(storageRoot, 'teams', legacyTildeSid, 'plans'));
+
+  // Clear live in-memory actors so observability & lt-bugreport read purely from disk + .zstd!
+  rt.actors.clear();
+  rt.hostAgents.clear();
+  ctx.agents.clear();
+  ctx.sessions.clear();
+
+  const prevDshHome = process.env.DSH_HOME;
+  process.env.DSH_HOME = dshHome;
+  try {
+    const recentObs = recentTeamObservability(ctx, rt, 16);
+    for (const sid of [colonSid, tildeSid, longSid]) {
+      const entry = recentObs.find(o => o.teamId === sid);
+      assert.ok(entry, `recentTeamObservability must return exact original sessionId for ${sid.slice(0, 24)}`);
+      assert.equal(entry.usage.groups.leader.tokens.totalTokens, 150, `recentTeamObservability must fold 150 leader tokens on ${sid.slice(0, 24)}`);
+
+      const bugExplicit = generateRedactedBugReport({
+        dshHome,
+        storageRoot,
+        teamId: sid,
+        hostname: 'test-host',
+        username: 'test-user',
+      });
+      assert.equal(bugExplicit.metrics.teamFound, true);
+      assert.equal(bugExplicit.metrics.usageByRole.leader?.totalTokens, 150, `lt-bugreport --team must fold 150 leader tokens without ~ double-encoding on ${sid.slice(0, 24)}`);
+    }
+  } finally {
+    if (prevDshHome === undefined) delete process.env.DSH_HOME;
+    else process.env.DSH_HOME = prevDshHome;
+  }
+
+  // 5. S8-SYS-03: scripts/configure-models.mjs --sync-desktop surfaces desktopSyncAction.error instead of "undefined"
+  if (process.platform !== 'win32') {
+    let stderrText = '';
+    try {
+      execFileSync(
+        process.execPath,
+        [path.join(ROOT, 'scripts/configure-models.mjs'), '--config', cfgFile, '--dsh-home', dshHome, '--sync-desktop'],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] },
+      );
+      assert.fail('expected --sync-desktop to exit non-zero on non-win32');
+    } catch (err) {
+      stderrText = String(err?.stderr ?? err?.message ?? '');
+    }
+    assert.doesNotMatch(stderrText, /Desktop sync failed:\s*undefined/);
+    assert.match(stderrText, /Desktop sync failed:.*Linux\/macOS/);
+  }
+});
+
+test('Stage 9 S8-E2E-01b & 1d: syncUpstreamModelsToDshSettings reconciles dynamic Magpie baseURL/headers/clearApiKeyEnv, and Desktop getter agent.options selects roles.leader while preserving headless overrides', async t => {
+  // 1. S8-E2E-01d: Reconcile existing providers.magpie across dynamic Magpie port restarts & clearApiKeyEnv
+  let currentProviders = {
+    magpie: {
+      displayName: 'Magpie Gateway',
+      baseURL: 'http://127.0.0.1:38001/v1',
+      apiKeyEnv: 'MAGPIE_API_KEY',
+      models: [{ id: 'localrelay/alpha-pro', input: ['text'], contextWindow: 128000, maxTokens: 16384 }],
+    },
+    dashscope: {
+      displayName: 'DashScope Custom Relay',
+      api: 'openai-completions',
+      baseURL: 'http://127.0.0.1:49999/v1',
+      apiKeyEnv: 'DASHSCOPE_API_KEY',
+      models: [{ id: 'qwen-max', input: ['text'], contextWindow: 131072, maxTokens: 16384 }],
+    },
+  };
+  const updates = [];
+  const settingsCtx = {
+    get(name) {
+      if (name !== 'settings') return null;
+      return {
+        describe() {
+          return [{ ns: 'llm-pi-ai', value: { providers: currentProviders } }];
+        },
+        async update(ns, payload) {
+          updates.push({ ns, payload });
+          currentProviders = structuredClone(payload.providers);
+        },
+      };
+    },
+  };
+
+  const templates = {
+    ...buildSoloProviderSettingsTemplates({ DASHSCOPE_API_KEY: 'sk-dash' }),
+    magpie: {
+      displayName: 'Magpie Gateway',
+      api: 'openai-completions',
+      baseURL: 'http://127.0.0.1:39112/v1',
+      headers: { Authorization: 'Bearer magpie-leaderteam' },
+      clearApiKeyEnv: true,
+    },
+  };
+
+  const res1 = await syncUpstreamModelsToDshSettings(
+    settingsCtx,
+    [
+      { route: 'localrelay/alpha-pro', provider: 'magpie', upstreamModel: 'localrelay/alpha-pro', efforts: ['none'], contextWindow: 128000, maxTokens: 16384 },
+      { route: 'dashscope/qwen-max', provider: 'dashscope', upstreamModel: 'qwen-max', efforts: ['none'] },
+    ],
+    'magpie',
+    { providerTemplates: templates },
+  );
+  assert.equal(res1.synced, true);
+  assert.equal(res1.changed, true);
+  assert.deepEqual(res1.updatedProviders, ['magpie']);
+  assert.equal(currentProviders.magpie.baseURL, 'http://127.0.0.1:39112/v1', 'stale Magpie port must update to new port');
+  assert.equal(currentProviders.magpie.api, 'openai-completions', 'missing api field must be populated');
+  assert.deepEqual(currentProviders.magpie.headers, { Authorization: 'Bearer magpie-leaderteam' });
+  assert.equal('apiKeyEnv' in currentProviders.magpie, false, 'clearApiKeyEnv: true must delete stale MAGPIE_API_KEY');
+  assert.equal('clearApiKeyEnv' in currentProviders.magpie, false, 'clearApiKeyEnv directive must never leak into DSH settings schema');
+  assert.equal(currentProviders.dashscope.baseURL, 'http://127.0.0.1:49999/v1', 'custom Solo-Key loopback relay baseURL must be preserved');
+
+  // Repeat sync with identical state is a clean no-op
+  const res2 = await syncUpstreamModelsToDshSettings(
+    settingsCtx,
+    [{ route: 'localrelay/alpha-pro', provider: 'magpie', upstreamModel: 'localrelay/alpha-pro', efforts: ['none'], contextWindow: 128000, maxTokens: 16384 }],
+    'magpie',
+    { providerTemplates: templates },
+  );
+  assert.equal(res2.synced, true);
+  assert.equal(res2.changed, false);
+  assert.equal(updates.length, 1);
+
+  // 2. S8-E2E-01b: Desktop / `dsh --profile web` getter `agent.options` vs `dsh headless` plain override (`it17-leader-model`)
+  const tmp = makeTempSandbox(t, 's9-e2e01b');
+  const ws = path.join(tmp, 'ws');
+  const storageRoot = path.join(tmp, 'lt-store');
+  fs.mkdirSync(ws, { recursive: true });
+  fs.mkdirSync(storageRoot, { recursive: true });
+
+  const cfgRaw = JSON.parse(fs.readFileSync(path.join(ROOT, 'config/leaderteam.config.json'), 'utf8'));
+  cfgRaw.storage = { root: storageRoot };
+  const cfgFile = path.join(tmp, 'leaderteam.config.json');
+  fs.writeFileSync(cfgFile, JSON.stringify(cfgRaw, null, 2));
+
+  const rt = resetRuntimeForTest(storageRoot, cfgFile);
+  const ctx = createMockCtx();
+
+  // (a) `dsh --profile web` (`rt.surface = 'desktop'`): `agent.options` has getter `get model()` returning DSH host default
+  rt.surface = 'desktop';
+  const webSelections = [];
+  let webRecorded = null;
+  const webOptions = {
+    get provider() { return 'deepseek-official'; },
+    get model() { return 'deepseek-reasoner'; },
+    get reasoningEffort() { return undefined; },
+  };
+  const webAgent = {
+    id: 'sess-web-default-model',
+    status: 'idle',
+    options: webOptions,
+    model: {
+      recordedSelection: () => webRecorded,
+      select(sel) {
+        webSelections.push(sel);
+        webRecorded = sel;
+      },
+    },
+    ctx: { systemPrompt: createFakePromptRegistry().systemPrompt, get: name => ctx.get(name) },
+    session: {
+      id: 'sess-web-default-model',
+      header: { id: 'sess-web-default-model', cwd: ws, agentPreset: 'leaderteam' },
+      snapshotEvents: () => [],
+    },
+  };
+  assert.equal(shouldApplyDefaultLeaderModel(rt, webAgent), true);
+  ctx.sessions.set(webAgent.id, webAgent.session);
+  ctx.agents.set(webAgent.id, webAgent);
+  rt.hostAgents.set(webAgent.id, webAgent);
+  onAgentCreated(ctx, { agent: webAgent });
+  assert.equal(webSelections.length, 1, 'dsh web session with host-default getter must select roles.leader');
+  assert.equal(webSelections[0].model, rt.config.roles.leader.route);
+  assert.equal(shouldApplyDefaultLeaderModel(rt, webAgent), false, 'once recordedSelection is non-null, must not re-select');
+
+  // (b) `dsh headless` (`rt.surface = 'headless'`): plain `{ provider, model }` override (`it17-leader-model`) is preserved
+  rt.surface = 'headless';
+  const headlessSelections = [];
+  const headlessAgent = {
+    id: 'sess-headless-override',
+    status: 'idle',
+    options: { provider: 'magpie', model: 'zcode/GLM-5.3', reasoningEffort: 'high' },
+    model: {
+      recordedSelection: () => null,
+      select(sel) { headlessSelections.push(sel); },
+    },
+    ctx: { systemPrompt: createFakePromptRegistry().systemPrompt, get: name => ctx.get(name) },
+    session: {
+      id: 'sess-headless-override',
+      header: { id: 'sess-headless-override', cwd: ws },
+      snapshotEvents: () => [],
+    },
+  };
+  assert.equal(shouldApplyDefaultLeaderModel(rt, headlessAgent), false);
+  onAgentCreated(ctx, { agent: headlessAgent });
+  assert.equal(headlessSelections.length, 0, 'headless explicit/patched model override must not be overwritten');
 });

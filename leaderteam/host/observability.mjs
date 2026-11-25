@@ -4,6 +4,7 @@ import path from 'node:path';
 import zlib from 'node:zlib';
 import { TeamStore, readJsonl } from '../core/store.mjs';
 import { decodeSessionModeSegment } from '../core/session-mode.mjs';
+import { isInside } from '../core/paths.mjs';
 import { resolveCanonicalRouteFromHostSelection } from './runtime.mjs';
 
 export const MAX_CACHED_SESSIONS = 32;
@@ -127,10 +128,16 @@ export function _observabilityCacheSizeForTest() {
   return cache.size;
 }
 
-function durableRows(home,id) {
+function durableRows(home,id,fallbackSeg=null) {
   if (!home || !id) return null;
   const root=path.join(home,'sessions');
-  const segs=[...new Set([id, encodeDshSegment(id)])];
+  const isSafeRaw=/^[A-Za-z0-9._-]+$/.test(id)&&id!=='.'&&id!=='..'&&!id.includes('..');
+  const isSafeFallback=typeof fallbackSeg==='string'&&/^[A-Za-z0-9._~-]+$/.test(fallbackSeg)&&fallbackSeg!=='.'&&fallbackSeg!=='..'&&!fallbackSeg.includes('..');
+  const segs=[...new Set([
+    ...(isSafeRaw?[id]:[]),
+    encodeDshSegment(id),
+    ...(isSafeFallback?[fallbackSeg]:[]),
+  ])];
   const candidates=[];
   for (const seg of segs) candidates.push(path.join(root,seg,'session.v4.jsonl.zstd'));
   try {
@@ -141,7 +148,9 @@ function durableRows(home,id) {
   } catch {
     if (candidates.length === 0) return null;
   }
+  const absRoot=path.resolve(root);
   for (const file of candidates) {
+    if (!isInside(path.resolve(file),absRoot)) continue;
     let stat;
     try { stat=fs.statSync(file); } catch { continue; }
     const signature=`${stat.mtimeMs}:${stat.size}`;
@@ -181,7 +190,18 @@ function dedupedNativeRows(rows) {
 
 export function teamObservability(ctx,rt,teamId) {
   const store=new TeamStore(rt.storageRoot,teamId);
-  const resolvedTeamId=rt.actors.has(teamId)?teamId:decodeSessionModeSegment(teamId);
+  let teamMeta;
+  try { teamMeta=JSON.parse(fs.readFileSync(path.join(store.dir,'team.json'),'utf8')); } catch {}
+  const metaSessionId=typeof teamMeta?.sessionId==='string'&&teamMeta.sessionId.trim()?teamMeta.sessionId.trim():null;
+  const decodedMetaTeamId=(!metaSessionId&&typeof teamMeta?.teamId==='string'&&teamMeta.teamId.trim()&&!/~h[0-9a-f]{32}$/.test(teamMeta.teamId.trim()))
+    ?decodeSessionModeSegment(teamMeta.teamId.trim())
+    :null;
+  const gateTeamId=metaSessionId
+    ?null
+    :(readJsonl(store.gateFile).records.find(r=>typeof r?.teamId==='string'&&r.teamId.trim())?.teamId?.trim()??null);
+  const resolvedTeamId=rt.actors.has(teamId)
+    ?teamId
+    :(metaSessionId??gateTeamId??decodedMetaTeamId??(teamId!==store.teamId?teamId:decodeSessionModeSegment(store.teamId)));
   const governance=readJsonl(path.join(store.dir,'usage.jsonl')).records;
   let snapshot;
   try { snapshot=JSON.parse(fs.readFileSync(path.join(store.dir,'governance.json'),'utf8')); } catch {}
@@ -191,11 +211,11 @@ export function teamObservability(ctx,rt,teamId) {
   home??=path.dirname(rt.storageRoot);
   const members=[...store.members().values()];
   const sessions=[
-    {id:resolvedTeamId,name:'leader',group:'leader',actorRole:'leader',configuredModel:null},
-    ...members.map(m=>({id:m.childId,name:m.name,group:'execution',actorRole:m.actorRole??'member',configuredModel:m.model??null})),
+    {id:resolvedTeamId,name:'leader',group:'leader',actorRole:'leader',configuredModel:null,fallbackSeg:store.teamId},
+    ...members.map(m=>({id:m.childId,name:m.name,group:'execution',actorRole:m.actorRole??'member',configuredModel:m.model??null,fallbackSeg:null})),
   ].map(s=>{
     let rows=rt.actors.get(s.id)?.agent?.session?.snapshotEvents?.();
-    if (!rows?.some(nativeResponse)) rows=durableRows(home,s.id);
+    if (!rows?.some(nativeResponse)) rows=durableRows(home,s.id,s.fallbackSeg);
     return {...s,rows:rows??[],available:rows!==null&&rows!==undefined};
   });
   const extractSessionFallbackRoute = sess => {

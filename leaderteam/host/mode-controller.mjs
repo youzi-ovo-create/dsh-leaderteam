@@ -2,7 +2,7 @@
 // Kept 100% free of bare `@deepseek-ai/*` imports so DSH host, standalone `lt-ui`, and Node unit tests share one engine.
 import fs from 'node:fs';
 import { LtError } from '../core/constants.mjs';
-import { TeamStore } from '../core/store.mjs';
+import { TeamStore, encodeTeamStoreId } from '../core/store.mjs';
 import { replayGovernanceState } from '../core/governance-protocol.mjs';
 import {
   EXECUTION_MODES,
@@ -74,6 +74,30 @@ function safeCurrentTaskSeq(ctx, sessionId) {
   } catch {
     return 1;
   }
+}
+
+function computeMaxRecordedStoreTaskSeq(store, rec = null) {
+  let maxSeq = Number.isInteger(rec?.lastTaskSeqHint) && rec.lastTaskSeqHint >= 1 ? rec.lastTaskSeqHint : 1;
+  if (!store) return maxSeq;
+  const bump = val => {
+    if (Number.isInteger(val) && val > maxSeq) maxSeq = val;
+  };
+  try {
+    for (const ev of store.governanceEvents?.() ?? []) bump(ev?.taskSeq);
+  } catch {}
+  try {
+    for (const ev of store.workflowEvents?.() ?? []) bump(ev?.taskSeq);
+  } catch {}
+  try {
+    const members = store.members?.();
+    if (members) {
+      for (const m of members.values()) bump(m?.taskSeq);
+    }
+  } catch {}
+  try {
+    for (const r of store.agreementRecords?.() ?? []) bump(r?.taskSeq);
+  } catch {}
+  return maxSeq;
 }
 
 /**
@@ -210,40 +234,88 @@ export function inspectSessionModeState(ctx, rt = runtime(), sessionId, options 
   let activeConferenceId = null;
   let activeHumanEscalation = null;
   let unsatisfiedDirective = null;
+  const memberChildIds = new Set();
   if (baseRt?.storageRoot && TeamStore.exists(baseRt.storageRoot, sessionId)) {
     const store = baseRt === runtime()
       ? teamStore(sessionId)
       : (baseRt.stores?.get?.(sessionId) ?? new TeamStore(baseRt.storageRoot, sessionId));
     reconcileStaleMembers(baseRt, store);
-    for (const m of store.members().values()) {
+    for (const [cid, m] of store.members().entries()) {
+      if (typeof cid === 'string' && cid) memberChildIds.add(cid);
       if (BUSY_MEMBER_STATUSES.has(m.status) || BUSY_MEMBER_GOV_STATES.has(m.governanceState)) {
         activeMembersCount += 1;
       }
     }
-    const tSeq = safeCurrentTaskSeq(ctx, sessionId);
-    const govState = replayGovernanceState(store.governanceEvents(), tSeq);
-    if (govState.activeConference || govState.pausingConference) {
-      activeConferenceId = govState.activeConference?.conferenceId
-        ?? govState.pausingConference?.conferenceId
-        ?? 'conference-open';
+    const govEvents = store.governanceEvents();
+    const liveTSeq = safeCurrentTaskSeq(ctx, sessionId);
+    const maxRecordedStoreTaskSeq = computeMaxRecordedStoreTaskSeq(store, rec);
+    const effectiveTSeq = Math.max(liveTSeq, maxRecordedStoreTaskSeq);
+    let maxGovEventSeq = 1;
+    for (const ev of govEvents) {
+      if (Number.isInteger(ev?.taskSeq) && ev.taskSeq > maxGovEventSeq) maxGovEventSeq = ev.taskSeq;
     }
-    if (govState.activeHumanEscalation) {
-      activeHumanEscalation = govState.activeHumanEscalation;
+    const candidateTSeqs = [...new Set(
+      [effectiveTSeq, maxGovEventSeq, liveTSeq].filter(n => Number.isInteger(n) && n >= 1),
+    )];
+    for (const seq of candidateTSeqs) {
+      // Skip stale earlier taskSeqs when a live session has already advanced past them,
+      // while always checking both `liveTSeq` and `effectiveTSeq` (and cold recorded taskSeqs).
+      if (liveAgent?.session && liveTSeq > 1 && seq < liveTSeq) continue;
+      if (!liveAgent?.session && seq < maxGovEventSeq && seq < effectiveTSeq) continue;
+      const govState = replayGovernanceState(govEvents, seq);
+      if (!activeConferenceId && (govState.activeConference || govState.pausingConference)) {
+        activeConferenceId = govState.activeConference?.conferenceId
+          ?? govState.pausingConference?.conferenceId
+          ?? 'conference-open';
+      }
+      if (!activeHumanEscalation && govState.activeHumanEscalation) {
+        activeHumanEscalation = govState.activeHumanEscalation;
+      }
+      if (!unsatisfiedDirective) {
+        unsatisfiedDirective = (govState.activeDirectives ?? []).find(
+          d => d && !d.satisfied && (d.decision === 'enforce_correction' || d.decision === 'adopt_alternative'),
+        ) ?? null;
+      }
     }
-    unsatisfiedDirective = (govState.activeDirectives ?? []).find(
-      d => d && !d.satisfied && (d.decision === 'enforce_correction' || d.decision === 'adopt_alternative'),
-    ) ?? null;
+    // Strike-3 human escalation is session-wide until paired with `human-escalation-resolved` (`governance.mjs:1898-1900`).
+    if (!activeHumanEscalation && govEvents.length > 0) {
+      const resolvedEscIds = new Set(
+        govEvents.filter(e => e?.type === 'human-escalation-resolved').map(e => e.escalationId),
+      );
+      const openEsc = govEvents.findLast(
+        e => e?.type === 'human-escalation-opened' && !resolvedEscIds.has(e.escalationId),
+      );
+      if (openEsc) activeHumanEscalation = openEsc;
+    }
   }
 
-  const execReviews = [...(baseRt?.executionReviewJobs?.values?.() ?? [])].filter(j => j?.teamId === sessionId).length;
-  const govJobs = [...(baseRt?.governanceJobs?.values?.() ?? [])].filter(j => j?.teamId === sessionId).length;
-  const stopRev = baseRt?.stopReviewPending?.has?.(sessionId) ? 1 : 0;
-  const dirVer = baseRt?.directiveVerifyPending?.has?.(sessionId) ? 1 : 0;
-  const gateMap = baseRt?.inFlightGateReviews?.get?.(sessionId);
+  let encodedStoreId = null;
+  if (baseRt?.storageRoot) {
+    try { encodedStoreId = encodeTeamStoreId(sessionId, baseRt.storageRoot); } catch {}
+  }
+  const matchesTeamId = tid => tid === sessionId || (encodedStoreId !== null && tid === encodedStoreId);
+  const execReviews = [...(baseRt?.executionReviewJobs?.values?.() ?? [])].filter(j => matchesTeamId(j?.teamId)).length;
+  const govJobs = [...(baseRt?.governanceJobs?.values?.() ?? [])].filter(j => matchesTeamId(j?.teamId)).length;
+  const stopRev = (baseRt?.stopReviewPending?.has?.(sessionId) || (encodedStoreId && baseRt?.stopReviewPending?.has?.(encodedStoreId))) ? 1 : 0;
+  const dirVer = (baseRt?.directiveVerifyPending?.has?.(sessionId) || (encodedStoreId && baseRt?.directiveVerifyPending?.has?.(encodedStoreId))) ? 1 : 0;
+  const gateMap = baseRt?.inFlightGateReviews?.get?.(sessionId)
+    ?? (encodedStoreId ? baseRt?.inFlightGateReviews?.get?.(encodedStoreId) : undefined);
   const gateRev = gateMap instanceof Map
     ? [...gateMap.values()].reduce((acc, n) => acc + (Number.isFinite(n) && n > 0 ? n : 0), 0)
     : (typeof gateMap === 'number' && gateMap > 0 ? gateMap : 0);
-  const pendingReviewsCount = execReviews + govJobs + stopRev + dirVer + gateRev;
+  const trackedCircuitAgentIds = new Set([sessionId, ...memberChildIds]);
+  for (const a of baseRt?.actors?.values?.() ?? []) {
+    if (matchesTeamId(a?.teamId) && typeof a.agentId === 'string' && a.agentId) {
+      trackedCircuitAgentIds.add(a.agentId);
+    }
+  }
+  let circuitInv = 0;
+  for (const aid of trackedCircuitAgentIds) {
+    if (baseRt?.circuitStates?.get?.(aid)?.inFlightInvestigation === true) {
+      circuitInv += 1;
+    }
+  }
+  const pendingReviewsCount = execReviews + govJobs + stopRev + dirVer + gateRev + circuitInv;
 
   let activeShellJobsCount = Number.isInteger(options.activeShellJobsCount) && options.activeShellJobsCount > 0
     ? options.activeShellJobsCount
@@ -289,7 +361,9 @@ export function inspectSessionModeState(ctx, rt = runtime(), sessionId, options 
     } else if (activeMembersCount > 0) {
       busyReason = `${activeMembersCount} team member(s) are currently active or paused at checkpoint`;
     } else if (pendingReviewsCount > 0) {
-      busyReason = `${pendingReviewsCount} governance or safety review job(s) are still in flight`;
+      busyReason = circuitInv > 0 && pendingReviewsCount === circuitInv
+        ? `${circuitInv} circuit-breaker investigation review(s) are still in flight`
+        : `${pendingReviewsCount} governance or safety review job(s) are still in flight`;
     } else if (activeShellJobsCount > 0) {
       busyReason = `${activeShellJobsCount} shell command or background job(s) are still running`;
     }
@@ -336,14 +410,24 @@ export function switchSessionExecutionMode(ctx, rt = runtime(), sessionId, targe
   }
 
   let diskCorrupt = false;
+  let existingRec = null;
   try {
-    readSessionModeRecord(baseRt.storageRoot, sessionId);
+    existingRec = readSessionModeRecord(baseRt.storageRoot, sessionId);
   } catch (err) {
     if (err?.code === 'SESSION_MODE_CORRUPT') diskCorrupt = true;
     else throw err;
   }
 
-  const taskSeqHint = safeCurrentTaskSeq(ctx, sessionId);
+  let maxStoreSeq = Number.isInteger(existingRec?.lastTaskSeqHint) && existingRec.lastTaskSeqHint >= 1
+    ? existingRec.lastTaskSeqHint
+    : 1;
+  if (TeamStore.exists(baseRt.storageRoot, sessionId)) {
+    const storeForSeq = baseRt === runtime()
+      ? teamStore(sessionId)
+      : (baseRt.stores?.get?.(sessionId) ?? new TeamStore(baseRt.storageRoot, sessionId));
+    maxStoreSeq = computeMaxRecordedStoreTaskSeq(storeForSeq, existingRec);
+  }
+  const taskSeqHint = Math.max(safeCurrentTaskSeq(ctx, sessionId), maxStoreSeq);
 
   if (state.mode === nextMode && !options.forcePersist && !diskCorrupt) {
     if (options.persistInitial === true) {

@@ -473,7 +473,7 @@ async function main() {
       dryRun: opts.dryRun,
     });
     if (!desktopSyncAction.ok) {
-      throw new Error(`Desktop sync failed: ${desktopSyncAction.stderr || desktopSyncAction.stdout}`);
+      throw new Error(`Desktop sync failed: ${desktopSyncAction.error || desktopSyncAction.stderr || desktopSyncAction.stdout}`);
     }
   }
 

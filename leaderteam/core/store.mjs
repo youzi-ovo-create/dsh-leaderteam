@@ -23,6 +23,14 @@ export function encodeTeamStoreId(teamId, root = null) {
       if (fs.existsSync(path.join(root, 'teams', teamId))) return teamId;
     } catch {}
   }
+  if (
+    teamId.length <= 192
+    && !teamId.startsWith('.')
+    && !teamId.includes('..')
+    && /^(?:[A-Za-z0-9._-]|~[0-9A-F]{4})+(?:~h[0-9a-f]{32})?$/.test(teamId)
+  ) {
+    return teamId;
+  }
   if (teamId === '.') return '~002E';
   if (teamId === '..') return '~002E~002E';
   let out = '';
@@ -177,7 +185,24 @@ export class TeamStore {
   ensure(meta) {
     fs.mkdirSync(this.dir, { recursive: true });
     const f = path.join(this.dir, 'team.json');
-    if (!fs.existsSync(f)) writeFileAtomic(f, JSON.stringify({ v: 1, teamId: this.teamId, createdAt: new Date().toISOString(), ...meta }, null, 2));
+    if (!fs.existsSync(f)) {
+      writeFileAtomic(f, JSON.stringify({
+        v: 1,
+        teamId: this.teamId,
+        sessionId: this.rawTeamId,
+        createdAt: new Date().toISOString(),
+        ...meta,
+      }, null, 2));
+      return;
+    }
+    if (typeof this.rawTeamId === 'string' && this.rawTeamId) {
+      try {
+        const existing = JSON.parse(fs.readFileSync(f, 'utf8'));
+        if (existing && typeof existing === 'object' && !Array.isArray(existing) && typeof existing.sessionId !== 'string') {
+          writeFileAtomic(f, JSON.stringify({ ...existing, sessionId: this.rawTeamId }, null, 2));
+        }
+      } catch {}
+    }
   }
   /** Members keyed by childId, with the latest status folded in. */
   members() {

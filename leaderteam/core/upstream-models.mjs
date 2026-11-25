@@ -618,10 +618,42 @@ export async function syncUpstreamModelsToDshSettings(ctx, modelsToEnsure = [], 
     const tpl = providerTemplates?.[prov] ?? null;
     let provObj = nextData.providers[prov];
     if ((!provObj || typeof provObj !== 'object') && tpl) {
-      const { modelMetadata: _meta, ...profileFields } = tpl;
+      const { modelMetadata: _meta, clearApiKeyEnv: _clearKey, ...profileFields } = tpl;
+      if (_clearKey === true) delete profileFields.apiKeyEnv;
       provObj = { ...profileFields, models: [] };
       nextData.providers[prov] = provObj;
       if (!updatedProviders.includes(prov)) updatedProviders.push(prov);
+    } else if (provObj && typeof provObj === 'object' && tpl && typeof tpl === 'object') {
+      let provChanged = false;
+      const isAuthoritativeTpl = !tpl.modelMetadata || Boolean(tpl.clearApiKeyEnv || tpl.headers);
+      if (tpl.baseURL && (isAuthoritativeTpl ? provObj.baseURL !== tpl.baseURL : !provObj.baseURL)) {
+        provObj.baseURL = tpl.baseURL;
+        provChanged = true;
+      }
+      if (tpl.api && !provObj.api) {
+        provObj.api = tpl.api;
+        provChanged = true;
+      }
+      if (tpl.displayName && !provObj.displayName) {
+        provObj.displayName = tpl.displayName;
+        provChanged = true;
+      }
+      if (tpl.headers && typeof tpl.headers === 'object' && !Array.isArray(tpl.headers)) {
+        const curHeaders = (provObj.headers && typeof provObj.headers === 'object' && !Array.isArray(provObj.headers))
+          ? provObj.headers
+          : {};
+        if (Object.keys(tpl.headers).some(k => curHeaders[k] !== tpl.headers[k])) {
+          provObj.headers = { ...curHeaders, ...tpl.headers };
+          provChanged = true;
+        }
+      }
+      if (tpl.clearApiKeyEnv === true && 'apiKeyEnv' in provObj) {
+        delete provObj.apiKeyEnv;
+        provChanged = true;
+      }
+      if (provChanged && !updatedProviders.includes(prov)) {
+        updatedProviders.push(prov);
+      }
     }
     if (!provObj || typeof provObj !== 'object') continue;
     provObj.models = Array.isArray(provObj.models) ? provObj.models : [];
