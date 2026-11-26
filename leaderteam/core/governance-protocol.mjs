@@ -483,6 +483,7 @@ export function replayGovernanceState(events = [], taskSeq = 1) {
         const sameSnapshot = prev?.dedupeKey === key;
         const opinionA = ev.opinionA ?? (sameSnapshot ? prev?.opinionA : null) ?? null;
         const opinionB = ev.opinionB ?? (sameSnapshot ? prev?.opinionB : null) ?? null;
+        const policyRefused = Boolean(ev.policyRefused || (sameSnapshot && prev?.policyRefused));
         deferredSupervisions.set(key, {
           supervisionId: ev.supervisionId,
           dedupeKey: key,
@@ -499,7 +500,8 @@ export function replayGovernanceState(events = [], taskSeq = 1) {
           opinionB,
           errorA: opinionA ? null : (ev.errorA ?? (sameSnapshot ? prev?.errorA : null) ?? 'reviewer_a_unavailable'),
           errorB: opinionB ? null : (ev.errorB ?? (sameSnapshot ? prev?.errorB : null) ?? 'reviewer_b_unavailable'),
-          retrySpec: ev.retrySpec ?? prev?.retrySpec ?? null,
+          policyRefused,
+          retrySpec: policyRefused ? null : (ev.retrySpec ?? (sameSnapshot ? prev?.retrySpec : null) ?? null),
           at: ev.at ?? null,
         });
       }

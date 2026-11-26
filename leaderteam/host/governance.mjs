@@ -1389,9 +1389,10 @@ export function queueAsyncSupervision({
     parentDisputeId,
     postConferencePacket,
   });
+  let curGov = null;
   let slotPending = [];
   try {
-    const curGov = replayGovernanceState(store.governanceEvents(), taskSeq);
+    curGov = replayGovernanceState(store.governanceEvents(), taskSeq);
     slotPending = (curGov.pendingSupervisions ?? []).filter(p =>
       (p.logicalSlotKey && p.logicalSlotKey === logicalSlotKey)
       || supersedesDedupeKeys.includes(p.dedupeKey)
@@ -1426,6 +1427,18 @@ export function queueAsyncSupervision({
   const dedupeKey = `${store.teamId}:${taskSeq}:${phaseKind}:${dedupeIdentity}:${postConferencePacket?.conference_id ?? 'initial'}`;
   if (base.supervisedDigests.has(dedupeKey) && slotPending.length === 0 && effectiveSupersedesKeys.length === 0) {
     return { queued: false, deduplicated: true, status: 'already_completed', behaviorDigest: snapshotDigest };
+  }
+  const refusedSameSnapshot = (curGov?.pendingSupervisions ?? []).find(p => p.dedupeKey === dedupeKey && p.policyRefused);
+  if (refusedSameSnapshot) {
+    return {
+      queued: false,
+      deduplicated: true,
+      status: 'policy_refused',
+      completed: false,
+      policyRefused: true,
+      supervisionId: refusedSameSnapshot.supervisionId ?? null,
+      behaviorDigest: snapshotDigest,
+    };
   }
   if (base.inFlightSupervisionKeys.has(dedupeKey)) {
     const existingJob = [...base.governanceJobs.values()].find(j => j.dedupeKey === dedupeKey);
@@ -1528,6 +1541,10 @@ export function queueAsyncSupervision({
       const opinionA = resA?.ok ? resA.opinion : null;
       const opinionB = resB?.ok ? resB.opinion : null;
       if (!opinionA || !opinionB) {
+        const policyRefused = Boolean(
+          (!opinionA && resA?.error?.kind === 'policy')
+          || (!opinionB && resB?.error?.kind === 'policy'),
+        );
         if (opinionA || opinionB) {
           base.partialSupervisionOpinions.set(dedupeKey, { opinionA, opinionB });
         }
@@ -1551,11 +1568,13 @@ export function queueAsyncSupervision({
           ...(opinionB ? { opinionB } : {}),
           errorA,
           errorB,
-          retrySpec,
+          ...(policyRefused ? { policyRefused: true } : {}),
+          retrySpec: policyRefused ? null : retrySpec,
         });
         return {
           status: 'deferred',
           completed: false,
+          policyRefused,
           supervisionId,
           dedupeKey,
           logicalSlotKey,
@@ -1788,7 +1807,7 @@ export function retryDeferredSupervisions({
 
   const groupedBySlot = new Map();
   for (const pending of gov.pendingSupervisions) {
-    if (!pending.retrySpec) continue;
+    if (pending.policyRefused || !pending.retrySpec) continue;
     if (excludePhaseKind && pending.phaseKind === excludePhaseKind && !pending.isStage4ReReview) continue;
     const slotKey = pending.logicalSlotKey ?? pending.dedupeKey ?? pending.supervisionId;
     const prev = groupedBySlot.get(slotKey);

@@ -33,7 +33,7 @@ registerHooks({
       return {
         format: 'module',
         shortCircuit: true,
-        source: 'export class BlockAssembler { constructor() { this._b = []; } push(c) { if (c.type === "text") this._b.push(c); } blocks() { return this._b; } } export const boundContextSummary = s => s.slice(0, 120); export const createUserMessage = m => ({ id: "msg-1", role: "user", ...m });',
+        source: 'export class BlockAssembler { constructor() { this._b = []; } push(c) { if (c.type === "text") this._b.push(c); else if (c.type === "text-delta") this._b.push({ type: "text", text: c.text }); } blocks() { return this._b; } } export const boundContextSummary = s => s.slice(0, 120); export const createUserMessage = m => ({ id: "msg-1", role: "user", ...m });',
       };
     }
     return nextLoad(url, context);
@@ -43,6 +43,9 @@ registerHooks({
 const { maybeNotifyLeaderScaleUp, onLeaderTurnCompleted, evaluateTeamRequestWindow } = await import('../../leaderteam/host/concurrency.mjs');
 const { onAgentStatus, onSessionEvent } = await import('../../leaderteam/host/roles.mjs');
 const { callRoleJson } = await import('../../leaderteam/host/llm.mjs');
+const { Gate } = await import('../../leaderteam/host/final-gate.mjs');
+const { queueAsyncSupervision, retryDeferredSupervisions } = await import('../../leaderteam/host/governance.mjs');
+const { replayGovernanceState } = await import('../../leaderteam/core/governance-protocol.mjs');
 import { roleRouteChain } from '../../leaderteam/core/role-routes.mjs';
 import { parseGateVerdict } from '../../leaderteam/core/gate-policy.mjs';
 import { recordUsage } from '../../leaderteam/host/runtime.mjs';
@@ -520,6 +523,142 @@ test('V2.2.1 [Provider Pair Fallback, Policy Refusal Stop, & 5h Retry Accounting
 
     assert.equal(evaluateTeamRequestWindow(rt, teamId, Date.now(), { targetRoute: 'zcode/GLM-5.3' }).local_estimated_requests_5h, 2);
     assert.equal(evaluateTeamRequestWindow(rt, teamId, Date.now(), { targetRoute: 'codex/gpt-6.1-sol' }).local_estimated_requests_5h, 2);
+
+    // 4. Mid-request model switch: Codex stream starts, user selects GLM for next step, then Codex stream fails -> Codex +1, GLM +0
+    const leadId = 'team-v221-midswitch';
+    const leadStore = new TeamStore(tmp, leadId);
+    leadStore.ensure({ workspace: tmp });
+    const codexBefore = evaluateTeamRequestWindow(rt, leadId, Date.now(), { targetRoute: 'codex/gpt-6.1-sol' }).local_estimated_requests_5h;
+    const glmBefore = evaluateTeamRequestWindow(rt, leadId, Date.now(), { targetRoute: 'zcode/GLM-5.3' }).local_estimated_requests_5h;
+    const leadEvents = [
+      { type: 'request/header', seq: 1, data: { header: { config: { provider: 'magpie', model: 'codex/gpt-6.1-sol' } }, reason: 'initial' } },
+      { type: 'request/context', seq: 2, data: { provider: 'magpie', model: 'codex/gpt-6.1-sol' } },
+      { type: 'model/selection', seq: 3, data: { provider: 'magpie', model: 'zcode/GLM-5.3' } },
+      { type: 'assistant/attempt', seq: 4, time: Date.now(), data: { turn: 1, step: 1, stream: [] } },
+    ];
+    const leadSession = { id: leadId, header: { cwd: tmp }, snapshotEvents: () => leadEvents };
+    const leadActor = {
+      role: 'leader',
+      teamId: leadId,
+      agentId: leadId,
+      cwd: tmp,
+      agent: { id: leadId, session: leadSession, model: { current: () => ({ provider: 'magpie', model: 'zcode/GLM-5.3' }) } },
+    };
+    rt.actors.set(leadId, leadActor);
+    rt.stores.set(leadId, leadStore);
+    onSessionEvent({}, leadSession, leadEvents[3]);
+    assert.equal(evaluateTeamRequestWindow(rt, leadId, Date.now(), { targetRoute: 'codex/gpt-6.1-sol' }).local_estimated_requests_5h - codexBefore, 1);
+    assert.equal(evaluateTeamRequestWindow(rt, leadId, Date.now(), { targetRoute: 'zcode/GLM-5.3' }).local_estimated_requests_5h - glmBefore, 0);
+
+    // 5. Async dual supervision stops automatic re-send after CONTENT_REFUSED while keeping supervision incomplete,
+    //    and Safety Gate receipt distinguishes policy refusal from transient gate-error
+    const ws = path.join(tmp, 'ws-sup');
+    fs.mkdirSync(path.join(ws, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(ws, 'src', 'a.js'), 'export const a = 1;\n');
+    const supCfg = validateConfig({
+      ...raw,
+      storage: { ...raw.storage, root: tmp },
+      governance: { mode: 'autonomous' },
+      gate: { ...raw.gate, sandboxDirectAllow: false },
+      plugins: { ...raw.plugins, consensus: true },
+      roles: {
+        ...raw.roles,
+        gate: { ...raw.roles.gate, retries: 0, fallback: [{ route: 'zcode/GLM-5.3', effort: 'high', retries: 0 }] },
+        discussA: { route: 'zcode/GLM-5.3', effort: 'high', maxTokens: 512, timeoutMs: 5000, retries: 1, fallback: [] },
+        discussB: { route: 'codex/gpt-6.1-sol', effort: 'high', maxTokens: 512, timeoutMs: 5000, retries: 1, fallback: [] },
+      },
+    });
+    let callsA = 0;
+    let callsB = 0;
+    let gateMode = 'policy';
+    const supLlm = {
+      async *stream(opts) {
+        const sys = String(opts.system ?? '');
+        if (sys.includes('final safety gate')) {
+          if (gateMode === 'policy') {
+            yield { type: 'finish', reason: { kind: 'error', failure: { code: 'CONTENT_REFUSED', message: 'refused by policy' } } };
+            return;
+          }
+          yield { type: 'finish', reason: { kind: 'error', failure: { code: 'SERVER', message: '502' } } };
+          return;
+        }
+        if (opts.model.startsWith('zcode/')) {
+          callsA++;
+          yield { type: 'finish', reason: { kind: 'error', failure: { code: 'CONTENT_REFUSED', message: 'refused' } } };
+          return;
+        }
+        callsB++;
+        yield {
+          type: 'text-delta',
+          text: JSON.stringify({ stance: 'endorse', intervene: false, summary: 'B ok', concerns: [], suggestions: [], target_paths: ['src/a.js'] }),
+        };
+        yield { type: 'finish', reason: { kind: 'stop' } };
+      },
+    };
+    const supTeamId = 'team-v221-sup';
+    const supStore = new TeamStore(tmp, supTeamId);
+    supStore.ensure({ workspace: ws, surface: 'headless' });
+    const supActor = { role: 'leader', teamId: supTeamId, agentId: supTeamId, cwd: ws };
+    Object.assign(rt, {
+      config: supCfg,
+      storageRoot: tmp,
+      llm: supLlm,
+      surface: 'headless',
+      planningDisposed: false,
+      governanceJobs: new Map(),
+      supervisedDigests: new Set(),
+      inFlightSupervisionKeys: new Set(),
+      partialSupervisionOpinions: new Map(),
+      reads: new Map(),
+      counters: { allowed: 0, denied: 0, uncontrolled: 0, reviewErrors: 0 },
+    });
+    rt.stores.set(supTeamId, supStore);
+    rt.actors.set(supTeamId, supActor);
+
+    const job = queueAsyncSupervision({
+      ctx: {},
+      rt,
+      store: supStore,
+      actor: supActor,
+      leaderAgent: null,
+      taskSeq: 1,
+      phaseKind: 'execution',
+      stageId: 'st-1',
+      stageHash: 'h-1',
+      targets: ['src/a.js'],
+      summary: 'check',
+      proposal: 'write src/a.js',
+    });
+    const out = await job.promise;
+    assert.equal(out.status, 'deferred');
+    assert.equal(out.policyRefused, true);
+    assert.equal(callsA, 1);
+    assert.equal(callsB, 1);
+    assert.equal(retryDeferredSupervisions({ ctx: {}, rt, store: supStore, actor: supActor, leaderAgent: null, taskSeq: 1 }).length, 0);
+    assert.equal(callsA, 1);
+    const gov = replayGovernanceState(supStore.governanceEvents(), 1);
+    assert.equal(gov.completedSupervisionCount, 0);
+    assert.equal(gov.pendingSupervisions.length, 1);
+    assert.equal(gov.pendingSupervisions[0].hasValidOpinionA, false);
+    assert.equal(gov.pendingSupervisions[0].hasValidOpinionB, true);
+
+    const gate = new Gate({});
+    const gAgent = { id: 'm-g1', session: { header: { cwd: ws, origin: 'subagent', parentSession: supTeamId } } };
+    const gActor = { role: 'member', teamId: supTeamId, agentId: 'm-g1', agent: gAgent, name: 'w', profile: 'code', allowedTools: supCfg.profiles.code.tools, writeScope: ['src/**'], refs: [], task: 't', acceptance: ['ok'], userTask: 'u', cwd: ws };
+    rt.actors.set('m-g1', gActor);
+    const gPolicy = await gate.decide({ name: 'write', args: { file_path: 'src/a.js', content: '2' }, agent: gAgent, actor: gActor, callId: 'c-pol' });
+    assert.equal(gPolicy.decision, 'deny');
+    assert.equal(gPolicy.by, 'rule:provider-policy-refusal');
+    assert.doesNotMatch(gPolicy.reason, /safe to retry/i);
+
+    gateMode = 'server';
+    const gAgent2 = { id: 'm-g2', session: { header: { cwd: ws, origin: 'subagent', parentSession: supTeamId } } };
+    const gActor2 = { ...gActor, agentId: 'm-g2', agent: gAgent2, name: 'w2' };
+    rt.actors.set('m-g2', gActor2);
+    const gServer = await gate.decide({ name: 'write', args: { file_path: 'src/a.js', content: '2' }, agent: gAgent2, actor: gActor2, callId: 'c-srv' });
+    assert.equal(gServer.decision, 'deny');
+    assert.equal(gServer.by, 'gate-error');
+    assert.match(gServer.reason, /safe to retry/);
   } finally {
     Object.assign(rt, prevRt);
     fs.rmSync(tmp, { recursive: true, force: true });

@@ -1252,6 +1252,7 @@ export function registerTeamTools(ctx) {
           };
         }
         if (jobResult?.status === 'deferred' || (!jobResult && !job?.deduplicated) || govAfter.pendingSupervisions?.length > 0) {
+          const anyPolicyRefused = (govAfter.pendingSupervisions ?? []).some(p => p.policyRefused);
           return {
             status: 'error',
             governance_mode: 'autonomous',
@@ -1263,8 +1264,11 @@ export function registerTeamTools(ctx) {
               missing_reviewers: [!p.hasValidOpinionA ? 'discussA' : null, !p.hasValidOpinionB ? 'discussB' : null].filter(Boolean),
               error_a: p.errorA,
               error_b: p.errorB,
+              ...(p.policyRefused ? { policy_refused: true } : {}),
             })),
-            hint: 'Retry team_discuss(kind="delivery", ...) once reviewer routes are reachable, or call team_status(stop_state="blocked", reason=...) if upstream reviewer routes remain unavailable.',
+            hint: anyPolicyRefused
+              ? 'One or more supervision items were refused by provider policy (non-retryable); adjust the refused content/route or call team_status(stop_state="blocked", reason=...) instead of retrying unchanged.'
+              : 'Retry team_discuss(kind="delivery", ...) once reviewer routes are reachable, or call team_status(stop_state="blocked", reason=...) if upstream reviewer routes remain unavailable.',
           };
         }
         return {
