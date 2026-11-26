@@ -25,11 +25,23 @@ import { loadConfig } from '../../core/config.mjs';
 import {
   runtime,
   baseRuntime,
+  runtimeForTeam,
   bindRuntimeConfigFile,
   syncRuntimeConfig,
   activePluginsMap,
   refreshUpstreamCatalog,
+  inspectSessionBusyForConfig,
+  effectiveSessionConfig,
+  rebindTeamGovernanceSnapshot,
+  rebindAllIdleSessionsOnGlobalUserSave,
 } from '../../host/runtime.mjs';
+import {
+  readSessionConfigRecord,
+  hasActiveSessionOverride,
+  hasPendingSessionOverride,
+  mutateSessionConfig,
+  buildAutoAdoptedLocalOverrideFromDshModels,
+} from '../../core/session-config.mjs';
 import {
   EXECUTION_MODES,
   DEFAULT_EXECUTION_MODE,
@@ -95,6 +107,7 @@ export const PUBLIC_API_ROUTES = Object.freeze({
   WORKBENCH_PROMPT: '/api/lt/v1/workbench/prompt',
   WORKBENCH_CANCEL: '/api/lt/v1/workbench/cancel',
   WORKBENCH_MODE: '/api/lt/v1/workbench/mode',
+  WORKBENCH_SESSION_CONFIG: '/api/lt/v1/workbench/session-config',
   ARCHIVE_QUERY: '/api/lt/v1/archive/query',
   ARCHIVE_ACTION: '/api/lt/v1/archive/action',
   USAGE_STATUS: '/api/lt/v1/usage/status',
@@ -2296,11 +2309,16 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
           target,
           dryRun: Boolean(body.dryRun),
           discoveredModels,
+          autoAlignRoleEfforts: true,
         });
         let dshSettingsSync = { synced: false, reason: body.dryRun ? 'dry-run' : 'no-host-context', updatedProviders: [] };
         const warnings = [...(applyResult.warnings ?? [])];
+        let idleRebind = { reboundIds: [], skippedBusyIds: [] };
         if (!body.dryRun) {
           syncRuntimeConfig(rt);
+          idleRebind = rebindAllIdleSessionsOnGlobalUserSave(rt, {
+            principal: { kind: 'user', source: 'lt-public-v1' },
+          });
           if (ctx) {
             dshSettingsSync = await syncActiveModelsToDshHost(
               ctx,
@@ -2325,6 +2343,7 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
           },
           dshSettingsSync,
           shadowedByLocal: applyResult.shadowedByLocal ?? [],
+          idleRebind,
           warnings,
           runtime: await buildRuntimeSnapshotPayload(ctx, rt),
         });
@@ -2831,6 +2850,225 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
       }
     },
 
+    async workbenchSessionConfig(request) {
+      try {
+        ensureConfigLoaded();
+        const body = await parseJsonRequest(request);
+        const action = String(body.action || 'get').trim().toLowerCase();
+        const storageRoot = getStorageRoot();
+        const principal = { kind: 'user', source: 'lt-public-v1' };
+        const mgr = getGatewayMgr();
+        const { gwStatus, discoveredModels } = await collectCombinedDiscoveredModels(ctx, rt, mgr);
+
+        const buildSnap = sid => {
+          const rec = readSessionConfigRecord(storageRoot, sid);
+          const busy = inspectSessionBusyForConfig(rt, sid);
+          const eff = effectiveSessionConfig(rt, sid) ?? rt.config;
+          return {
+            sessionId: sid,
+            hasOverride: hasActiveSessionOverride(rec),
+            hasPending: hasPendingSessionOverride(rec),
+            isBusy: busy.busy,
+            busyReasons: busy.reasons,
+            record: rec,
+            effective: {
+              roles: eff?.roles ?? {},
+              executionPool: eff?.team?.executionPool ?? [],
+              maxActiveMembers: eff?.team?.maxActiveMembers ?? 6,
+              leaderModelPolicy: eff?.team?.leaderModelPolicy ?? 'follow',
+            },
+          };
+        };
+
+        if (action === 'auto-adopt-host') {
+          const scope = body.scope === 'session' ? 'session' : 'global';
+          const candidatePool = discoveredModels?.length > 0
+            ? discoveredModels
+            : Object.entries(rt.config?.models ?? {}).map(([route, s]) => ({
+                route,
+                provider: s.provider ?? rt.config?.magpie?.provider,
+                upstreamModel: s.upstreamModel ?? route,
+                family: s.family,
+                label: s.label,
+                efforts: s.efforts,
+                defaultEffort: s.defaultEffort,
+                vision: s.vision,
+                contextWindow: s.contextWindow,
+                maxTokens: s.maxTokens,
+                registeredInDsh: true,
+              }));
+          const adopted = buildAutoAdoptedLocalOverrideFromDshModels(candidatePool);
+          if (!adopted) {
+            return errEnvelope('NO_USABLE_MODELS', '未发现可用的已注册模型，请先连接至少一个模型供应商。', 400);
+          }
+          if (scope === 'session') {
+            const sessionId = String(body.sessionId || '').trim();
+            if (!sessionId) return errEnvelope('BAD_REQUEST', 'sessionId is required for scope="session"', 400);
+            const busy = inspectSessionBusyForConfig(rt, sessionId);
+            const mut = mutateSessionConfig({
+              storageRoot,
+              sessionId,
+              baseConfig: rt.config,
+              patch: adopted,
+              action: 'set',
+              principal,
+              isBusy: busy.busy,
+              busyReasons: busy.reasons,
+              discoveredModels,
+            });
+            if (mut.appliedImmediately) {
+              rebindTeamGovernanceSnapshot(rt, sessionId, { principal, forceAtSafeBoundary: true });
+            }
+            return okEnvelope({
+              scope: 'session',
+              appliedImmediately: mut.appliedImmediately,
+              stagedForSafeBoundary: mut.stagedForSafeBoundary,
+              sessionConfig: buildSnap(sessionId),
+            });
+          }
+
+          // Global (`leaderteam.local.json`) one-click auto-wire
+          const setRoles = Object.entries(adopted.roles).map(([role, spec]) => ({ role, ...spec }));
+          const upsertModels = Object.entries(adopted.models).map(([route, spec]) => ({ route, ...spec }));
+          applyModelConfigChanges(
+            {
+              upsertModels,
+              poolSet: adopted.team.executionPool,
+              setRoles,
+              leaderModelPolicy: 'follow',
+            },
+            {
+              configFile: rt.configPath,
+              target: 'local',
+              discoveredModels,
+              autoAlignRoleEfforts: true,
+            },
+          );
+          syncRuntimeConfig(rt);
+          const idleRebind = rebindAllIdleSessionsOnGlobalUserSave(rt, { principal });
+          if (ctx) {
+            await syncActiveModelsToDshHost(ctx, rt, rt.config, discoveredModels, gwStatus).catch(() => null);
+          }
+          return okEnvelope({
+            scope: 'global',
+            idleRebind,
+            runtime: await buildRuntimeSnapshotPayload(ctx, rt),
+          });
+        }
+
+        const sessionId = String(body.sessionId || '').trim();
+        if (!sessionId) return errEnvelope('BAD_REQUEST', 'sessionId is required', 400);
+
+        if (action === 'get') {
+          return okEnvelope(buildSnap(sessionId));
+        }
+
+        if (action === 'set') {
+          const busy = inspectSessionBusyForConfig(rt, sessionId);
+          const rawPatch = isPlainObj(body.patch) ? body.patch : {};
+          const patch = {
+            ...rawPatch,
+            ...(body.syncAllRolesToLeader ? { syncAllRolesToLeader: true } : {}),
+          };
+          const mut = mutateSessionConfig({
+            storageRoot,
+            sessionId,
+            baseConfig: rt.config,
+            patch,
+            action: body.replaceAll ? 'set' : 'merge',
+            principal,
+            isBusy: busy.busy,
+            busyReasons: busy.reasons,
+            discoveredModels,
+          });
+          if (mut.appliedImmediately) {
+            rebindTeamGovernanceSnapshot(rt, sessionId, { principal, forceAtSafeBoundary: true });
+            if (ctx) {
+              await syncActiveModelsToDshHost(ctx, rt, mut.effectiveConfig, discoveredModels, gwStatus).catch(() => null);
+            }
+            const baseRt = baseRuntime(rt);
+            const liveAgent = baseRt?.actors?.get?.(sessionId)?.agent ?? baseRt?.hostAgents?.get?.(sessionId) ?? null;
+            if (liveAgent && typeof liveAgent.model?.select === 'function' && patch.roles?.leader) {
+              try {
+                const effCfg = effectiveSessionConfig(rt, sessionId) ?? rt.config;
+                const tgt = resolveModelTarget(effCfg, effCfg.roles.leader.route, effCfg.roles.leader.effort);
+                liveAgent.model.select(tgt);
+              } catch {}
+            }
+          }
+          return okEnvelope({
+            appliedImmediately: mut.appliedImmediately,
+            stagedForSafeBoundary: mut.stagedForSafeBoundary,
+            busyReasons: mut.busyReasons,
+            sessionConfig: buildSnap(sessionId),
+          });
+        }
+
+        if (action === 'reset') {
+          const busy = inspectSessionBusyForConfig(rt, sessionId);
+          const mut = mutateSessionConfig({
+            storageRoot,
+            sessionId,
+            baseConfig: rt.config,
+            action: 'reset',
+            principal,
+            isBusy: busy.busy,
+            busyReasons: busy.reasons,
+          });
+          if (mut.appliedImmediately) {
+            rebindTeamGovernanceSnapshot(rt, sessionId, { principal, forceAtSafeBoundary: true });
+          }
+          return okEnvelope({
+            appliedImmediately: mut.appliedImmediately,
+            stagedForSafeBoundary: mut.stagedForSafeBoundary,
+            busyReasons: mut.busyReasons,
+            sessionConfig: buildSnap(sessionId),
+          });
+        }
+
+        if (action === 'promote-to-global') {
+          const snap = buildSnap(sessionId);
+          const setRoles = Object.entries(snap.effective.roles).map(([role, spec]) => ({ role, ...spec }));
+          applyModelConfigChanges(
+            {
+              poolSet: snap.effective.executionPool,
+              setRoles,
+              leaderModelPolicy: snap.effective.leaderModelPolicy,
+            },
+            {
+              configFile: rt.configPath,
+              target: 'local',
+              discoveredModels,
+              autoAlignRoleEfforts: true,
+            },
+          );
+          syncRuntimeConfig(rt);
+          const idleRebind = rebindAllIdleSessionsOnGlobalUserSave(rt, { principal });
+          if (!snap.isBusy) {
+            mutateSessionConfig({
+              storageRoot,
+              sessionId,
+              baseConfig: rt.config,
+              action: 'reset',
+              principal,
+              isBusy: false,
+            });
+            rebindTeamGovernanceSnapshot(rt, sessionId, { principal, forceAtSafeBoundary: true });
+          }
+          return okEnvelope({
+            promoted: true,
+            idleRebind,
+            sessionConfig: buildSnap(sessionId),
+            runtime: await buildRuntimeSnapshotPayload(ctx, rt),
+          });
+        }
+
+        return errEnvelope('BAD_ACTION', `Unsupported workbench/session-config action: ${action}`, 400);
+      } catch (e) {
+        return errFromException(e?.code || 'SESSION_CONFIG_FAILED', e, e?.statusCode || 200);
+      }
+    },
+
     async workbenchPrompt(request) {
       try {
         const body = await parseJsonRequest(request);
@@ -3209,6 +3447,10 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
             verifyConnectivity: Boolean(body.verifyConnectivity),
             fetchImpl: options.fetchImpl ?? globalThis.fetch,
           });
+          if (rt?.configPath && rt?.config) {
+            bindRuntimeConfigFile(rt, rt.configPath, rt.config);
+            rebindAllIdleSessionsOnGlobalUserSave(rt, { principal: { kind: 'user', source: 'onboarding' } });
+          }
           return okEnvelope(applied);
         }
 
@@ -3407,6 +3649,7 @@ export function registerPublicContractRoutes(scopeCtx, connection, rootCtx, rt =
     [PUBLIC_API_ROUTES.WORKBENCH_PROMPT, h.workbenchPrompt],
     [PUBLIC_API_ROUTES.WORKBENCH_CANCEL, h.workbenchCancel],
     [PUBLIC_API_ROUTES.WORKBENCH_MODE, h.workbenchMode],
+    [PUBLIC_API_ROUTES.WORKBENCH_SESSION_CONFIG, h.workbenchSessionConfig],
     [PUBLIC_API_ROUTES.ARCHIVE_QUERY, h.archiveQuery],
     [PUBLIC_API_ROUTES.ARCHIVE_ACTION, h.archiveAction],
     [PUBLIC_API_ROUTES.USAGE_STATUS, h.usageStatus],

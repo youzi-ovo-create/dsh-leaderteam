@@ -468,3 +468,78 @@ export function formatSessionUpdatedLabel(ms: number | null | undefined): string
   const d = new Date(ms);
   return `${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
+
+export interface SessionScopedConfigSnapshot {
+  sessionId: string;
+  hasOverride: boolean;
+  hasPending: boolean;
+  isBusy: boolean;
+  busyReasons: string[];
+  record: {
+    updatedAt: string | null;
+    updatedBy: string | null;
+    activePatch: Record<string, any>;
+    pendingPatch: Record<string, any> | null;
+  };
+  effective: {
+    roles: Record<string, { route: string; effort: string; fallback?: Array<{ route: string; effort: string }> }>;
+    executionPool: string[];
+    maxActiveMembers: number;
+    leaderModelPolicy: 'follow' | 'enforce' | 'warn' | 'off' | string;
+  };
+}
+
+export async function fetchWorkbenchSessionConfig(sessionId: string): Promise<SessionScopedConfigSnapshot> {
+  return callLtApi<SessionScopedConfigSnapshot>('workbench/session-config', {
+    action: 'get',
+    sessionId,
+  });
+}
+
+export async function updateWorkbenchSessionConfig(params: {
+  sessionId: string;
+  patch: Record<string, any>;
+  syncAllRolesToLeader?: boolean;
+  replaceAll?: boolean;
+}): Promise<{
+  appliedImmediately: boolean;
+  stagedForSafeBoundary: boolean;
+  busyReasons: string[];
+  sessionConfig: SessionScopedConfigSnapshot;
+}> {
+  return callLtApi('workbench/session-config', {
+    action: 'set',
+    ...params,
+  });
+}
+
+export async function resetWorkbenchSessionConfig(sessionId: string): Promise<{
+  appliedImmediately: boolean;
+  stagedForSafeBoundary: boolean;
+  sessionConfig: SessionScopedConfigSnapshot;
+}> {
+  return callLtApi('workbench/session-config', {
+    action: 'reset',
+    sessionId,
+  });
+}
+
+export async function promoteWorkbenchSessionConfigToGlobal(sessionId: string): Promise<{
+  promoted: boolean;
+  sessionConfig: SessionScopedConfigSnapshot;
+}> {
+  return callLtApi('workbench/session-config', {
+    action: 'promote-to-global',
+    sessionId,
+  });
+}
+
+export async function autoAdoptHostModels(params: {
+  scope: 'global' | 'session';
+  sessionId?: string;
+}): Promise<any> {
+  return callLtApi('workbench/session-config', {
+    action: 'auto-adopt-host',
+    ...params,
+  });
+}

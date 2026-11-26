@@ -15,6 +15,7 @@
     RETROSPECT: 'api/leaderteam-panel/retrospect',
     CLEAN: 'api/leaderteam-panel/clean',
     SESSION_MODE: 'api/leaderteam-panel/session-mode',
+    SESSION_CONFIG: 'api/leaderteam-panel/session-config',
     UPDATE: 'api/leaderteam-panel/update',
     ONBOARDING: 'api/leaderteam-panel/onboarding',
   };
@@ -453,7 +454,49 @@
           } else if (warns.length > 0) {
             setWarningMsg(warns.join('；'));
           }
-          setNotice('已保存：成员池下一次派发生效；治理角色与策略在新建团队／新会话生效。');
+          setNotice('已保存：所有空闲会话已立即热更新；执行中的会话将在当前回合结束后自动切换。');
+        } catch (e) {
+          setError(e && e.message ? e.message : String(e));
+        } finally {
+          setLoading(false);
+        }
+      };
+
+      const onSetSessionLeaderOverride = async (sid, nextRoute) => {
+        if (!sid) return;
+        setLoading(true);
+        setError(null);
+        setNotice(null);
+        try {
+          if (!nextRoute) {
+            const res = await postApi(ROUTES.SESSION_CONFIG, { action: 'reset', sessionId: sid });
+            if (res && res.state) hydrateFromState(res.state, { preserveDirty: isDirty });
+            setNotice(res.appliedImmediately ? ('会话 ' + sid + ' 已恢复跟随全局配置。') : ('会话 ' + sid + ' 正在执行，已暂存重置并在当前回合结束后生效。'));
+          } else {
+            const res = await postApi(ROUTES.SESSION_CONFIG, {
+              action: 'set',
+              sessionId: sid,
+              syncAllRolesToLeader: true,
+              patch: { roles: { leader: { route: nextRoute } } },
+            });
+            if (res && res.state) hydrateFromState(res.state, { preserveDirty: isDirty });
+            setNotice(res.appliedImmediately ? ('会话 ' + sid + ' 已切换为专属模型 ' + nextRoute + '（不影响全局及其他会话）。') : ('会话 ' + sid + ' 正在执行，已暂存模型切换并在安全边界自动生效。'));
+          }
+        } catch (e) {
+          setError(e && e.message ? e.message : String(e));
+        } finally {
+          setLoading(false);
+        }
+      };
+
+      const onAutoWireHostModels = async () => {
+        setLoading(true);
+        setError(null);
+        setNotice(null);
+        try {
+          const res = await postApi(ROUTES.SESSION_CONFIG, { action: 'auto-adopt-host' });
+          if (res && res.state) hydrateFromState(res.state, { preserveDirty: false });
+          setNotice('已根据当前 DSH 已连接模型一键自动配齐全部角色与成员执行池，所有空闲会话已立即生效！');
         } catch (e) {
           setError(e && e.message ? e.message : String(e));
         } finally {
@@ -938,14 +981,30 @@
                   ),
                   isLt
                     ? h(
-                      'button',
-                      {
-                        style: btnStyle(curMode === 'team'),
-                        disabled: loading || isSwitchingThis || !canSwitch,
-                        title: canSwitch ? ('空闲热切换会话执行模式：' + targetLabel) : (busyReason || '当前会话忙碌中，仅允许空闲时切换'),
-                        onClick: () => onSwitchSessionMode(s.sessionId, targetMode),
-                      },
-                      isSwitchingThis ? '切换中…' : targetLabel
+                      'div',
+                      { style: { display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' } },
+                      h(
+                        'select',
+                        {
+                          value: s.hasSessionConfigOverride ? (s.effectiveLeaderRoute || '') : '',
+                          onChange: e => onSetSessionLeaderOverride(s.sessionId, e.target.value),
+                          disabled: loading,
+                          title: '仅修改当前会话专属模型（不影响全局与其他会话；空闲立即生效，运行中安全边界生效）',
+                          style: { ...inputStyle, maxWidth: '185px' },
+                        },
+                        h('option', { value: '' }, s.hasPendingSessionConfig ? '⏳ 待安全边界切换' : ('跟随全局 (' + (s.effectiveLeaderRoute || '默认') + ')')),
+                        models.map(m => h('option', { key: m.route, value: m.route }, '本会话专属: ' + m.route))
+                      ),
+                      h(
+                        'button',
+                        {
+                          style: btnStyle(curMode === 'team'),
+                          disabled: loading || isSwitchingThis || !canSwitch,
+                          title: canSwitch ? ('空闲热切换会话执行模式：' + targetLabel) : (busyReason || '当前会话忙碌中，仅允许空闲时切换'),
+                          onClick: () => onSwitchSessionMode(s.sessionId, targetMode),
+                        },
+                        isSwitchingThis ? '切换中…' : targetLabel
+                      )
                     )
                     : h('span', { style: { fontSize: '11px', opacity: 0.65 } }, '仅 LT 会话可切换')
                 );
@@ -953,12 +1012,15 @@
           ),
           h('div', { style: cardStyle },
             h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px', flexWrap: 'wrap', gap: '6px' } },
-              h('strong', null, '治理角色与领队模型（支持任意 DSH 上游 Provider 与非推理模型）'),
-              h('label', { style: { fontSize: '12px' } },
-                '写入目标：',
-                h('select', { value: saveTarget, onChange: e => setSaveTarget(e.target.value), style: { ...inputStyle, marginLeft: '4px' } },
-                  h('option', { value: 'local' }, '本机覆盖 (leaderteam.local.json)'),
-                  h('option', { value: 'base' }, '基础配置 (leaderteam.config.json)')
+              h('strong', null, '治理角色与领队模型（空闲会话立即热生效 · 支持任意 DSH 上游模型）'),
+              h('div', { style: { display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' } },
+                h('button', { style: btnStyle(false), onClick: onAutoWireHostModels, disabled: loading }, '✨ 一键用已连接模型配齐全部角色'),
+                h('label', { style: { fontSize: '12px' } },
+                  '写入目标：',
+                  h('select', { value: saveTarget, onChange: e => setSaveTarget(e.target.value), style: { ...inputStyle, marginLeft: '4px' } },
+                    h('option', { value: 'local' }, '本机覆盖 (leaderteam.local.json)'),
+                    h('option', { value: 'base' }, '基础配置 (leaderteam.config.json)')
+                  )
                 )
               )
             ),

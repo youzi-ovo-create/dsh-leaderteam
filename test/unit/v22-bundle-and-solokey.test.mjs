@@ -99,7 +99,7 @@ test('Solo-Key starter presets produce strictly valid frozen configs with active
     const validated = validateConfig(raw);
     assert.equal(validated.magpie.provider, preset.provider);
     assert.equal(validated.roles.leader.route, preset.reasoningRoute);
-    assert.equal(validated.team.leaderModelPolicy, 'warn');
+    assert.equal(validated.team.leaderModelPolicy, 'follow');
     assert.equal(validated.governance.mode, 'autonomous');
     assert.equal(validated.powerMonitor.enabled, true);
     assert.equal(validated.powerMonitor.pollIntervalMs, 720000);

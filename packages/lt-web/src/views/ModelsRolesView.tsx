@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { callLtApi, type HydratedBundle } from '../lib/api';
+import { autoAdoptHostModels, callLtApi, type HydratedBundle } from '../lib/api';
 import { Icon, type IconName } from '../components/Icon';
 import { StageHead } from '../components/AppShell';
 import { Dialog } from '../components/Overlays';
@@ -43,7 +43,7 @@ export function ModelsRolesView({
   const [localSaveTarget, setLocalSaveTarget] = useState<'local' | 'base'>(propSaveTarget || 'local');
   const [draftPool, setDraftPool] = useState<string[]>([]);
   const [draftRoles, setDraftRoles] = useState<Record<string, RoleAssignment>>({});
-  const [leaderPolicy, setLeaderPolicy] = useState<string>('warn');
+  const [leaderPolicy, setLeaderPolicy] = useState<string>('follow');
   const [isDirty, setIsDirty] = useState(false);
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
@@ -62,7 +62,7 @@ export function ModelsRolesView({
     if (isDirty) return;
     setDraftPool([...(bundle.runtime.modelPool.executionPool || [])]);
     setDraftRoles(structuredClone(bundle.runtime.roleAssignments || {}));
-    setLeaderPolicy(bundle.runtime.leaderModelPolicy || 'warn');
+    setLeaderPolicy(bundle.runtime.leaderModelPolicy || 'follow');
   }, [bundle, isDirty]);
 
   const localOverrides =
@@ -252,12 +252,28 @@ export function ModelsRolesView({
       setWarnings(warns);
       setIsDirty(false);
       notify(
-        `已写入 ${saveTarget === 'local' ? 'leaderteam.local.json' : 'leaderteam.config.json + YAML 补丁'}（执行池实时生效，治理角色对新建团队生效）`,
+        `已写入 ${saveTarget === 'local' ? 'leaderteam.local.json' : 'leaderteam.config.json + YAML 补丁'}（所有空闲会话已立即热生效；运行中的会话将在当前回合结束后自动切换）`,
         'check',
       );
       await onRefreshBundle();
     } catch (e: any) {
       setError(`保存配置失败：${e.message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleAutoWireAllRoles() {
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      await autoAdoptHostModels({ scope: 'global' });
+      setIsDirty(false);
+      await onRefreshBundle();
+      notify('已根据当前可用模型自动配齐全部角色与执行池，所有空闲会话已立即生效', 'check');
+    } catch (e: any) {
+      setError(`自动分配角色失败：${e.message}`);
     } finally {
       setBusy(false);
     }
@@ -623,6 +639,15 @@ export function ModelsRolesView({
             leading={leadingToggle}
             right={
               <div className="row" style={{ gap: 8 }}>
+                <button
+                  type="button"
+                  className="btn btn-sm"
+                  disabled={busy}
+                  onClick={() => void handleAutoWireAllRoles()}
+                  title="用当前已接入的模型一键配齐全部治理角色与成员池，无需逐项手填"
+                >
+                  ✨ 一键自动配齐角色
+                </button>
                 {isDirty && (
                   <button
                     type="button"
@@ -632,7 +657,7 @@ export function ModelsRolesView({
                       setIsDirty(false);
                       setDraftPool([...(bundle.runtime.modelPool.executionPool || [])]);
                       setDraftRoles(structuredClone(bundle.runtime.roleAssignments || {}));
-                      setLeaderPolicy(bundle.runtime.leaderModelPolicy || 'warn');
+                      setLeaderPolicy(bundle.runtime.leaderModelPolicy || 'follow');
                     }}
                   >
                     重置草稿
@@ -777,8 +802,33 @@ export function ModelsRolesView({
                 })}
               </div>
 
+              <div className="card" style={{ marginTop: 14, padding: '12px 16px' }}>
+                <div className="row-between" style={{ gap: 12, flexWrap: 'wrap' }}>
+                  <div className="col" style={{ gap: 2 }}>
+                    <b>DSH 会话手动切模型策略 (team.leaderModelPolicy)</b>
+                    <span className="t-meta">
+                      默认「自适应同步会话」：当您在 DSH 聊天框切换领队模型或推理强度时，自动同步到该会话（不污染全局、不报错）。仅在主动选择「严格锁定」时才会拦截不一致模型。
+                    </span>
+                  </div>
+                  <select
+                    className="input"
+                    style={{ width: 280 }}
+                    value={leaderPolicy}
+                    onChange={e => {
+                      setIsDirty(true);
+                      setLeaderPolicy(e.target.value);
+                    }}
+                  >
+                    <option value="follow">follow · 自适应同步当前会话（默认推荐）</option>
+                    <option value="warn">warn · 允许运行并提示不一致</option>
+                    <option value="enforce">enforce · 严格强制约束（不一致阻断）</option>
+                    <option value="off">off · 关闭校验</option>
+                  </select>
+                </div>
+              </div>
+
               <div className="row" style={{ marginTop: 16, gap: 10 }}>
-                <span className="t-meta">保存后事务化写入所选配置层，并同步至 DSH 设置（新建团队生效）。</span>
+                <span className="t-meta">保存后事务化写入所选配置层并同步至 DSH 设置：所有空闲会话立即热生效，运行中的会话将在安全边界切换。</span>
                 <span className="grow" />
                 <span className="row t-meta" style={{ gap: 6 }}>
                   <Icon name="check" className="icon-14" />

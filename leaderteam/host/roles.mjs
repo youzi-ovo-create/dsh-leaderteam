@@ -2,7 +2,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { runtime, baseRuntime, teamStore, runtimeForTeam, isPluginActive, activePluginsMap, effectiveRuntimeConfig, recordSessionModelRequest, resolveCanonicalRouteFromHostSelection } from './runtime.mjs';
+import { runtime, baseRuntime, teamStore, runtimeForTeam, isPluginActive, activePluginsMap, effectiveRuntimeConfig, recordSessionModelRequest, resolveCanonicalRouteFromHostSelection, syncSessionLeaderSelectionFromHost, flushPendingSessionConfigAtSafeBoundary } from './runtime.mjs';
 import { TeamStore } from '../core/store.mjs';
 import { leaderSection, memberSection, directExecSection, singleModeSection } from '../core/prompts.mjs';
 import { readSessionModeHistory } from '../core/session-mode.mjs';
@@ -607,13 +607,17 @@ export function onAgentStatus(ctx, { agent, status } = {}) {
   rt = runtimeForTeam(actor?.teamId);
   if (actor?.role === 'leader') {
     if (status === 'running') {
+      const syncSel = syncSessionLeaderSelectionFromHost(ctx, baseRuntime(rt), agent, { atUserTurnStart: true });
+      rt = runtimeForTeam(actor.teamId);
       const liveMode = getSessionExecutionMode(rt, actor.teamId);
-      if (actor.executionMode !== liveMode || actor.promptAppliedMode !== liveMode) {
+      if (syncSel?.appliedImmediately || actor.executionMode !== liveMode || actor.promptAppliedMode !== liveMode) {
         syncLeaderAgentMode(ctx, rt, actor.teamId);
       }
       return;
     }
     if (status === 'idle') {
+      flushPendingSessionConfigAtSafeBoundary(ctx, baseRuntime(rt), actor.teamId);
+      rt = runtimeForTeam(actor.teamId);
       if (getSessionExecutionMode(rt, actor.teamId) === 'single') {
         maybeRecoverSingleLeaderMaxTokens(rt, actor, agent);
         return;

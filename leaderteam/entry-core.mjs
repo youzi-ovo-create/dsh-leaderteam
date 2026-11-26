@@ -1,10 +1,13 @@
 // DSH plugin row "leaderteam-core" (profile root): config, safety gate, team roles.
+import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadConfig } from './core/config.mjs';
+import { writeFileAtomic } from './core/store.mjs';
 import { resolveOrBootstrapConfigPath, buildSoloProviderSettingsTemplates } from './core/solo-key.mjs';
-import { isPluginActive, runtimeForTeam, runtime, bindRuntimeConfigFile, refreshUpstreamCatalog, effectiveRuntimeConfig } from './host/runtime.mjs';
+import { buildAutoAdoptedLocalOverrideFromDshModels } from './core/session-config.mjs';
+import { isPluginActive, runtimeForTeam, runtime, bindRuntimeConfigFile, syncRuntimeConfig, refreshUpstreamCatalog, effectiveRuntimeConfig, syncSessionLeaderSelectionFromHost, flushPendingSessionConfigAtSafeBoundary, rebindAllIdleSessionsOnGlobalUserSave } from './host/runtime.mjs';
 import { syncUpstreamModelsToDshSettings, resolveModelTarget } from './core/upstream-models.mjs';
 import { onAgentCreated, onAgentPresetSelected, onAgentDisposed, onAgentStatus, onAgentError, onSessionEvent, onToolResult, shouldApplyDefaultLeaderModel } from './host/roles.mjs';
 import { bindHostImports } from './host/host-imports.mjs';
@@ -105,8 +108,13 @@ export function apply(ctx, config) {
     if ((!rt.cordisCompositionMode || rt.plugins.timerArchive) && rt.config.plugins?.timerArchive !== false) {
       hostTimerArchive.syncArchivedMemberStatuses(teamId, taskSeq, runtimeForTeam(teamId));
     }
+    try { flushPendingSessionConfigAtSafeBoundary(ctx, rt, teamId); } catch {}
   };
   rt.onLeaderUserMessage = (hookCtx, teamId) => {
+    const preActor = rt.actors.get(teamId);
+    if (preActor?.agent) {
+      try { syncSessionLeaderSelectionFromHost(hookCtx, rt, preActor.agent, { atUserTurnStart: true }); } catch {}
+    }
     const teamRt = runtimeForTeam(teamId), actor = rt.actors.get(teamId);
     const latestMsg = userMessageTexts(hookCtx, teamId).at(-1) ?? '';
     if (latestMsg && !isReadGrantOnlyMessage(latestMsg)) {
@@ -153,6 +161,7 @@ export function apply(ctx, config) {
     if ((!rt.cordisCompositionMode || rt.plugins.scheduler) && rt.config.plugins?.scheduler !== false) {
       try { hostConcurrency.onLeaderTurnCompleted(hookCtx, teamId); } catch {}
     }
+    try { flushPendingSessionConfigAtSafeBoundary(hookCtx, rt, teamId); } catch {}
   };
   rt.onLeaderIdle = (hookCtx, teamId) => {
     if (runtimeForTeam(teamId).config.team.rollingPlanning && frontierNeedsPlanning(teamStore(teamId), currentTaskSeq(hookCtx, teamId))) return false;
@@ -222,6 +231,31 @@ export function apply(ctx, config) {
     }
     return syncRes;
   };
+  const maybeAutoAdoptHostModels = cat => {
+    if (!cat?.models?.length || rt.planningDisposed || !rt.configPath) return false;
+    if (resolvedCfg.mode !== 'solo-deepseek-default') return false;
+    const localFile = path.basename(rt.configPath) === 'leaderteam.config.json'
+      ? path.join(path.dirname(rt.configPath), 'leaderteam.local.json')
+      : null;
+    if (!localFile || fs.existsSync(localFile)) return false;
+    // Only auto-adopt when the user actually configured non-placeholder models in DSH Settings and has no DeepSeek env key
+    if (process.env.DEEPSEEK_API_KEY) return false;
+    const realHostModels = cat.models.filter(
+      m => m.registeredInDsh && m.route && !m.route.startsWith('deepseek-official/'),
+    );
+    if (realHostModels.length === 0) return false;
+    const adopted = buildAutoAdoptedLocalOverrideFromDshModels(realHostModels);
+    if (!adopted) return false;
+    try {
+      writeFileAtomic(localFile, `${JSON.stringify(adopted, null, 2)}\n`);
+      syncRuntimeConfig(rt);
+      rebindAllIdleSessionsOnGlobalUserSave(rt, { principal: { kind: 'user', source: 'onboarding' } });
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
   rt.initialSettingsSyncPromise = null;
   rt.upstreamCatalog = null;
   let activeSettingsCtx = ctx;
@@ -233,7 +267,11 @@ export function apply(ctx, config) {
       if (microtaskStarted) {
         chain = chain
           .then(() => refreshUpstreamCatalog(settingsCtx, rt, { force: true, probeEndpoints: true }))
-          .then(cat => (cat && !rt.planningDisposed ? syncConfiguredModelsToHostSettings(settingsCtx) : null))
+          .then(cat => {
+            if (!cat || rt.planningDisposed) return null;
+            maybeAutoAdoptHostModels(cat);
+            return syncConfiguredModelsToHostSettings(settingsCtx);
+          })
           .catch(() => null);
       } else if (rt.upstreamCatalog) {
         chain = chain.then(() => syncConfiguredModelsToHostSettings(settingsCtx).catch(() => null));
@@ -248,6 +286,7 @@ export function apply(ctx, config) {
       .then(() => refreshUpstreamCatalog(activeSettingsCtx, rt, { force: true, probeEndpoints: true }))
       .then(cat => {
         if (!cat || rt.planningDisposed) return;
+        maybeAutoAdoptHostModels(cat);
         return syncConfiguredModelsToHostSettings(activeSettingsCtx);
       })
       .catch(() => {});

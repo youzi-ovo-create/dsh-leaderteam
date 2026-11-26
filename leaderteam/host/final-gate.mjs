@@ -26,7 +26,8 @@ import {
 import { frontierState } from '../core/frontier.mjs';
 import { boundJson, sanitizeArguments } from '../core/redact.mjs';
 import { GATE_DENIED_CODE, GATE_DENIED_NAME } from '../core/constants.mjs';
-import { pathKey } from '../core/paths.mjs';
+import { pathKey, resolvePath } from '../core/paths.mjs';
+import { isProtectedLeaderTeamConfigPath } from '../core/session-config.mjs';
 import { readQuotaStateFile } from '../core/quota.mjs';
 import { quotaGate } from '../core/models.mjs';
 import { replay, nextAction } from '../core/agreement.mjs';
@@ -178,6 +179,14 @@ export function installFinalGate(supportedVersionsOrOptions) {
     }
     const isShell = Boolean(runtimeForTeam(actor.teamId).config?.gate?.shellTools?.includes(name));
     const sessionKey = actor.teamId ?? agent?.id ?? null;
+    const baseRtForFlight = runtime();
+    if (sessionKey) {
+      baseRtForFlight.inFlightToolDispatchesByTeam ??= new Map();
+      baseRtForFlight.inFlightToolDispatchesByTeam.set(
+        sessionKey,
+        (baseRtForFlight.inFlightToolDispatchesByTeam.get(sessionKey) ?? 0) + 1,
+      );
+    }
     if (isShell) {
       const baseRt = runtime();
       baseRt.scheduler?.beginShellCall?.();
@@ -189,6 +198,11 @@ export function installFinalGate(supportedVersionsOrOptions) {
     try {
       return await original.call(this, exec);
     } finally {
+      if (sessionKey && baseRtForFlight.inFlightToolDispatchesByTeam) {
+        const nextToolCnt = (baseRtForFlight.inFlightToolDispatchesByTeam.get(sessionKey) ?? 1) - 1;
+        if (nextToolCnt <= 0) baseRtForFlight.inFlightToolDispatchesByTeam.delete(sessionKey);
+        else baseRtForFlight.inFlightToolDispatchesByTeam.set(sessionKey, nextToolCnt);
+      }
       if (isShell) {
         const baseRt = runtime();
         baseRt.scheduler?.endShellCall?.();
@@ -223,6 +237,39 @@ export class Gate {
     const cfg = rt.config;
     const unreadRefs = actor.role === 'member' ? (actor.refs ?? []).filter(r => !(rt.reads.get(agent.id)?.has(pathKey(r)))) : [];
     const cwd = typeof agent?.session?.header?.cwd === 'string' ? agent.session.header.cwd : actor.cwd;
+    const baseRt = runtime();
+    // Enforce Agent-vs-User separation at filesystem boundary: agents may NEVER mutate LeaderTeam global or session config files.
+    if (cfg.gate?.mutatingTools?.includes(name)) {
+      const argKeys = [...new Set([...(cfg.gate?.pathArgs?.[name] ?? []), 'file_path', 'path'])];
+      for (const k of argKeys) {
+        const rawTarget = args?.[k];
+        if (typeof rawTarget === 'string' && rawTarget.trim()) {
+          const resolved = resolvePath(rawTarget, cwd) ?? rawTarget;
+          if (isProtectedLeaderTeamConfigPath(resolved, { storageRoot: baseRt.storageRoot, configPath: baseRt.configPath })) {
+            return {
+              rule: 'protected-lt-config',
+              reason: 'Agent processes are forbidden from modifying LeaderTeam global or session configuration files; only user-initiated actions are permitted.',
+            };
+          }
+        }
+      }
+    }
+    if (cfg.gate?.shellTools?.includes(name) && typeof args?.command === 'string') {
+      const cmdLower = args.command.toLowerCase();
+      if (
+        cmdLower.includes('leaderteam.config.json') ||
+        cmdLower.includes('leaderteam.local.json') ||
+        cmdLower.includes('session-config.json') ||
+        (cmdLower.includes('governance.json') && cmdLower.includes('teams'))
+      ) {
+        if (/(?:>|tee\b|sed\s+-i|mv\b|cp\b|rm\b|python|node\s+-e|writefile)/i.test(args.command)) {
+          return {
+            rule: 'protected-lt-config',
+            reason: 'Shell commands initiated by an agent may not modify LeaderTeam configuration or governance files.',
+          };
+        }
+      }
+    }
     const userTexts = actor.role === 'leader' ? () => userMessageTexts(this.ctx, actor.teamId) : undefined; // read grants; evaluated only when a leader read leaves the standing roots
     const rawSessionId = typeof agent?.session?.id === 'string' ? agent.session.id : (typeof agent?.session?.header?.id === 'string' ? agent.session.header.id : '');
     const ownSpillSessionSegment = rawSessionId ? `session-${createHash('sha256').update(rawSessionId).digest('hex').slice(0, 12)}` : undefined;

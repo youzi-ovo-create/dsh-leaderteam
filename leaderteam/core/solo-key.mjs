@@ -210,7 +210,7 @@ export function buildSoloKeyStarterConfig(baseRawConfig, { preset = SOLO_PROVIDE
 
   cfg.team = {
     ...cfg.team,
-    leaderModelPolicy: 'warn',
+    leaderModelPolicy: 'follow',
     executionPool: cRoute !== rRoute ? [cRoute, rRoute] : [rRoute],
     autoIncludeUpstreamModels: true,
     disabledModels: [],
@@ -221,7 +221,7 @@ export function buildSoloKeyStarterConfig(baseRawConfig, { preset = SOLO_PROVIDE
     ...cfg.quota,
     stateFile: null,
     allowUnknown: true,
-    allowUnknownGpt: preset.family === 'gpt',
+    allowUnknownGpt: true,
   };
 
   return cfg;

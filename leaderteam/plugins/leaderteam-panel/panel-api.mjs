@@ -10,11 +10,25 @@ import { inspectModelConfiguration, applyModelConfigChanges } from '../../core/m
 import { recentTeamObservability } from '../../host/observability.mjs';
 import {
   runtime,
+  baseRuntime,
+  runtimeForTeam,
   syncRuntimeConfig,
   activePluginsMap,
   isPluginActive,
   refreshUpstreamCatalog,
+  inspectSessionBusyForConfig,
+  effectiveSessionConfig,
+  rebindTeamGovernanceSnapshot,
+  rebindAllIdleSessionsOnGlobalUserSave,
 } from '../../host/runtime.mjs';
+import { resolveModelTarget } from '../../core/upstream-models.mjs';
+import {
+  readSessionConfigRecord,
+  hasActiveSessionOverride,
+  hasPendingSessionOverride,
+  mutateSessionConfig,
+  buildAutoAdoptedLocalOverrideFromDshModels,
+} from '../../core/session-config.mjs';
 import {
   EXECUTION_MODES,
   DEFAULT_EXECUTION_MODE,
@@ -54,6 +68,7 @@ export const PANEL_ROUTES = Object.freeze({
   RETROSPECT: '/api/leaderteam-panel/retrospect',
   CLEAN: '/api/leaderteam-panel/clean',
   SESSION_MODE: '/api/leaderteam-panel/session-mode',
+  SESSION_CONFIG: '/api/leaderteam-panel/session-config',
   UPDATE: '/api/leaderteam-panel/update',
   ONBOARDING: '/api/leaderteam-panel/onboarding',
 });
@@ -267,7 +282,18 @@ export async function buildPanelStateSnapshot(ctx, rt = runtime(), { probeEndpoi
     upstreamCatalog: catalog ?? { discoveredAt: null, providers: [], models: [], endpointErrors: [] },
     timers: collectRecentTeamTimers(rt),
     teams: recentTeamObservability(ctx,rt),
-    sessionModes: await collectKnownSessionModeItems(ctx, rt),
+    sessionModes: (await collectKnownSessionModeItems(ctx, rt)).map(item => {
+      if (!item?.sessionId || !rt?.storageRoot) return item;
+      const rec = readSessionConfigRecord(rt.storageRoot, item.sessionId);
+      const eff = runtimeForTeam(item.sessionId)?.config ?? rt.config;
+      return {
+        ...item,
+        hasSessionConfigOverride: hasActiveSessionOverride(rec),
+        hasPendingSessionConfig: hasPendingSessionOverride(rec),
+        effectiveLeaderRoute: eff?.roles?.leader?.route ?? null,
+        effectiveLeaderEffort: eff?.roles?.leader?.effort ?? null,
+      };
+    }),
     archive: archiveView,
     hostCompatibility: rt?.hostCompatibility ?? null,
     compatibilityMatrix: getHostCompatibilityMatrix({
@@ -338,11 +364,15 @@ export function createPanelHandlers(ctx, rt = runtime(), options = {}) {
           target,
           dryRun: Boolean(body.dryRun),
           discoveredModels,
+          autoAlignRoleEfforts: true,
         });
         let dshSettingsSync = { synced: false, reason: 'dry-run' };
         const warnings = [...(applyResult.warnings ?? [])];
         if (!body.dryRun) {
           syncRuntimeConfig(rt);
+          rebindAllIdleSessionsOnGlobalUserSave(rt, {
+            principal: { kind: 'user', source: 'panel-api' },
+          });
           dshSettingsSync = await syncActiveModelsToDshHost(
             ctx,
             rt,
@@ -511,6 +541,111 @@ export function createPanelHandlers(ctx, rt = runtime(), options = {}) {
       }
     },
 
+    async sessionConfig(request) {
+      try {
+        syncRuntimeConfig(rt);
+        const body = await parseBody(request);
+        const action = String(body.action || 'get').trim().toLowerCase();
+        const principal = { kind: 'user', source: 'panel-api' };
+        const { gwStatus, discoveredModels } = await collectCombinedDiscoveredModels(ctx, rt);
+
+        if (action === 'auto-adopt-host') {
+          const poolCandidates = discoveredModels?.length > 0 ? discoveredModels : [];
+          const adopted = buildAutoAdoptedLocalOverrideFromDshModels(poolCandidates);
+          if (!adopted) return errReply('NO_USABLE_MODELS', '未发现可用的已连接 DSH 模型，请先在 DSH 设置或新手引导中连接模型。', 400);
+          const setRoles = Object.entries(adopted.roles).map(([role, spec]) => ({ role, ...spec }));
+          const upsertModels = Object.entries(adopted.models).map(([route, spec]) => ({ route, ...spec }));
+          applyModelConfigChanges(
+            { upsertModels, poolSet: adopted.team.executionPool, setRoles, leaderModelPolicy: 'follow' },
+            { configFile: rt.configPath, target: 'local', discoveredModels, autoAlignRoleEfforts: true },
+          );
+          syncRuntimeConfig(rt);
+          const idleRebind = rebindAllIdleSessionsOnGlobalUserSave(rt, { principal });
+          await syncActiveModelsToDshHost(ctx, rt, rt.config, discoveredModels, gwStatus).catch(() => null);
+          return okReply({ idleRebind, state: await buildPanelStateSnapshot(ctx, rt) });
+        }
+
+        const sessionId = typeof body.sessionId === 'string' ? body.sessionId.trim() : '';
+        if (!sessionId) return errReply('BAD_SESSION_ID', 'sessionId is required', 400);
+        const busy = inspectSessionBusyForConfig(rt, sessionId);
+
+        if (action === 'get') {
+          const rec = readSessionConfigRecord(rt.storageRoot, sessionId);
+          const eff = effectiveSessionConfig(rt, sessionId) ?? rt.config;
+          return okReply({
+            sessionId,
+            hasOverride: hasActiveSessionOverride(rec),
+            hasPending: hasPendingSessionOverride(rec),
+            isBusy: busy.busy,
+            busyReasons: busy.reasons,
+            record: rec,
+            effective: {
+              roles: eff?.roles ?? {},
+              executionPool: eff?.team?.executionPool ?? [],
+              maxActiveMembers: eff?.team?.maxActiveMembers ?? 6,
+              leaderModelPolicy: eff?.team?.leaderModelPolicy ?? 'follow',
+            },
+          });
+        }
+
+        if (action === 'set') {
+          const rawPatch = isPlainObj(body.patch) ? body.patch : {};
+          const mut = mutateSessionConfig({
+            storageRoot: rt.storageRoot,
+            sessionId,
+            baseConfig: rt.config,
+            patch: { ...rawPatch, ...(body.syncAllRolesToLeader ? { syncAllRolesToLeader: true } : {}) },
+            action: body.replaceAll ? 'set' : 'merge',
+            principal,
+            isBusy: busy.busy,
+            busyReasons: busy.reasons,
+            discoveredModels,
+          });
+          if (mut.appliedImmediately) {
+            rebindTeamGovernanceSnapshot(rt, sessionId, { principal, forceAtSafeBoundary: true });
+            const baseRt = baseRuntime(rt);
+            const liveAgent = baseRt?.actors?.get?.(sessionId)?.agent ?? baseRt?.hostAgents?.get?.(sessionId) ?? null;
+            if (liveAgent && typeof liveAgent.model?.select === 'function' && rawPatch.roles?.leader) {
+              try {
+                const effCfg = runtimeForTeam(sessionId).config;
+                liveAgent.model.select(resolveModelTarget(effCfg, effCfg.roles.leader.route, effCfg.roles.leader.effort));
+              } catch {}
+            }
+          }
+          return okReply({
+            appliedImmediately: mut.appliedImmediately,
+            stagedForSafeBoundary: mut.stagedForSafeBoundary,
+            busyReasons: mut.busyReasons,
+            state: await buildPanelStateSnapshot(ctx, rt),
+          });
+        }
+
+        if (action === 'reset') {
+          const mut = mutateSessionConfig({
+            storageRoot: rt.storageRoot,
+            sessionId,
+            baseConfig: rt.config,
+            action: 'reset',
+            principal,
+            isBusy: busy.busy,
+            busyReasons: busy.reasons,
+          });
+          if (mut.appliedImmediately) {
+            rebindTeamGovernanceSnapshot(rt, sessionId, { principal, forceAtSafeBoundary: true });
+          }
+          return okReply({
+            appliedImmediately: mut.appliedImmediately,
+            stagedForSafeBoundary: mut.stagedForSafeBoundary,
+            state: await buildPanelStateSnapshot(ctx, rt),
+          });
+        }
+
+        return errReply('BAD_ACTION', `Unsupported session-config action: ${action}`, 400);
+      } catch (e) {
+        return errReply(e?.code ?? 'PANEL_SESSION_CONFIG_FAILED', e instanceof Error ? e.message : String(e), e?.statusCode ?? 200);
+      }
+    },
+
     async update(request) {
       try {
         syncRuntimeConfig(rt);
@@ -611,6 +746,7 @@ export function registerPanelRoutes(effectScope, connection, ctxForHandlers, rt 
     [PANEL_ROUTES.RETROSPECT, handlers.retrospect, 'leaderteam-panel:retrospect'],
     [PANEL_ROUTES.CLEAN, handlers.clean, 'leaderteam-panel:clean'],
     [PANEL_ROUTES.SESSION_MODE, handlers.sessionMode, 'leaderteam-panel:session-mode'],
+    [PANEL_ROUTES.SESSION_CONFIG, handlers.sessionConfig, 'leaderteam-panel:session-config'],
     [PANEL_ROUTES.UPDATE, handlers.update, 'leaderteam-panel:update'],
     [PANEL_ROUTES.ONBOARDING, handlers.onboarding, 'leaderteam-panel:onboarding'],
   ];

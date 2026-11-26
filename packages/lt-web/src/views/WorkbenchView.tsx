@@ -2,6 +2,7 @@ import React, { useEffect, useState, useCallback, useRef } from 'react';
 import {
   LtApiError,
   callLtApi,
+  fetchWorkbenchSessionConfig,
   fetchWorkbenchSessionMode,
   formatClockTime,
   formatDurationMs,
@@ -10,10 +11,12 @@ import {
   formatSessionUpdatedLabel,
   switchWorkbenchSessionMode,
   type HydratedBundle,
+  type SessionScopedConfigSnapshot,
 } from '../lib/api';
 import { HeluoxuHorizonMark, HeluoxuMark } from '../components/HeluoxuMark';
 import { Icon, type IconName } from '../components/Icon';
 import { Splitter } from '../components/AppShell';
+import { SessionConfigModal } from '../components/SessionConfigModal';
 import { UnknownValue } from '../components/UnknownValue';
 import type { ExecutionMode, SessionModeSnapshot, TeamObservation } from '../types/lt-public-v1';
 
@@ -186,6 +189,24 @@ export function WorkbenchView({
   const [showLockDetails, setShowLockDetails] = useState(false);
   const [showNewSessionPanel, setShowNewSessionPanel] = useState(false);
   const [hasUnreadBelow, setHasUnreadBelow] = useState(false);
+  const [showSessionConfig, setShowSessionConfig] = useState(false);
+  const [sessionConfigSnap, setSessionConfigSnap] = useState<SessionScopedConfigSnapshot | null>(null);
+
+  useEffect(() => {
+    if (!selectedSessionId) {
+      setSessionConfigSnap(null);
+      return;
+    }
+    let cancelled = false;
+    fetchWorkbenchSessionConfig(selectedSessionId)
+      .then(s => {
+        if (!cancelled) setSessionConfigSnap(s);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedSessionId, passiveRunning]);
 
   const selectedSessionIdRef = useRef<string>(selectedSessionId);
   selectedSessionIdRef.current = selectedSessionId;
@@ -945,6 +966,24 @@ export function WorkbenchView({
                   DSH 原生
                 </span>
               )
+            )}
+
+            {selectedSessionId && isLtSession && (
+              <button
+                type="button"
+                className="btn btn-sm"
+                onClick={() => setShowSessionConfig(true)}
+                title="仅修改当前会话的模型、角色与并发配置（不影响全局与其他会话）"
+              >
+                <Icon name="sliders" className="icon-14" />
+                <span>
+                  {sessionConfigSnap?.hasPending
+                    ? '本会话待切换'
+                    : sessionConfigSnap?.hasOverride
+                      ? `本会话专属 · ${sessionConfigSnap.effective.roles?.leader?.route?.split('/').pop() || '已定制'}`
+                      : '本会话模型配置'}
+                </span>
+              </button>
             )}
 
             {showLockDetails && isLtSession && isSwitchLockedByBusy && (
@@ -1850,6 +1889,17 @@ export function WorkbenchView({
           </>
         )}
       </aside>
+
+      <SessionConfigModal
+        open={showSessionConfig}
+        sessionId={selectedSessionId || null}
+        sessionTitle={selectedSession?.title}
+        bundle={bundle}
+        onClose={() => setShowSessionConfig(false)}
+        onRefreshBundle={onRefreshBundle}
+        onSaved={nextSnap => setSessionConfigSnap(nextSnap)}
+        onNotify={onNotify}
+      />
     </div>
   );
 }

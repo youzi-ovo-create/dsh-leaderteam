@@ -157,6 +157,7 @@ export async function startStandaloneLtUiServer({
     [PUBLIC_API_ROUTES.WORKBENCH_PROMPT, handlers.workbenchPrompt],
     [PUBLIC_API_ROUTES.WORKBENCH_CANCEL, handlers.workbenchCancel],
     [PUBLIC_API_ROUTES.WORKBENCH_MODE, handlers.workbenchMode],
+    [PUBLIC_API_ROUTES.WORKBENCH_SESSION_CONFIG, handlers.workbenchSessionConfig],
     [PUBLIC_API_ROUTES.ARCHIVE_QUERY, handlers.archiveQuery],
     [PUBLIC_API_ROUTES.ARCHIVE_ACTION, handlers.archiveAction],
     [PUBLIC_API_ROUTES.USAGE_STATUS, handlers.usageStatus],

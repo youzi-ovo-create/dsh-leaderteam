@@ -469,10 +469,12 @@ export async function applyQuickOnboardingSetup({
       upsertModels,
       poolSet: starterCfg.team.executionPool,
       setRoles,
+      leaderModelPolicy: 'follow',
     },
     {
       configFile: configPath,
       target: 'local',
+      autoAlignRoleEfforts: true,
     },
   );
 
