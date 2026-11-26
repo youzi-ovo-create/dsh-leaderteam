@@ -289,16 +289,21 @@ async function main() {
     assert.ok(!pat.re.test(gitDiffText), `Leak audit failed in git history (${pat.name})`);
   }
 
-  // Verify original `/home/dev/workspace/Leader Team/leaderteam-v2.2-dev` outside `open-source-v2.2.x` is untouched!
-  const outerGitStatus = runSync('git', ['status', '--porcelain'], {
-    cwd: path.resolve(ossRoot, '..', 'leaderteam-v2.2-dev'),
-  });
-  assert.equal(outerGitStatus.trim(), '', 'Outer leaderteam-v2.2-dev repository must remain 100% unmodified');
+  // Verify original `/home/dev/workspace/Leader Team/leaderteam-v2.2-dev` outside `open-source-v2.2.x` is untouched when present!
+  const outerRepoDir = path.resolve(ossRoot, '..', 'leaderteam-v2.2-dev');
+  let outerBaselineRepoClean = 'skipped-standalone-layout';
+  if (fs.existsSync(path.join(outerRepoDir, '.git'))) {
+    const outerGitStatus = runSync('git', ['status', '--porcelain'], {
+      cwd: outerRepoDir,
+    });
+    assert.equal(outerGitStatus.trim(), '', 'Outer leaderteam-v2.2-dev repository must remain 100% unmodified');
+    outerBaselineRepoClean = true;
+  }
 
   report.steps.leakAndIsolationAudit = {
     ok: true,
     commitsAuditedRange: '1fda9f0..HEAD',
-    outerBaselineRepoClean: true,
+    outerBaselineRepoClean,
   };
   report.completedAt = new Date().toISOString();
 
