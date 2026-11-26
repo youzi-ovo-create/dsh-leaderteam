@@ -59,7 +59,7 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
 test('root package.json and cordis.patch.yml conform to official DSH bundle rules', () => {
   const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
   assert.equal(pkg.name, 'dsh-leaderteam');
-  assert.equal(pkg.version, '2.2.0');
+  assert.equal(pkg.version, '2.2.1');
   assert.equal(pkg.license, 'Apache-2.0');
   assert.equal(pkg.dsh?.bundle?.patch, './cordis.patch.yml');
   assert.equal(pkg.dsh?.client?.platform, 'web');

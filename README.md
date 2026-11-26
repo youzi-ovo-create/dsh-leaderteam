@@ -1,6 +1,6 @@
 # LeaderTeam for DeepSeek Harness (V2.2)
 
-![Version](https://img.shields.io/badge/version-2.2.0-blue)
+![Version](https://img.shields.io/badge/version-2.2.1-blue)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows-success)
 ![DSH Host](https://img.shields.io/badge/DeepSeek%20Harness-0.2.2--rc.1%20%7C%200.2.2--rc.5-5b6ee1)
 ![Node.js](https://img.shields.io/badge/node-%3E%3D22.15-339933)
@@ -25,19 +25,19 @@ LeaderTeam 是运行在 **DeepSeek Harness（Linux & Windows）** 上的长周�
   - 已端到端实机验真的 **DeepSeek Harness `0.2.2-rc.1` 或 `0.2.2-rc.5`**（未实机放行的中间版本如 `rc.2–rc.4` 或未知新版本默认保持 Fail-Closed 拒绝加载，可通过 `lt-doctor --check-host` 离线预检）；
   - 实机验证平台为 **Linux（x86_64 / WSL2）与 Windows**（底层 POSIX 路径兼容类 Unix 环境，macOS 暂未纳入官方真机验收矩阵）；Linux 下执行 `dsh plugin add` 需确保 `PATH` 中包含 `node` 与 `pnpm`（可通过 `corepack enable pnpm` 启用）。
 
-> **安装源说明**：当前稳定版通过 [GitHub Releases](https://github.com/youzi-ovo-create/dsh-leaderteam/releases/tag/v2.2.0) 分发离线 `.tgz` 插件包（公共 npm registry 尚未上架，请直接安装 `.tgz` 包或本地克隆目录）：
+> **安装源说明**：当前稳定版通过 [GitHub Releases](https://github.com/youzi-ovo-create/dsh-leaderteam/releases/tag/v2.2.1) 分发离线 `.tgz` 插件包（公共 npm registry 尚未上架，请直接安装 `.tgz` 包或本地克隆目录）：
 
 ```bash
-# 1. 从 GitHub Release 下载 v2.2.0 标准插件包
-curl -fLO https://github.com/youzi-ovo-create/dsh-leaderteam/releases/download/v2.2.0/dsh-leaderteam-2.2.0.tgz
+# 1. 从 GitHub Release 下载 v2.2.1 标准插件包
+curl -fLO https://github.com/youzi-ovo-create/dsh-leaderteam/releases/download/v2.2.1/dsh-leaderteam-2.2.1.tgz
 
 # 2A. Linux / Web CLI Profile 安装
-dsh plugin --profile web add ./dsh-leaderteam-2.2.0.tgz
+dsh plugin --profile web add ./dsh-leaderteam-2.2.1.tgz
 
 # 2B. 官方 Windows Desktop Profile 安装
 # （若此前用 V2.1 install-desktop.ps1 注入过旧补丁，先在克隆仓内运行一次清理，会自动备份原文件：
 #   node bin/lt-doctor.mjs --clean-legacy-patch ）
-dsh plugin --profile desktop add ./dsh-leaderteam-2.2.0.tgz
+dsh plugin --profile desktop add ./dsh-leaderteam-2.2.1.tgz
 ```
 
 > 若已 `git clone` 本仓库，也可在仓库根目录直接执行 `dsh plugin --profile web add .`；Windows 旧版脚本备份恢复流程见《[官方 Desktop 部署与恢复](docs/官方Desktop部署与恢复.md)》。
@@ -77,7 +77,7 @@ dsh plugin --profile desktop add ./dsh-leaderteam-2.2.0.tgz
 
 ### 阶梯 1：`¥0` 纯离线单元测试验证（零模型调用、不依赖客户端）
 
-克隆仓库后直接验证安全门硬规则、四阶段自治状态机、Linux `cgroup v2/v1` 并发调度、5h 窗口节流与电量状态机（共 289 项跨平台单测）：
+克隆仓库后直接验证安全门硬规则、四阶段自治状态机、Linux `cgroup v2/v1` 并发调度、5h 窗口节流与电量状态机（共 296 项跨平台单测）：
 
 ```bash
 node --test "test/unit/*.test.mjs"
@@ -115,7 +115,10 @@ node bin/lt-bugreport.mjs --out lt-bugreport.md
 
 ### 架构文档与实跑基准报告
 
-- **实跑基准与横向对照**：[V2.1 双项复杂工程实跑测评报告（自举编译器 & 存量生态账本插件，含耗时/成本客观劣势披露）](docs/benchmarks/LeaderTeam_V2.1_双项工程实跑测评报告.md)
+- **实跑基准与演进分析**：
+  - [V2.2 工程实证报告：49 分钟完成 Linux 跨语言核心模块自举与宿主集成](docs/benchmarks/LeaderTeam_V2.2_Linux跨语言自举工程实证报告.md)（附 [脱敏验收回执与账本核算脚本](docs/benchmarks/evidence/v2.2-linux-selfhost/README.md)）
+  - [V1.1–V2.2：基于五项真实工程实测的架构演进与发展潜力分析](docs/benchmarks/LeaderTeam_V1.1至V2.2_架构演进与发展潜力分析.md)
+  - [V2.1 双项复杂工程实跑测评报告（自举编译器 & 存量生态账本插件，含耗时/成本客观劣势披露）](docs/benchmarks/LeaderTeam_V2.1_双项工程实跑测评报告.md)
 - **核心设计与接口契约**：[架构总览与设计决定](docs/00-总览.md) · [配置与接口参考](docs/01-配置与接口.md) · [按需工具与技能](docs/07-按需工具与技能.md) · [可视化与用量账本](docs/08-可视化与用量.md)
 - **日常操作与客户端维护**：[使用指南](docs/使用指南.md) · [官方 Desktop 部署与恢复](docs/官方Desktop部署与恢复.md) · [官方客户端更新复验](docs/官方Desktop更新复验.md) · [CHANGELOG.md](CHANGELOG.md)
 - **开源许可**：本项目采用 [Apache License 2.0](LICENSE) 许可发布，第三方组件声明见 [leaderteam/NOTICE](leaderteam/NOTICE)。

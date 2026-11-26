@@ -1,11 +1,13 @@
 {
   "name": "dsh-leaderteam-internal",
-  "version": "2.2.0",
+  "version": "2.2.1",
   "private": true,
   "description": "LeaderTeam V2.2 core runtime for DeepSeek Harness (Linux & Windows): autonomous leader execution, 0ms deterministic safety gate, Solo-Key bootstrap, 5h request-window guard, and battery-aware graceful shutdown.",
   "type": "module",
   "license": "Apache-2.0",
-  "engines": { "node": ">=22.15" },
+  "engines": {
+    "node": ">=22.15"
+  },
   "leaderteam": {
     "supportedCoreVersions": [
       "0.2.2-rc.1",

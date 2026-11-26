@@ -1,6 +1,6 @@
 {
   "name": "@leaderteam/plugin-scheduler",
-  "version": "2.2.0",
+  "version": "2.2.1",
   "private": true,
   "type": "module",
   "description": "Detachable LeaderTeam elastic concurrency & device-load scheduler plugin.",
