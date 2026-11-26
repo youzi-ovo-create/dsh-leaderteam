@@ -659,6 +659,94 @@ test('V2.2.1 [Provider Pair Fallback, Policy Refusal Stop, & 5h Retry Accounting
     assert.equal(gServer.decision, 'deny');
     assert.equal(gServer.by, 'gate-error');
     assert.match(gServer.reason, /safe to retry/);
+
+    // 6. Delivery submission binding & legacy 857c9a6 policy-refusal replay:
+    //    - Verbatim repeat stays deduplicated (`callsA=1, callsB=1`)
+    //    - Revising `evidence` or `proposal` under the same `summary`/`targets` obtains fresh A & B opinions!
+    let dCallsA = 0;
+    let dCallsB = 0;
+    let dRefuseA = true;
+    rt.llm = {
+      async *stream(opts) {
+        if (opts.model.startsWith('zcode/')) {
+          dCallsA++;
+          if (dRefuseA) {
+            yield { type: 'finish', reason: { kind: 'error', failure: { code: 'CONTENT_REFUSED', message: 'refused' } } };
+            return;
+          }
+        } else {
+          dCallsB++;
+        }
+        yield {
+          type: 'text-delta',
+          text: JSON.stringify({ stance: 'endorse', intervene: false, summary: 'ok', concerns: [], suggestions: [], target_paths: ['src/a.js'] }),
+        };
+        yield { type: 'finish', reason: { kind: 'stop' } };
+      },
+    };
+    const delivStore = new TeamStore(tmp, 'team-v221-deliv');
+    delivStore.ensure({ workspace: ws, surface: 'headless' });
+    const delivActor = { role: 'leader', teamId: 'team-v221-deliv', agentId: 'team-v221-deliv', cwd: ws };
+    rt.stores.set('team-v221-deliv', delivStore);
+    rt.actors.set('team-v221-deliv', delivActor);
+
+    const dj1 = queueAsyncSupervision({
+      ctx: {}, rt, store: delivStore, actor: delivActor, leaderAgent: null, taskSeq: 1,
+      phaseKind: 'delivery', targets: ['src/a.js'], summary: 'Delivery topic', proposal: 'Proposal v1', evidence: 'Evidence v1', evidenceFiles: ['src/a.js'],
+    });
+    await dj1.promise;
+    assert.equal(dCallsA, 1);
+    assert.equal(dCallsB, 1);
+
+    // Verbatim repeat -> deduplicated
+    const dj1Dup = queueAsyncSupervision({
+      ctx: {}, rt, store: delivStore, actor: delivActor, leaderAgent: null, taskSeq: 1,
+      phaseKind: 'delivery', targets: ['src/a.js'], summary: 'Delivery topic', proposal: 'Proposal v1', evidence: 'Evidence v1', evidenceFiles: ['src/a.js'],
+    });
+    assert.equal(dj1Dup.queued, false);
+    assert.equal(dj1Dup.status, 'policy_refused');
+    assert.equal(dCallsA, 1);
+    assert.equal(dCallsB, 1);
+
+    // Revise evidence only (same summary & attachment) -> calls A & B
+    const dj2 = queueAsyncSupervision({
+      ctx: {}, rt, store: delivStore, actor: delivActor, leaderAgent: null, taskSeq: 1,
+      phaseKind: 'delivery', targets: ['src/a.js'], summary: 'Delivery topic', proposal: 'Proposal v1', evidence: 'Evidence v2', evidenceFiles: ['src/a.js'],
+    });
+    await dj2.promise;
+    assert.equal(dCallsA, 2);
+    assert.equal(dCallsB, 2);
+
+    // Revise proposal + evidence & allow A -> settles and clears pending!
+    dRefuseA = false;
+    const dj3 = queueAsyncSupervision({
+      ctx: {}, rt, store: delivStore, actor: delivActor, leaderAgent: null, taskSeq: 1,
+      phaseKind: 'delivery', targets: ['src/a.js'], summary: 'Delivery topic', proposal: 'Proposal v3', evidence: 'Evidence v3', evidenceFiles: ['src/a.js'],
+    });
+    const dj3Res = await dj3.promise;
+    assert.equal(dj3Res.status, 'advisory');
+    assert.equal(dCallsA, 3);
+    assert.equal(dCallsB, 3);
+    assert.equal(replayGovernanceState(delivStore.governanceEvents(), 1).pendingSupervisions.length, 0);
+
+    // Legacy 857c9a6 event without `policyRefused` boolean restores `policyRefused=true`, preserves `opinionB`, and skips retry
+    const legGov = replayGovernanceState([{
+      type: 'supervision-deferred',
+      taskSeq: 1,
+      supervisionId: 'sup-old',
+      dedupeKey: 'team-leg:1:delivery:old:initial',
+      logicalSlotKey: 'team-leg:1:delivery:initial',
+      phaseKind: 'delivery',
+      hasValidOpinionA: false,
+      hasValidOpinionB: true,
+      opinionB: { stance: 'endorse', intervene: false, summary: 'B kept', concerns: [], suggestions: [], targetPaths: [] },
+      errorA: 'policy: CONTENT_REFUSED: refused',
+      errorB: null,
+      retrySpec: { phaseKind: 'delivery', targets: ['src/a.js'], summary: 's', proposal: 'p', evidence: 'e' },
+    }], 1);
+    assert.equal(legGov.pendingSupervisions[0].policyRefused, true);
+    assert.equal(legGov.pendingSupervisions[0].retrySpec, null);
+    assert.equal(legGov.pendingSupervisions[0].opinionB.summary, 'B kept');
   } finally {
     Object.assign(rt, prevRt);
     fs.rmSync(tmp, { recursive: true, force: true });
