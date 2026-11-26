@@ -1,9 +1,11 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { decompress as fzstdDecompress } from 'fzstd';
 // @ts-expect-error Pure JS ESM shared core
 import { decodeSessionBytes, parseJsonl, buildReport, defaultPricing } from '@lt-usage-core';
 import {
   callLtApi,
+  computeTodayUsageSummary,
+  extractCnyAmount,
   formatClockTime,
   formatCny,
   formatDurationMs,
@@ -71,10 +73,10 @@ function buildDailyTokenBuckets(calls: any[], rangeDays: number): StackedBarRow[
     if (c.unmetered) {
       cur.unk += 1;
     } else {
-      cur.u += Math.round((c.inputTokens || 0) / 1000);
-      cur.r += Math.round((c.cacheReadTokens || 0) / 1000);
-      cur.w += Math.round((c.cacheWriteTokens || 0) / 1000);
-      cur.o += Math.round((c.outputTokens || 0) / 1000);
+      cur.u += Number(c.inputTokens || 0);
+      cur.r += Number(c.cacheReadTokens || 0);
+      cur.w += Number(c.cacheWriteTokens || 0);
+      cur.o += Number(c.outputTokens || 0);
     }
     byDay.set(key, cur);
   }
@@ -118,6 +120,14 @@ export function HengzhangView({
   const [error, setError] = useState<string | null>(null);
 
   const enabled = bundle.usageStatus.enabled;
+  const offlineModeRef = useRef(offlineMode);
+  offlineModeRef.current = offlineMode;
+  const overviewReqSeqRef = useRef(0);
+  const reportReqSeqRef = useRef(0);
+  const overviewDataRef = useRef<any>(overviewData);
+  overviewDataRef.current = overviewData;
+  const selectedSessionIdRef = useRef<string>(selectedSessionId);
+  selectedSessionIdRef.current = selectedSessionId;
 
   const notify = useCallback(
     (msg: string, icon: IconName = 'check') => {
@@ -128,43 +138,60 @@ export function HengzhangView({
   );
 
   const loadLiveOverview = useCallback(async () => {
-    if (!enabled || offlineMode) return;
+    if (!enabled || offlineModeRef.current) return;
+    const reqSeq = ++overviewReqSeqRef.current;
     try {
       const res = await callLtApi<any>('usage/overview', { syncGateway: true });
+      if (offlineModeRef.current || reqSeq !== overviewReqSeqRef.current) return;
+      overviewDataRef.current = res;
       setOverviewData(res);
       if (res?.pricing?.usdToCny) setUsdToCnyInput(String(res.pricing.usdToCny));
-      if (!selectedSessionId && res?.overview?.sessions?.length > 0) {
-        setSelectedSessionId(res.overview.sessions[0].sessionId);
+      if (!selectedSessionIdRef.current && res?.overview?.sessions?.length > 0) {
+        const firstSid = res.overview.sessions[0].sessionId;
+        selectedSessionIdRef.current = firstSid;
+        setSelectedSessionId(firstSid);
       }
-      if (onUsageSummary && res?.overview?.totals) {
-        const t = res.overview.totals;
-        onUsageSummary({
-          costCny: typeof t.costActualCny?.total === 'number' ? t.costActualCny.total : null,
-          unknownCount: (t.unmeteredCalls || 0) + (t.unpricedCalls || 0),
-        });
+      if (onUsageSummary && res?.overview) {
+        onUsageSummary(computeTodayUsageSummary(res.overview));
       }
     } catch (e: any) {
+      if (offlineModeRef.current || reqSeq !== overviewReqSeqRef.current) return;
       setError(e.message);
     }
-  }, [enabled, offlineMode, selectedSessionId, onUsageSummary]);
+  }, [enabled, onUsageSummary]);
 
   const loadLiveReport = useCallback(
     async (sid: string) => {
-      if (!sid || !enabled || offlineMode) return;
+      if (!sid || !enabled || offlineModeRef.current) return;
+      const reqSeq = ++reportReqSeqRef.current;
       try {
         const res = await callLtApi<any>('usage/report', { sessionId: sid, syncGateway: true });
-        setReport(res?.report || null);
+        if (
+          offlineModeRef.current ||
+          reqSeq !== reportReqSeqRef.current ||
+          selectedSessionIdRef.current !== sid
+        ) {
+          return;
+        }
+        const nextReport = res?.report || null;
+        setReport(nextReport);
         setPage(1);
+        if (onUsageSummary && overviewDataRef.current?.overview) {
+          onUsageSummary(computeTodayUsageSummary(overviewDataRef.current.overview, nextReport));
+        }
       } catch (e: any) {
+        if (offlineModeRef.current || reqSeq !== reportReqSeqRef.current) return;
         setError(e.message);
       }
     },
-    [enabled, offlineMode],
+    [enabled, onUsageSummary],
   );
 
   useEffect(() => {
-    void loadLiveOverview();
-  }, [loadLiveOverview]);
+    if (!offlineMode) {
+      void loadLiveOverview();
+    }
+  }, [offlineMode, loadLiveOverview]);
 
   useEffect(() => {
     if (selectedSessionId && !offlineMode) {
@@ -178,6 +205,8 @@ export function HengzhangView({
     try {
       await callLtApi('usage/toggle', { enabled: next });
       if (!next) {
+        overviewReqSeqRef.current += 1;
+        reportReqSeqRef.current += 1;
         setReport(null);
         setOverviewData(null);
       }
@@ -208,8 +237,11 @@ export function HengzhangView({
         sessionId: header.id || file.name,
         kind: 'session',
         sessions: [{ id: header.id || file.name, header, rows }],
-        pricing: overviewData?.pricing || defaultPricing,
+        pricing: overviewDataRef.current?.pricing || defaultPricing,
       });
+      offlineModeRef.current = true;
+      overviewReqSeqRef.current += 1;
+      reportReqSeqRef.current += 1;
       setOfflineMode(true);
       setReport(built);
       setPage(1);
@@ -346,7 +378,10 @@ export function HengzhangView({
 
   const dailyRows = buildDailyTokenBuckets(report?.calls || [], rangeDays);
   const byModel: any[] = report?.byModel || [];
-  const maxModelCost = Math.max(0.0001, ...byModel.map(m => (typeof m.costActualCny === 'number' ? m.costActualCny : 0)));
+  const maxModelCost = Math.max(
+    0.0001,
+    ...byModel.map(m => extractCnyAmount(m.costActualCny) ?? 0),
+  );
   const byGroup: any[] = report?.groups || [];
   const totalGroupTokens = Math.max(1, byGroup.reduce((s, g) => s + (g.totalTokens || 0), 0));
 
@@ -403,6 +438,7 @@ export function HengzhangView({
                     style={{ display: 'none' }}
                     onChange={e => {
                       const f = e.target.files?.[0];
+                      e.target.value = '';
                       if (f) void decodeLocalFile(f);
                     }}
                   />
@@ -414,8 +450,12 @@ export function HengzhangView({
                   type="button"
                   className="btn btn-sm"
                   onClick={() => {
+                    offlineModeRef.current = false;
                     setOfflineMode(false);
                     void loadLiveOverview();
+                    if (selectedSessionIdRef.current) {
+                      void loadLiveReport(selectedSessionIdRef.current);
+                    }
                   }}
                 >
                   返回实时统计
@@ -636,7 +676,7 @@ export function HengzhangView({
                   <div className="grid" style={{ gridTemplateColumns: 'minmax(0, 1.6fr) minmax(0, 1fr)', marginBottom: 16 }}>
                     <div className="card">
                       <div className="card-head">
-                        <h3>每日 Token（千）</h3>
+                        <h3>每日 Token</h3>
                         <div className="legend">
                           {tokenBuckets.map(b => (
                             <span key={b.key}>
@@ -674,7 +714,8 @@ export function HengzhangView({
                           <div className="t-meta">暂无模型维度汇总</div>
                         ) : (
                           byModel.slice(0, 6).map((m: any) => {
-                            const knownCost = typeof m.costActualCny === 'number' && Number.isFinite(m.costActualCny);
+                            const modelCost = extractCnyAmount(m.costActualCny);
+                            const knownCost = modelCost !== null;
                             return (
                               <div key={m.route} className="hbar">
                                 <span className="mono ellipsis" title={m.route}>
@@ -686,7 +727,7 @@ export function HengzhangView({
                                   ) : (
                                     <span
                                       style={{
-                                        width: `${Math.max(2, (m.costActualCny / maxModelCost) * 100)}%`,
+                                        width: `${Math.max(2, (modelCost / maxModelCost) * 100)}%`,
                                         background: 'var(--lt-chart-1)',
                                       }}
                                     />
@@ -696,7 +737,7 @@ export function HengzhangView({
                                   {!knownCost ? (
                                     <span className="badge sm warning">未定价</span>
                                   ) : (
-                                    formatCny(m.costActualCny)
+                                    formatCny(modelCost)
                                   )}
                                 </span>
                               </div>

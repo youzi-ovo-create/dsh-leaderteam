@@ -192,6 +192,115 @@ export function formatCny(n: number | null | undefined): string {
   return `¥${n.toFixed(Math.abs(n) < 1 ? 3 : 2)}`;
 }
 
+export function extractCnyAmount(val: unknown): number | null {
+  if (typeof val === 'number' && Number.isFinite(val)) return val;
+  if (val && typeof val === 'object') {
+    const total = (val as { total?: unknown }).total;
+    if (typeof total === 'number' && Number.isFinite(total)) return total;
+  }
+  return null;
+}
+
+export function computeTodayUsageSummary(
+  overview: any,
+  activeReport?: any,
+  nowMs: number = Date.now(),
+): { costCny: number | null; unknownCount: number } {
+  if (overview?.today && typeof overview.today === 'object') {
+    const todayObj = overview.today;
+    const costCny = extractCnyAmount(todayObj.costActualCny);
+    const unknownCount =
+      (Number(todayObj.unmeteredCalls) || 0) + (Number(todayObj.unpricedCalls) || 0);
+    return { costCny, unknownCount };
+  }
+
+  const now = new Date(nowMs);
+  const startOfTodayMs = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  const sessions: any[] = Array.isArray(overview?.sessions) ? overview.sessions : [];
+
+  let costSum = 0;
+  let knownCount = 0;
+  let succeededCount = 0;
+  let unknownCount = 0;
+
+  if (sessions.length > 0) {
+    for (const s of sessions) {
+      const lastMs =
+        typeof s?.lastActivityMs === 'number' && Number.isFinite(s.lastActivityMs)
+          ? s.lastActivityMs
+          : typeof s?.startedAtMs === 'number' && Number.isFinite(s.startedAtMs)
+            ? s.startedAtMs
+            : null;
+      const startMs =
+        typeof s?.startedAtMs === 'number' && Number.isFinite(s.startedAtMs)
+          ? s.startedAtMs
+          : lastMs;
+      if (lastMs === null || lastMs < startOfTodayMs) continue;
+
+      if (
+        startMs !== null &&
+        startMs < startOfTodayMs &&
+        activeReport?.meta?.sessionId === s.sessionId &&
+        Array.isArray(activeReport?.calls)
+      ) {
+        for (const c of activeReport.calls) {
+          if (typeof c?.timeMs !== 'number' || c.timeMs < startOfTodayMs) continue;
+          if (c.ok !== false) succeededCount += 1;
+          if (c.unmetered) {
+            unknownCount += 1;
+          } else if (c.ok !== false) {
+            const amt = extractCnyAmount(c.costActualCny);
+            if (amt !== null) {
+              costSum += amt;
+              knownCount += 1;
+            } else {
+              unknownCount += 1;
+            }
+          }
+        }
+        continue;
+      }
+
+      const sessSucc = Number(s?.callsSucceeded) || 0;
+      succeededCount += sessSucc;
+      unknownCount += (Number(s?.unmeteredCalls) || 0) + (Number(s?.unpricedCalls) || 0);
+      const amt = extractCnyAmount(s?.costActualCny);
+      if (amt !== null) {
+        costSum += amt;
+        knownCount += 1;
+      }
+    }
+    return {
+      costCny: succeededCount > 0 && knownCount === 0 ? null : Number(costSum.toFixed(4)),
+      unknownCount,
+    };
+  }
+
+  if (Array.isArray(activeReport?.calls)) {
+    for (const c of activeReport.calls) {
+      if (typeof c?.timeMs !== 'number' || c.timeMs < startOfTodayMs) continue;
+      if (c.ok !== false) succeededCount += 1;
+      if (c.unmetered) {
+        unknownCount += 1;
+      } else if (c.ok !== false) {
+        const amt = extractCnyAmount(c.costActualCny);
+        if (amt !== null) {
+          costSum += amt;
+          knownCount += 1;
+        } else {
+          unknownCount += 1;
+        }
+      }
+    }
+    return {
+      costCny: succeededCount > 0 && knownCount === 0 ? null : Number(costSum.toFixed(4)),
+      unknownCount,
+    };
+  }
+
+  return { costCny: null, unknownCount: 0 };
+}
+
 export function formatClockTime(ms: number | null | undefined): string {
   if (typeof ms !== 'number' || !Number.isFinite(ms) || ms <= 0) return '';
   const d = new Date(ms);

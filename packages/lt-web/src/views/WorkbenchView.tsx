@@ -142,6 +142,8 @@ export function WorkbenchView({
   onNotify,
   onRunningChange,
   onSessionSelected,
+  draftsBySession,
+  onDraftChange,
 }: {
   bundle: HydratedBundle;
   onRefreshBundle: () => Promise<void>;
@@ -154,6 +156,8 @@ export function WorkbenchView({
   onNotify?: (message: string, icon?: IconName) => void;
   onRunningChange?: (running: boolean) => void;
   onSessionSelected?: (sessionId: string) => void;
+  draftsBySession?: Record<string, string>;
+  onDraftChange?: (sessionId: string, text: string) => void;
 }) {
   const dualModeEnabled = bundle.capabilities.features.inSessionDualMode === true;
 
@@ -170,7 +174,9 @@ export function WorkbenchView({
   const [modeError, setModeError] = useState<string | null>(null);
   const [initialMode, setInitialMode] = useState<ExecutionMode>('team');
   const [newCwd, setNewCwd] = useState('');
-  const [promptText, setPromptText] = useState('');
+  const [promptText, setPromptText] = useState(
+    initialSessionId && draftsBySession ? draftsBySession[initialSessionId] || '' : '',
+  );
   const [promptMode, setPromptMode] = useState<'queue' | 'steer'>('queue');
   const [busy, setBusy] = useState(false);
   const [sending, setSending] = useState(false);
@@ -183,12 +189,39 @@ export function WorkbenchView({
 
   const selectedSessionIdRef = useRef<string>(selectedSessionId);
   selectedSessionIdRef.current = selectedSessionId;
+  const promptTextRef = useRef<string>(promptText);
+  promptTextRef.current = promptText;
+  const localDraftsRef = useRef<Record<string, string>>({ ...(draftsBySession || {}) });
+  if (draftsBySession) {
+    for (const [sidKey, draftVal] of Object.entries(draftsBySession)) {
+      if (sidKey !== selectedSessionId) {
+        localDraftsRef.current[sidKey] = draftVal;
+      }
+    }
+  }
+  const imeComposingRef = useRef<boolean>(false);
   const transcriptReqSeqRef = useRef<number>(0);
   const modeMutationEpochRef = useRef<number>(0);
   const prevSelectedSessionRef = useRef<string>(selectedSessionId);
   const streamScrollRef = useRef<HTMLDivElement | null>(null);
   const pinnedToBottomRef = useRef<boolean>(true);
   const prevMessageCountRef = useRef<number>(0);
+
+  const updatePromptText = useCallback(
+    (nextOrUpdater: string | ((prev: string) => string)) => {
+      const sid = selectedSessionIdRef.current;
+      const nextVal =
+        typeof nextOrUpdater === 'function' ? nextOrUpdater(promptTextRef.current) : nextOrUpdater;
+      promptTextRef.current = nextVal;
+      setPromptText(nextVal);
+      if (sid) {
+        if (nextVal) localDraftsRef.current[sid] = nextVal;
+        else delete localDraftsRef.current[sid];
+        if (onDraftChange) onDraftChange(sid, nextVal);
+      }
+    },
+    [onDraftChange],
+  );
 
   const syncModeSnapshotIntoSessionList = useCallback((snap: SessionModeSnapshot) => {
     setSessions(prev =>
@@ -350,6 +383,10 @@ export function WorkbenchView({
       setMessages([]);
       setPassiveRunning(Boolean(matched?.modeState?.activeTurn));
       setModeState(matched?.modeState ?? null);
+      const savedDraft = selectedSessionId
+        ? (draftsBySession?.[selectedSessionId] ?? localDraftsRef.current[selectedSessionId] ?? '')
+        : '';
+      setPromptText(savedDraft);
     } else if (matched?.modeState) {
       applyModeSnapshot(matched.modeState);
     }
@@ -533,7 +570,7 @@ export function WorkbenchView({
         text: promptText.trim(),
         mode: promptMode,
       });
-      setPromptText('');
+      updatePromptText('');
       pinnedToBottomRef.current = true;
       await Promise.all([loadTranscript(selectedSessionId), loadSessions(), onRefreshBundle()]);
     } catch (err: any) {
@@ -1303,8 +1340,23 @@ export function WorkbenchView({
                   }
                   disabled={!liveHost || !selectedSessionId || busy}
                   value={promptText}
-                  onChange={e => setPromptText(e.target.value)}
+                  onChange={e => updatePromptText(e.target.value)}
+                  onCompositionStart={() => {
+                    imeComposingRef.current = true;
+                  }}
+                  onCompositionEnd={() => {
+                    imeComposingRef.current = false;
+                  }}
                   onKeyDown={e => {
+                    const nativeEv = e.nativeEvent as any;
+                    const isComposing =
+                      imeComposingRef.current ||
+                      Boolean(nativeEv?.isComposing) ||
+                      Boolean((e as any).isComposing) ||
+                      e.keyCode === 229 ||
+                      nativeEv?.keyCode === 229 ||
+                      e.key === 'Process';
+                    if (isComposing) return;
                     if (e.key === 'Enter' && !e.shiftKey) {
                       e.preventDefault();
                       void handleSendPrompt();
@@ -1321,7 +1373,7 @@ export function WorkbenchView({
                         disabled={!liveHost || !selectedSessionId}
                         title="插入内联指令：最大并发 3"
                         onClick={() =>
-                          setPromptText(prev => (prev ? `${prev}\n最大并发 3` : '最大并发 3'))
+                          updatePromptText(prev => (prev ? `${prev}\n最大并发 3` : '最大并发 3'))
                         }
                       >
                         <Icon name="gauge" className="icon-14" />
@@ -1334,7 +1386,7 @@ export function WorkbenchView({
                         disabled={!liveHost || !selectedSessionId}
                         title="插入内联指令：允许读取 ./docs"
                         onClick={() =>
-                          setPromptText(prev => (prev ? `${prev}\n允许读取 ./docs` : '允许读取 ./docs'))
+                          updatePromptText(prev => (prev ? `${prev}\n允许读取 ./docs` : '允许读取 ./docs'))
                         }
                       >
                         <Icon name="file" className="icon-14" />

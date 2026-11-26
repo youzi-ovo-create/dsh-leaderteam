@@ -32,7 +32,7 @@ export function StackedBars({
   width = 680,
   height = 210,
   unit = '',
-  unknownScale = 40,
+  unknownScale,
   ariaLabel = '堆叠柱状图',
 }: {
   rows: StackedBarRow[];
@@ -54,11 +54,23 @@ export function StackedBars({
   const pb = 22;
   const pt = 8;
   const pr = 8;
+  let maxKnown = 0;
+  for (const r of rows) {
+    let sum = 0;
+    for (const s of series) sum += r.values[s.key] || 0;
+    if (sum > maxKnown) maxKnown = sum;
+  }
+  const effectiveUnknownScale =
+    unknownScale !== undefined
+      ? unknownScale
+      : maxKnown > 0
+        ? Math.max(1, maxKnown * 0.08)
+        : 1;
   let rawMax = 0;
   for (const r of rows) {
     let sum = 0;
     for (const s of series) sum += r.values[s.key] || 0;
-    if (r.unknownCount) sum += r.unknownCount * unknownScale;
+    if (r.unknownCount) sum += r.unknownCount * effectiveUnknownScale;
     if (sum > rawMax) rawMax = sum;
   }
   const max = niceMax(rawMax);
@@ -121,7 +133,7 @@ export function StackedBars({
           }
         }
         if (r.unknownCount && r.unknownCount > 0) {
-          const hu = (plotH * r.unknownCount * unknownScale) / max;
+          const hu = (plotH * r.unknownCount * effectiveUnknownScale) / max;
           y -= hu;
           rects.push(
             <rect

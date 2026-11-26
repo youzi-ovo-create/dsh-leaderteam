@@ -8,7 +8,101 @@ import { isInside } from './paths.mjs';
 
 export const EXECUTION_MODES = Object.freeze(['team', 'single']);
 export const DEFAULT_EXECUTION_MODE = 'team';
+export const SESSION_MODE_WRITE_META = Symbol.for('leaderteam.sessionMode.writeMeta');
 const MAX_SAFE_SEGMENT_CHARS = 192;
+const LOCK_TIMEOUT_MS = 5000;
+const LOCK_STALE_MS = 15000;
+const LOCK_SLEEP_BUF = new Int32Array(new SharedArrayBuffer(4));
+
+function sleepSyncMs(ms) {
+  const waitMs = Math.max(1, Math.floor(ms));
+  try {
+    Atomics.wait(LOCK_SLEEP_BUF, 0, 0, waitMs);
+  } catch {
+    const end = Date.now() + waitMs;
+    while (Date.now() < end) {}
+  }
+}
+
+function isPidDead(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (err) {
+    return err?.code === 'ESRCH';
+  }
+}
+
+function attachWriteMeta(record, meta) {
+  Object.defineProperty(record, SESSION_MODE_WRITE_META, {
+    value: Object.freeze(meta),
+    enumerable: false,
+    configurable: false,
+  });
+  return record;
+}
+
+function withSessionModeLock(lockFile, fn) {
+  const deadline = Date.now() + LOCK_TIMEOUT_MS;
+  let acquired = false;
+  let attempt = 0;
+
+  while (!acquired) {
+    try {
+      const fd = fs.openSync(lockFile, 'wx', 0o600);
+      try {
+        fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, at: Date.now() }) + '\n', 'utf8');
+      } finally {
+        fs.closeSync(fd);
+      }
+      acquired = true;
+      break;
+    } catch (err) {
+      if (err?.code !== 'EEXIST') throw err;
+      let shouldBreakStale = false;
+      try {
+        const st = fs.statSync(lockFile);
+        const ageMs = Date.now() - st.mtimeMs;
+        if (ageMs > LOCK_STALE_MS) {
+          shouldBreakStale = true;
+        } else {
+          const raw = fs.readFileSync(lockFile, 'utf8');
+          if (raw.trim()) {
+            const parsed = JSON.parse(raw);
+            if (
+              Number.isInteger(parsed?.pid)
+              && parsed.pid > 0
+              && parsed.pid !== process.pid
+              && isPidDead(parsed.pid)
+            ) {
+              shouldBreakStale = true;
+            }
+          }
+        }
+      } catch (inspectErr) {
+        if (inspectErr?.code === 'ENOENT') continue;
+      }
+
+      if (shouldBreakStale) {
+        try { fs.unlinkSync(lockFile); } catch {}
+        continue;
+      }
+
+      if (Date.now() >= deadline) {
+        throw new LtError('SESSION_MODE_LOCK_TIMEOUT', `timed out waiting for session mode lock (${lockFile})`);
+      }
+      attempt += 1;
+      sleepSyncMs(Math.min(15, 3 + (attempt % 7)));
+    }
+  }
+
+  try {
+    return fn();
+  } finally {
+    try { fs.rmSync(lockFile, { force: true }); } catch {}
+  }
+}
 
 export function normalizeExecutionMode(val) {
   if (typeof val !== 'string') {
@@ -191,86 +285,98 @@ export function readSessionModeRecord(storageRoot, sessionId) {
 export function writeSessionModeRecord(storageRoot, sessionId, nextMode, meta = {}) {
   const mode = normalizeExecutionMode(nextMode);
   const { stateFile, historyFile } = resolveSessionModePaths(storageRoot, sessionId, { ensureDir: true });
-  let prev;
-  try {
-    prev = readSessionModeRecord(storageRoot, sessionId);
-  } catch (err) {
-    if (err?.code !== 'SESSION_MODE_CORRUPT') throw err;
-    const corruptBackup = `${stateFile}.corrupt.${Date.now()}`;
+  const lockFile = `${stateFile}.lock`;
+
+  return withSessionModeLock(lockFile, () => {
+    let prev;
+    let recoveredCorrupt = false;
     try {
-      if (fs.existsSync(stateFile)) fs.renameSync(stateFile, corruptBackup);
-    } catch {}
-    prev = {
+      prev = readSessionModeRecord(storageRoot, sessionId);
+    } catch (err) {
+      if (err?.code !== 'SESSION_MODE_CORRUPT') throw err;
+      recoveredCorrupt = true;
+      const corruptBackup = `${stateFile}.corrupt.${Date.now()}`;
+      try {
+        if (fs.existsSync(stateFile)) fs.renameSync(stateFile, corruptBackup);
+      } catch {}
+      prev = {
+        sessionId,
+        mode: DEFAULT_EXECUTION_MODE,
+        persisted: false,
+        createdAt: null,
+        updatedAt: null,
+        switchCount: 0,
+        lastSwitchedFrom: null,
+        lastTaskSeqHint: null,
+      };
+    }
+    if (prev.persisted && prev.mode === mode && !meta?.force && !recoveredCorrupt) {
+      return attachWriteMeta(
+        {
+          ...prev,
+          persisted: true,
+        },
+        { changed: false, previousMode: prev.mode },
+      );
+    }
+    const nowIso = typeof meta?.at === 'string' && meta.at ? meta.at : new Date().toISOString();
+    const isInitial = Boolean(meta?.initial && !prev.persisted);
+    const didSwitch = !isInitial && prev.mode !== mode;
+    const switchCount = (prev.switchCount ?? 0) + (didSwitch ? 1 : 0);
+    const lastSwitchedFrom = didSwitch ? prev.mode : (prev.lastSwitchedFrom ?? null);
+    const taskSeqHint = Number.isInteger(meta?.taskSeqHint) && meta.taskSeqHint >= 1
+      ? meta.taskSeqHint
+      : (prev.lastTaskSeqHint ?? null);
+
+    const record = {
+      v: 1,
       sessionId,
-      mode: DEFAULT_EXECUTION_MODE,
-      persisted: false,
-      createdAt: null,
-      updatedAt: null,
-      switchCount: 0,
-      lastSwitchedFrom: null,
-      lastTaskSeqHint: null,
+      mode,
+      createdAt: prev.createdAt ?? nowIso,
+      updatedAt: nowIso,
+      switchCount,
+      lastSwitchedFrom,
+      lastTaskSeqHint: taskSeqHint,
     };
-  }
-  if (meta?.initial && prev.persisted && prev.mode === mode) {
-    return {
-      ...prev,
-      persisted: true,
+
+    const source = typeof meta?.source === 'string' && meta.source.trim() ? meta.source.trim() : 'user';
+    const actor = typeof meta?.actor === 'string' && meta.actor.trim() ? meta.actor.trim() : source;
+    const historyEntry = {
+      v: 1,
+      at: nowIso,
+      sessionId,
+      fromMode: isInitial ? null : prev.mode,
+      toMode: mode,
+      source,
+      actor,
+      taskSeqHint,
     };
-  }
-  const nowIso = typeof meta?.at === 'string' && meta.at ? meta.at : new Date().toISOString();
-  const isInitial = Boolean(meta?.initial && !prev.persisted);
-  const didSwitch = !isInitial && prev.mode !== mode;
-  const switchCount = (prev.switchCount ?? 0) + (didSwitch ? 1 : 0);
-  const lastSwitchedFrom = didSwitch ? prev.mode : (prev.lastSwitchedFrom ?? null);
-  const taskSeqHint = Number.isInteger(meta?.taskSeqHint) && meta.taskSeqHint >= 1
-    ? meta.taskSeqHint
-    : (prev.lastTaskSeqHint ?? null);
 
-  const record = {
-    v: 1,
-    sessionId,
-    mode,
-    createdAt: prev.createdAt ?? nowIso,
-    updatedAt: nowIso,
-    switchCount,
-    lastSwitchedFrom,
-    lastTaskSeqHint: taskSeqHint,
-  };
+    const existedBefore = fs.existsSync(historyFile);
+    const prevHistSize = existedBefore ? fs.statSync(historyFile).size : 0;
+    appendJsonl(historyFile, historyEntry);
 
-  const source = typeof meta?.source === 'string' && meta.source.trim() ? meta.source.trim() : 'user';
-  const actor = typeof meta?.actor === 'string' && meta.actor.trim() ? meta.actor.trim() : source;
-  const historyEntry = {
-    v: 1,
-    at: nowIso,
-    sessionId,
-    fromMode: isInitial ? null : prev.mode,
-    toMode: mode,
-    source,
-    actor,
-    taskSeqHint,
-  };
-
-  const existedBefore = fs.existsSync(historyFile);
-  const prevHistSize = existedBefore ? fs.statSync(historyFile).size : 0;
-  appendJsonl(historyFile, historyEntry);
-
-  try {
-    writeFileAtomic(stateFile, JSON.stringify(record, null, 2) + '\n');
-  } catch (err) {
     try {
-      if (existedBefore) {
-        fs.truncateSync(historyFile, prevHistSize);
-      } else {
-        fs.rmSync(historyFile, { force: true });
-      }
-    } catch {}
-    throw err;
-  }
+      writeFileAtomic(stateFile, JSON.stringify(record, null, 2) + '\n');
+    } catch (err) {
+      try {
+        if (existedBefore) {
+          fs.truncateSync(historyFile, prevHistSize);
+        } else {
+          fs.rmSync(historyFile, { force: true });
+        }
+      } catch {}
+      throw err;
+    }
 
-  return {
-    ...record,
-    persisted: true,
-  };
+    return attachWriteMeta(
+      {
+        ...record,
+        persisted: true,
+      },
+      { changed: didSwitch, previousMode: prev.mode },
+    );
+  });
 }
 
 export function readSessionModeHistory(storageRoot, sessionId) {

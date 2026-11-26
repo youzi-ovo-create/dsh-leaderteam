@@ -58,7 +58,12 @@ export function apply(ctx, config) {
   rt.plugins = { scheduler: null, consensus: null, timerArchive: null, panel: null };
   rt.surface = config?.surface === 'headless' ? 'headless' : 'desktop';
   if (!rt.config.storage.root && !home) throw new Error('leaderteam-core: cannot locate DSH_HOME for team storage');
-  rt.storageRoot = rt.config.storage.root ?? path.join(home, 'leaderteam');
+  const configuredStorageRoot = typeof rt.config.storage.root === 'string' && rt.config.storage.root.trim()
+    ? rt.config.storage.root.trim()
+    : null;
+  rt.storageRoot = configuredStorageRoot
+    ? path.resolve(home || process.cwd(), configuredStorageRoot)
+    : path.resolve(home, 'leaderteam');
   rt.llm = ctx.llm;
   rt.logger = ctx.logger;
   rt.hostAgents = ctx.agents ?? null;

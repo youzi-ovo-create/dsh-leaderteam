@@ -91,6 +91,7 @@ export function SettingsView({
   const [busy, setBusy] = useState(false);
   const [pendingModules, setPendingModules] = useState<Record<string, boolean>>({});
   const [notice, setNotice] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     setSeeds(customTheme);
@@ -107,8 +108,15 @@ export function SettingsView({
   }
 
   function notify(msg: string, icon: IconName = 'check') {
+    setError(null);
     setNotice(msg);
     if (onNotify) onNotify(msg, icon);
+  }
+
+  function reportError(msg: string) {
+    setNotice(null);
+    setError(msg);
+    if (onNotify) onNotify(msg, 'alert');
   }
 
   function handleLiveSeedChange<K extends keyof CustomThemeSeeds>(key: K, val: CustomThemeSeeds[K]) {
@@ -119,24 +127,53 @@ export function SettingsView({
     }
   }
 
+  async function handleSelectTheme(nextTheme: ThemePresetId) {
+    setBusy(true);
+    setNotice(null);
+    setError(null);
+    try {
+      await onChangeTheme(nextTheme, seeds);
+      notify('主题偏好已保存至本地与服务端 ui-preferences.json', 'check');
+    } catch (e: any) {
+      reportError(`主题服务端保存失败（仅更新本地预览）：${e?.message || '请求失败'}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function handlePersistCustomTheme() {
     setBusy(true);
+    setNotice(null);
+    setError(null);
     try {
       await onChangeTheme('custom', seeds);
       notify('自定义主题已持久化至本地与服务端 ui-preferences.json', 'check');
+    } catch (e: any) {
+      reportError(`自定义主题服务端保存失败（仅更新本地预览）：${e?.message || '请求失败'}`);
     } finally {
       setBusy(false);
     }
   }
 
   async function handleResetCustomSeeds() {
+    setBusy(true);
+    setNotice(null);
+    setError(null);
     setSeeds(DEFAULT_CUSTOM_SEEDS);
-    await onChangeTheme('custom', DEFAULT_CUSTOM_SEEDS);
-    notify('已恢复默认自定义种子色', 'rollback');
+    try {
+      await onChangeTheme('custom', DEFAULT_CUSTOM_SEEDS);
+      notify('已恢复默认自定义种子色', 'rollback');
+    } catch (e: any) {
+      reportError(`恢复默认主题服务端保存失败（仅更新本地预览）：${e?.message || '请求失败'}`);
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function handleTogglePlugin(pluginKey: string, enabled: boolean) {
     setBusy(true);
+    setNotice(null);
+    setError(null);
     try {
       await callLtApi('runtime/configure', {
         target: 'local',
@@ -145,6 +182,8 @@ export function SettingsView({
       setPendingModules(prev => ({ ...prev, [pluginKey]: true }));
       notify(`模块 ${pluginKey} 已更新为${enabled ? '启用' : '拆卸停用'}`, 'check');
       await onRefreshBundle();
+    } catch (e: any) {
+      reportError(`模块 ${pluginKey} 保存失败：${e?.message || '请求失败'}`);
     } finally {
       setBusy(false);
     }
@@ -152,6 +191,8 @@ export function SettingsView({
 
   async function handleTogglePower(enabled: boolean) {
     setBusy(true);
+    setNotice(null);
+    setError(null);
     try {
       await callLtApi('runtime/configure', {
         target: 'local',
@@ -159,6 +200,8 @@ export function SettingsView({
       });
       notify(`电池感知安全收尾已${enabled ? '启用' : '关闭'}`, 'check');
       await onRefreshBundle();
+    } catch (e: any) {
+      reportError(`电源守护设置保存失败：${e?.message || '请求失败'}`);
     } finally {
       setBusy(false);
     }
@@ -231,6 +274,16 @@ export function SettingsView({
 
         <div className="stage-body">
           <div className="stage-pad" style={{ maxWidth: 1100 }}>
+            {error && (
+              <div className="callout danger" role="alert" style={{ marginBottom: 18 }}>
+                <Icon name="alert" />
+                <span className="grow">{error}</span>
+                <button type="button" className="btn btn-ghost btn-sm" onClick={() => setError(null)}>
+                  关闭
+                </button>
+              </div>
+            )}
+
             {notice && (
               <div className="callout info" style={{ marginBottom: 18 }}>
                 <Icon name="info" />
@@ -282,7 +335,8 @@ export function SettingsView({
                           type="button"
                           className="theme-card"
                           aria-pressed={theme === id}
-                          onClick={() => void onChangeTheme(id, seeds)}
+                          disabled={busy}
+                          onClick={() => void handleSelectTheme(id)}
                         >
                           <ThemeMiniPreview {...preview} />
                           <span className="col" style={{ gap: 1, padding: '0 2px 2px' }}>

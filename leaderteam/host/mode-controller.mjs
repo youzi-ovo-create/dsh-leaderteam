@@ -7,6 +7,7 @@ import { replayGovernanceState } from '../core/governance-protocol.mjs';
 import {
   EXECUTION_MODES,
   DEFAULT_EXECUTION_MODE,
+  SESSION_MODE_WRITE_META,
   normalizeExecutionMode,
   encodeSessionModeSegment,
   resolveSessionModePaths,
@@ -487,6 +488,7 @@ export function switchSessionExecutionMode(ctx, rt = runtime(), sessionId, targe
 
   const rec = writeSessionModeRecord(baseRt.storageRoot, sessionId, nextMode, {
     initial: Boolean(options.persistInitial),
+    force: Boolean(options.forcePersist),
     source: options.source ?? 'user',
     actor: options.actor ?? options.source ?? 'user',
     taskSeqHint,
@@ -515,9 +517,10 @@ export function switchSessionExecutionMode(ctx, rt = runtime(), sessionId, targe
 
   syncLeaderAgentMode(ctx, baseRt, sessionId);
   const updatedState = inspectSessionModeState(ctx, baseRt, sessionId, options);
+  const writeMeta = rec?.[SESSION_MODE_WRITE_META];
   return {
-    changed: state.mode !== nextMode,
-    previousMode: state.mode,
+    changed: typeof writeMeta?.changed === 'boolean' ? writeMeta.changed : (state.mode !== nextMode),
+    previousMode: writeMeta?.previousMode ?? state.mode,
     modeState: updatedState,
   };
 }

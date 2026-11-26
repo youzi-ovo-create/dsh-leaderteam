@@ -1,5 +1,10 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { applyThemeToDom, callLtApi, type HydratedBundle } from './lib/api';
+import {
+  applyThemeToDom,
+  callLtApi,
+  computeTodayUsageSummary,
+  type HydratedBundle,
+} from './lib/api';
 import {
   DEFAULT_CUSTOM_SEEDS,
   readStoredAppearance,
@@ -83,6 +88,7 @@ export function App() {
   const [insOpen, setInsOpen] = useState(true);
   const [hasRunningSession, setHasRunningSession] = useState(false);
   const [activeSessionId, setActiveSessionId] = useState<string>(route.sessionParam || '');
+  const [draftsBySession, setDraftsBySession] = useState<Record<string, string>>({});
   const [todayUsage, setTodayUsage] = useState<{ costCny: number | null; unknownCount: number }>({
     costCny: null,
     unknownCount: 0,
@@ -121,6 +127,17 @@ export function App() {
           display: displayRef.current,
         });
       }
+      if (data.capabilities?.features?.usageAnalytics && data.usageStatus?.enabled) {
+        callLtApi<any>('usage/overview', { syncGateway: false })
+          .then(ovRes => {
+            if (ovRes?.overview) {
+              setTodayUsage(computeTodayUsageSummary(ovRes.overview));
+            }
+          })
+          .catch(() => {});
+      } else {
+        setTodayUsage({ costCny: null, unknownCount: 0 });
+      }
     } catch (e: any) {
       setLoadError(e.message || '加载工作台状态失败');
     }
@@ -132,9 +149,26 @@ export function App() {
   }, [refreshBundle]);
 
   useEffect(() => {
-    const onHash = () => setRoute(parseLocationRoute());
+    const onHash = () => {
+      const parsed = parseLocationRoute();
+      setRoute(parsed);
+      if (parsed.sessionParam) setActiveSessionId(parsed.sessionParam);
+    };
     window.addEventListener('hashchange', onHash);
     return () => window.removeEventListener('hashchange', onHash);
+  }, []);
+
+  const handleDraftChange = useCallback((sessionId: string, text: string) => {
+    if (!sessionId) return;
+    setDraftsBySession(prev => {
+      if ((prev[sessionId] || '') === text) return prev;
+      if (!text) {
+        const next = { ...prev };
+        delete next[sessionId];
+        return next;
+      }
+      return { ...prev, [sessionId]: text };
+    });
   }, []);
 
   const navigateTo = useCallback((view: NavViewId, sub?: string | null, sessionId?: string | null) => {
@@ -173,9 +207,7 @@ export function App() {
       density: densityRef.current,
       display: displayRef.current,
     });
-    try {
-      await callLtApi('ui-preferences', { theme: nextTheme, customTheme: nextSeeds });
-    } catch {}
+    await callLtApi('ui-preferences', { theme: nextTheme, customTheme: nextSeeds });
   }, []);
 
   const handleDensityChange = useCallback(
@@ -309,6 +341,15 @@ export function App() {
           ]
         : [];
 
+    const switchThemeSafe = (nextTheme: ThemePresetId) => {
+      void handleThemeChange(nextTheme, customTheme).catch(err => {
+        pushToast(
+          `主题服务端保存失败（仅更新本地预览）：${err?.message || '请求失败'}`,
+          'alert',
+        );
+      });
+    };
+
     const themeCmds: PaletteCommand[] = [
       {
         id: 'th-white',
@@ -316,7 +357,7 @@ export function App() {
         label: '主题：白色（日光工程白）',
         icon: 'sun',
         keywords: 'theme white',
-        run: () => void handleThemeChange('white', customTheme),
+        run: () => switchThemeSafe('white'),
       },
       {
         id: 'th-dark',
@@ -324,7 +365,7 @@ export function App() {
         label: '主题：黑色（深碳石板）',
         icon: 'moon',
         keywords: 'theme dark',
-        run: () => void handleThemeChange('dark', customTheme),
+        run: () => switchThemeSafe('dark'),
       },
       {
         id: 'th-heluoxu',
@@ -332,7 +373,7 @@ export function App() {
         label: '主题：河洛序（宣纸焦铜）',
         icon: 'doc',
         keywords: 'theme heluoxu',
-        run: () => void handleThemeChange('heluoxu', customTheme),
+        run: () => switchThemeSafe('heluoxu'),
       },
       {
         id: 'th-custom',
@@ -340,7 +381,7 @@ export function App() {
         label: '主题：自定义（种子色推导）',
         icon: 'contrast',
         keywords: 'theme custom',
-        run: () => void handleThemeChange('custom', customTheme),
+        run: () => switchThemeSafe('custom'),
       },
       {
         id: 'th-density',
@@ -383,7 +424,7 @@ export function App() {
     }
 
     return [...navCmds, ...connectCmds, ...themeCmds, ...layoutCmds];
-  }, [navItems, feats, navigateTo, handleThemeChange, customTheme, density, handleDensityChange, dshFrontendUrl]);
+  }, [navItems, feats, navigateTo, handleThemeChange, customTheme, density, handleDensityChange, dshFrontendUrl, pushToast]);
 
   /* ==================== ERROR / LOADING SHELL ==================== */
   if (loadError && !bundle) {
@@ -471,7 +512,7 @@ export function App() {
       {activeView === 'workbench' && (
         <WorkbenchView
           bundle={bundle}
-          initialSessionId={route.sessionParam || undefined}
+          initialSessionId={route.sessionParam || activeSessionId || undefined}
           ctxOpen={ctxOpen}
           insOpen={insOpen}
           onToggleCtx={() => setCtxOpen(v => !v)}
@@ -481,6 +522,8 @@ export function App() {
           onNotify={pushToast}
           onRunningChange={setHasRunningSession}
           onSessionSelected={setActiveSessionId}
+          draftsBySession={draftsBySession}
+          onDraftChange={handleDraftChange}
         />
       )}
 
@@ -569,8 +612,13 @@ export function App() {
             type="button"
             className="menu-item"
             onClick={() => {
-              void handleThemeChange(id, customTheme);
               setThemeMenuAnchor(null);
+              void handleThemeChange(id, customTheme).catch(err => {
+                pushToast(
+                  `主题服务端保存失败（仅更新本地预览）：${err?.message || '请求失败'}`,
+                  'alert',
+                );
+              });
             }}
           >
             <Icon name={icon} />

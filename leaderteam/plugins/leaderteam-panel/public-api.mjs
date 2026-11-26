@@ -785,36 +785,14 @@ export function extractReadableMessagesFromRows(rows = []) {
     const rowTime = row.time ?? rawRow?.time ?? null;
     if (surfaceOp === 'seed' || surfaceOp?.op === 'seed') continue;
 
-    if (surfaceOp?.op === 'replace') {
-      const startSeq = Number.isInteger(surfaceOp.startSeq) ? surfaceOp.startSeq : 0;
-      const endSeq = Number.isInteger(surfaceOp.endSeq) ? surfaceOp.endSeq : seq - 1;
-      for (let i = messages.length - 1; i >= 0; i--) {
-        if (messages[i]._seq >= startSeq && messages[i]._seq <= endSeq) {
-          seenMsgIds.delete(messages[i].id);
-          messages.splice(i, 1);
-        }
-      }
-      const msg = row.data?.message ?? row.data;
-      const blocks = Array.isArray(msg?.content) ? msg.content : [];
-      const repText = blocks.length > 0
-        ? blocks.map(b => (typeof b?.text === 'string' ? b.text : '')).filter(Boolean).join('\n')
-        : (typeof msg?.summary === 'string' ? msg.summary : (typeof msg?.text === 'string' ? msg.text : ''));
-      if (repText) {
-        const repId = msg?.id || row.data?.compactionId || `compact-${seq}`;
-        if (!seenMsgIds.has(repId)) {
-          seenMsgIds.add(repId);
-          const isRealUser = msg?.source?.kind === 'user';
-          messages.push({
-            _seq: seq,
-            id: repId,
-            role: isRealUser ? 'user' : 'assistant',
-            timeMs: rowTime,
-            text: repText,
-            model: isRealUser ? null : (msg?.source?.model ?? row.data?.model ?? 'compaction'),
-            toolCalls: [],
-          });
-        }
-      }
+    // Per DSH 0.2.2-rc.5 `@deepseek-ai/dsh-session/surface` (`isAppendSurfaceEvent`),
+    // surface replacements (`{ op: 'replace', startSeq, endSeq }`) are model-context
+    // compaction copies only; append-origin events remain the durable human transcript.
+    // Never delete original Q&A or append compaction summaries out of order.
+    if (
+      surfaceOp?.op === 'replace'
+      || (surfaceOp !== null && surfaceOp !== undefined && surfaceOp !== 'append')
+    ) {
       continue;
     }
 
@@ -1833,7 +1811,7 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
     return resolveDshHomeFromCtx(ctx, rt);
   };
 
-  const getStorageRoot = () => {
+  const resolveConfiguredRoot = () => {
     const configuredRoot = typeof rt?.config?.storage?.root === 'string' && rt.config.storage.root.trim()
       ? rt.config.storage.root.trim()
       : null;
@@ -1842,9 +1820,15 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
       return path.resolve(baseHome, configuredRoot);
     }
     if (options.dshHome) return resolveStorageRoot(path.resolve(options.dshHome));
-    if (rt?.storageRoot) return rt.storageRoot;
     const home = getDshHome() || path.join(process.cwd(), '.lt-standalone');
     return resolveStorageRoot(home);
+  };
+
+  const getStorageRoot = () => {
+    if (!options.dshHome && typeof rt?.storageRoot === 'string' && rt.storageRoot.trim()) {
+      return path.resolve(rt.storageRoot);
+    }
+    return resolveConfiguredRoot();
   };
 
   const ensureConfigLoaded = () => {
@@ -1853,9 +1837,15 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
       rt.config = null;
     }
     if (rt?.config && rt?.configPath && fs.existsSync(rt.configPath)) {
-      syncRuntimeConfig(rt);
-      if (options.dshHome || rt.config?.storage?.root) {
-        rt.storageRoot = getStorageRoot();
+      const prevConfiguredRoot = typeof rt.config?.storage?.root === 'string'
+        ? rt.config.storage.root.trim()
+        : (rt.config?.storage?.root ?? null);
+      const syncRes = syncRuntimeConfig(rt);
+      const nextConfiguredRoot = typeof rt.config?.storage?.root === 'string'
+        ? rt.config.storage.root.trim()
+        : (rt.config?.storage?.root ?? null);
+      if (!rt.storageRoot || options.dshHome || (syncRes?.reloaded && nextConfiguredRoot !== prevConfiguredRoot)) {
+        rt.storageRoot = resolveConfiguredRoot();
       }
       return;
     }
@@ -1867,7 +1857,9 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
       bundledDefaultConfigPath: path.join(repoRoot, 'config', 'leaderteam.config.json'),
     });
     bindRuntimeConfigFile(rt, configPath, loadConfig(configPath));
-    rt.storageRoot = getStorageRoot();
+    if (!rt.storageRoot || options.dshHome || options.configPath) {
+      rt.storageRoot = resolveConfiguredRoot();
+    }
   };
 
   const getGatewayMgr = () => getOrCreateGatewayManager(getStorageRoot());

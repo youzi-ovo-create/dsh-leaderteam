@@ -335,7 +335,7 @@ export function StatusBar({
             <Icon name="ledger" className="icon-14" />
             {bundle.usageStatus.enabled ? (
               <>
-                衡账{' '}
+                今日{' '}
                 {todayCostCny !== null ? <span className="num">{formatCny(todayCostCny)}</span> : <span>就绪</span>}
                 {todayUnknownCount > 0 && (
                   <>

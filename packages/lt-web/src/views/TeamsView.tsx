@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useRef, useState } from 'react';
 import { callLtApi, formatDurationMs, formatNumber, type HydratedBundle } from '../lib/api';
 import { Icon, type IconName } from '../components/Icon';
 import { Splitter, StageHead } from '../components/AppShell';
@@ -68,9 +68,20 @@ export function TeamsView({
   const [retroNotes, setRetroNotes] = useState('');
   const [showCleanupDialog, setShowCleanupDialog] = useState(false);
   const [cleanDays, setCleanDays] = useState('21');
-  const [cleanPreview, setCleanPreview] = useState<{ matchedCount: number; dryRun: boolean } | null>(null);
+  const [cleanPreview, setCleanPreview] = useState<{
+    matchedCount: number;
+    dryRun: boolean;
+    rawDays: string;
+    olderThanDays: number | null;
+    all: boolean;
+  } | null>(null);
   const [busy, setBusy] = useState(false);
   const [archiveError, setArchiveError] = useState<string | null>(null);
+  const cleanPreviewReqSeqRef = useRef(0);
+  const cleanDaysRef = useRef(cleanDays);
+  cleanDaysRef.current = cleanDays;
+  const showCleanupDialogRef = useRef(showCleanupDialog);
+  showCleanupDialogRef.current = showCleanupDialog;
 
   const activeSection = initialSub === 'archive' && archiveEnabled ? 'archive' : section;
   const team = teams.find(t => t.teamId === selectedTeamId) || teams[0] || null;
@@ -101,6 +112,43 @@ export function TeamsView({
   }
 
   async function handleCleanArchive(confirm: boolean) {
+    if (confirm) {
+      const snap = cleanPreview;
+      if (!snap || snap.matchedCount <= 0 || snap.rawDays !== cleanDays.trim()) {
+        setArchiveError('筛选条件已变更，请先重新执行 dryRun 预览后再确认清理');
+        return;
+      }
+      const reqSeq = ++cleanPreviewReqSeqRef.current;
+      setBusy(true);
+      setArchiveError(null);
+      try {
+        const res = await callLtApi<{ dryRun: boolean; matchedCount: number; removedCount: number }>(
+          'archive/action',
+          {
+            action: 'clean',
+            olderThanDays: snap.olderThanDays,
+            all: snap.all,
+            dryRun: false,
+            confirm: true,
+          },
+        );
+        if (reqSeq !== cleanPreviewReqSeqRef.current) return;
+        setShowCleanupDialog(false);
+        setCleanPreview(null);
+        if (onNotify) onNotify(`已安全清理 ${res.removedCount} 条外部归档计划`, 'trash');
+        await onRefreshBundle();
+      } catch (e: any) {
+        if (reqSeq === cleanPreviewReqSeqRef.current) {
+          setArchiveError(`清理失败：${e.message}`);
+        }
+      } finally {
+        if (reqSeq === cleanPreviewReqSeqRef.current) {
+          setBusy(false);
+        }
+      }
+      return;
+    }
+
     const rawDays = cleanDays.trim();
     let parsedDays: number | null = null;
     if (rawDays !== '') {
@@ -111,31 +159,44 @@ export function TeamsView({
       }
       parsedDays = n;
     }
+    const all = rawDays === '';
+    const reqSeq = ++cleanPreviewReqSeqRef.current;
     setBusy(true);
     setArchiveError(null);
+    setCleanPreview(null);
     try {
       const res = await callLtApi<{ dryRun: boolean; matchedCount: number; removedCount: number }>(
         'archive/action',
         {
           action: 'clean',
           olderThanDays: parsedDays,
-          all: rawDays === '',
-          dryRun: !confirm,
-          confirm,
+          all,
+          dryRun: true,
+          confirm: false,
         },
       );
-      if (res.dryRun) {
-        setCleanPreview({ matchedCount: res.matchedCount, dryRun: true });
-      } else {
-        setShowCleanupDialog(false);
-        setCleanPreview(null);
-        if (onNotify) onNotify(`已安全清理 ${res.removedCount} 条外部归档计划`, 'trash');
-        await onRefreshBundle();
+      if (
+        reqSeq !== cleanPreviewReqSeqRef.current ||
+        !showCleanupDialogRef.current ||
+        cleanDaysRef.current.trim() !== rawDays
+      ) {
+        return;
       }
+      setCleanPreview({
+        matchedCount: res.matchedCount,
+        dryRun: true,
+        rawDays,
+        olderThanDays: parsedDays,
+        all,
+      });
     } catch (e: any) {
-      setArchiveError(`清理失败：${e.message}`);
+      if (reqSeq === cleanPreviewReqSeqRef.current) {
+        setArchiveError(`清理失败：${e.message}`);
+      }
     } finally {
-      setBusy(false);
+      if (reqSeq === cleanPreviewReqSeqRef.current) {
+        setBusy(false);
+      }
     }
   }
 
@@ -278,6 +339,8 @@ export function TeamsView({
                     type="button"
                     className="btn btn-sm btn-danger"
                     onClick={() => {
+                      cleanPreviewReqSeqRef.current += 1;
+                      setBusy(false);
                       setCleanPreview(null);
                       setArchiveError(null);
                       setShowCleanupDialog(true);
@@ -343,14 +406,24 @@ export function TeamsView({
                               <span className="badge sm">{p.lifecycleState || 'archived'}</span>
                             </td>
                             <td>
-                              {p.retrospectives?.length > 0 || p.hasRetrospective ? (
-                                <span className="badge sm success">
-                                  <Icon name="check" />
-                                  已复盘
-                                </span>
-                              ) : (
-                                <span className="t-meta">—</span>
-                              )}
+                              {(() => {
+                                const retroCount =
+                                  typeof p.retrospectiveCount === 'number' && p.retrospectiveCount > 0
+                                    ? p.retrospectiveCount
+                                    : Array.isArray(p.retrospectives) && p.retrospectives.length > 0
+                                      ? p.retrospectives.length
+                                      : p.hasRetrospective
+                                        ? 1
+                                        : 0;
+                                return retroCount > 0 ? (
+                                  <span className="badge sm success">
+                                    <Icon name="check" />
+                                    {retroCount > 1 ? `已复盘 (${retroCount})` : '已复盘'}
+                                  </span>
+                                ) : (
+                                  <span className="t-meta">—</span>
+                                );
+                              })()}
                             </td>
                             <td className="r">
                               <Icon name="chevR" className="icon-14" />
@@ -898,20 +971,39 @@ export function TeamsView({
       {/* Retention Cleanup 2-step Dry-Run Dialog */}
       <Dialog
         open={showCleanupDialog}
-        onClose={() => setShowCleanupDialog(false)}
+        onClose={() => {
+          cleanPreviewReqSeqRef.current += 1;
+          setBusy(false);
+          setCleanPreview(null);
+          setShowCleanupDialog(false);
+        }}
         title="按保留期清理外部归档"
         footer={
           <>
-            <button type="button" className="btn" onClick={() => setShowCleanupDialog(false)}>
+            <button
+              type="button"
+              className="btn"
+              onClick={() => {
+                cleanPreviewReqSeqRef.current += 1;
+                setBusy(false);
+                setCleanPreview(null);
+                setShowCleanupDialog(false);
+              }}
+            >
               取消
             </button>
             <button
               type="button"
               className="btn btn-danger-solid"
-              disabled={busy || !cleanPreview || cleanPreview.matchedCount === 0}
+              disabled={
+                busy ||
+                !cleanPreview ||
+                cleanPreview.matchedCount === 0 ||
+                cleanPreview.rawDays !== cleanDays.trim()
+              }
               onClick={() => void handleCleanArchive(true)}
             >
-              确认清理 ({cleanPreview?.matchedCount ?? 0} 条)
+              确认清理 ({cleanPreview && cleanPreview.rawDays === cleanDays.trim() ? cleanPreview.matchedCount : 0} 条)
             </button>
           </>
         }
@@ -932,8 +1024,13 @@ export function TeamsView({
             style={{ width: 84 }}
             value={cleanDays}
             onChange={e => {
-              setCleanDays(e.target.value);
+              const nextVal = e.target.value;
+              cleanDaysRef.current = nextVal;
+              cleanPreviewReqSeqRef.current += 1;
+              setBusy(false);
+              setCleanDays(nextVal);
               setCleanPreview(null);
+              setArchiveError(null);
             }}
             placeholder="留空=全部"
           />
@@ -948,11 +1045,12 @@ export function TeamsView({
             预览（dryRun）
           </button>
         </div>
-        {cleanPreview ? (
+        {cleanPreview && cleanPreview.rawDays === cleanDays.trim() ? (
           <div className={`callout ${cleanPreview.matchedCount > 0 ? 'warning' : 'info'}`}>
             <Icon name={cleanPreview.matchedCount > 0 ? 'alert' : 'info'} />
             <span>
-              预览结果：匹配到 <b>{cleanPreview.matchedCount}</b> 条外部归档计划（尚未删除任何文件）。
+              预览结果（{cleanPreview.all ? '清理全部归档' : `早于 ${cleanPreview.olderThanDays} 天`}）：匹配到{' '}
+              <b>{cleanPreview.matchedCount}</b> 条外部归档计划（尚未删除任何文件）。
             </span>
           </div>
         ) : (
