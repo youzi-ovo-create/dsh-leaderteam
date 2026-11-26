@@ -116,10 +116,70 @@
     return json.value;
   }
 
+  function isStalePanelModeSnapshot(prevSnap, nextSnap) {
+    if (!prevSnap || !nextSnap) return false;
+    if (prevSnap.sessionId && nextSnap.sessionId && prevSnap.sessionId !== nextSnap.sessionId) return false;
+    if (
+      Number.isInteger(prevSnap.switchCount) &&
+      Number.isInteger(nextSnap.switchCount) &&
+      nextSnap.switchCount < prevSnap.switchCount
+    ) {
+      return true;
+    }
+    return false;
+  }
+
+  function mergeIncomingSessionModes(prevList, nextList, opts) {
+    const prevArr = Array.isArray(prevList) ? prevList : [];
+    const nextArr = Array.isArray(nextList) ? nextList : [];
+    const epochStale = Boolean(opts && opts.epochStale);
+    const authSid = opts && opts.authoritativeSid ? String(opts.authoritativeSid) : null;
+    const authSnap = opts && opts.authoritativeModeState ? opts.authoritativeModeState : null;
+    const prevById = new Map();
+    for (let i = 0; i < prevArr.length; i++) {
+      const p = prevArr[i];
+      if (p && p.sessionId) prevById.set(p.sessionId, p);
+    }
+    return nextArr.map(item => {
+      if (!item || !item.sessionId) return item;
+      const existing = prevById.get(item.sessionId);
+      if (authSid && item.sessionId === authSid && authSnap) {
+        if (existing && isStalePanelModeSnapshot(existing.modeState, authSnap)) {
+          return existing;
+        }
+        return Object.assign({}, item, {
+          executionMode: authSnap.mode,
+          isLtSession: authSnap.isLtSession,
+          canSwitchMode: authSnap.canSwitch,
+          modeBusyReason: authSnap.busyReason,
+          modeState: authSnap,
+        });
+      }
+      if (!existing) return item;
+      if (epochStale || isStalePanelModeSnapshot(existing.modeState, item.modeState)) {
+        const keepSnap = existing.modeState || item.modeState;
+        return Object.assign({}, item, {
+          executionMode: existing.executionMode !== undefined ? existing.executionMode : item.executionMode,
+          isLtSession: existing.isLtSession !== undefined ? existing.isLtSession : item.isLtSession,
+          canSwitchMode: existing.canSwitchMode !== undefined ? existing.canSwitchMode : item.canSwitchMode,
+          modeBusyReason: existing.modeBusyReason !== undefined ? existing.modeBusyReason : item.modeBusyReason,
+          ...(keepSnap ? { modeState: keepSnap } : {}),
+        });
+      }
+      return item;
+    });
+  }
+
   function createLeaderTeamPanelClient(requireFn) {
     const React = requireFn('react');
     const h = React.createElement;
     const { useState, useEffect, useCallback } = React;
+    const useRefCompat = typeof React.useRef === 'function'
+      ? React.useRef
+      : function useRefFallback(initialValue) {
+          const pair = useState({ current: initialValue });
+          return pair[0];
+        };
 
     function PanelIcon(props) {
       const size = (props && typeof props.size === 'number') ? props.size : 18;
@@ -169,6 +229,7 @@
       // Session execution modes (Single / Team)
       const [sessionModes, setSessionModes] = useState([]);
       const [switchingMap, setSwitchingMap] = useState({});
+      const modeMutationEpochRef = useRefCompat(0);
 
       // Archive filters & detail
       const [catFilter, setCatFilter] = useState('');
@@ -182,6 +243,7 @@
       const hydrateFromState = useCallback((snap, opts) => {
         setData(snap);
         const keepDrafts = Boolean(opts && opts.preserveDirty);
+        const epochStale = Boolean(opts && opts.epochStale);
         if (snap && snap.configSnapshot && !keepDrafts) {
           const rMap = {};
           ROLE_META.forEach(({ key }) => {
@@ -196,7 +258,7 @@
           setDraftPool(prev => (prev.includes(r) ? prev : prev.concat([r])));
         }
         if (snap && Array.isArray(snap.sessionModes)) {
-          setSessionModes(snap.sessionModes);
+          setSessionModes(prev => mergeIncomingSessionModes(prev, snap.sessionModes, { epochStale }));
         }
         if (snap && snap.archive && Array.isArray(snap.archive.recentPlans)) {
           setArchivePlans(snap.archive.recentPlans);
@@ -204,11 +266,15 @@
       }, []);
 
       const loadState = useCallback(async (opts) => {
+        const modeEpoch = modeMutationEpochRef.current;
         setLoading(true);
         setError(null);
         try {
           const snap = await postApi(ROUTES.STATE, opts || {});
-          hydrateFromState(snap, { preserveDirty: false });
+          hydrateFromState(snap, {
+            preserveDirty: false,
+            epochStale: modeEpoch !== modeMutationEpochRef.current,
+          });
         } catch (e) {
           setError(e && e.message ? e.message : String(e));
         } finally {
@@ -221,12 +287,16 @@
       }, [loadState]);
 
       const onDiscoverUpstream = async (probeEndpoints) => {
+        const modeEpoch = modeMutationEpochRef.current;
         setLoading(true);
         setError(null);
         setNotice(null);
         try {
           const res = await postApi(ROUTES.DISCOVER, { probeEndpoints: Boolean(probeEndpoints) });
-          hydrateFromState(res.state, { preserveDirty: isDirty });
+          hydrateFromState(res.state, {
+            preserveDirty: isDirty,
+            epochStale: modeEpoch !== modeMutationEpochRef.current,
+          });
           const count = (res.catalog && Array.isArray(res.catalog.models)) ? res.catalog.models.length : 0;
           setNotice('已同步 DSH 上游模型目录，共发现 ' + count + ' 个上游模型' + (isDirty ? '（已保留当前未保存的角色草稿）' : '') + '。');
         } catch (e) {
@@ -237,6 +307,7 @@
       };
 
       const onSaveModelsAndRoles = async () => {
+        const modeEpoch = modeMutationEpochRef.current;
         setLoading(true);
         setError(null);
         setNotice(null);
@@ -259,7 +330,10 @@
               poolSet: draftPool,
             },
           });
-          hydrateFromState(res.state, { preserveDirty: false });
+          hydrateFromState(res.state, {
+            preserveDirty: false,
+            epochStale: modeEpoch !== modeMutationEpochRef.current,
+          });
           const shadowed = (res && Array.isArray(res.shadowedByLocal) && res.shadowedByLocal.length > 0)
             ? res.shadowedByLocal
             : (res && res.applyResult && Array.isArray(res.applyResult.shadowedByLocal) ? res.applyResult.shadowedByLocal : []);
@@ -280,6 +354,7 @@
       };
 
       const onClearLocalOverrides = async () => {
+        const modeEpoch = modeMutationEpochRef.current;
         setLoading(true);
         setError(null);
         setNotice(null);
@@ -289,7 +364,10 @@
             target: 'local',
             changes: { clearLocalOverrides: true },
           });
-          hydrateFromState(res.state, { preserveDirty: false });
+          hydrateFromState(res.state, {
+            preserveDirty: false,
+            epochStale: modeEpoch !== modeMutationEpochRef.current,
+          });
           setNotice('已清除本机覆盖 (leaderteam.local.json 中的模型、执行池与角色覆盖)，正式基础配置已恢复生效。');
         } catch (e) {
           setError(e && e.message ? e.message : String(e));
@@ -301,6 +379,7 @@
       const onAddCustomModel = async () => {
         const route = newModelRoute.trim();
         if (!route) return;
+        const modeEpoch = modeMutationEpochRef.current;
         setLoading(true);
         setError(null);
         setNotice(null);
@@ -319,7 +398,11 @@
               }],
             },
           });
-          hydrateFromState(res.state, { preserveDirty: isDirty, addedPoolRoute: route });
+          hydrateFromState(res.state, {
+            preserveDirty: isDirty,
+            addedPoolRoute: route,
+            epochStale: modeEpoch !== modeMutationEpochRef.current,
+          });
           setNewModelRoute('');
           setNotice('已登记模型 ' + route + ' 并加入成员执行池。');
         } catch (e) {
@@ -330,6 +413,7 @@
       };
 
       const onTogglePlugin = async (pluginKey, nextVal) => {
+        const modeEpoch = modeMutationEpochRef.current;
         setLoading(true);
         setError(null);
         setNotice(null);
@@ -338,7 +422,7 @@
             target: saveTarget,
             changes: { setPlugins: { [pluginKey]: nextVal } },
           });
-          hydrateFromState(res.state);
+          hydrateFromState(res.state, { epochStale: modeEpoch !== modeMutationEpochRef.current });
           setNotice('插件 ' + pluginKey + ' 已切换为 ' + (nextVal ? '启用' : '拆卸停用') + '。');
         } catch (e) {
           setError(e && e.message ? e.message : String(e));
@@ -348,6 +432,7 @@
       };
 
       const onTogglePowerMonitor = async (nextVal) => {
+        const modeEpoch = modeMutationEpochRef.current;
         setLoading(true);
         setError(null);
         setNotice(null);
@@ -356,7 +441,7 @@
             target: saveTarget,
             changes: { setPowerMonitor: { enabled: nextVal } },
           });
-          hydrateFromState(res.state);
+          hydrateFromState(res.state, { epochStale: modeEpoch !== modeMutationEpochRef.current });
           setNotice('电池感知式安全收尾已切换为 ' + (nextVal ? '启用' : '停用') + '。');
         } catch (e) {
           setError(e && e.message ? e.message : String(e));
@@ -438,11 +523,13 @@
       };
 
       const onRefreshSessionModes = async () => {
+        const modeEpoch = modeMutationEpochRef.current;
         setError(null);
         try {
           const res = await postApi(ROUTES.SESSION_MODE, { action: 'list' });
+          const epochStale = modeEpoch !== modeMutationEpochRef.current;
           if (res && Array.isArray(res.sessions)) {
-            setSessionModes(res.sessions);
+            setSessionModes(prev => mergeIncomingSessionModes(prev, res.sessions, { epochStale }));
           }
         } catch (e) {
           setError(e && e.message ? e.message : String(e));
@@ -451,6 +538,7 @@
 
       const onSwitchSessionMode = async (sid, nextMode) => {
         if (!sid || !nextMode) return;
+        modeMutationEpochRef.current += 1;
         setSwitchingMap(prev => Object.assign({}, prev || {}, { [sid]: true }));
         setError(null);
         setNotice(null);
@@ -460,35 +548,43 @@
             sessionId: sid,
             mode: nextMode,
           });
+          modeMutationEpochRef.current += 1;
           if (res && Array.isArray(res.sessions)) {
-            setSessionModes(res.sessions);
+            setSessionModes(prev =>
+              mergeIncomingSessionModes(prev, res.sessions, {
+                epochStale: false,
+                authoritativeSid: sid,
+                authoritativeModeState: res.modeState || null,
+              })
+            );
           } else if (res && res.modeState) {
-            setSessionModes(prev => prev.map(s => (
-              s.sessionId === sid
-                ? Object.assign({}, s, {
-                    executionMode: res.modeState.mode,
-                    canSwitchMode: res.modeState.canSwitch,
-                    modeBusyReason: res.modeState.busyReason,
-                    modeState: res.modeState,
-                  })
-                : s
-            )));
+            setSessionModes(prev => prev.map(s => {
+              if (s.sessionId !== sid) return s;
+              if (isStalePanelModeSnapshot(s.modeState, res.modeState)) return s;
+              return Object.assign({}, s, {
+                executionMode: res.modeState.mode,
+                canSwitchMode: res.modeState.canSwitch,
+                modeBusyReason: res.modeState.busyReason,
+                modeState: res.modeState,
+              });
+            }));
           }
           setNotice('会话 ' + sid + ' 已切换为 ' + (nextMode === 'single' ? 'Single 单代理直执' : 'Team 团队协作') + ' 模式（0 次模型调用）。');
         } catch (e) {
+          modeMutationEpochRef.current += 1;
           if (e && e.details && e.details.modeState) {
             const ms = e.details.modeState;
-            setSessionModes(prev => prev.map(s => (
-              s.sessionId === sid
-                ? Object.assign({}, s, {
-                    executionMode: ms.mode,
-                    isLtSession: ms.isLtSession,
-                    canSwitchMode: ms.canSwitch,
-                    modeBusyReason: ms.busyReason,
-                    modeState: ms,
-                  })
-                : s
-            )));
+            setSessionModes(prev => prev.map(s => {
+              if (s.sessionId !== sid) return s;
+              if (isStalePanelModeSnapshot(s.modeState, ms)) return s;
+              return Object.assign({}, s, {
+                executionMode: ms.mode,
+                isLtSession: ms.isLtSession,
+                canSwitchMode: ms.canSwitch,
+                modeBusyReason: ms.busyReason,
+                modeState: ms,
+              });
+            }));
           }
           const prefix = e && e.code === 'MODE_SWITCH_BUSY' ? '无法切换会话模式（当前忙碌）：' : '切换会话模式失败：';
           setError(prefix + (e && e.message ? e.message : String(e)));

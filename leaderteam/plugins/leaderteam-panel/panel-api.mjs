@@ -250,7 +250,10 @@ export async function buildPanelStateSnapshot(ctx, rt = runtime(), { probeEndpoi
   };
 }
 
-export function createPanelHandlers(ctx, rt = runtime()) {
+export function createPanelHandlers(ctx, rt = runtime(), options = {}) {
+  const explicitDshHome = typeof options?.dshHome === 'string' && options.dshHome.trim()
+    ? path.resolve(options.dshHome.trim())
+    : null;
   return {
     async state(request) {
       try {
@@ -435,7 +438,7 @@ export function createPanelHandlers(ctx, rt = runtime()) {
           : (body.mode !== undefined ? 'set' : (body.sessionId !== undefined ? 'get' : 'list'));
 
         if (rawAction === 'list') {
-          const sessions = await collectKnownSessionModeItems(ctx, rt);
+          const sessions = await collectKnownSessionModeItems(ctx, rt, explicitDshHome);
           return okReply({
             defaultMode: DEFAULT_EXECUTION_MODE,
             modes: [...EXECUTION_MODES],
@@ -445,18 +448,18 @@ export function createPanelHandlers(ctx, rt = runtime()) {
 
         const sessionId = typeof body.sessionId === 'string' ? body.sessionId.trim() : '';
         if (rawAction === 'get') {
-          const hints = sessionId ? await resolveHostSessionModeHints(ctx, rt, sessionId) : {};
+          const hints = sessionId ? await resolveHostSessionModeHints(ctx, rt, sessionId, explicitDshHome) : {};
           const modeState = inspectSessionModeState(ctx, rt, sessionId, hints);
           return okReply({ modeState });
         }
 
         if (rawAction === 'set') {
-          const hints = sessionId ? await resolveHostSessionModeHints(ctx, rt, sessionId) : {};
+          const hints = sessionId ? await resolveHostSessionModeHints(ctx, rt, sessionId, explicitDshHome) : {};
           const switched = switchSessionExecutionMode(ctx, rt, sessionId, body.mode, {
             ...hints,
             source: 'panel-api',
           });
-          const sessions = await collectKnownSessionModeItems(ctx, rt);
+          const sessions = await collectKnownSessionModeItems(ctx, rt, explicitDshHome);
           return okReply({
             ...switched,
             sessions,

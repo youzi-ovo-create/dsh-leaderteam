@@ -46,6 +46,22 @@ const MODE_BEHAVIOR_HINT: Record<ExecutionMode, string> = {
   single: 'Single：主代理直接读写与命令 + 安全门守护 · 零团队开销',
 };
 
+export function isStaleModeSnapshot(
+  prev: SessionModeSnapshot | null | undefined,
+  next: SessionModeSnapshot | null | undefined,
+): boolean {
+  if (!prev || !next) return false;
+  if (prev.sessionId !== next.sessionId) return false;
+  if (
+    Number.isInteger(prev.switchCount)
+    && Number.isInteger(next.switchCount)
+    && next.switchCount < prev.switchCount
+  ) {
+    return true;
+  }
+  return false;
+}
+
 export function WorkbenchView({
   bundle,
   onRefreshBundle,
@@ -78,26 +94,32 @@ export function WorkbenchView({
   const selectedSessionIdRef = useRef<string>(selectedSessionId);
   selectedSessionIdRef.current = selectedSessionId;
   const transcriptReqSeqRef = useRef<number>(0);
+  const modeMutationEpochRef = useRef<number>(0);
   const prevSelectedSessionRef = useRef<string>(selectedSessionId);
 
   const syncModeSnapshotIntoSessionList = useCallback((snap: SessionModeSnapshot) => {
     setSessions(prev =>
-      prev.map(item =>
-        item.sessionId === snap.sessionId
-          ? {
-              ...item,
-              executionMode: snap.mode,
-              isLtSession: snap.isLtSession,
-              canSwitchMode: snap.canSwitch,
-              modeBusyReason: snap.busyReason,
-              modeState: snap,
-            }
-          : item,
-      ),
+      prev.map(item => {
+        if (item.sessionId !== snap.sessionId) return item;
+        if (isStaleModeSnapshot(item.modeState, snap)) return item;
+        return {
+          ...item,
+          executionMode: snap.mode,
+          isLtSession: snap.isLtSession,
+          canSwitchMode: snap.canSwitch,
+          modeBusyReason: snap.busyReason,
+          modeState: snap,
+        };
+      }),
     );
   }, []);
 
+  const applyModeSnapshot = useCallback((snap: SessionModeSnapshot) => {
+    setModeState(prev => (isStaleModeSnapshot(prev, snap) ? prev : snap));
+  }, []);
+
   const loadSessions = useCallback(async () => {
+    const modeEpoch = modeMutationEpochRef.current;
     try {
       const data = await callLtApi<{
         liveHost: boolean;
@@ -111,26 +133,46 @@ export function WorkbenchView({
         setSelectedWorkspaceId(wsList[0].workspaceId);
       }
       const nextSessions = data.sessions || [];
-      setSessions(nextSessions);
+      const epochStale = modeEpoch !== modeMutationEpochRef.current;
+      setSessions(prev => {
+        const prevById = new Map(prev.map(item => [item.sessionId, item]));
+        return nextSessions.map(item => {
+          const existing = prevById.get(item.sessionId);
+          if (!existing) return item;
+          if (epochStale || isStaleModeSnapshot(existing.modeState, item.modeState)) {
+            const keepSnap = existing.modeState ?? item.modeState;
+            return {
+              ...item,
+              executionMode: existing.executionMode ?? item.executionMode,
+              isLtSession: existing.isLtSession ?? item.isLtSession,
+              canSwitchMode: existing.canSwitchMode ?? item.canSwitchMode,
+              modeBusyReason: existing.modeBusyReason !== undefined ? existing.modeBusyReason : item.modeBusyReason,
+              ...(keepSnap ? { modeState: keepSnap } : {}),
+            };
+          }
+          return item;
+        });
+      });
       const curSelected = selectedSessionIdRef.current;
       const activeSid = curSelected || (nextSessions.length > 0 ? nextSessions[0].sessionId : '');
       if (!curSelected && activeSid) {
         selectedSessionIdRef.current = activeSid;
         setSelectedSessionId(activeSid);
       }
-      if (activeSid && activeSid === selectedSessionIdRef.current) {
+      if (!epochStale && activeSid && activeSid === selectedSessionIdRef.current) {
         const matched = nextSessions.find(s => s.sessionId === activeSid);
         if (matched?.modeState) {
-          setModeState(matched.modeState);
+          applyModeSnapshot(matched.modeState);
         }
       }
     } catch (e: any) {
       setFeedback(e.message);
     }
-  }, [selectedWorkspaceId]);
+  }, [selectedWorkspaceId, applyModeSnapshot]);
 
   const loadTranscript = useCallback(async (sid: string) => {
     const reqSeq = ++transcriptReqSeqRef.current;
+    const modeEpoch = modeMutationEpochRef.current;
     if (!sid) {
       if (selectedSessionIdRef.current === '') {
         setMessages([]);
@@ -146,7 +188,8 @@ export function WorkbenchView({
         modeState?: SessionModeSnapshot | null;
       }>('workbench/transcript', { sessionId: sid });
 
-      if (res.modeState) {
+      const modeEpochMatches = modeEpoch === modeMutationEpochRef.current;
+      if (res.modeState && modeEpochMatches) {
         syncModeSnapshotIntoSessionList(res.modeState);
       }
       if (sid !== selectedSessionIdRef.current || reqSeq !== transcriptReqSeqRef.current) {
@@ -159,14 +202,21 @@ export function WorkbenchView({
         Boolean(ps && (ps.running === true || ps.busy === true || ps.turnRunning === true || ps.status === 'running')),
       );
       if (res.modeState) {
-        setModeState(res.modeState);
-      } else if (dualModeEnabled) {
+        if (modeEpochMatches) {
+          applyModeSnapshot(res.modeState);
+        }
+      } else if (dualModeEnabled && modeEpochMatches) {
         try {
+          const fallbackEpoch = modeMutationEpochRef.current;
           const modeRes = await fetchWorkbenchSessionMode(sid);
-          if (modeRes.modeState) {
+          if (
+            modeRes.modeState
+            && fallbackEpoch === modeMutationEpochRef.current
+            && modeEpoch === modeMutationEpochRef.current
+          ) {
             syncModeSnapshotIntoSessionList(modeRes.modeState);
             if (sid === selectedSessionIdRef.current && reqSeq === transcriptReqSeqRef.current) {
-              setModeState(modeRes.modeState);
+              applyModeSnapshot(modeRes.modeState);
             }
           }
         } catch {}
@@ -176,7 +226,7 @@ export function WorkbenchView({
         setPassiveRunning(false);
       }
     }
-  }, [dualModeEnabled, syncModeSnapshotIntoSessionList]);
+  }, [dualModeEnabled, syncModeSnapshotIntoSessionList, applyModeSnapshot]);
 
   useEffect(() => {
     void loadSessions();
@@ -192,7 +242,7 @@ export function WorkbenchView({
       setPassiveRunning(Boolean(matched?.modeState?.activeTurn));
       setModeState(matched?.modeState ?? null);
     } else if (matched?.modeState) {
-      setModeState(matched.modeState);
+      applyModeSnapshot(matched.modeState);
     }
     void loadTranscript(selectedSessionId);
     if (!selectedSessionId) return;
@@ -200,7 +250,7 @@ export function WorkbenchView({
       void loadTranscript(selectedSessionId);
     }, 3000);
     return () => clearInterval(timer);
-  }, [selectedSessionId, loadTranscript]);
+  }, [selectedSessionId, loadTranscript, applyModeSnapshot]);
 
   const selectedSession = sessions.find(s => s.sessionId === selectedSessionId) || null;
   const effectiveModeState =
@@ -238,24 +288,30 @@ export function WorkbenchView({
     if (!dualModeEnabled || !targetSid || !isLtSession || isSwitchLockedByBusy || targetMode === currentMode) {
       return;
     }
+    ++modeMutationEpochRef.current;
+    ++transcriptReqSeqRef.current;
     setSwitchingSessionIds(prev => ({ ...prev, [targetSid]: true }));
     setModeError(null);
     try {
       const res = await switchWorkbenchSessionMode(targetSid, targetMode);
+      ++modeMutationEpochRef.current;
+      ++transcriptReqSeqRef.current;
       syncModeSnapshotIntoSessionList(res.modeState);
       if (targetSid === selectedSessionIdRef.current) {
-        setModeState(res.modeState);
+        applyModeSnapshot(res.modeState);
         setFeedback(
           `已切换会话执行模式为 ${res.modeState.mode === 'single' ? 'Single 单代理直执' : 'Team 团队协作'}（0 次模型调用）`,
         );
       }
     } catch (err: any) {
+      ++modeMutationEpochRef.current;
+      ++transcriptReqSeqRef.current;
       const apiErr = err instanceof LtApiError ? err : null;
       const latestSnap = apiErr?.details?.modeState as SessionModeSnapshot | undefined;
       if (latestSnap && latestSnap.sessionId === targetSid) {
         syncModeSnapshotIntoSessionList(latestSnap);
         if (targetSid === selectedSessionIdRef.current) {
-          setModeState(latestSnap);
+          applyModeSnapshot(latestSnap);
         }
       }
       if (targetSid === selectedSessionIdRef.current) {
@@ -272,6 +328,8 @@ export function WorkbenchView({
   }
 
   async function handleCreateSession() {
+    ++modeMutationEpochRef.current;
+    ++transcriptReqSeqRef.current;
     setBusy(true);
     setFeedback(null);
     setModeError(null);
@@ -296,8 +354,11 @@ export function WorkbenchView({
         agentPreset: 'leaderteam',
         ...(dualModeEnabled ? { executionMode: initialMode } : {}),
       });
+      ++modeMutationEpochRef.current;
+      ++transcriptReqSeqRef.current;
       if (created.modeState) {
         setModeState(created.modeState);
+        syncModeSnapshotIntoSessionList(created.modeState);
       }
       selectedSessionIdRef.current = created.sessionId;
       await loadSessions();
@@ -311,6 +372,8 @@ export function WorkbenchView({
         setFeedback(`已创建新 LeaderTeam 会话：${created.sessionId}`);
       }
     } catch (e: any) {
+      ++modeMutationEpochRef.current;
+      ++transcriptReqSeqRef.current;
       setFeedback(`创建会话失败：${e.message}`);
     } finally {
       setBusy(false);

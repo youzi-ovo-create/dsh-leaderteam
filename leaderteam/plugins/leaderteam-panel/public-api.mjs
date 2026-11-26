@@ -12,7 +12,7 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { TeamStore, readJsonl, writeFileAtomic } from '../../core/store.mjs';
+import { TeamStore, readJsonl, writeFileAtomic, resolveTeamStoreLogicalId } from '../../core/store.mjs';
 import { frontierView } from '../../core/frontier.mjs';
 import { isAutonomousGovernance, replayGovernanceState } from '../../core/governance-protocol.mjs';
 import { computeTimerSnapshot, resolveNowMs } from '../../core/timer.mjs';
@@ -38,7 +38,7 @@ import {
   normalizeExecutionMode,
   readSessionModeRecord,
 } from '../../host/mode-controller.mjs';
-import { resolveSessionModePaths } from '../../core/session-mode.mjs';
+import { resolveSessionModePaths, encodeSessionModeSegment } from '../../core/session-mode.mjs';
 import { recentTeamObservability } from '../../host/observability.mjs';
 import {
   getOrCreateGatewayManager,
@@ -951,10 +951,21 @@ function extractSessionMetaFromRows(rows) {
   for (const raw of rows) {
     const ev = raw?.type === 'event' && raw.event ? raw.event : raw;
     if (!ev || typeof ev !== 'object') continue;
-    if (ev.type === 'session') {
-      if (typeof ev.agentPreset === 'string' && ev.agentPreset.trim()) agentPreset = ev.agentPreset.trim();
-      if (typeof ev.data?.agentPreset === 'string' && ev.data.agentPreset.trim()) agentPreset = ev.data.agentPreset.trim();
-      if (ev.origin === 'subagent' || ev.data?.origin === 'subagent' || ev.parentSession || ev.data?.parentSession) {
+    if (ev.type === 'session' || ev.type === 'session/header') {
+      const hdr = ev.data?.header ?? ev.header ?? ev.data ?? ev;
+      const candPreset = ev.agentPreset ?? ev.data?.agentPreset ?? hdr?.agentPreset;
+      if (typeof candPreset === 'string' && candPreset.trim()) agentPreset = candPreset.trim();
+      if (
+        ev.origin === 'subagent'
+        || ev.data?.origin === 'subagent'
+        || hdr?.origin === 'subagent'
+        || ev.parentSession
+        || ev.data?.parentSession
+        || hdr?.parentSession
+        || ev.parentSessionId
+        || ev.data?.parentSessionId
+        || hdr?.parentSessionId
+      ) {
         origin = 'subagent';
       }
     } else if (ev.type === 'agent-preset/selected') {
@@ -969,6 +980,139 @@ function extractSessionMetaFromRows(rows) {
   return { agentPreset, origin, openTurn };
 }
 
+function extractControllerEventPage(res) {
+  if (Array.isArray(res)) return res;
+  if (Array.isArray(res?.records)) return res.records;
+  if (Array.isArray(res?.events)) return res.events;
+  if (Array.isArray(res?.items)) return res.items;
+  return [];
+}
+
+function attachEventsMeta(rows, meta) {
+  const arr = Array.isArray(rows) ? rows : [];
+  Object.defineProperty(arr, '_meta', {
+    value: meta,
+    enumerable: false,
+    configurable: true,
+  });
+  return arr;
+}
+
+export async function readAllControllerSessionEvents(sessionController, sessionId, signal, { dshHome = null } = {}) {
+  if (!sessionController || typeof sessionController.events !== 'function' || !sessionId) {
+    return attachEventsMeta([], { complete: false, hasCursor: false, cursor: undefined });
+  }
+
+  let reqMode = 'address+max';
+  let res;
+  try {
+    res = await sessionController.events(
+      { address: { kind: 'session', sessionId }, maxMessages: 500 },
+      signal,
+    );
+  } catch {
+    try {
+      reqMode = 'address';
+      res = await sessionController.events(
+        { address: { kind: 'session', sessionId } },
+        signal,
+      );
+    } catch {
+      reqMode = 'legacy';
+      res = await sessionController.events({ sessionId }, signal);
+    }
+  }
+
+  let pageRows = extractControllerEventPage(res);
+  const firstPageRows = pageRows;
+  const throughSeq = Number.isSafeInteger(res?.cursor) ? res.cursor : undefined;
+  const olderChunks = [];
+  let prevBeforeSeq = null;
+  let incomplete = false;
+  let pages = 1;
+  const MAX_PAGES = 100;
+
+  while (res?.hasMore === true) {
+    if (pageRows.length === 0 || pages >= MAX_PAGES) {
+      incomplete = true;
+      break;
+    }
+    const firstRaw = pageRows[0];
+    const firstEv = firstRaw?.type === 'event' && firstRaw.event ? firstRaw.event : firstRaw;
+    const beforeSeq = Number.isSafeInteger(firstEv?.seq)
+      ? firstEv.seq
+      : (Number.isSafeInteger(firstRaw?.seq) ? firstRaw.seq : undefined);
+    if (!Number.isSafeInteger(beforeSeq) || beforeSeq < 0 || (prevBeforeSeq !== null && beforeSeq >= prevBeforeSeq)) {
+      incomplete = true;
+      break;
+    }
+    if (beforeSeq === 0) {
+      break;
+    }
+    prevBeforeSeq = beforeSeq;
+    pages += 1;
+
+    let olderRes;
+    try {
+      const pageReq =
+        reqMode === 'legacy'
+          ? { sessionId, beforeSeq, ...(throughSeq !== undefined ? { throughSeq } : {}) }
+          : reqMode === 'address'
+            ? { address: { kind: 'session', sessionId }, beforeSeq, ...(throughSeq !== undefined ? { throughSeq } : {}) }
+            : { address: { kind: 'session', sessionId }, maxMessages: 500, beforeSeq, ...(throughSeq !== undefined ? { throughSeq } : {}) };
+      try {
+        olderRes = await sessionController.events(pageReq, signal);
+      } catch (innerErr) {
+        if (reqMode === 'address+max') {
+          reqMode = 'address';
+          olderRes = await sessionController.events(
+            { address: { kind: 'session', sessionId }, beforeSeq, ...(throughSeq !== undefined ? { throughSeq } : {}) },
+            signal,
+          );
+        } else {
+          throw innerErr;
+        }
+      }
+    } catch {
+      incomplete = true;
+      break;
+    }
+
+    const olderRows = extractControllerEventPage(olderRes);
+    if (olderRows.length === 0) {
+      if (olderRes?.hasMore === true) incomplete = true;
+      break;
+    }
+    olderChunks.push(olderRows);
+    res = olderRes;
+    pageRows = olderRows;
+  }
+
+  if (incomplete && dshHome) {
+    const durableRows = findDurableSessionRows(dshHome, sessionId);
+    if (Array.isArray(durableRows) && durableRows.length > 0) {
+      return attachEventsMeta(durableRows, {
+        complete: true,
+        hasCursor: true,
+        cursor: throughSeq,
+        fromDurableFallback: true,
+      });
+    }
+  }
+
+  const combined = [];
+  for (let i = olderChunks.length - 1; i >= 0; i--) {
+    for (const r of olderChunks[i]) combined.push(r);
+  }
+  for (const r of firstPageRows) combined.push(r);
+
+  return attachEventsMeta(combined, {
+    complete: !incomplete,
+    hasCursor: throughSeq !== undefined,
+    cursor: throughSeq,
+  });
+}
+
 export async function resolveHostSessionModeHints(ctx, rt, sessionId, dshHome = null) {
   const hints = {
     passiveState: null,
@@ -978,7 +1122,23 @@ export async function resolveHostSessionModeHints(ctx, rt, sessionId, dshHome = 
   };
   if (typeof sessionId !== 'string' || !sessionId.trim()) return hints;
 
+  const baseRt = baseRuntime(rt ?? runtime());
+  const effectiveDshHome = dshHome ?? resolveDshHomeFromCtx(ctx, baseRt);
   const sessionController = getHostService(ctx, 'sessionController');
+  const liveActor = baseRt?.actors?.get?.(sessionId) ?? null;
+  const hostAgents = baseRt?.hostAgents ?? getHostService(ctx, 'agents');
+  const liveAgent = (liveActor?.role === 'leader' ? liveActor.agent : null) ?? hostAgents?.get?.(sessionId) ?? null;
+  const sessionsSvc = getHostService(ctx, 'sessions');
+  const liveSession = sessionsSvc?.get?.(sessionId) ?? liveAgent?.session ?? liveActor?.agent?.session ?? null;
+
+  let sessionExists = Boolean(
+    liveActor
+    || liveAgent
+    || liveSession
+    || baseRt?.workbenchCreatedSessionIds?.has?.(sessionId)
+    || safeHasPersistedLtSession(baseRt?.storageRoot, sessionId),
+  );
+
   if (sessionController && typeof sessionController.state === 'function') {
     const ac = new AbortController();
     try {
@@ -988,16 +1148,15 @@ export async function resolveHostSessionModeHints(ctx, rt, sessionId, dshHome = 
         hints.passiveRunning = Boolean(
           ps.running === true || ps.busy === true || ps.turnRunning === true || ps.status === 'running',
         );
+        if (hints.passiveRunning || ps.active === true || ps.exists === true) {
+          sessionExists = true;
+        }
       }
     } catch {} finally {
       ac.abort();
     }
   }
 
-  const baseRt = baseRuntime(rt ?? runtime());
-  const liveActor = baseRt?.actors?.get?.(sessionId) ?? null;
-  const sessionsSvc = getHostService(ctx, 'sessions');
-  const liveSession = sessionsSvc?.get?.(sessionId) ?? liveActor?.agent?.session ?? null;
   const presetsSvc = getHostService(ctx, 'agentPresets');
   if (liveSession) {
     const p = typeof presetsSvc?.presetForSession === 'function'
@@ -1009,23 +1168,40 @@ export async function resolveHostSessionModeHints(ctx, rt, sessionId, dshHome = 
     }
   }
 
-  if (hints.agentPreset === undefined && sessionController && typeof sessionController.projections === 'function') {
+  if ((hints.agentPreset === undefined || !sessionExists) && sessionController && typeof sessionController.projections === 'function') {
     const ac = new AbortController();
     try {
-      const proj = await sessionController.projections({ sessionId }, ac.signal);
-      const p = proj?.values?.agentPreset;
-      if (typeof p === 'string' && p.trim()) hints.agentPreset = p.trim();
+      let proj;
+      try {
+        proj = await sessionController.projections({ sessionId }, ac.signal);
+      } catch {
+        proj = await sessionController.projections({ address: { kind: 'session', sessionId } }, ac.signal);
+      }
+      if (proj && typeof proj === 'object') {
+        const vals = proj.values;
+        if (Number.isSafeInteger(proj.cursor) || (vals && typeof vals === 'object' && Object.keys(vals).length > 0)) {
+          sessionExists = true;
+        }
+        const p = vals?.agentPreset;
+        if (hints.agentPreset === undefined && typeof p === 'string' && p.trim()) {
+          hints.agentPreset = p.trim();
+        }
+        if (hints.origin === undefined && (vals?.origin === 'subagent' || vals?.parentSessionId || vals?.parentSession)) {
+          hints.origin = 'subagent';
+        }
+      }
     } catch {} finally {
       ac.abort();
     }
   }
 
-  if ((hints.agentPreset === undefined || hints.passiveState === null) && sessionController && typeof sessionController.list === 'function') {
+  if ((hints.agentPreset === undefined || hints.passiveState === null || !sessionExists) && sessionController && typeof sessionController.list === 'function') {
     const ac = new AbortController();
     try {
       const listed = await sessionController.list({}, ac.signal);
       const hit = (listed?.items ?? []).find(it => String(it?.sessionId ?? it?.id ?? '') === sessionId);
       if (hit) {
+        sessionExists = true;
         const p = hit.projections?.values?.agentPreset ?? hit.agentPreset ?? null;
         if (hints.agentPreset === undefined && typeof p === 'string' && p.trim()) {
           hints.agentPreset = p.trim();
@@ -1042,16 +1218,15 @@ export async function resolveHostSessionModeHints(ctx, rt, sessionId, dshHome = 
     }
   }
 
-  if ((hints.agentPreset === undefined || hints.passiveState === null) && sessionController && typeof sessionController.events === 'function') {
+  if ((hints.agentPreset === undefined || hints.passiveState === null || !sessionExists) && sessionController && typeof sessionController.events === 'function') {
     const ac = new AbortController();
     try {
-      let evRes;
-      try {
-        evRes = await sessionController.events({ address: { kind: 'session', sessionId } }, ac.signal);
-      } catch {
-        evRes = await sessionController.events({ sessionId }, ac.signal);
+      const evRows = await readAllControllerSessionEvents(sessionController, sessionId, ac.signal, {
+        dshHome: effectiveDshHome,
+      });
+      if (evRows.length > 0 || (evRows._meta?.hasCursor && evRows._meta.cursor >= 0)) {
+        sessionExists = true;
       }
-      const evRows = Array.isArray(evRes) ? evRes : (evRes?.events ?? evRes?.records ?? evRes?.items ?? []);
       const meta = extractSessionMetaFromRows(evRows);
       if (hints.agentPreset === undefined && meta.agentPreset) hints.agentPreset = meta.agentPreset;
       if (hints.origin === undefined && meta.origin) hints.origin = meta.origin;
@@ -1061,17 +1236,25 @@ export async function resolveHostSessionModeHints(ctx, rt, sessionId, dshHome = 
     }
   }
 
-  if (hints.agentPreset === undefined && dshHome) {
-    const durableRows = findDurableSessionRows(dshHome, sessionId);
-    if (durableRows) {
+  if ((!sessionController || hints.agentPreset === undefined || hints.passiveState === null || !sessionExists) && effectiveDshHome) {
+    const durableRows = findDurableSessionRows(effectiveDshHome, sessionId);
+    if (durableRows !== null) {
+      sessionExists = true;
       const meta = extractSessionMetaFromRows(durableRows);
-      if (meta.agentPreset) hints.agentPreset = meta.agentPreset;
+      if (hints.agentPreset === undefined && meta.agentPreset) hints.agentPreset = meta.agentPreset;
       if (hints.origin === undefined && meta.origin) hints.origin = meta.origin;
+      if ((!sessionController || hints.passiveState === null) && meta.openTurn) {
+        hints.passiveRunning = true;
+      }
     }
   }
 
+  hints.standaloneLookup = !sessionController;
+  hints.sessionExists = Boolean(sessionExists);
   return hints;
 }
+
+export const resolvePassiveModeHints = resolveHostSessionModeHints;
 
 function isLtSessionPreset(preset, rt) {
   const leaderPreset = rt?.config?.profiles?.leader?.preset ?? 'leaderteam';
@@ -1211,42 +1394,94 @@ export async function collectKnownSessionModeItems(ctx, rt, dshHome = null) {
     }
 
     const teamsDir = path.join(storageRoot, 'teams');
+    const childMemberIds = new Set();
     if (fs.existsSync(teamsDir)) {
       try {
+        const teamEntries = [];
         for (const d of fs.readdirSync(teamsDir, { withFileTypes: true })) {
           if (!d.isDirectory()) continue;
-          upsert(d.name, {});
+          const entryDir = path.join(teamsDir, d.name);
+          if (!fs.existsSync(path.join(entryDir, 'members.jsonl')) && !fs.existsSync(path.join(entryDir, 'team.json'))) {
+            continue;
+          }
+          teamEntries.push(d.name);
+          try {
+            const members = foldMembers(readJsonl(path.join(entryDir, 'members.jsonl')).records);
+            for (const m of members.values()) {
+              if (m?.childId) childMemberIds.add(String(m.childId));
+            }
+          } catch {}
+        }
+        for (const dirName of teamEntries) {
+          const entryDir = path.join(teamsDir, dirName);
+          let teamJson = null;
+          try {
+            const tf = path.join(entryDir, 'team.json');
+            if (fs.existsSync(tf)) teamJson = JSON.parse(fs.readFileSync(tf, 'utf8'));
+          } catch {}
+          if (teamJson?.parentSessionId || teamJson?.origin === 'subagent') continue;
+          const logicalSid = String(resolveTeamStoreLogicalId(storageRoot, dirName) || '').trim();
+          if (!logicalSid || childMemberIds.has(logicalSid)) continue;
+          upsert(logicalSid, {
+            title: typeof teamJson?.title === 'string' && teamJson.title.trim() ? teamJson.title.trim() : null,
+            cwd: teamJson?.workspace ?? teamJson?.cwd ?? null,
+          });
         }
       } catch {}
     }
   }
 
   const resolvedDshHome = dshHome ?? resolveDshHomeFromCtx(ctx, baseRt);
+  if (!sessionController && resolvedDshHome && fs.existsSync(path.join(resolvedDshHome, 'sessions'))) {
+    try {
+      const listed = listSessions(resolvedDshHome, { storageRoot: storageRoot || undefined });
+      const durableChildIds = new Set();
+      for (const s of listed) {
+        if (s?.isChild && s?.id) durableChildIds.add(String(s.id).trim());
+      }
+      for (const s of listed) {
+        const sid = String(s?.id ?? '').trim();
+        if (!sid || s.isChild || durableChildIds.has(sid) || archivedSet.has(sid)) continue;
+        upsert(sid, {
+          title: s.title ?? null,
+          cwd: s.cwd ?? null,
+          updatedAt: s.lastActivityMs ?? s.startedAtMs ?? null,
+        });
+      }
+    } catch {}
+  }
+
   const out = [];
   for (const entry of byId.values()) {
     let preset = entry.agentPreset;
     let origin = entry.origin;
-    if (!preset && resolvedDshHome) {
+    let passiveRunning = Boolean(entry.passiveRunning);
+    if ((!preset || !sessionController) && resolvedDshHome) {
       const durableRows = findDurableSessionRows(resolvedDshHome, entry.sessionId);
       if (durableRows) {
         const meta = extractSessionMetaFromRows(durableRows);
-        if (meta.agentPreset) preset = meta.agentPreset;
+        if (!preset && meta.agentPreset) preset = meta.agentPreset;
         if (!origin && meta.origin) origin = meta.origin;
+        if (!sessionController && meta.openTurn) passiveRunning = true;
       }
     }
     if (origin === 'subagent') continue;
+    const isTeam = Boolean(storageRoot && TeamStore.exists(storageRoot, entry.sessionId));
+    const persistedLt = safeHasPersistedLtSession(storageRoot, entry.sessionId);
+    const effectivePreset = preset ?? ((isTeam || persistedLt) ? (baseRt?.config?.profiles?.leader?.preset ?? 'leaderteam') : null);
     const modeState = safeInspectSessionItemMode(ctx, baseRt, entry.sessionId, {
-      agentPreset: preset,
+      agentPreset: effectivePreset,
       origin,
-      passiveRunning: entry.passiveRunning,
+      passiveRunning,
+      sessionExists: true,
     });
     out.push({
       sessionId: entry.sessionId,
       title: entry.title,
       cwd: entry.cwd,
-      agentPreset: preset,
+      agentPreset: effectivePreset,
       updatedAt: entry.updatedAt ?? modeState.updatedAt,
-      isTeam: Boolean(storageRoot && TeamStore.exists(storageRoot, entry.sessionId)),
+      isTeam,
       executionMode: modeState.mode,
       isLtSession: modeState.isLtSession,
       canSwitchMode: modeState.canSwitch,
@@ -1469,7 +1704,7 @@ function discoverStandaloneWorkbenchSessions(ctx, rt, dshHome, storageRoot, arch
       const tf = path.join(dirPath, 'team.json');
       if (fs.existsSync(tf)) teamJson = JSON.parse(fs.readFileSync(tf, 'utf8'));
     } catch {}
-    const sid = String(teamJson?.sessionId ?? teamJson?.teamId ?? dirName).trim();
+    const sid = String(resolveTeamStoreLogicalId(storageRoot, dirName) || '').trim();
     if (!sid || childIds.has(sid) || archivedSet.has(sid)) continue;
     if (teamJson?.parentSessionId || teamJson?.origin === 'subagent') continue;
     const existing = bySessionId.get(sid);
@@ -2154,53 +2389,112 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
         const dshHome = getDshHome();
         const sessionController = getHostService(ctx, 'sessionController');
         const sessionsRegistry = getHostService(ctx, 'sessions');
+        const hostAgents = baseRuntime(rt)?.hostAgents ?? getHostService(ctx, 'agents');
 
-        let rows = rt?.actors?.get?.(sessionId)?.agent?.session?.snapshotEvents?.() ?? null;
+        const liveActor = rt?.actors?.get?.(sessionId) ?? null;
+        const liveSess = sessionsRegistry?.get?.(sessionId) ?? null;
+        const liveAgent = hostAgents?.get?.(sessionId) ?? liveActor?.agent ?? null;
+        let foundLiveOrController = Boolean(liveActor || liveSess || liveAgent);
+        let foundDurable = false;
+        let fallbackListPreset = null;
+        let fallbackListOrigin;
+
+        let rows = liveActor?.agent?.session?.snapshotEvents?.() ?? null;
         if (!rows || rows.length === 0) {
-          const liveSess = sessionsRegistry?.get?.(sessionId);
           rows = liveSess?.snapshotEvents?.() ?? liveSess?.session?.snapshotEvents?.() ?? null;
         }
         if ((!rows || rows.length === 0) && sessionController && typeof sessionController.events === 'function') {
           const ac = new AbortController();
           try {
-            let evRes;
-            try {
-              evRes = await sessionController.events({ address: { kind: 'session', sessionId } }, ac.signal);
-            } catch {
-              evRes = await sessionController.events({ sessionId }, ac.signal);
+            const ctrlRows = await readAllControllerSessionEvents(sessionController, sessionId, ac.signal, { dshHome });
+            if (ctrlRows.length > 0 || (ctrlRows._meta?.hasCursor && ctrlRows._meta.cursor >= 0)) {
+              rows = ctrlRows;
+              foundLiveOrController = true;
             }
-            if (Array.isArray(evRes)) rows = evRes;
-            else if (Array.isArray(evRes?.events)) rows = evRes.events;
-            else if (Array.isArray(evRes?.records)) rows = evRes.records;
-            else if (Array.isArray(evRes?.items)) rows = evRes.items;
           } catch {} finally {
             ac.abort();
           }
         }
         if (!rows || rows.length === 0) {
-          rows = findDurableSessionRows(dshHome, sessionId) ?? [];
+          const durableRows = findDurableSessionRows(dshHome, sessionId);
+          if (durableRows !== null) {
+            rows = durableRows;
+            foundDurable = true;
+          } else {
+            rows = [];
+          }
         }
 
         let passiveState = null;
         if (sessionController && typeof sessionController.state === 'function') {
+          const ac = new AbortController();
           try {
-            const ac = new AbortController();
             passiveState = await sessionController.state({ sessionId }, ac.signal);
-          } catch {}
+            if (
+              passiveState
+              && (
+                passiveState.running === true
+                || passiveState.busy === true
+                || passiveState.turnRunning === true
+                || passiveState.status === 'running'
+                || passiveState.active === true
+                || passiveState.exists === true
+              )
+            ) {
+              foundLiveOrController = true;
+            }
+          } catch {} finally {
+            ac.abort();
+          }
+        }
+
+        if (!foundLiveOrController && !foundDurable && sessionController && typeof sessionController.list === 'function') {
+          const ac = new AbortController();
+          try {
+            const listed = await sessionController.list({}, ac.signal);
+            const hit = (listed?.items ?? []).find(it => String(it?.sessionId ?? it?.id ?? '') === sessionId);
+            if (hit) {
+              foundLiveOrController = true;
+              const p = hit.projections?.values?.agentPreset ?? hit.agentPreset ?? null;
+              if (typeof p === 'string' && p.trim()) fallbackListPreset = p.trim();
+              if (hit.origin === 'subagent' || hit.parentSessionId) fallbackListOrigin = 'subagent';
+            }
+          } catch {} finally {
+            ac.abort();
+          }
         }
 
         const rowMeta = extractSessionMetaFromRows(rows);
+        if (passiveState === null && rowMeta.openTurn === true) {
+          passiveState = {
+            running: true,
+            busy: true,
+            turnRunning: true,
+            status: 'running',
+          };
+        }
         const passiveRunning = Boolean(
           passiveState?.running === true
           || passiveState?.busy === true
           || passiveState?.turnRunning === true
           || passiveState?.status === 'running',
         );
+        const sessionExists = Boolean(
+          foundLiveOrController
+          || foundDurable
+          || rows.length > 0
+          || baseRuntime(rt)?.workbenchCreatedSessionIds?.has?.(sessionId)
+          || safeHasPersistedLtSession(rt?.storageRoot, sessionId),
+        );
+        const effectivePreset = rowMeta.agentPreset ?? fallbackListPreset;
+        const effectiveOrigin = rowMeta.origin ?? fallbackListOrigin;
         const modeState = safeInspectSessionItemMode(ctx, rt, sessionId, {
           passiveState,
           passiveRunning,
-          ...(rowMeta.agentPreset ? { agentPreset: rowMeta.agentPreset } : {}),
-          ...(rowMeta.origin ? { origin: rowMeta.origin } : {}),
+          sessionExists,
+          standaloneLookup: !sessionController,
+          ...(effectivePreset ? { agentPreset: effectivePreset } : {}),
+          ...(effectiveOrigin ? { origin: effectiveOrigin } : {}),
         });
 
         return okEnvelope({
@@ -2276,50 +2570,77 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
           throw notLtErr;
         }
 
-        // Pre-seed Single mode before DSH publishes the new Agent so `onAgentCreated` skips TeamStore creation (`0` team overhead).
-        let preMintedSid = null;
+        const requestedSid = typeof body.sessionId === 'string' && body.sessionId.trim()
+          ? body.sessionId.trim()
+          : null;
+        if (requestedSid && (isLtSessionPreset(requestedPreset, rt) || isLtSessionPreset(effectiveRequestedPreset, rt) || hasExplicitExecutionMode)) {
+          encodeSessionModeSegment(requestedSid);
+        }
+
+        // Pre-seed Single mode before DSH publishes the new Agent so `onAgentCreated` skips TeamStore creation (`0` team overhead)
+        // for BOTH explicit `body.sessionId` and auto-generated `session-<uuid>`.
+        const dshHome = getDshHome();
+        const baseRtForCreate = baseRuntime(rt);
+        const alreadyExisted = requestedSid
+          ? Boolean(
+              baseRtForCreate?.actors?.has?.(requestedSid)
+              || baseRtForCreate?.hostAgents?.has?.(requestedSid)
+              || getHostService(ctx, 'agents')?.get?.(requestedSid)
+              || getHostService(ctx, 'sessions')?.get?.(requestedSid)
+              || baseRtForCreate?.workbenchCreatedSessionIds?.has?.(requestedSid)
+              || safeHasPersistedLtSession(rt?.storageRoot, requestedSid)
+              || (dshHome && findDurableSessionRows(dshHome, requestedSid) !== null),
+            )
+          : false;
+
+        const cleanPreSeededModeFiles = sidToClean => {
+          if (!sidToClean || alreadyExisted || !rt?.storageRoot) return;
+          try {
+            const { stateFile, historyFile } = resolveSessionModePaths(rt.storageRoot, sidToClean, { ensureDir: false });
+            fs.rmSync(stateFile, { force: true });
+            fs.rmSync(historyFile, { force: true });
+            baseRuntime(rt)?.sessionModesCache?.delete?.(sidToClean);
+          } catch {}
+        };
+
+        let seedSid = null;
+        let preSeeded = false;
         if (
-          requestedMode === 'single'
+          !alreadyExisted
+          && requestedMode === 'single'
           && (isLtSessionPreset(requestedPreset, rt) || isLtSessionPreset(effectiveRequestedPreset, rt))
-          && !body.sessionId
           && rt?.storageRoot
         ) {
-          preMintedSid = `session-${crypto.randomUUID()}`;
-          switchSessionExecutionMode(ctx, rt, preMintedSid, 'single', {
+          seedSid = requestedSid ?? `session-${crypto.randomUUID()}`;
+          switchSessionExecutionMode(ctx, rt, seedSid, 'single', {
             persistInitial: true,
             isLtSession: true,
+            sessionExists: true,
             agentPreset: leaderPreset,
             source: 'workbench-create',
           });
+          preSeeded = true;
         }
 
         let created;
         try {
           created = await sessionController.create({
             ...(body.workspaceId ? { workspaceId: body.workspaceId } : { cwd: body.cwd || process.cwd() }),
-            ...(body.sessionId ? { sessionId: body.sessionId } : (preMintedSid ? { sessionId: preMintedSid } : {})),
+            ...(requestedSid ? { sessionId: requestedSid } : (seedSid ? { sessionId: seedSid } : {})),
             ...(passPresetToHost ? { agentPreset: passPresetToHost } : {}),
           });
         } catch (createErr) {
-          if (preMintedSid && rt?.storageRoot) {
-            try {
-              const { stateFile, historyFile } = resolveSessionModePaths(rt.storageRoot, preMintedSid, { ensureDir: false });
-              fs.rmSync(stateFile, { force: true });
-              fs.rmSync(historyFile, { force: true });
-              baseRuntime(rt)?.sessionModesCache?.delete?.(preMintedSid);
-            } catch {}
+          if (preSeeded) {
+            cleanPreSeededModeFiles(seedSid);
           }
           throw createErr;
         }
 
         const createdSid = String(created?.sessionId ?? created?.id ?? '').trim();
-        if (preMintedSid && createdSid !== preMintedSid && rt?.storageRoot) {
-          try {
-            const { stateFile, historyFile } = resolveSessionModePaths(rt.storageRoot, preMintedSid, { ensureDir: false });
-            fs.rmSync(stateFile, { force: true });
-            fs.rmSync(historyFile, { force: true });
-            baseRuntime(rt)?.sessionModesCache?.delete?.(preMintedSid);
-          } catch {}
+        const effectivePreset = created?.agentPreset ?? requestedPreset;
+        const isLt = effectivePreset === leaderPreset;
+        if (preSeeded && (!createdSid || createdSid !== seedSid || !isLt)) {
+          cleanPreSeededModeFiles(seedSid);
         }
 
         if (createdSid && rt && typeof rt === 'object') {
@@ -2333,8 +2654,7 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
           rt.workbenchCreatedSessionIds.add(createdSid);
         }
 
-        const effectivePreset = created?.agentPreset ?? requestedPreset;
-        const isLt = effectivePreset === leaderPreset;
+        // Select configured `roles.leader` model strictly on this session's Agent instance (`0` mutations to DSH's profile-wide default model).
         if (createdSid && isLt && !body.model && rt?.config?.roles?.leader?.route) {
           const leaderTarget = resolveModelTarget(
             rt.config,
@@ -2347,36 +2667,35 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
               model: leaderTarget.model,
               ...(leaderTarget.reasoningEffort ? { reasoningEffort: leaderTarget.reasoningEffort } : {}),
             };
-            let selectedViaController = false;
-            if (typeof sessionController.selectModel === 'function') {
+            const agentsSvc = getHostService(ctx, 'agents');
+            const liveAgent =
+              agentsSvc?.get?.(createdSid)
+              ?? baseRtForCreate?.hostAgents?.get?.(createdSid)
+              ?? baseRtForCreate?.actors?.get?.(createdSid)?.agent
+              ?? created?.agent
+              ?? null;
+            const recordedSel = typeof liveAgent?.model?.recordedSelection === 'function'
+              ? liveAgent.model.recordedSelection()
+              : null;
+            if (typeof liveAgent?.model?.select === 'function' && recordedSel == null) {
+              const llmSvc = getHostService(ctx, 'llm') ?? getHostService(liveAgent?.ctx, 'llm');
               try {
-                await sessionController.selectModel({
-                  sessionId: createdSid,
-                  ...selection,
-                });
-                selectedViaController = true;
+                if (typeof llmSvc?.resolveCallConfig === 'function') {
+                  await llmSvc.resolveCallConfig(selection);
+                }
+                liveAgent.model.select(selection);
               } catch {}
-            }
-            if (!selectedViaController) {
-              const agentsSvc = getHostService(ctx, 'agents');
-              const liveAgent =
-                agentsSvc?.get?.(createdSid)
-                ?? baseRuntime(rt)?.actors?.get?.(createdSid)?.agent
-                ?? null;
-              if (typeof liveAgent?.model?.select === 'function') {
-                try {
-                  liveAgent.model.select(selection);
-                } catch {}
-              }
             }
           }
         }
+
         let modeState = null;
         if (createdSid) {
           if (isLt || body.executionMode !== undefined) {
             const switched = switchSessionExecutionMode(ctx, rt, createdSid, requestedMode, {
               persistInitial: true,
               isLtSession: isLt,
+              sessionExists: true,
               agentPreset: effectivePreset,
               source: 'workbench-create',
             });
@@ -2384,6 +2703,7 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
           } else {
             modeState = inspectSessionModeState(ctx, rt, createdSid, {
               isLtSession: false,
+              sessionExists: true,
               agentPreset: effectivePreset,
             });
           }

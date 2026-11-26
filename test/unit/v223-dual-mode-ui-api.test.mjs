@@ -1912,21 +1912,23 @@ test('Stage 9 Product Regressions (S8-E2E-01a/b/c, S8-E2E-02, S8-E2E-03, S8-E2E-
     assert.equal(cfgRes.ok, true);
     assert.equal(rt.config.models[syncedMagpieModel.routeId].provider, 'magpie');
 
-    // S8-E2E-01b: `workbenchCreate` immediately selects `roles.leader.route` via `sessionController.selectModel`
+    // S8-E2E-01b + R2-V223-04: `workbenchCreate` immediately selects `roles.leader.route` on `liveAgent.model.select`
+    // WITHOUT calling `sessionController.selectModel` (which would overwrite DSH's global agentDefaultModel)!
     const created1 = await (await h.workbenchCreate(makeJsonPost({ cwd: workspaceDir, executionMode: 'single' }))).json();
     assert.equal(created1.ok, true);
-    assert.equal(selectModelCalls.length, 1);
-    assert.equal(selectModelCalls[0].sessionId, created1.data.sessionId);
-    assert.equal(selectModelCalls[0].provider, 'magpie');
-    assert.equal(selectModelCalls[0].model, syncedMagpieModel.magpieModelId);
+    assert.equal(selectModelCalls.length, 0, 'workbenchCreate must never call sessionController.selectModel');
+    assert.equal(fallbackAgentSelectCalls.length, 1);
+    assert.equal(fallbackAgentSelectCalls[0].sessionId, created1.data.sessionId);
+    assert.equal(fallbackAgentSelectCalls[0].provider, 'magpie');
+    assert.equal(fallbackAgentSelectCalls[0].model, syncedMagpieModel.magpieModelId);
 
-    // Graceful fallback when `selectModel` rejects (e.g., route not yet registered in host)
     simulateSelectModelUnavailable = true;
     const created2 = await (await h.workbenchCreate(makeJsonPost({ cwd: workspaceDir }))).json();
     assert.equal(created2.ok, true);
-    assert.equal(fallbackAgentSelectCalls.length, 1);
-    assert.equal(fallbackAgentSelectCalls[0].sessionId, created2.data.sessionId);
-    assert.equal(fallbackAgentSelectCalls[0].provider, 'magpie');
+    assert.equal(selectModelCalls.length, 0);
+    assert.equal(fallbackAgentSelectCalls.length, 2);
+    assert.equal(fallbackAgentSelectCalls[1].sessionId, created2.data.sessionId);
+    assert.equal(fallbackAgentSelectCalls[1].provider, 'magpie');
 
     // --- 2. S8-E2E-02: Overlong >192-char pure Single session gate usage via `/api/lt/v1/usage/report` ---
     const overlongSid = `session-overlong-single-${'x'.repeat(190)}`; // 214 chars

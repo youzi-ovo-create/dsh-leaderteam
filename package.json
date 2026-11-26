@@ -9,6 +9,9 @@
     "node": ">=22.15",
     "dsh": "0.2.2-rc.1 || 0.2.2-rc.5"
   },
+  "scripts": {
+    "build:web": "npm --prefix packages/lt-web run build"
+  },
   "bin": {
     "lt-doctor": "./bin/lt-doctor.mjs",
     "lt-bugreport": "./bin/lt-bugreport.mjs",
