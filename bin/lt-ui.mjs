@@ -166,6 +166,9 @@ export async function startStandaloneLtUiServer({
     [PUBLIC_API_ROUTES.USAGE_PRICING, handlers.usagePricing],
     [PUBLIC_API_ROUTES.USAGE_TOGGLE, handlers.usageToggle],
     [PUBLIC_API_ROUTES.UI_PREFERENCES, handlers.uiPreferences],
+    [PUBLIC_API_ROUTES.SYSTEM_COMPATIBILITY, handlers.systemCompatibility],
+    [PUBLIC_API_ROUTES.SYSTEM_UPDATE, handlers.systemUpdate],
+    [PUBLIC_API_ROUTES.ONBOARDING, handlers.onboarding],
   ]);
 
   let boundPort = port;

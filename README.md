@@ -1,8 +1,8 @@
 # LeaderTeam for DeepSeek Harness (V2.2)
 
-![Version](https://img.shields.io/badge/version-2.2.0-blue)
+![Version](https://img.shields.io/badge/version-2.2.3-blue)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows-success)
-![DSH Host](https://img.shields.io/badge/DeepSeek%20Harness-0.2.2--rc.1%20%7C%200.2.2--rc.5-5b6ee1)
+![DSH Host](https://img.shields.io/badge/DeepSeek%20Harness-%3E%3D0.2.2--alpha.2%20%3C1.0.0-5b6ee1)
 ![Node.js](https://img.shields.io/badge/node-%3E%3D22.15-339933)
 ![License](https://img.shields.io/badge/license-Apache--2.0-orange)
 
@@ -18,12 +18,18 @@ LeaderTeam 是运行在 **DeepSeek Harness（Linux & Windows）** 上的长周�
 
 ## 第一屏：3 分钟安装与单 Key 即刻启动（Quick Start）
 
-### 1. 标准插件包安装（`dsh.bundle`）
+### 1. 零命令行图形化一键安装（推荐新手）与标准命令行安装
 
-- **运行环境要求**：
-  - **Node.js `>= 22.15`**（若需从源码构建 `extensions/dsh-context` 推荐 `22.19+` 或 `24.x`）；
-  - 已端到端实机验真的 **DeepSeek Harness `0.2.2-rc.1` 或 `0.2.2-rc.5`**（未实机放行的中间版本如 `rc.2–rc.4` 或未知新版本默认保持 Fail-Closed 拒绝加载，可通过 `lt-doctor --check-host` 离线预检）；
-  - 实机验证平台为 **Linux（x86_64 / WSL2）与 Windows**（底层 POSIX 路径兼容类 Unix 环境，macOS 暂未纳入官方真机验收矩阵）；Linux 下执行 `dsh plugin add` 需确保 `PATH` 中包含 `node` 与 `pnpm`（可通过 `corepack enable pnpm` 启用）。
+- **运行环境与宿主兼容范围**（完整列表见《[DSH 宿主版本兼容性列表](docs/10-DSH宿主兼容性列表.md)》）：
+  - **Node.js `>= 22.15`**（Windows 官方桌面端用户双击 `Install-LeaderTeam.cmd` 时可自动复用桌面端内置运行时，无需单独安装 Node.js）；
+  - **DeepSeek Harness `>=0.2.2-alpha.2 <1.0.0`**：已实机核验覆盖 **`0.2.2-alpha.2` ~ `0.2.2-rc.5`** 及最新 **`0.2.3-alpha.1` ~ `0.2.3-alpha.2`**，并内置**自适应结构契约校验**，后续官方桌面端或 CLI 常规更新只要未破坏安全门管道契约即可免升级直跑（安装前可通过图形安装器或 `node bin/lt-doctor.mjs --compatibility-matrix` 预检）；
+  - **控制台内置新手引导与一键升级**：首次打开控制台自动弹出三步引导（免命令行粘贴 API Key、选择团队模式、创建首个任务），并在「设置 → 版本更新与兼容」中支持自动检查更新、SHA-256 校验一键升级与失败自动回滚（开源版与闭源免费版严格独立检查，详见《[一键安装、新手引导与自动更新指南](docs/11-一键安装新手引导与自动更新指南.md)》）。
+
+- **方式 A：图形化一键安装器（全程无需命令行）**：
+  - Windows：解压后双击 **`Install-LeaderTeam.cmd`**；
+  - Linux / WSL2：执行 **`./install-leaderteam.sh`**（或 `node bin/lt-installer.mjs --gui`），在自动打开的浏览器向导中点击安装并直接启动客户端。
+
+- **方式 B：标准 `dsh plugin` 命令行安装**：
 
 > **安装源说明**：当前稳定版通过 [GitHub Releases](https://github.com/youzi-ovo-create/dsh-leaderteam/releases/tag/v2.2.0) 分发离线 `.tgz` 插件包（公共 npm registry 尚未上架，请直接安装 `.tgz` 包或本地克隆目录）：
 

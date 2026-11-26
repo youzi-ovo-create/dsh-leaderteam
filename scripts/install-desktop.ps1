@@ -101,10 +101,10 @@ try {
     throw 'Official DeepSeek Harness version 0.2.2-rc.1 required, but runtime locator returned invalid JSON.'
 }
 
-$isSupportedOfficial = ($runtime.kind -eq 'official-desktop' -and $runtime.version -eq '0.2.2-rc.1')
+$isSupportedOfficial = ($runtime.kind -eq 'official-desktop' -and [bool]$runtime.version)
 $isSupportedExplicitLegacy = ([bool]$DshApp -and $runtime.kind -eq 'legacy-dataelem' -and $runtime.version -eq '0.13.2')
 if (-not ($isSupportedOfficial -or $isSupportedExplicitLegacy)) {
-    throw "Official DeepSeek Harness version 0.2.2-rc.1 required, but found kind='$($runtime.kind)' version='$($runtime.version)'. Installation aborted."
+    throw "Supported Official DeepSeek Harness Desktop (>=0.2.2-alpha.2 <1.0.0) required, but found kind='$($runtime.kind)' version='$($runtime.version)'. Installation aborted."
 }
 
 $desktopExe = [string]$runtime.exe

@@ -1068,7 +1068,7 @@ test('Stage 4 Re-Audit Fixes (S3-UIGW-01, S3-UIGW-02, S3-UIGW-04, S3-UIGW-06): l
   // 2. S3-UIGW-04: ALL non-read-only `/api/lt/v1/*` routes reject GET with 405 Allow: POST and NEVER mutate disk!
   const allRoutes = Object.values(PUBLIC_API_ROUTES);
   const mutatingRoutes = allRoutes.filter(p => !PUBLIC_READONLY_API_ROUTES.has(p));
-  assert.equal(mutatingRoutes.length, 14);
+  assert.equal(mutatingRoutes.length, 16);
 
   const bundleBefore = await (await fetch(`${uiSrv.baseUrl}/api/lt/v1/bundle`, { headers: { Cookie: cookiePair } })).json();
   assert.equal(bundleBefore.data.usageStatus.enabled, true);

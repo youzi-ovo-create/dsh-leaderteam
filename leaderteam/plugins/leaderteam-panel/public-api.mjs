@@ -56,6 +56,23 @@ import {
   resolveStorageRoot,
 } from '../../../packages/lt-usage/index.mjs';
 import { listKnownHomes } from '../../../packages/lt-usage/reader/homes.js';
+import { getHostCompatibilityMatrix } from '../../core/host-compat.mjs';
+import {
+  UPDATE_TRACKS,
+  readInstalledVersionInfo,
+  readUpdaterState,
+  writeUpdaterState,
+  listSavedBackups,
+  checkForUpdates,
+  performOneClickUpgrade,
+  rollbackToSavedBackup,
+} from '../../core/updater.mjs';
+import {
+  buildOnboardingSnapshot,
+  writePersistedOnboardingRecord,
+  probeProviderKeyConnectivity,
+  applyQuickOnboardingSetup,
+} from '../../core/onboarding.mjs';
 import pkg from '../../../package.json' with { type: 'json' };
 
 export const CONTRACT_ID = 'lt.public.v1';
@@ -87,6 +104,9 @@ export const PUBLIC_API_ROUTES = Object.freeze({
   USAGE_PRICING: '/api/lt/v1/usage/pricing',
   USAGE_TOGGLE: '/api/lt/v1/usage/toggle',
   UI_PREFERENCES: '/api/lt/v1/ui-preferences',
+  SYSTEM_COMPATIBILITY: '/api/lt/v1/system/compatibility',
+  SYSTEM_UPDATE: '/api/lt/v1/system/update',
+  ONBOARDING: '/api/lt/v1/onboarding',
 });
 
 export const PUBLIC_READONLY_API_ROUTES = new Set([
@@ -101,6 +121,7 @@ export const PUBLIC_READONLY_API_ROUTES = new Set([
   PUBLIC_API_ROUTES.USAGE_STATUS,
   PUBLIC_API_ROUTES.USAGE_OVERVIEW,
   PUBLIC_API_ROUTES.USAGE_SESSIONS,
+  PUBLIC_API_ROUTES.SYSTEM_COMPATIBILITY,
 ]);
 
 export const SUPPORTED_V22_ROLES = Object.freeze([
@@ -428,7 +449,12 @@ export function buildCapabilitiesPayload(ctx, rt, { hostKindOverride = null } = 
       usageOfflineImport: true,
       themePersistence: Boolean(rt?.storageRoot),
       inSessionDualMode: true,
+      autoUpdate: true,
+      onboardingWizard: true,
+      hostCompatibilityMatrix: true,
     },
+    distributionTrack: 'open-source',
+    hostCompatibility: rt?.hostCompatibility ?? null,
     supportedRoles: SUPPORTED_V22_ROLES,
   };
 }
@@ -1923,6 +1949,18 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
         const runtimeSnap = await buildRuntimeSnapshotPayload(ctx, rt);
         const uiPreferences = readUiPreferences(storageRoot);
         const usageStatus = await getUsageBridge().getStatus();
+        const pluginRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
+        const installedInfo = readInstalledVersionInfo(pluginRoot);
+        const updaterState = readUpdaterState(storageRoot);
+        const backups = listSavedBackups(storageRoot);
+        const onboardingSnap = buildOnboardingSnapshot({
+          storageRoot,
+          dshHome: getDshHome(),
+          hasLocalOverrides: Boolean(runtimeSnap?.localOverrides?.exists),
+          hasGatewayRunning: gateway?.state === 'running',
+          hasExternalProviders: Array.isArray(providers) && providers.some(p => p.enabled),
+          sessionCount: Array.isArray(runtimeSnap?.teams) ? runtimeSnap.teams.length : 0,
+        });
 
         return okEnvelope({
           capabilities: buildCapabilitiesPayload(ctx, rt, { hostKindOverride: options.hostKindOverride }),
@@ -1933,6 +1971,17 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
           runtime: runtimeSnap,
           uiPreferences,
           usageStatus,
+          onboarding: onboardingSnap,
+          updater: {
+            installed: installedInfo,
+            tracks: Object.values(UPDATE_TRACKS),
+            state: updaterState,
+            backups: backups.slice(0, 10),
+          },
+          compatibilityMatrix: getHostCompatibilityMatrix({
+            track: installedInfo.track,
+            currentHostVersion: rt?.hostCompatibility?.toolsVersion ?? null,
+          }),
         });
       } catch (e) {
         return errFromException('BUNDLE_FAILED', e);
@@ -3000,6 +3049,202 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
         return errFromException('UI_PREFS_FAILED', e);
       }
     },
+
+    /* ==================== Host Compatibility, Auto-Update & Onboarding ==================== */
+
+    async systemCompatibility(request) {
+      try {
+        if (request) await parseJsonRequest(request, { allowGet: true });
+        const pluginRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
+        const installed = readInstalledVersionInfo(pluginRoot);
+        const hostVersion = rt?.hostCompatibility?.toolsVersion ?? null;
+        return okEnvelope({
+          installed,
+          hostCompatibility: rt?.hostCompatibility ?? null,
+          matrix: getHostCompatibilityMatrix({
+            track: installed.track,
+            currentHostVersion: hostVersion,
+          }),
+        });
+      } catch (e) {
+        return errFromException('SYSTEM_COMPATIBILITY_FAILED', e);
+      }
+    },
+
+    async systemUpdate(request) {
+      try {
+        ensureConfigLoaded();
+        const storageRoot = getStorageRoot();
+        const dshHome = getDshHome();
+        const pluginRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
+        const body = await parseJsonRequest(request);
+        const action = String(body.action || 'status').trim().toLowerCase();
+        const hostVersion = rt?.hostCompatibility?.toolsVersion ?? null;
+
+        if (action === 'status') {
+          return okEnvelope({
+            installed: readInstalledVersionInfo(pluginRoot),
+            tracks: Object.values(UPDATE_TRACKS),
+            state: readUpdaterState(storageRoot),
+            backups: listSavedBackups(storageRoot).slice(0, 10),
+            hostCompatibility: rt?.hostCompatibility ?? null,
+          });
+        }
+
+        if (action === 'toggle-auto-check') {
+          const nextState = writeUpdaterState(storageRoot, {
+            autoCheckEnabled: Boolean(body.enabled),
+          });
+          return okEnvelope({ state: nextState });
+        }
+
+        if (action === 'check') {
+          const checkRes = await checkForUpdates({
+            pluginRoot,
+            storageRoot,
+            track: body.track || null,
+            includePrerelease: Boolean(body.includePrerelease),
+            force: body.force !== false,
+            currentHostVersion: hostVersion,
+            apiUrlOverride: options.allowUpdateMirrorOverride ? (body.apiUrlOverride || null) : null,
+            fetchImpl: options.fetchImpl ?? globalThis.fetch,
+          });
+          return okEnvelope({
+            check: checkRes,
+            state: readUpdaterState(storageRoot),
+            backups: listSavedBackups(storageRoot).slice(0, 10),
+          });
+        }
+
+        if (action === 'apply') {
+          const upgRes = await performOneClickUpgrade({
+            ctx,
+            rt,
+            pluginRoot,
+            storageRoot,
+            dshHome,
+            profile: body.profile || null,
+            localTgzPath: body.localTgzPath || null,
+            downloadUrl: body.downloadUrl || null,
+            sha256SumsUrl: body.sha256SumsUrl || null,
+            expectedSha256: body.expectedSha256 || null,
+            targetTrack: body.targetTrack || null,
+            confirmTrackSwitch: body.confirmTrackSwitch || null,
+            currentHostVersion: hostVersion,
+            fetchImpl: options.fetchImpl ?? globalThis.fetch,
+            installerHook: options.installerHook ?? null,
+          });
+          return okEnvelope({
+            result: upgRes,
+            state: readUpdaterState(storageRoot),
+            backups: listSavedBackups(storageRoot).slice(0, 10),
+          });
+        }
+
+        if (action === 'rollback') {
+          const rbRes = await rollbackToSavedBackup({
+            ctx,
+            rt,
+            storageRoot,
+            dshHome,
+            backupId: body.backupId || null,
+            profile: body.profile || null,
+            installerHook: options.installerHook ?? null,
+          });
+          return okEnvelope({
+            result: rbRes,
+            state: readUpdaterState(storageRoot),
+            backups: listSavedBackups(storageRoot).slice(0, 10),
+          });
+        }
+
+        return errEnvelope('BAD_UPDATE_ACTION', `Unknown system/update action: ${action}`, 400);
+      } catch (e) {
+        return errFromException(e?.code || 'SYSTEM_UPDATE_FAILED', e, e?.statusCode || 200);
+      }
+    },
+
+    async onboarding(request) {
+      try {
+        ensureConfigLoaded();
+        const storageRoot = getStorageRoot();
+        const dshHome = getDshHome();
+        const pluginRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
+        const body = await parseJsonRequest(request);
+        const action = String(body.action || 'status').trim().toLowerCase();
+
+        if (action === 'status') {
+          const runtimeSnap = await buildRuntimeSnapshotPayload(ctx, rt);
+          return okEnvelope(
+            buildOnboardingSnapshot({
+              storageRoot,
+              dshHome,
+              hasLocalOverrides: Boolean(runtimeSnap?.localOverrides?.exists),
+              sessionCount: Array.isArray(runtimeSnap?.teams) ? runtimeSnap.teams.length : 0,
+            }),
+          );
+        }
+
+        if (action === 'probe-key') {
+          const res = await probeProviderKeyConnectivity({
+            baseURL: body.baseURL,
+            apiKey: body.apiKey,
+            fetchImpl: options.fetchImpl ?? globalThis.fetch,
+          });
+          return okEnvelope(res);
+        }
+
+        if (action === 'apply-quick-setup') {
+          const applied = await applyQuickOnboardingSetup({
+            ctx,
+            rt,
+            storageRoot,
+            dshHome,
+            configPath: rt.configPath,
+            bundledDefaultConfigPath: path.join(pluginRoot, 'config', 'leaderteam.config.json'),
+            providerId: body.providerId || 'deepseek',
+            apiKey: body.apiKey || '',
+            customBaseURL: body.customBaseURL || '',
+            collabPresetId: body.collabPresetId || 'balanced-team',
+            verifyConnectivity: Boolean(body.verifyConnectivity),
+            fetchImpl: options.fetchImpl ?? globalThis.fetch,
+          });
+          return okEnvelope(applied);
+        }
+
+        if (action === 'complete') {
+          const rec = writePersistedOnboardingRecord(storageRoot, {
+            completed: true,
+            dismissed: false,
+            completedAt: new Date().toISOString(),
+            ...(body.firstSessionId ? { firstSessionId: String(body.firstSessionId) } : {}),
+          });
+          return okEnvelope(rec);
+        }
+
+        if (action === 'dismiss') {
+          const rec = writePersistedOnboardingRecord(storageRoot, {
+            dismissed: true,
+            dismissedAt: new Date().toISOString(),
+          });
+          return okEnvelope(rec);
+        }
+
+        if (action === 'reset') {
+          const rec = writePersistedOnboardingRecord(storageRoot, {
+            completed: false,
+            dismissed: false,
+            completedAt: null,
+            dismissedAt: null,
+          });
+          return okEnvelope(rec);
+        }
+
+        return errEnvelope('BAD_ONBOARDING_ACTION', `Unknown onboarding action: ${action}`, 400);
+      } catch (e) {
+        return errFromException(e?.code || 'ONBOARDING_FAILED', e, e?.statusCode || 200);
+      }
+    },
   };
 }
 
@@ -3171,6 +3416,9 @@ export function registerPublicContractRoutes(scopeCtx, connection, rootCtx, rt =
     [PUBLIC_API_ROUTES.USAGE_PRICING, h.usagePricing],
     [PUBLIC_API_ROUTES.USAGE_TOGGLE, h.usageToggle],
     [PUBLIC_API_ROUTES.UI_PREFERENCES, h.uiPreferences],
+    [PUBLIC_API_ROUTES.SYSTEM_COMPATIBILITY, h.systemCompatibility],
+    [PUBLIC_API_ROUTES.SYSTEM_UPDATE, h.systemUpdate],
+    [PUBLIC_API_ROUTES.ONBOARDING, h.onboarding],
   ];
 
   scopeCtx.effect(() => {

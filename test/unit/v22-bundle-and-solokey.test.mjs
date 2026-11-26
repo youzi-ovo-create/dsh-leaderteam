@@ -69,7 +69,7 @@ test('root package.json and cordis.patch.yml conform to official DSH bundle rule
   assert.equal(pkg.dsh?.client?.platform, 'web');
   // Review check #3: never emit non-standard dsh.compatibility.dshReleases; use bounded engines.dsh
   assert.equal(pkg.dsh?.compatibility, undefined);
-  assert.equal(pkg.engines?.dsh, '0.2.2-rc.1 || 0.2.2-rc.5');
+  assert.equal(pkg.engines?.dsh, '>=0.2.2-alpha.2 <1.0.0');
 
   // Every exported subpath target and bundle patch file must exist on disk
   for (const [subpath, target] of Object.entries(pkg.exports)) {

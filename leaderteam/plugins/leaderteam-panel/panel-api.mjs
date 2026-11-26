@@ -29,6 +29,22 @@ import {
   syncActiveModelsToDshHost,
 } from './public-api.mjs';
 import { resolveMagpieGatewayHostProvider } from '../../gateway/index.mjs';
+import { fileURLToPath } from 'node:url';
+import { getHostCompatibilityMatrix } from '../../core/host-compat.mjs';
+import {
+  UPDATE_TRACKS,
+  readInstalledVersionInfo,
+  readUpdaterState,
+  listSavedBackups,
+  checkForUpdates,
+  performOneClickUpgrade,
+  rollbackToSavedBackup,
+} from '../../core/updater.mjs';
+import {
+  buildOnboardingSnapshot,
+  applyQuickOnboardingSetup,
+  writePersistedOnboardingRecord,
+} from '../../core/onboarding.mjs';
 
 export const PANEL_ROUTES = Object.freeze({
   STATE: '/api/leaderteam-panel/state',
@@ -38,6 +54,8 @@ export const PANEL_ROUTES = Object.freeze({
   RETROSPECT: '/api/leaderteam-panel/retrospect',
   CLEAN: '/api/leaderteam-panel/clean',
   SESSION_MODE: '/api/leaderteam-panel/session-mode',
+  UPDATE: '/api/leaderteam-panel/update',
+  ONBOARDING: '/api/leaderteam-panel/onboarding',
 });
 
 const isPlainObj = v => v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -236,6 +254,10 @@ export async function buildPanelStateSnapshot(ctx, rt = runtime(), { probeEndpoi
     }
   }
 
+  const pluginRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
+  const installedInfo = readInstalledVersionInfo(pluginRoot);
+  const hostVersion = rt?.hostCompatibility?.toolsVersion ?? null;
+
   return {
     activePlugins: activePluginsMap(rt),
     cordisCompositionMode: Boolean(rt.cordisCompositionMode),
@@ -247,6 +269,23 @@ export async function buildPanelStateSnapshot(ctx, rt = runtime(), { probeEndpoi
     teams: recentTeamObservability(ctx,rt),
     sessionModes: await collectKnownSessionModeItems(ctx, rt),
     archive: archiveView,
+    hostCompatibility: rt?.hostCompatibility ?? null,
+    compatibilityMatrix: getHostCompatibilityMatrix({
+      track: installedInfo.track,
+      currentHostVersion: hostVersion,
+    }),
+    updater: {
+      installed: installedInfo,
+      tracks: Object.values(UPDATE_TRACKS),
+      state: rt.storageRoot ? readUpdaterState(rt.storageRoot) : null,
+      backups: rt.storageRoot ? listSavedBackups(rt.storageRoot).slice(0, 5) : [],
+    },
+    onboarding: rt.storageRoot
+      ? buildOnboardingSnapshot({
+          storageRoot: rt.storageRoot,
+          hasLocalOverrides: Boolean(configSnapshot?.localOverrides?.exists),
+        })
+      : null,
   };
 }
 
@@ -471,6 +510,90 @@ export function createPanelHandlers(ctx, rt = runtime(), options = {}) {
         return errReplyFromModeError('PANEL_SESSION_MODE_FAILED', e);
       }
     },
+
+    async update(request) {
+      try {
+        syncRuntimeConfig(rt);
+        const body = await parseBody(request);
+        const action = String(body.action || 'status').trim().toLowerCase();
+        const pluginRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
+        const hostVersion = rt?.hostCompatibility?.toolsVersion ?? null;
+
+        if (action === 'status') {
+          return okReply({
+            installed: readInstalledVersionInfo(pluginRoot),
+            state: readUpdaterState(rt.storageRoot),
+            backups: listSavedBackups(rt.storageRoot).slice(0, 5),
+          });
+        }
+        if (action === 'check') {
+          const check = await checkForUpdates({
+            pluginRoot,
+            storageRoot: rt.storageRoot,
+            track: body.track || null,
+            force: body.force !== false,
+            currentHostVersion: hostVersion,
+          });
+          return okReply({ check, state: readUpdaterState(rt.storageRoot) });
+        }
+        if (action === 'apply') {
+          const result = await performOneClickUpgrade({
+            ctx,
+            rt,
+            pluginRoot,
+            storageRoot: rt.storageRoot,
+            dshHome: explicitDshHome,
+            targetTrack: body.targetTrack || null,
+            confirmTrackSwitch: body.confirmTrackSwitch || null,
+            localTgzPath: body.localTgzPath || null,
+            currentHostVersion: hostVersion,
+          });
+          return okReply({ result, state: readUpdaterState(rt.storageRoot) });
+        }
+        if (action === 'rollback') {
+          const result = await rollbackToSavedBackup({
+            ctx,
+            rt,
+            storageRoot: rt.storageRoot,
+            dshHome: explicitDshHome,
+            backupId: body.backupId || null,
+          });
+          return okReply({ result, state: readUpdaterState(rt.storageRoot) });
+        }
+        return errReply('BAD_UPDATE_ACTION', `Unsupported update action: ${action}`, 400);
+      } catch (e) {
+        return errReply(e?.code ?? 'PANEL_UPDATE_FAILED', e instanceof Error ? e.message : String(e), e?.statusCode ?? 200, e?.details);
+      }
+    },
+
+    async onboarding(request) {
+      try {
+        syncRuntimeConfig(rt);
+        const body = await parseBody(request);
+        const action = String(body.action || 'status').trim().toLowerCase();
+        const pluginRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
+        if (action === 'apply-quick-setup') {
+          const applied = await applyQuickOnboardingSetup({
+            ctx,
+            rt,
+            storageRoot: rt.storageRoot,
+            dshHome: explicitDshHome,
+            configPath: rt.configPath,
+            bundledDefaultConfigPath: path.join(pluginRoot, 'config', 'leaderteam.config.json'),
+            providerId: body.providerId || 'deepseek',
+            apiKey: body.apiKey || '',
+            collabPresetId: body.collabPresetId || 'balanced-team',
+          });
+          return okReply(applied);
+        }
+        if (action === 'dismiss') {
+          return okReply(writePersistedOnboardingRecord(rt.storageRoot, { dismissed: true }));
+        }
+        return okReply(buildOnboardingSnapshot({ storageRoot: rt.storageRoot }));
+      } catch (e) {
+        return errReply(e?.code ?? 'PANEL_ONBOARDING_FAILED', e instanceof Error ? e.message : String(e), 200);
+      }
+    },
   };
 }
 
@@ -488,6 +611,8 @@ export function registerPanelRoutes(effectScope, connection, ctxForHandlers, rt 
     [PANEL_ROUTES.RETROSPECT, handlers.retrospect, 'leaderteam-panel:retrospect'],
     [PANEL_ROUTES.CLEAN, handlers.clean, 'leaderteam-panel:clean'],
     [PANEL_ROUTES.SESSION_MODE, handlers.sessionMode, 'leaderteam-panel:session-mode'],
+    [PANEL_ROUTES.UPDATE, handlers.update, 'leaderteam-panel:update'],
+    [PANEL_ROUTES.ONBOARDING, handlers.onboarding, 'leaderteam-panel:onboarding'],
   ];
   for (const [routePath, fn, label] of table) {
     effectScope.effect(

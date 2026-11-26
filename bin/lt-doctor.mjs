@@ -9,19 +9,21 @@ import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { loadRawConfig, validateConfig, deepMergePlain } from '../leaderteam/core/config.mjs';
 import { detectLegacyProfilePatchConflicts, cleanLegacyProfilePatches } from '../leaderteam/core/legacy-patch-guard.mjs';
+import {
+  VERIFIED_CORE_VERSIONS,
+  SUPPORTED_DSH_ENGINE_RANGE,
+  CANONICAL_PIPELINE_SNIPPETS,
+  evaluateHostCompatibility,
+  getHostCompatibilityMatrix,
+  renderCompatibilityMatrixMarkdown,
+} from '../leaderteam/core/host-compat.mjs';
 
 const THIS_DIR = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(THIS_DIR, '..');
 
-export const DEFAULT_SUPPORTED_CORE_VERSIONS = Object.freeze([
-  '0.2.2-rc.1',
-  '0.2.2-rc.5',
-]);
+export const DEFAULT_SUPPORTED_CORE_VERSIONS = VERIFIED_CORE_VERSIONS;
 
-export const REQUIRED_PIPELINE_INVARIANTS = Object.freeze([
-  'this.resolveExecution(exec.name, exec.agent, exec.parent !== void 0, exec.toolSet)',
-  'await tool.execute(exec.arguments, exec)',
-]);
+export const REQUIRED_PIPELINE_INVARIANTS = CANONICAL_PIPELINE_SNIPPETS;
 
 export const SOLO_KEY_ENV_NAMES = Object.freeze([
   'DEEPSEEK_API_KEY',
@@ -355,6 +357,8 @@ export function checkNodeRuntime(nodeVersion = process.versions.node) {
 export function checkDshHostCompatibility({
   checkHost = null,
   supportedCoreVersions = null,
+  supportedCoreRange = SUPPORTED_DSH_ENGINE_RANGE,
+  policy = 'adaptive',
   platform = process.platform,
   env = process.env,
   fsImpl = fs,
@@ -378,10 +382,12 @@ export function checkDshHostCompatibility({
       status: isolatedProbeMode ? 'fail' : 'warn',
       classification: 'NOT_FOUND',
       classificationLabel: 'NOT_FOUND',
+      policy,
       isolatedProbeMode,
       toolsVersion: null,
       desktopVersion: null,
       supportedCoreVersions: supported,
+      supportedCoreRange,
       requiredInvariants: {
         dispatchToolBodyPresent: false,
         resolveExecutionPresent: false,
@@ -397,68 +403,34 @@ export function checkDshHostCompatibility({
 
   const src = hit.pipelineSource ?? '';
   const bodySlice = extractDispatchToolBodySlice(src);
-  const dispatchToolBodyPresent = Boolean(bodySlice) && src.includes('resolveExecution');
-  const resolveExecutionPresent = bodySlice.includes(REQUIRED_PIPELINE_INVARIANTS[0]);
-  const toolExecutePresent = bodySlice.includes(REQUIRED_PIPELINE_INVARIANTS[1]);
-  const shapeCompatible = dispatchToolBodyPresent && resolveExecutionPresent && toolExecutePresent;
-  const versionVerified = supported.includes(hit.toolsVersion);
-
-  if (!shapeCompatible) {
-    return {
-      status: 'fail',
-      classification: 'INCOMPATIBLE_PIPELINE',
-      classificationLabel: 'INCOMPATIBLE_PIPELINE',
-      isolatedProbeMode,
-      toolsVersion: hit.toolsVersion,
-      desktopVersion: hit.desktopVersion,
-      supportedCoreVersions: supported,
-      requiredInvariants: {
-        dispatchToolBodyPresent,
-        resolveExecutionPresent,
-        toolExecutePresent,
-      },
-      resolvedFrom: hit.resolvedFrom,
-      productionAllowed: false,
-      summary: `@deepseek-ai/dsh-tools ${hit.toolsVersion} failed pipeline invariant check (INCOMPATIBLE_PIPELINE — safety gate cannot attach; blocked in production).`,
-    };
-  }
-
-  if (!versionVerified) {
-    return {
-      status: 'warn',
-      classification: 'UNVERIFIED_COMPATIBLE_SHAPE',
-      classificationLabel: 'UNVERIFIED_COMPATIBLE_SHAPE (isolated test only — blocked in production)',
-      isolatedProbeMode,
-      toolsVersion: hit.toolsVersion,
-      desktopVersion: hit.desktopVersion,
-      supportedCoreVersions: supported,
-      requiredInvariants: {
-        dispatchToolBodyPresent: true,
-        resolveExecutionPresent: true,
-        toolExecutePresent: true,
-      },
-      resolvedFrom: hit.resolvedFrom,
-      productionAllowed: false,
-      summary: `@deepseek-ai/dsh-tools ${hit.toolsVersion} matches dispatchToolBody invariants -> UNVERIFIED_COMPATIBLE_SHAPE (isolated test only — blocked in production; verified versions: ${supported.join(', ')}).`,
-    };
-  }
+  const dispatchSliceOrEmpty = Boolean(bodySlice) && src.includes('resolveExecution') ? bodySlice : '';
+  const evalRes = evaluateHostCompatibility({
+    toolsVersion: hit.toolsVersion,
+    desktopVersion: hit.desktopVersion,
+    pipelineSource: dispatchSliceOrEmpty,
+    supportedVersions: supported,
+    supportedRange: supportedCoreRange,
+    policy,
+  });
 
   return {
-    status: 'pass',
-    classification: 'VERIFIED',
-    classificationLabel: 'VERIFIED',
+    status: evalRes.status,
+    classification: evalRes.classification,
+    classificationLabel: evalRes.classificationLabel,
+    policy: evalRes.policy,
     isolatedProbeMode,
     toolsVersion: hit.toolsVersion,
     desktopVersion: hit.desktopVersion,
     supportedCoreVersions: supported,
+    supportedCoreRange,
     requiredInvariants: {
-      dispatchToolBodyPresent: true,
-      resolveExecutionPresent: true,
-      toolExecutePresent: true,
+      dispatchToolBodyPresent: Boolean(bodySlice) && src.includes('resolveExecution'),
+      resolveExecutionPresent: evalRes.requiredInvariants.resolveExecutionPresent,
+      toolExecutePresent: evalRes.requiredInvariants.toolExecutePresent,
     },
     resolvedFrom: hit.resolvedFrom,
-    productionAllowed: true,
-    summary: `@deepseek-ai/dsh-tools ${hit.toolsVersion} is VERIFIED and matches all dispatchToolBody safety-gate invariants.`,
+    productionAllowed: evalRes.productionAllowed,
+    summary: evalRes.summary,
   };
 }
 
@@ -908,6 +880,7 @@ export function runDoctorChecks(options = {}) {
   const dshHost = checkDshHostCompatibility({
     checkHost: options.checkHost ?? null,
     supportedCoreVersions: options.supportedCoreVersions ?? null,
+    policy: options.strictVerified ? 'strict-verified' : (options.policy ?? 'adaptive'),
     platform,
     env,
     fsImpl,
@@ -968,12 +941,14 @@ function formatHumanReport(report) {
 }
 
 function parseCliArgs(argv) {
-  const opts = { json: false, help: false, cleanLegacyPatch: false };
+  const opts = { json: false, help: false, cleanLegacyPatch: false, compatibilityMatrix: false, strictVerified: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--json') opts.json = true;
     else if (a === '--help' || a === '-h') opts.help = true;
     else if (a === '--clean-legacy-patch') opts.cleanLegacyPatch = true;
+    else if (a === '--compatibility-matrix' || a === '--matrix') opts.compatibilityMatrix = true;
+    else if (a === '--strict-verified') opts.strictVerified = true;
     else if (a === '--workspace' && argv[i + 1]) opts.workspace = argv[++i];
     else if (a === '--dsh-home' && argv[i + 1]) opts.dshHome = argv[++i];
     else if (a === '--config' && argv[i + 1]) opts.configPath = argv[++i];
@@ -989,6 +964,8 @@ function printUsage() {
     '',
     'Options:',
     '  --json                      Output machine-readable JSON',
+    '  --compatibility-matrix      Print the DSH Host Compatibility Matrix and exit',
+    '  --strict-verified           Require exact verified version list instead of adaptive contract policy',
     '  --workspace <dir>           Target workspace folder to inspect (Windows ACL / sandbox)',
     '  --dsh-home <dir>            Override DSH_HOME directory',
     '  --config <file>             Explicit leaderteam.config.json path to validate',
@@ -1015,6 +992,14 @@ if (isMainCliModule(import.meta.url)) {
     const cli = parseCliArgs(process.argv.slice(2));
     if (cli.help) {
       printUsage();
+      process.exit(0);
+    }
+    if (cli.compatibilityMatrix) {
+      if (cli.json) {
+        console.log(JSON.stringify(getHostCompatibilityMatrix(), null, 2));
+      } else {
+        console.log(renderCompatibilityMatrixMarkdown());
+      }
       process.exit(0);
     }
     let cleanedPatches = [];

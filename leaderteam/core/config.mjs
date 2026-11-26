@@ -173,7 +173,10 @@ export function validateConfig(raw) {
   }
 
   const g = isObj(raw.gate) ? raw.gate : (p.push('gate must be an object'), {});
-  onlyKeys(g, ['scope', 'sandboxDirectAllow', 'enablePatternCache', 'uncontrolledTools', 'shellTools', 'mutatingTools', 'pathArgs', 'requireReadBeforeWrite', 'maxArgChars', 'maxAuthorizationChars', 'dedupeDeniedCalls', 'maxReviewsPerMember', 'maxDenialsPerMember', 'maxReviewsPerTask', 'ruleOnlyTools', 'maxConsecutiveGateErrors', 'gateErrorCooldownMs'], 'gate');
+  onlyKeys(g, ['scope', 'sandboxDirectAllow', 'enablePatternCache', 'uncontrolledTools', 'shellTools', 'mutatingTools', 'pathArgs', 'requireReadBeforeWrite', 'maxArgChars', 'maxAuthorizationChars', 'dedupeDeniedCalls', 'maxReviewsPerMember', 'maxDenialsPerMember', 'maxReviewsPerTask', 'ruleOnlyTools', 'maxConsecutiveGateErrors', 'gateErrorCooldownMs', 'hostCompatibilityPolicy'], 'gate');
+  if (g.hostCompatibilityPolicy !== undefined && g.hostCompatibilityPolicy !== 'adaptive' && g.hostCompatibilityPolicy !== 'strict-verified') {
+    p.push('gate.hostCompatibilityPolicy must be "adaptive" or "strict-verified"');
+  }
   if (g.sandboxDirectAllow !== undefined) bool(g.sandboxDirectAllow, 'gate.sandboxDirectAllow');
   if (g.enablePatternCache !== undefined) bool(g.enablePatternCache, 'gate.enablePatternCache');
   // "all" was never a working mode: it left ordinary sessions without any tool. Only team sessions are governed.

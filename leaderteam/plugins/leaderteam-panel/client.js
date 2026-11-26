@@ -15,6 +15,8 @@
     RETROSPECT: 'api/leaderteam-panel/retrospect',
     CLEAN: 'api/leaderteam-panel/clean',
     SESSION_MODE: 'api/leaderteam-panel/session-mode',
+    UPDATE: 'api/leaderteam-panel/update',
+    ONBOARDING: 'api/leaderteam-panel/onboarding',
   };
   const ROLE_META = [
     { key: 'leader', label: '领队 (leader)' },
@@ -342,6 +344,9 @@
       const [retroNotes, setRetroNotes] = useState('');
       const [cleanPreview, setCleanPreview] = useState(null);
       const [cleanDays, setCleanDays] = useState('');
+      const [updateCheckInfo, setUpdateCheckInfo] = useState(null);
+      const [quickProvider, setQuickProvider] = useState('deepseek');
+      const [quickApiKey, setQuickApiKey] = useState('');
 
       const hydrateFromState = useCallback((snap, opts) => {
         setData(snap);
@@ -859,6 +864,7 @@
             ['plugins', '可拆卸插件'],
             ['timers', '工程计时器'],
             ['archive', '历史计划归档 (' + archivePlans.length + ')'],
+            ['updates', '版本更新与新手引导'],
           ].map(([id, label]) =>
             h('button', { key: id, style: btnStyle(tab === id), onClick: () => setTab(id) }, label)
           )
@@ -1203,6 +1209,101 @@
               ))
               : null
           ) : null
+        ) : null,
+
+        // TAB 6: Auto-Update, Rollback, Host Compatibility & Quick Onboarding
+        tab === 'updates' ? h(
+          'div',
+          null,
+          h('div', { style: cardStyle },
+            h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px', flexWrap: 'wrap', gap: '6px' } },
+              h('strong', null, '版本更新、一键升级与宿主兼容性'),
+              h('button', {
+                style: btnStyle(true),
+                disabled: loading,
+                onClick: async () => {
+                  setLoading(true); setError(null); setNotice(null);
+                  try {
+                    const res = await postApi(ROUTES.UPDATE, { action: 'check', force: true });
+                    setUpdateCheckInfo(res.check);
+                    setNotice(res.check && res.check.hasUpdate ? ('发现新版本 v' + res.check.latestRelease.version + '！') : '当前已是该发行分支最新版本。');
+                  } catch (e) { setError(e && e.message ? e.message : String(e)); }
+                  finally { setLoading(false); }
+                },
+              }, loading ? '检查中…' : '立即检查更新')
+            ),
+            h('div', { style: { fontSize: '12px', marginBottom: '8px' } },
+              '当前版本：v' + ((data && data.updater && data.updater.installed && data.updater.installed.version) || '2.2.x') +
+              ' · 分支：' + ((data && data.updater && data.updater.installed && data.updater.installed.trackInfo && data.updater.installed.trackInfo.label) || '开源版') +
+              (data && data.hostCompatibility ? (' · DSH 宿主：' + (data.hostCompatibility.toolsVersion || '') + ' (' + data.hostCompatibility.classification + ')') : '')
+            ),
+            (updateCheckInfo && updateCheckInfo.hasUpdate && updateCheckInfo.latestRelease)
+              ? h('div', { style: { padding: '10px', borderRadius: '6px', background: tok.infoBg, marginBottom: '8px', fontSize: '12px' } },
+                  h('div', { style: { fontWeight: 700, marginBottom: '4px' } }, '可用更新：v' + updateCheckInfo.latestRelease.version + ' (' + updateCheckInfo.latestRelease.tagName + ')'),
+                  h('pre', { style: { whiteSpace: 'pre-wrap', maxHeight: '140px', overflowY: 'auto', fontSize: '11px', margin: '6px 0' } }, updateCheckInfo.latestRelease.body || '无详细说明'),
+                  h('button', {
+                    style: btnStyle(true),
+                    disabled: loading,
+                    onClick: async () => {
+                      setLoading(true); setError(null); setNotice('正在下载、校验 SHA-256、备份并升级…');
+                      try {
+                        const res = await postApi(ROUTES.UPDATE, { action: 'apply' });
+                        setNotice((res.result && res.result.message) || '已完成一键升级！');
+                        setTimeout(() => loadState({}), 2500);
+                      } catch (e) { setError(e && e.message ? e.message : String(e)); }
+                      finally { setLoading(false); }
+                    },
+                  }, '一键下载、校验并安装升级')
+                )
+              : null,
+            (data && data.updater && Array.isArray(data.updater.backups) && data.updater.backups.length > 0)
+              ? h('div', { style: { marginTop: '8px', fontSize: '12px' } },
+                  h('strong', null, '本地回滚快照：'),
+                  data.updater.backups.map(b => h('div', { key: b.backupId, style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '4px' } },
+                    h('span', null, 'v' + b.fromVersion + ' → v' + b.toVersion),
+                    h('button', {
+                      style: btnStyle(false),
+                      disabled: loading,
+                      onClick: async () => {
+                        setLoading(true); setError(null);
+                        try {
+                          const res = await postApi(ROUTES.UPDATE, { action: 'rollback', backupId: b.backupId });
+                          setNotice((res.result && res.result.message) || '已执行回滚');
+                        } catch (e) { setError(e && e.message ? e.message : String(e)); }
+                        finally { setLoading(false); }
+                      },
+                    }, '一键回滚至 v' + b.fromVersion)
+                  ))
+                )
+              : null
+          ),
+          h('div', { style: cardStyle },
+            h('strong', { style: { display: 'block', marginBottom: '6px' } }, '新手零命令行快速模型接入'),
+            h('div', { style: { fontSize: '11.5px', color: tok.fgMuted, marginBottom: '8px' } }, '直接选择厂商并粘贴 API Key，自动写入本地凭据库并生成全套团队角色路由，无需配置环境变量。'),
+            h('div', { style: { display: 'flex', gap: '6px', flexWrap: 'wrap', alignItems: 'center' } },
+              h('select', { style: inputStyle, value: quickProvider, onChange: e => setQuickProvider(e.target.value) },
+                h('option', { value: 'deepseek' }, 'DeepSeek'),
+                h('option', { value: 'dashscope' }, '阿里云百炼 (Qwen)'),
+                h('option', { value: 'zhipu' }, '智谱 (GLM)'),
+                h('option', { value: 'openai' }, 'OpenAI')
+              ),
+              h('input', { type: 'password', style: { ...inputStyle, flex: 1, minWidth: '160px' }, placeholder: '粘贴 API Key (sk-...)', value: quickApiKey, onChange: e => setQuickApiKey(e.target.value) }),
+              h('button', {
+                style: btnStyle(true),
+                disabled: loading || !quickApiKey.trim(),
+                onClick: async () => {
+                  setLoading(true); setError(null);
+                  try {
+                    await postApi(ROUTES.ONBOARDING, { action: 'apply-quick-setup', providerId: quickProvider, apiKey: quickApiKey.trim() });
+                    setQuickApiKey('');
+                    setNotice('已完成快速模型接入与团队角色配置！新建会话选择 LeaderTeam 预设即可开始。');
+                    await loadState({});
+                  } catch (e) { setError(e && e.message ? e.message : String(e)); }
+                  finally { setLoading(false); }
+                },
+              }, '一键保存并配置团队')
+            )
+          )
         ) : null
       );
     }

@@ -27,7 +27,7 @@ try {
     $runtime = ($runtimeJson -join "`n") | ConvertFrom-Json
 } finally { [Environment]::SetEnvironmentVariable('LT_DSH_APP',$priorApp,'Process') }
 $version = $runtime.version
-if ($runtime.kind -ne 'official-desktop' -or $version -ne '0.2.2-rc.1') { throw 'This official Desktop build has not been qualified by LeaderTeam.' }
+if ($runtime.kind -ne 'official-desktop' -or -not $version) { throw 'This official Desktop build has not been qualified by LeaderTeam.' }
 $legacyHome = Join-Path $env:APPDATA 'dsh-desktop'
 foreach ($target in @($paths.home,$paths.userData)) {
     if ($target -ieq $legacyHome -or $target.StartsWith($legacyHome + '\',[StringComparison]::OrdinalIgnoreCase)) {

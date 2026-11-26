@@ -32,6 +32,7 @@ import { TeamsView } from './views/TeamsView';
 import { ConnectView } from './views/ConnectView';
 import { HengzhangView } from './views/HengzhangView';
 import { SettingsView } from './views/SettingsView';
+import { OnboardingModal } from './components/OnboardingModal';
 import type { CustomThemeSeeds, ThemePresetId } from './types/lt-public-v1';
 
 interface ParsedRoute {
@@ -94,6 +95,13 @@ export function App() {
     unknownCount: 0,
   });
   const [paletteOpen, setPaletteOpen] = useState(false);
+  const [onboardingOpen, setOnboardingOpen] = useState<boolean>(() => {
+    if (typeof window === 'undefined') return false;
+    return new URLSearchParams(window.location.search || '').get('onboarding') === '1';
+  });
+  const [autoDetectedUpdateVer, setAutoDetectedUpdateVer] = useState<string | null>(null);
+  const autoOpenedOnboardingRef = useRef(false);
+  const autoCheckedUpdateRef = useRef(false);
   const [themeMenuAnchor, setThemeMenuAnchor] = useState<DOMRect | null>(null);
   const [toasts, setToasts] = useState<ToastItem[]>([]);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -126,6 +134,25 @@ export function App() {
           density: densityRef.current,
           display: displayRef.current,
         });
+      }
+      if (data.onboarding?.shouldAutoOpen && !autoOpenedOnboardingRef.current) {
+        autoOpenedOnboardingRef.current = true;
+        setOnboardingOpen(true);
+      }
+      if (data.updater?.state?.availableUpdate?.version) {
+        setAutoDetectedUpdateVer(data.updater.state.availableUpdate.version);
+      } else if (
+        data.updater?.state?.autoCheckEnabled !== false &&
+        !autoCheckedUpdateRef.current
+      ) {
+        autoCheckedUpdateRef.current = true;
+        callLtApi<any>('system/update', { action: 'check', force: false })
+          .then(res => {
+            if (res?.check?.hasUpdate && res?.check?.latestRelease?.version) {
+              setAutoDetectedUpdateVer(res.check.latestRelease.version);
+            }
+          })
+          .catch(() => {});
       }
       if (data.capabilities?.features?.usageAnalytics && data.usageStatus?.enabled) {
         callLtApi<any>('usage/overview', { syncGateway: false })
@@ -409,6 +436,22 @@ export function App() {
         hint: 'Ctrl+.',
         run: () => setInsOpen(v => !v),
       },
+      {
+        id: 'sys-onboarding',
+        group: '引导与升级',
+        label: '打开首次使用新手引导向导（模型接入 / 团队配置 / 首个任务）',
+        icon: 'spark',
+        keywords: 'onboarding wizard guide install setup',
+        run: () => setOnboardingOpen(true),
+      },
+      {
+        id: 'sys-updates',
+        group: '引导与升级',
+        label: '检查版本更新、一键升级与 DSH 宿主兼容性列表',
+        icon: 'refresh',
+        keywords: 'update upgrade compatibility dsh rollback',
+        run: () => navigateTo('settings', 'updates'),
+      },
     ];
 
     if (dshFrontendUrl) {
@@ -577,6 +620,7 @@ export function App() {
           onChangeDisplay={handleDisplayChange}
           onNavigateSub={sub => navigateTo('settings', sub)}
           onRefreshBundle={refreshBundle}
+          onOpenOnboarding={() => setOnboardingOpen(true)}
           onNotify={pushToast}
         />
       )}
@@ -585,8 +629,19 @@ export function App() {
         bundle={bundle}
         todayCostCny={todayUsage.costCny}
         todayUnknownCount={todayUsage.unknownCount}
+        availableUpdateVersion={autoDetectedUpdateVer || bundle.updater?.state?.availableUpdate?.version || null}
         onNavigate={(v, sub) => navigateTo(v, sub)}
         onOpenPalette={() => setPaletteOpen(true)}
+        onOpenOnboarding={() => setOnboardingOpen(true)}
+      />
+
+      <OnboardingModal
+        open={onboardingOpen}
+        bundle={bundle}
+        onClose={() => setOnboardingOpen(false)}
+        onRefreshBundle={refreshBundle}
+        onOpenSession={sid => navigateTo('workbench', null, sid)}
+        onNotify={pushToast}
       />
 
       {/* Quick Theme & Density Popover from Rail */}

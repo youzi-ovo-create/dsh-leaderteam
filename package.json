@@ -7,7 +7,7 @@
   "icon": "icon.svg",
   "engines": {
     "node": ">=22.15",
-    "dsh": "0.2.2-rc.1 || 0.2.2-rc.5"
+    "dsh": ">=0.2.2-alpha.2 <1.0.0"
   },
   "scripts": {
     "build:web": "npm --prefix packages/lt-web run build"
@@ -16,7 +16,9 @@
     "lt-doctor": "./bin/lt-doctor.mjs",
     "lt-bugreport": "./bin/lt-bugreport.mjs",
     "lt-magpie": "./bin/lt-magpie.mjs",
-    "lt-ui": "./bin/lt-ui.mjs"
+    "lt-ui": "./bin/lt-ui.mjs",
+    "lt-installer": "./bin/lt-installer.mjs",
+    "lt-update": "./bin/lt-update.mjs"
   },
   "main": "./leaderteam/plugins/leaderteam-panel/index.mjs",
   "exports": {
@@ -36,6 +38,8 @@
   },
   "files": [
     "cordis.patch.yml",
+    "Install-LeaderTeam.cmd",
+    "install-leaderteam.sh",
     "icon.svg",
     "locale/*.json",
     "bin/*.mjs",

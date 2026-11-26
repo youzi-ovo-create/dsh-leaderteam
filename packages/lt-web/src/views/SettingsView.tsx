@@ -18,7 +18,7 @@ import { Splitter, StageHead } from '../components/AppShell';
 import { UnknownValue } from '../components/UnknownValue';
 import type { CustomThemeSeeds, ThemePresetId } from '../types/lt-public-v1';
 
-export type SettingsSubId = 'appearance' | 'modules' | 'about';
+export type SettingsSubId = 'appearance' | 'modules' | 'updates' | 'about';
 
 function ThemeMiniPreview({
   canvas,
@@ -66,6 +66,7 @@ export function SettingsView({
   onChangeDisplay,
   onNavigateSub,
   onRefreshBundle,
+  onOpenOnboarding,
   onNotify,
 }: {
   bundle: HydratedBundle;
@@ -82,23 +83,30 @@ export function SettingsView({
   onChangeDisplay?: (next: DisplayFontMode) => void;
   onNavigateSub?: (sub: SettingsSubId) => void;
   onRefreshBundle: () => Promise<void>;
+  onOpenOnboarding?: () => void;
   onNotify?: (message: string, icon?: IconName) => void;
 }) {
   const [localSub, setLocalSub] = useState<SettingsSubId>(
-    initialSub === 'modules' || initialSub === 'about' ? initialSub : 'appearance',
+    initialSub === 'modules' || initialSub === 'updates' || initialSub === 'about'
+      ? initialSub
+      : 'appearance',
   );
   const [seeds, setSeeds] = useState<CustomThemeSeeds>(customTheme);
   const [busy, setBusy] = useState(false);
   const [pendingModules, setPendingModules] = useState<Record<string, boolean>>({});
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [updateCheckRes, setUpdateCheckRes] = useState<any>(null);
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
+  const [upgrading, setUpgrading] = useState(false);
+  const [crossTrackAck, setCrossTrackAck] = useState(false);
 
   useEffect(() => {
     setSeeds(customTheme);
   }, [customTheme]);
 
   const activeSub: SettingsSubId =
-    initialSub === 'appearance' || initialSub === 'modules' || initialSub === 'about'
+    initialSub === 'appearance' || initialSub === 'modules' || initialSub === 'updates' || initialSub === 'about'
       ? initialSub
       : localSub;
 
@@ -215,8 +223,111 @@ export function SettingsView({
   const titles: Record<SettingsSubId, string> = {
     appearance: '外观',
     modules: '功能模块',
+    updates: '版本更新与宿主兼容',
     about: '关于',
   };
+
+  async function handleCheckUpdate(targetTrack?: string | null) {
+    setCheckingUpdate(true);
+    setError(null);
+    try {
+      const res = await callLtApi<any>('system/update', {
+        action: 'check',
+        track: targetTrack || undefined,
+        force: true,
+      });
+      setUpdateCheckRes(res.check);
+      await onRefreshBundle();
+      if (res.check?.hasUpdate && res.check?.latestRelease) {
+        notify(`发现可用版本 v${res.check.latestRelease.version}！`, 'spark');
+      } else {
+        notify('当前已是所选发行分支的最新版本。', 'check');
+      }
+    } catch (e: any) {
+      reportError(e?.message || '检查更新失败');
+    } finally {
+      setCheckingUpdate(false);
+    }
+  }
+
+  async function handleToggleAutoUpdate(enabled: boolean) {
+    setBusy(true);
+    try {
+      await callLtApi('system/update', { action: 'toggle-auto-check', enabled });
+      await onRefreshBundle();
+      notify(enabled ? '已开启启动时自动检查新版本' : '已关闭自动检查更新', 'check');
+    } catch (e: any) {
+      reportError(e?.message || '更新偏好保存失败');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleApplyOneClickUpgrade(opts: { targetTrack?: string; confirmTrackSwitch?: string } = {}) {
+    setUpgrading(true);
+    setError(null);
+    setNotice('正在下载安装包、校验 SHA-256、检查宿主兼容性并创建回滚快照…');
+    try {
+      const res = await callLtApi<any>('system/update', {
+        action: 'apply',
+        ...(opts.targetTrack ? { targetTrack: opts.targetTrack } : {}),
+        ...(opts.confirmTrackSwitch ? { confirmTrackSwitch: opts.confirmTrackSwitch } : {}),
+      });
+      const r = res?.result;
+      if (r?.asyncApplying) {
+        setNotice(r.message || '正在后台热替换升级，请稍候…');
+        const targetVer = r.toVersion;
+        for (let i = 0; i < 18; i++) {
+          await new Promise(resolve => setTimeout(resolve, 1000));
+          try {
+            const st = await callLtApi<any>('system/update', { action: 'status' });
+            if (st?.installed?.version === targetVer || st?.state?.phase === 'succeeded') {
+              await onRefreshBundle();
+              setUpdateCheckRes(null);
+              notify(`已无感完成升级（v${targetVer}），所有模型配置、历史会话与团队记录已完整保留！`, 'check');
+              return;
+            }
+            if (st?.state?.phase === 'rolled_back' || st?.state?.phase === 'failed') {
+              throw new Error(st?.state?.lastError || '升级失败，已自动回滚至原版本');
+            }
+          } catch (pollErr: any) {
+            if (pollErr?.message?.includes('回滚')) throw pollErr;
+          }
+        }
+        await onRefreshBundle();
+        notify('后台升级已提交，请刷新页面确认最新状态。', 'info');
+      } else {
+        await onRefreshBundle();
+        setUpdateCheckRes(null);
+        notify(r?.message || `已成功安装 v${r?.toVersion || ''}`, 'check');
+      }
+    } catch (e: any) {
+      reportError(e?.message || '一键升级失败');
+    } finally {
+      setUpgrading(false);
+    }
+  }
+
+  async function handleRollback(backupId?: string) {
+    setUpgrading(true);
+    setError(null);
+    try {
+      const res = await callLtApi<any>('system/update', {
+        action: 'rollback',
+        ...(backupId ? { backupId } : {}),
+      });
+      if (res?.result?.asyncApplying) {
+        setNotice(res.result.message || '正在热回滚至上一版本…');
+        await new Promise(resolve => setTimeout(resolve, 3500));
+      }
+      await onRefreshBundle();
+      notify(res?.result?.message || '已成功回滚至历史备份版本', 'check');
+    } catch (e: any) {
+      reportError(e?.message || '版本回滚失败');
+    } finally {
+      setUpgrading(false);
+    }
+  }
 
   const leadingToggle =
     !ctxOpen && onToggleCtx ? (
@@ -247,6 +358,7 @@ export function SettingsView({
             [
               ['appearance', '外观', 'contrast'],
               ['modules', '功能模块', 'layers'],
+              ['updates', '版本更新与兼容', 'refresh'],
               ['about', '关于', 'info'],
             ] as Array<[SettingsSubId, string, IconName]>
           ).map(([id, label, icon]) => (
@@ -721,6 +833,268 @@ export function SettingsView({
                 </div>
               </>
             )}
+
+            {/* ==================== UPDATES & HOST COMPATIBILITY ==================== */}
+            {activeSub === 'updates' && (() => {
+              const upd = bundle.updater;
+              const installed = upd?.installed;
+              const activeRel = updateCheckRes?.latestRelease ?? upd?.state?.availableUpdate ?? null;
+              const hasNew = updateCheckRes ? Boolean(updateCheckRes.hasUpdate) : Boolean(upd?.state?.availableUpdate);
+              const isCrossTrack = Boolean(updateCheckRes?.isCrossTrack);
+              const otherTrackId = installed?.track === 'closed-free' ? 'open-source' : 'closed-free';
+              const otherTrackInfo = upd?.tracks?.find(t => t.id === otherTrackId);
+              const hostCompat = bundle.capabilities.hostCompatibility;
+              const matrix = bundle.compatibilityMatrix;
+
+              return (
+                <>
+                  <div className="section">
+                    <div className="section-head">
+                      <div>
+                        <span className="t-overline">在线升级 · 自动备份回滚</span>
+                        <h2>自动检查更新与一键升级</h2>
+                      </div>
+                      <div className="row" style={{ gap: 8 }}>
+                        {onOpenOnboarding && (
+                          <button
+                            type="button"
+                            className="btn"
+                            onClick={onOpenOnboarding}
+                          >
+                            <Icon name="spark" />
+                            打开首次使用新手引导
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          className="btn btn-primary"
+                          disabled={checkingUpdate || upgrading}
+                          onClick={() => void handleCheckUpdate(null)}
+                        >
+                          <Icon name="refresh" />
+                          {checkingUpdate ? '正在检查…' : '立即检查更新'}
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="card card-pad" style={{ marginBottom: 16 }}>
+                      <div className="row" style={{ justifyContent: 'space-between', flexWrap: 'wrap', gap: 12 }}>
+                        <div className="col" style={{ gap: 4 }}>
+                          <div className="row" style={{ gap: 8 }}>
+                            <b style={{ fontSize: 16 }}>当前版本：v{installed?.version || bundle.capabilities.backendVersion}</b>
+                            <span className="badge outline">
+                              {installed?.trackInfo?.label || '开源维护版 (Apache-2.0)'}
+                            </span>
+                            {hostCompat && (
+                              <span className={`badge ${hostCompat.productionAllowed ? 'success' : 'danger'}`}>
+                                DSH {hostCompat.toolsVersion || '未知'} · {hostCompat.classification}
+                              </span>
+                            )}
+                          </div>
+                          <span className="t-meta">
+                            发行仓库：<code>{installed?.trackInfo?.repo || 'youzi-ovo-create/dsh-leaderteam'}</code>
+                            {upd?.state?.lastCheckedAt ? ` · 上次检查：${new Date(upd.state.lastCheckedAt).toLocaleString()}` : ''}
+                          </span>
+                          <span className="t-meta">
+                            升级承诺：一键校验 SHA-256、预检 DSH 宿主兼容性，自动保留全部模型配置、历史会话与团队账本；升级失败自动无损回滚。
+                          </span>
+                        </div>
+                        <label className="row t-small" style={{ gap: 8 }}>
+                          <span>自动检查新版本</span>
+                          <span className="switch">
+                            <input
+                              type="checkbox"
+                              checked={upd?.state?.autoCheckEnabled !== false}
+                              disabled={busy}
+                              onChange={e => void handleToggleAutoUpdate(e.target.checked)}
+                            />
+                            <span className="track" />
+                          </span>
+                        </label>
+                      </div>
+                    </div>
+
+                    {hasNew && activeRel && (
+                      <div className="card card-pad" style={{ border: '1.5px solid var(--lt-accent)', marginBottom: 16 }}>
+                        <div className="row" style={{ justifyContent: 'space-between', alignItems: 'flex-start', gap: 12, marginBottom: 10 }}>
+                          <div className="col" style={{ gap: 4 }}>
+                            <div className="row" style={{ gap: 8 }}>
+                              <span className="badge success">发现新版本</span>
+                              <b style={{ fontSize: 16 }}>{activeRel.name || `v${activeRel.version}`}</b>
+                              <span className="mono t-meta">({activeRel.tagName})</span>
+                            </div>
+                            <span className="t-meta">
+                              发布时间：{activeRel.publishedAt ? new Date(activeRel.publishedAt).toLocaleString() : '未知'}
+                              {activeRel.asset?.size ? ` · 包大小：${(activeRel.asset.size / 1024).toFixed(1)} KB` : ''}
+                            </span>
+                          </div>
+                          {!isCrossTrack ? (
+                            <button
+                              type="button"
+                              className="btn btn-primary"
+                              disabled={upgrading || !activeRel.asset}
+                              onClick={() => void handleApplyOneClickUpgrade()}
+                            >
+                              <Icon name="zap" />
+                              {upgrading ? '正在下载校验并升级…' : `一键升级至 v${activeRel.version}`}
+                            </button>
+                          ) : (
+                            <div className="col" style={{ gap: 6, alignItems: 'flex-end' }}>
+                              <label className="row t-small" style={{ gap: 6 }}>
+                                <input
+                                  type="checkbox"
+                                  checked={crossTrackAck}
+                                  onChange={e => setCrossTrackAck(e.target.checked)}
+                                />
+                                我已知晓并确认切换到「{updateCheckRes?.queriedTrackInfo?.label}」
+                              </label>
+                              <button
+                                type="button"
+                                className="btn btn-danger"
+                                disabled={!crossTrackAck || upgrading || !activeRel.asset}
+                                onClick={() =>
+                                  void handleApplyOneClickUpgrade({
+                                    targetTrack: updateCheckRes.queriedTrack,
+                                    confirmTrackSwitch: updateCheckRes.crossTrackConfirmationToken,
+                                  })
+                                }
+                              >
+                                确认切换分支并安装 v{activeRel.version}
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                        <div
+                          style={{
+                            background: 'var(--lt-subtle, rgba(128,128,128,0.06))',
+                            padding: '12px 14px',
+                            borderRadius: 6,
+                            whiteSpace: 'pre-wrap',
+                            fontSize: 13,
+                            maxHeight: 240,
+                            overflow: 'auto',
+                          }}
+                        >
+                          {activeRel.body || '暂无详细更新日志。'}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Backups & Rollback */}
+                    {upd?.backups && upd.backups.length > 0 && (
+                      <div className="card card-pad" style={{ marginBottom: 16 }}>
+                        <b className="t-small" style={{ display: 'block', marginBottom: 8 }}>
+                          本地历史版本备份快照（支持离线一键回滚）
+                        </b>
+                        {upd.backups.map(b => (
+                          <div
+                            key={b.backupId}
+                            className="row"
+                            style={{
+                              justifyContent: 'space-between',
+                              padding: '8px 0',
+                              borderTop: '1px solid var(--lt-border-subtle)',
+                            }}
+                          >
+                            <span className="t-small">
+                              <code>v{b.fromVersion}</code> ({b.fromTrack}) → <code>v{b.toVersion}</code> ·{' '}
+                              <span className="t-meta">{new Date(b.createdAt).toLocaleString()}</span>
+                            </span>
+                            <button
+                              type="button"
+                              className="btn btn-sm"
+                              disabled={upgrading}
+                              onClick={() => void handleRollback(b.backupId)}
+                            >
+                              回滚至 v{b.fromVersion}
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+
+                    {/* Explicit Cross-Track Isolation Notice */}
+                    {otherTrackInfo && (
+                      <details className="card card-pad">
+                        <summary className="t-small" style={{ cursor: 'pointer', fontWeight: 600 }}>
+                          发行分支隔离保护说明（查看另一分支：{otherTrackInfo.label}）
+                        </summary>
+                        <p className="t-meta" style={{ margin: '8px 0 10px' }}>
+                          开源版（<code>youzi-ovo-create/dsh-leaderteam</code>）与闭源免费公开发行版（<code>youzi-ovo-create/dsh-leaderteam-releases</code>）严格各自独立检查更新，系统绝不会在未经您确认的情况下自动切换发行分支。
+                        </p>
+                        <button
+                          type="button"
+                          className="btn btn-sm"
+                          disabled={checkingUpdate || upgrading}
+                          onClick={() => {
+                            setCrossTrackAck(false);
+                            void handleCheckUpdate(otherTrackId);
+                          }}
+                        >
+                          仅预览「{otherTrackInfo.shortLabel}」最新发布版本
+                        </button>
+                      </details>
+                    )}
+                  </div>
+
+                  {/* Host Compatibility Matrix */}
+                  {matrix && (
+                    <div className="section">
+                      <div className="section-head">
+                        <div>
+                          <span className="t-overline">自适应契约 · 告别强锁版</span>
+                          <h2>DeepSeek Harness (DSH) 宿主版本兼容性列表</h2>
+                        </div>
+                      </div>
+                      <div className="card card-pad">
+                        <p className="t-small" style={{ marginTop: 0 }}>
+                          支持声明范围：<code>{matrix.engineRange}</code> · 默认兼容策略：<code>{matrix.defaultPolicy}</code>（启动时动态核验安全门结构契约，宿主常规小版本更新可直接兼容运行）
+                        </p>
+                        <div style={{ overflowX: 'auto' }}>
+                          <table className="table" style={{ width: '100%', fontSize: 13 }}>
+                            <thead>
+                              <tr>
+                                <th>DSH 版本范围</th>
+                                <th>适用形态</th>
+                                <th>支持平台</th>
+                                <th>兼容状态</th>
+                                <th>说明</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {matrix.rows.map(row => (
+                                <tr key={row.series}>
+                                  <td>
+                                    <code>{row.versionPattern}</code>
+                                    <div className="t-meta">{row.series}</div>
+                                  </td>
+                                  <td>{row.surfaces.join(' / ')}</td>
+                                  <td>{row.platforms.join(', ')}</td>
+                                  <td>
+                                    <span
+                                      className={`badge sm ${
+                                        row.status === 'VERIFIED'
+                                          ? 'success'
+                                          : row.productionAllowed
+                                            ? 'outline'
+                                            : 'danger'
+                                      }`}
+                                    >
+                                      {row.statusLabel}
+                                    </span>
+                                  </td>
+                                  <td className="t-meta">{row.notes}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </>
+              );
+            })()}
 
             {/* ==================== ABOUT ==================== */}
             {activeSub === 'about' && (

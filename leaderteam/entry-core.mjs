@@ -164,7 +164,11 @@ export function apply(ctx, config) {
   rt.reserveMemberActivation = (teamId, member) => isPluginActive(runtimeForTeam(teamId), 'scheduler') ? hostConcurrency.reserveTeamDispatch(ctx, teamId, { id: member.childId, name: member.name, taskSeq: member.taskSeq, profile: member.profile }) : null;
   rt.activationCapacity = teamId => isPluginActive(runtimeForTeam(teamId), 'scheduler') ? hostConcurrency.evaluateTeamConcurrency(ctx, teamId) : null;
   rt.activationLimit = teamId => isPluginActive(runtimeForTeam(teamId), 'scheduler') ? hostConcurrency.evaluateTeamConcurrency(ctx, teamId).controls.user_max_concurrent : runtimeForTeam(teamId).config.team.maxActiveMembers;
-  installFinalGate(pkg.leaderteam.supportedCoreVersions);
+  installFinalGate({
+    supportedVersions: pkg.leaderteam.supportedCoreVersions,
+    supportedRange: pkg.leaderteam.supportedCoreRange,
+    policy: rt.config?.gate?.hostCompatibilityPolicy ?? pkg.leaderteam?.compatibilityPolicy ?? 'adaptive',
+  });
   rt.gate = new Gate(ctx);
   hostSurface.installToolSurface(agent => agent?.session ? rt.gate.actorFor(agent) : null);
   hostCapabilities.registerCapabilityTools(ctx);

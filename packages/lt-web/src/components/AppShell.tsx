@@ -183,14 +183,18 @@ export function StatusBar({
   bundle,
   todayCostCny,
   todayUnknownCount,
+  availableUpdateVersion = null,
   onNavigate,
   onOpenPalette,
+  onOpenOnboarding,
 }: {
   bundle: HydratedBundle;
   todayCostCny: number | null;
   todayUnknownCount: number;
+  availableUpdateVersion?: string | null;
   onNavigate: (view: NavViewId, sub?: string) => void;
   onOpenPalette: () => void;
+  onOpenOnboarding?: () => void;
 }) {
   const feats = bundle.capabilities.features;
   const live = feats.liveSessionRpc;
@@ -354,6 +358,37 @@ export function StatusBar({
       )}
 
       <span className="status-spacer" />
+
+      {availableUpdateVersion && (
+        <>
+          <button
+            type="button"
+            className="status-item"
+            style={{ color: 'var(--lt-accent)', fontWeight: 600 }}
+            onClick={() => onNavigate('settings', 'updates')}
+            title="发现新版本，点击查看更新说明并一键升级"
+          >
+            <Icon name="spark" className="icon-14" />
+            新版本 v{availableUpdateVersion} · 点击升级
+          </button>
+          <i className="status-sep" />
+        </>
+      )}
+
+      {onOpenOnboarding && (
+        <>
+          <button
+            type="button"
+            className="status-item"
+            onClick={onOpenOnboarding}
+            title="打开零命令行新手配置与首个任务向导"
+          >
+            <Icon name="spark" className="icon-14" />
+            新手引导
+          </button>
+          <i className="status-sep" />
+        </>
+      )}
 
       <span className="status-item mono" title="公共接口契约">
         lt.public.v1 · {contractVersion}

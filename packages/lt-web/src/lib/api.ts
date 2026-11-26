@@ -52,8 +52,146 @@ export interface LocalOverridesSummary {
   roles: string[];
 }
 
+export interface OnboardingBundleSnapshot {
+  completed: boolean;
+  dismissed: boolean;
+  shouldAutoOpen: boolean;
+  selectedProviderId: string | null;
+  keyPreview: string | null;
+  selectedCollabPreset: string;
+  defaultSessionMode: 'team' | 'single';
+  firstSessionId: string | null;
+  defaultWorkspace: string;
+  detectedEnvVars: string[];
+  steps: {
+    modelConnected: boolean;
+    teamConfigured: boolean;
+    firstTaskCreated: boolean;
+  };
+  providerPresets: Array<{
+    id: string;
+    provider: string;
+    displayName: string;
+    envVar: string;
+    defaultBaseURL: string;
+    reasoningRoute: string;
+    reasoningLabel: string;
+    chatRoute: string;
+    chatLabel: string;
+    keyPlaceholder: string;
+    guideHint: string;
+  }>;
+  collabPresets: Array<{
+    id: string;
+    label: string;
+    defaultSessionMode: 'team' | 'single';
+    maxActiveMembers: number;
+    summary: string;
+  }>;
+  starterTasks: Array<{
+    id: string;
+    title: string;
+    recommendedMode: 'team' | 'single';
+    description: string;
+    prompt: string;
+  }>;
+}
+
+export interface UpdaterReleaseEntry {
+  track: string;
+  tagName: string;
+  version: string;
+  name: string;
+  prerelease: boolean;
+  publishedAt: string | null;
+  htmlUrl: string | null;
+  body: string;
+  asset: {
+    name: string;
+    size: number | null;
+    downloadUrl: string;
+    sha256: string | null;
+  } | null;
+  sha256SumsUrl: string | null;
+}
+
+export interface UpdaterBundleSnapshot {
+  installed: {
+    name: string;
+    version: string;
+    track: 'open-source' | 'closed-free';
+    trackInfo: {
+      id: string;
+      label: string;
+      shortLabel: string;
+      license: string;
+      repo: string;
+      releasesHtmlUrl: string;
+      description: string;
+    };
+    enginesDsh: string;
+  };
+  tracks: Array<{
+    id: string;
+    label: string;
+    shortLabel: string;
+    license: string;
+    repo: string;
+    releasesHtmlUrl: string;
+    description: string;
+  }>;
+  state: {
+    phase: string;
+    autoCheckEnabled: boolean;
+    lastCheckedAt: string | null;
+    lastError: string | null;
+    availableUpdate: UpdaterReleaseEntry | null;
+    lastCompletedUpgrade: Record<string, any> | null;
+  };
+  backups: Array<{
+    backupId: string;
+    createdAt: string;
+    fromVersion: string;
+    fromTrack: string;
+    toVersion: string;
+    toTrack: string;
+  }>;
+}
+
+export interface HostCompatibilityMatrixSnapshot {
+  track: string;
+  engineRange: string;
+  minSupportedVersion: string;
+  verifiedVersions: string[];
+  defaultPolicy: string;
+  rows: Array<{
+    series: string;
+    versionPattern: string;
+    surfaces: string[];
+    platforms: string[];
+    status: string;
+    statusLabel: string;
+    productionAllowed: boolean;
+    notes: string;
+  }>;
+}
+
 export interface HydratedBundle {
-  capabilities: BackendCapabilities;
+  capabilities: BackendCapabilities & {
+    distributionTrack?: string;
+    hostCompatibility?: {
+      status: string;
+      classification: string;
+      toolsVersion: string | null;
+      productionAllowed: boolean;
+      summary: string;
+    } | null;
+    features: BackendCapabilities['features'] & {
+      autoUpdate?: boolean;
+      onboardingWizard?: boolean;
+      hostCompatibilityMatrix?: boolean;
+    };
+  };
   gateway: GatewayStatus;
   providers: ProviderDescriptor[];
   providerPresets: ProviderPresetDescriptor[];
@@ -80,6 +218,9 @@ export interface HydratedBundle {
     lastSyncAt: string | null;
     lastSyncError: string | null;
   };
+  onboarding?: OnboardingBundleSnapshot;
+  updater?: UpdaterBundleSnapshot;
+  compatibilityMatrix?: HostCompatibilityMatrixSnapshot;
 }
 
 export function resolveApiPrefix(): string {
