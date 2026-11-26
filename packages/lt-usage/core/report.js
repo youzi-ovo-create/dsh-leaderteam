@@ -668,15 +668,76 @@ function buildByTask(ledger) {
   return out;
 }
 
+function appendGovernanceRows({
+  ledger,
+  specs,
+  ownerSessionId,
+  governance,
+  pricing,
+  issues,
+  matchGateway,
+  notes,
+  filterLeaderRole = false
+}) {
+  const governanceAgents = new Map();
+  const records = filterLeaderRole
+    ? (governance ?? []).filter((record) => record && record.role !== 'leader')
+    : (governance ?? []);
+  for (const record of records) {
+    const timeMs = Date.parse(record?.at);
+    if (!Number.isFinite(timeMs)) {
+      notes.push(`governance record without valid at: ${String(record?.at)}`);
+      continue;
+    }
+    const actor = governanceActor(record);
+    if (!governanceAgents.has(actor)) {
+      governanceAgents.set(actor, true);
+      specs.push({
+        agentKey: `governance|${ownerSessionId}|${actor}`,
+        group: 'governance',
+        name: actor,
+        actorRole: record.role ?? 'governance',
+        stageId: record.purpose ?? (record.role === 'gate' ? 'safety-gate' : null),
+        sessionId: ownerSessionId
+      });
+    }
+    ledger.push(
+      makeLedgerRow(
+        {
+          timeMs,
+          group: 'governance',
+          actor,
+          role: record.role ?? 'governance',
+          stageId: null,
+          taskSeq: Number.isInteger(record.taskSeq) ? record.taskSeq : null,
+          sessionId: ownerSessionId,
+          agentKey: `governance|${ownerSessionId}|${actor}`,
+          route: record.route ?? 'unknown',
+          hostProvider: record.hostProvider ?? null,
+          responseId: record.responseId ?? null,
+          attempts: Number.isInteger(record.attempts) ? record.attempts : null,
+          latencyMs: Number.isFinite(record.latencyMs) ? record.latencyMs : null,
+          usage: record.usage ?? null,
+          ok: record.ok !== false,
+          degraded: record.degraded
+        },
+        pricing,
+        issues,
+        matchGateway
+      )
+    );
+  }
+}
+
 function buildTeamReport(input, notes, issues, matchGateway) {
-  const { home, sessionId, sessions, governance, members, pricing } = input;
+  const { home, sessionId, sessions, governance, members, pricing, approvedDeliveryTimes, modeBoundaries } = input;
   const leader = sessions[0];
   const byId = new Map(sessions.map((session) => [session.id, session]));
   const catalog = catalogOf(sessions);
   const ledger = [];
   const specs = [];
 
-  const leaderReceipts = extractReceipts(leader.rows ?? []);
+  const leaderReceipts = extractReceipts(leader.rows ?? [], { approvedDeliveryTimes, modeBoundaries });
   for (const receipt of leaderReceipts.receipts) {
     ledger.push(
       makeLedgerRow(
@@ -814,55 +875,22 @@ function buildTeamReport(input, notes, issues, matchGateway) {
     });
   }
 
-  const governanceAgents = new Map();
-  for (const record of governance ?? []) {
-    const timeMs = Date.parse(record?.at);
-    if (!Number.isFinite(timeMs)) {
-      notes.push(`governance record without valid at: ${String(record?.at)}`);
-      continue;
-    }
-    const actor = governanceActor(record);
-    if (!governanceAgents.has(actor)) {
-      governanceAgents.set(actor, true);
-      specs.push({
-        agentKey: `governance|${leader.id}|${actor}`,
-        group: 'governance',
-        name: actor,
-        actorRole: record.role ?? 'governance',
-        stageId: record.purpose ?? (record.role === 'gate' ? 'safety-gate' : null),
-        sessionId: leader.id
-      });
-    }
-    ledger.push(
-      makeLedgerRow(
-        {
-          timeMs,
-          group: 'governance',
-          actor,
-          role: record.role ?? 'governance',
-          stageId: null,
-          taskSeq: Number.isInteger(record.taskSeq) ? record.taskSeq : null,
-          sessionId: leader.id,
-          agentKey: `governance|${leader.id}|${actor}`,
-          route: record.route ?? 'unknown',
-          attempts: Number.isInteger(record.attempts) ? record.attempts : null,
-          latencyMs: Number.isFinite(record.latencyMs) ? record.latencyMs : null,
-          usage: record.usage ?? null,
-          ok: record.ok !== false,
-          degraded: record.degraded
-        },
-        pricing,
-        issues,
-        matchGateway
-      )
-    );
-  }
+  appendGovernanceRows({
+    ledger,
+    specs,
+    ownerSessionId: leader.id,
+    governance,
+    pricing,
+    issues,
+    matchGateway,
+    notes
+  });
 
   return { ledger, specs, groups: ['leader', 'execution', 'governance'] };
 }
 
 function buildSessionReport(input, notes, issues, matchGateway) {
-  const { sessions, governance, pricing } = input;
+  const { sessions, governance, pricing, approvedDeliveryTimes, modeBoundaries } = input;
   const catalog = catalogOf(sessions);
   const ledger = [];
   const specs = [];
@@ -874,7 +902,10 @@ function buildSessionReport(input, notes, issues, matchGateway) {
       index === 0 ? 'main' : catalog.get(session.id) ?? shortId(session.id);
     const role = index === 0 ? 'main' : 'subagent';
     const agentKey = `${group}|${session.id}|${name}`;
-    const receipts = extractReceipts(session.rows ?? []);
+    const receipts = extractReceipts(
+      session.rows ?? [],
+      index === 0 ? { approvedDeliveryTimes, modeBoundaries } : undefined
+    );
     for (const receipt of receipts.receipts) {
       ledger.push(
         makeLedgerRow(
@@ -910,55 +941,23 @@ function buildSessionReport(input, notes, issues, matchGateway) {
     });
   });
 
-  const governanceRecords = (governance ?? []).filter((record) => record && record.role !== 'leader');
-  const governanceAgents = new Map();
-  for (const record of governanceRecords) {
-    const timeMs = Date.parse(record?.at);
-    if (!Number.isFinite(timeMs)) {
-      notes.push(`governance record without valid at: ${String(record?.at)}`);
-      continue;
-    }
-    const actor = governanceActor(record);
-    if (!governanceAgents.has(actor)) {
-      governanceAgents.set(actor, true);
-      specs.push({
-        agentKey: `governance|${main.id}|${actor}`,
-        group: 'governance',
-        name: actor,
-        actorRole: record.role ?? 'governance',
-        stageId: record.purpose ?? (record.role === 'gate' ? 'safety-gate' : null),
-        sessionId: main.id
-      });
-    }
-    ledger.push(
-      makeLedgerRow(
-        {
-          timeMs,
-          group: 'governance',
-          actor,
-          role: record.role ?? 'governance',
-          stageId: null,
-          taskSeq: Number.isInteger(record.taskSeq) ? record.taskSeq : null,
-          sessionId: main.id,
-          agentKey: `governance|${main.id}|${actor}`,
-          route: record.route ?? 'unknown',
-          hostProvider: record.hostProvider ?? null,
-          responseId: record.responseId ?? null,
-          attempts: Number.isInteger(record.attempts) ? record.attempts : null,
-          latencyMs: Number.isFinite(record.latencyMs) ? record.latencyMs : null,
-          usage: record.usage ?? null,
-          ok: record.ok !== false,
-          degraded: record.degraded
-        },
-        pricing,
-        issues,
-        matchGateway
-      )
-    );
-  }
+  appendGovernanceRows({
+    ledger,
+    specs,
+    ownerSessionId: main.id,
+    governance,
+    pricing,
+    issues,
+    matchGateway,
+    notes,
+    filterLeaderRole: true
+  });
 
-  const baseGroups = sessions.length > 1 ? ['main', 'subagents'] : ['main'];
-  const groups = governanceAgents.size > 0 ? [...baseGroups, 'governance'] : baseGroups;
+  const hasGovernance = ledger.some((row) => row.group === 'governance');
+  const groups = [
+    ...(sessions.length > 1 ? ['main', 'subagents'] : ['main']),
+    ...(hasGovernance ? ['governance'] : [])
+  ];
   return { ledger, specs, groups, main };
 }
 
@@ -968,6 +967,9 @@ export function buildReport(input) {
     sessionId,
     sessions = [],
     governance = [],
+    gateSummary,
+    approvedDeliveryTimes,
+    modeBoundaries,
     members,
     kind,
     pricing = defaultPricing,
@@ -984,8 +986,18 @@ export function buildReport(input) {
   const matchGateway = createGatewayMatcher(gatewayRecords);
   const built =
     kind === 'team'
-      ? buildTeamReport({ home, sessionId, sessions, governance, members, pricing }, notes, issues, matchGateway)
-      : buildSessionReport({ home, sessionId, sessions, governance, members, pricing }, notes, issues, matchGateway);
+      ? buildTeamReport(
+          { home, sessionId, sessions, governance, members, pricing, approvedDeliveryTimes, modeBoundaries },
+          notes,
+          issues,
+          matchGateway
+        )
+      : buildSessionReport(
+          { home, sessionId, sessions, governance, members, pricing, approvedDeliveryTimes, modeBoundaries },
+          notes,
+          issues,
+          matchGateway
+        );
   const ordered = assignOrder(built.ledger);
   const totals = aggregateRows(ordered);
   if (totals.unmeteredCalls > 0) {
@@ -1007,7 +1019,7 @@ export function buildReport(input) {
   const main = sessions[0];
   const meta = buildMeta({ home, sessionId, kind, main, sessions, ledger: ordered, notes });
 
-  return {
+  const out = {
     meta,
     totals,
     byModel,
@@ -1017,4 +1029,8 @@ export function buildReport(input) {
     agents,
     calls: ordered.map(toCall)
   };
+  if (gateSummary && kind === 'session') {
+    out.gateSummary = gateSummary;
+  }
+  return out;
 }

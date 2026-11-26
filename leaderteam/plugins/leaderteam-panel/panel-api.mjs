@@ -3,7 +3,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { PLAN_CATEGORIES, PLAN_LIFECYCLE_STATES } from '../../core/constants.mjs';
-import { TeamStore } from '../../core/store.mjs';
+import { TeamStore, resolveTeamStoreLogicalId } from '../../core/store.mjs';
 import { computeTimerSnapshot, resolveNowMs } from '../../core/timer.mjs';
 import { resolvePlanArchiveRoot, PlanArchiveStore } from '../../core/plan-archive.mjs';
 import { inspectModelConfiguration, applyModelConfigChanges } from '../../core/model-config-writer.mjs';
@@ -140,7 +140,8 @@ function collectRecentTeamTimers(rt, maxTeams = 30) {
   const rows = [];
   for (const dirent of entries.slice(0, maxTeams * 2)) {
     try {
-      const store = new TeamStore(rt.storageRoot, dirent.name);
+      const logicalTeamId = resolveTeamStoreLogicalId(rt.storageRoot, dirent.name);
+      const store = new TeamStore(rt.storageRoot, logicalTeamId);
       const tState = store.readTimerState();
       if (!tState) continue;
       const snap = computeTimerSnapshot(tState, rt.config, {
@@ -148,7 +149,7 @@ function collectRecentTeamTimers(rt, maxTeams = 30) {
         nowMs,
       });
       rows.push({
-        teamId: dirent.name,
+        teamId: logicalTeamId,
         workspace: tState.workspace ?? null,
         lastActivityAtMs: tState.lastActivityAtMs ?? 0,
         ...snap,

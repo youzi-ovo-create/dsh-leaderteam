@@ -255,8 +255,11 @@ export class HengzhangUsageBridge {
       }
 
       if (Array.isArray(page.deleted)) {
-        for (const delId of page.deleted) {
-          if (delId) this.gatewayRecordMap.delete(String(delId));
+        for (const delItem of page.deleted) {
+          const delId = typeof delItem === 'string'
+            ? delItem.trim()
+            : String(delItem?.id ?? delItem?.rid ?? '').trim();
+          if (delId) this.gatewayRecordMap.delete(delId);
         }
       }
 
@@ -283,8 +286,10 @@ export class HengzhangUsageBridge {
         this.gatewayRecordMap.delete(oldestKey);
       }
 
+      const prevCursor = this.nextCursor;
       this.nextCursor = page.nextCursor || this.nextCursor;
-      if (!page.hasMore || page.rows.length === 0) break;
+      const hasDeleted = Array.isArray(page.deleted) && page.deleted.length > 0;
+      if (!page.hasMore || (page.rows.length === 0 && !hasDeleted && this.nextCursor === prevCursor)) break;
     }
 
     this.lastSyncAt = new Date().toISOString();
@@ -329,6 +334,10 @@ export class HengzhangUsageBridge {
     }
   }
 
+  _storageRootForHome(resolvedHome) {
+    return samePath(resolvedHome, this.resolveDshHome(null)) ? this.storageRoot : undefined;
+  }
+
   async getOverview({ home = null, syncGateway = true, allowExternalOverride = true } = {}) {
     const check = this._guardEnabledAndHealthy();
     if (!check.active) {
@@ -340,7 +349,10 @@ export class HengzhangUsageBridge {
     }
     const pricing = this.getPricing();
     const overview = fs.existsSync(path.join(resolvedHome, 'sessions'))
-      ? overviewFor(resolvedHome, pricing, { gatewayRecords: this.gatewayRecords })
+      ? overviewFor(resolvedHome, pricing, {
+        gatewayRecords: this.gatewayRecords,
+        storageRoot: this._storageRootForHome(resolvedHome),
+      })
       : {
         totals: {
           callsTotal: 0,
@@ -380,7 +392,10 @@ export class HengzhangUsageBridge {
     if (!fs.existsSync(path.join(resolvedHome, 'sessions'))) {
       return { enabled: true, dshHome: resolvedHome, sessions: [] };
     }
-    const sessions = listSessions(resolvedHome, this.getPricing(), { gatewayRecords: this.gatewayRecords });
+    const sessions = listSessions(resolvedHome, this.getPricing(), {
+      gatewayRecords: this.gatewayRecords,
+      storageRoot: this._storageRootForHome(resolvedHome),
+    });
     return { enabled: true, dshHome: resolvedHome, sessions };
   }
 
@@ -397,7 +412,10 @@ export class HengzhangUsageBridge {
       await withBoundedTimeout(this.triggerBackgroundMagpieSync(), 1200);
     }
     const pricing = this.getPricing();
-    const res = reportFor(resolvedHome, sessionId, pricing, { gatewayRecords: this.gatewayRecords });
+    const res = reportFor(resolvedHome, sessionId, pricing, {
+      gatewayRecords: this.gatewayRecords,
+      storageRoot: this._storageRootForHome(resolvedHome),
+    });
     if (!res) return { enabled: true, report: null, signature: null };
     const customRoutes = this._getCustomRouteKeys();
     return {

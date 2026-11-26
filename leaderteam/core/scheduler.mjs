@@ -101,18 +101,24 @@ export function writeTeamConcurrencyFile(storageRoot, teamId, { maxActiveMembers
 export function resetAllTeamChatOverridesOnDisk(storageRoot, updatedAtMs = Date.now()) {
   const teamsDir = path.join(storageRoot, 'teams');
   let entries = [];
-  try { entries = fs.readdirSync(teamsDir); } catch { return 0; }
+  try { entries = fs.readdirSync(teamsDir, { withFileTypes: true }).filter(d => d.isDirectory()).map(d => d.name); } catch { return 0; }
   let count = 0;
-  for (const tid of entries) {
-    const existing = readTeamConcurrencyFile(storageRoot, tid);
-    if (!existing || existing.maxActiveMembers === null) continue;
+  for (const dirName of entries) {
+    const file = path.join(teamsDir, dirName, 'concurrency.json');
+    let existing = null;
+    try { existing = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { continue; }
+    if (!existing || existing.maxActiveMembers === null || existing.maxActiveMembers === undefined) continue;
     try {
-      writeTeamConcurrencyFile(storageRoot, tid, {
+      const payload = {
+        v: 1,
         maxActiveMembers: null,
-        lastChatDirectiveIndex: existing.lastChatDirectiveIndex,
+        lastChatDirectiveIndex: Number.isInteger(existing.lastChatDirectiveIndex) && existing.lastChatDirectiveIndex >= -1
+          ? existing.lastChatDirectiveIndex
+          : -1,
         source: 'cli-reset',
         updatedAtMs,
-      });
+      };
+      writeFileAtomic(file, JSON.stringify(payload, null, 2) + '\n');
       count += 1;
     } catch {}
   }

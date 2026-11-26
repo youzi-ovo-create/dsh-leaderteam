@@ -1790,13 +1790,13 @@ test('Stage 9 S8-SYS-02 & S8-SYS-03: special/overlong session-ID encoding across
 
   for (const sid of [colonSid, tildeSid, longSid]) {
     const encoded = encodeTeamStoreId(sid, storageRoot);
-    // Idempotency before and after directory creation
-    assert.equal(encodeTeamStoreId(encoded, storageRoot), encoded, `encodeTeamStoreId must be idempotent on ${sid}`);
+    // Canonical injectivity (`R2-V223-05a`): `~` is escaped as `~007E`, so `encoded` maps to a distinct segment when treated as a raw session ID
+    assert.notEqual(encodeTeamStoreId(encoded, storageRoot), encoded, `encodeTeamStoreId must be injective on ${sid} vs ${encoded}`);
 
     // 1. current-plan.mjs: writeCurrentPlan + readCurrentPlan + FinalGate globalRefRoots alignment
     const written = writeCurrentPlan(storageRoot, sid, 1, `# Plan for ${sid}\n1. Verify encoding\n`);
-    const expectedFile = currentPlanFile(storageRoot, encoded, 1);
-    assert.equal(written.path, expectedFile, `writeCurrentPlan(raw) and currentPlanFile(encoded) must match on ${sid}`);
+    const expectedFile = currentPlanFile(storageRoot, sid, 1);
+    assert.equal(written.path, expectedFile, `writeCurrentPlan(raw) and currentPlanFile(raw) must match on ${sid}`);
     assert.equal(readCurrentPlan(storageRoot, sid, 1)?.content, `# Plan for ${sid}\n1. Verify encoding\n`);
 
     // Create leader session in Team mode and verify FinalGate allows Leader read of written plan.md (zero tilde split-brain!)

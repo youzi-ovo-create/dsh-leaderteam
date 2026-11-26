@@ -97,7 +97,7 @@ export function runtimeForTeam(teamId) {
             team: { ...fixed.team, executionPool: live.team.executionPool, maxActiveMembers: live.team.maxActiveMembers },
             scheduler: live.scheduler,
             timer: live.timer,
-            paths: { ...fixed.paths, globalRefRoots: [...new Set([...fixed.paths.globalRefRoots, currentPlanRoot(rt.storageRoot, store.teamId), ...((fixed.team.rollingPlanning || fixed.governance?.mode === 'autonomous') ? [fileURLToPath(new URL('../../docs/HeLuoDoc/V2.1', import.meta.url))] : [])])] },
+            paths: { ...fixed.paths, globalRefRoots: [...new Set([...fixed.paths.globalRefRoots, currentPlanRoot(rt.storageRoot, store.rawTeamId ?? store.teamId), ...((fixed.team.rollingPlanning || fixed.governance?.mode === 'autonomous') ? [fileURLToPath(new URL('../../docs/HeLuoDoc/V2.1', import.meta.url))] : [])])] },
             derived: { ...fixed.derived, executionModels: live.models, governanceSha256: view.sourceSha256 },
           });
           view.live = target.config;
@@ -186,7 +186,6 @@ export function teamStore(teamId) {
   if (!s) {
     s = new TeamStore(rt.storageRoot, teamId);
     rt.stores.set(teamId, s);
-    if (s.teamId !== teamId) rt.stores.set(s.teamId, s);
   }
   return s;
 }

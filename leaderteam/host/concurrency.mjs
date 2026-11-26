@@ -31,7 +31,7 @@ import {
 import { assessRequestWindow } from '../core/request-window.mjs';
 import { readQuotaStateFile, routeQuota5hWindow } from '../core/quota.mjs';
 import { routeProvider } from '../core/config.mjs';
-import { TeamStore } from '../core/store.mjs';
+import { TeamStore, readJsonl } from '../core/store.mjs';
 import { frontierState, frontierNeedsPlanning } from '../core/frontier.mjs';
 import { hasAdmissibleFrontierWork } from './activation.mjs';
 import { readSystemPowerSample } from './power-adapter.mjs';
@@ -296,8 +296,7 @@ export function evaluateTeamRequestWindow(rt = runtime(), teamId = null, nowMs =
     if (fs.existsSync(teamsDir)) {
       for (const tid of fs.readdirSync(teamsDir)) {
         try {
-          const st = storeForRoot(tid);
-          for (const u of st.usageRecords()) {
+          for (const u of readJsonl(path.join(teamsDir, tid, 'usage.jsonl')).records) {
             if (!matchesProvider(u?.route ?? null, u?.provider ?? null, u?.hostProvider ?? null)) continue;
             const t = typeof u?.at === 'string' ? Date.parse(u.at) : (typeof u?.atMs === 'number' ? u.atMs : NaN);
             if (Number.isFinite(t)) timestampsMs.push(t);

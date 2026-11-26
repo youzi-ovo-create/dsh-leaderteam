@@ -285,8 +285,9 @@ export function applyLeaderPromptSections(ctx, rt, actor, agent, mode = 'team') 
           const seq = currentTaskSeq(ctx, actor.teamId);
           const store = teamStore(actor.teamId);
           if (curCfg.team.rollingPlanning) return formatFrontierContext(store, seq, curCfg);
-          const plan = readCurrentPlan(curRt.storageRoot, store.teamId, seq);
-          return `Current full task plan: ${currentPlanFile(curRt.storageRoot, store.teamId, seq)}. ${plan ? 'Read this file after context compaction; it is the source of plan review.' : 'Write the full plan using team_note(scope="current_plan", path="plan.md").'}`;
+          const logicalTeamId = store.rawTeamId ?? store.teamId;
+          const plan = readCurrentPlan(curRt.storageRoot, logicalTeamId, seq);
+          return `Current full task plan: ${currentPlanFile(curRt.storageRoot, logicalTeamId, seq)}. ${plan ? 'Read this file after context compaction; it is the source of plan review.' : 'Write the full plan using team_note(scope="current_plan", path="plan.md").'}`;
         },
       }));
       disposers.push(prompt.context({
@@ -659,7 +660,40 @@ export function onAgentStatus(ctx, { agent, status } = {}) {
   }
 }
 
-const ACTIVE_MEMBER_STATES = new Set(['starting', 'started', 'running']);
+export const ACTIVE_MEMBER_STATES = new Set(['starting', 'started', 'running']);
+
+export function isProcessPidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  if (pid === process.pid) return true;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err?.code === 'EPERM';
+  }
+}
+
+export function isMemberStaleForRuntime(rt, store, m) {
+  if (!m || !ACTIVE_MEMBER_STATES.has(m.status) || !store) return false;
+  const hasValidOwnerPid = Number.isInteger(m.ownerPid) && m.ownerPid > 0;
+  if (hasValidOwnerPid && m.ownerPid !== process.pid) {
+    return !isProcessPidAlive(m.ownerPid);
+  }
+  if (!rt || !(rt.liveProcessMemberIds instanceof Set) || typeof rt.hostAgents?.get !== 'function') {
+    return false;
+  }
+  if (rt.liveProcessMemberIds.has(m.childId)) return false;
+  if (rt.hostAgents.get(m.childId) !== undefined) return false;
+
+  const baseRt = baseRuntime(rt);
+  const rawId = typeof store.rawTeamId === 'string' && store.rawTeamId ? store.rawTeamId : null;
+  const encId = typeof store.teamId === 'string' && store.teamId ? store.teamId : null;
+  const hasMountedLeader = Boolean(
+    (rawId && (baseRt?.actors?.has?.(rawId) || rt.actors?.has?.(rawId) || rt.hostAgents.get(rawId) !== undefined))
+    || (encId && (baseRt?.actors?.has?.(encId) || rt.actors?.has?.(encId) || rt.hostAgents.get(encId) !== undefined)),
+  );
+  return hasMountedLeader;
+}
 
 export function reconcileStaleMembers(rt, store) {
   if (!rt || !(rt.liveProcessMemberIds instanceof Set) || typeof rt.hostAgents?.get !== 'function' || !store) return;
@@ -670,6 +704,7 @@ export function reconcileStaleMembers(rt, store) {
       rt.liveProcessMemberIds.add(m.childId);
       continue;
     }
+    if (!isMemberStaleForRuntime(rt, store, m)) continue;
     try {
       store.setMemberStatus(m.childId, 'cancelled', 'interrupted by previous host exit');
     } catch {}

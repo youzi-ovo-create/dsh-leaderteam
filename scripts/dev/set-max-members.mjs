@@ -7,7 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadConfig } from '../../leaderteam/core/config.mjs';
-import { TeamStore } from '../../leaderteam/core/store.mjs';
+import { TeamStore, resolveTeamStoreLogicalId } from '../../leaderteam/core/store.mjs';
 import {
   ACTIVE_EXECUTION_STATUSES,
   concurrencyControlPath,
@@ -80,12 +80,13 @@ const effectiveUserMax = currentCtrl?.maxActiveMembers ?? cfg.team.maxActiveMemb
 const teamsDir = path.join(storageRoot, 'teams');
 const activeTeams = [];
 if (fs.existsSync(teamsDir)) {
-  for (const id of fs.readdirSync(teamsDir)) {
+  for (const dirName of fs.readdirSync(teamsDir)) {
     try {
-      const store = new TeamStore(storageRoot, id);
+      const logicalId = resolveTeamStoreLogicalId(storageRoot, dirName);
+      const store = new TeamStore(storageRoot, logicalId);
       const active = [...store.members().values()].filter(m => ACTIVE_EXECUTION_STATUSES.has(m.status));
       if (active.length > 0) {
-        activeTeams.push({ teamId: id, activeExecutionMembers: active.length, names: active.map(m => m.name) });
+        activeTeams.push({ teamId: logicalId, activeExecutionMembers: active.length, names: active.map(m => m.name) });
       }
     } catch {}
   }

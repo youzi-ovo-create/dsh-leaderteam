@@ -211,6 +211,12 @@ export function writeSessionModeRecord(storageRoot, sessionId, nextMode, meta = 
       lastTaskSeqHint: null,
     };
   }
+  if (meta?.initial && prev.persisted && prev.mode === mode) {
+    return {
+      ...prev,
+      persisted: true,
+    };
+  }
   const nowIso = typeof meta?.at === 'string' && meta.at ? meta.at : new Date().toISOString();
   const isInitial = Boolean(meta?.initial && !prev.persisted);
   const didSwitch = !isInitial && prev.mode !== mode;
@@ -230,11 +236,10 @@ export function writeSessionModeRecord(storageRoot, sessionId, nextMode, meta = 
     lastSwitchedFrom,
     lastTaskSeqHint: taskSeqHint,
   };
-  writeFileAtomic(stateFile, JSON.stringify(record, null, 2) + '\n');
 
   const source = typeof meta?.source === 'string' && meta.source.trim() ? meta.source.trim() : 'user';
   const actor = typeof meta?.actor === 'string' && meta.actor.trim() ? meta.actor.trim() : source;
-  appendJsonl(historyFile, {
+  const historyEntry = {
     v: 1,
     at: nowIso,
     sessionId,
@@ -243,7 +248,24 @@ export function writeSessionModeRecord(storageRoot, sessionId, nextMode, meta = 
     source,
     actor,
     taskSeqHint,
-  });
+  };
+
+  const existedBefore = fs.existsSync(historyFile);
+  const prevHistSize = existedBefore ? fs.statSync(historyFile).size : 0;
+  appendJsonl(historyFile, historyEntry);
+
+  try {
+    writeFileAtomic(stateFile, JSON.stringify(record, null, 2) + '\n');
+  } catch (err) {
+    try {
+      if (existedBefore) {
+        fs.truncateSync(historyFile, prevHistSize);
+      } else {
+        fs.rmSync(historyFile, { force: true });
+      }
+    } catch {}
+    throw err;
+  }
 
   return {
     ...record,

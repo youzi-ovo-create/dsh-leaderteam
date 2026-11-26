@@ -33,12 +33,13 @@ export function queueExecutionReview(rt, store, taskSeq, agent, stage, args, run
   rt.executionReviewJobs ??= new Map();
   if (rt.executionReviewJobs.has(key)) return { status: 'reviewing', review_id: reviewId, stage_id: stage.id, instruction: 'Keep planning the next stage. Approval is required only before dispatch.' };
   if (!prior) store.appendWorkflowEvent({ type: 'execution-review-queued', taskSeq, reviewId, stageId: stage.id, stageHash: stage.hash, stage, args, resumeId: args.resume_id ?? null, revises: args.revises ?? null });
-  const controller = new AbortController(), work = { teamId: store.teamId, controller, promise: null };
+  const logicalTeamId = store.rawTeamId ?? store.teamId;
+  const controller = new AbortController(), work = { teamId: logicalTeamId, controller, promise: null };
   rt.executionReviewJobs.set(key, work);
   work.promise = Promise.resolve().then(() => run(controller.signal)).then(value => {
     if (controller.signal.aborted) return; // interrupted work remains recoverable; it cannot publish a late approval
     store.appendWorkflowEvent({ type: 'execution-review-result', taskSeq, reviewId, stageId: stage.id, stageHash: stage.hash, result: value });
-    wake(rt, agent, `[LeaderTeam execution review ${reviewId}] Stage ${stage.id} version ${stage.revision}: ${JSON.stringify(value)}. Dispatch only this approved version; continue planning future work concurrently.`, store.teamId, taskSeq);
+    wake(rt, agent, `[LeaderTeam execution review ${reviewId}] Stage ${stage.id} version ${stage.revision}: ${JSON.stringify(value)}. Dispatch only this approved version; continue planning future work concurrently.`, logicalTeamId, taskSeq);
   }).catch(e => {
     if (controller.signal.aborted) return;
     store.appendWorkflowEvent({ type: 'execution-review-result', taskSeq, reviewId, stageId: stage.id, stageHash: stage.hash, result: { status: 'error', error: e.message } });

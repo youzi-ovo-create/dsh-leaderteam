@@ -48,7 +48,13 @@ import {
   resolveMagpieGatewayHostProvider,
 } from '../../gateway/index.mjs';
 import { getOrCreateHengzhangBridge } from '../../usage/index.mjs';
-import { readSessionFile, parseJsonl } from '../../../packages/lt-usage/index.mjs';
+import {
+  foldMembers,
+  listSessions,
+  parseJsonl,
+  readSessionFile,
+  resolveStorageRoot,
+} from '../../../packages/lt-usage/index.mjs';
 import { listKnownHomes } from '../../../packages/lt-usage/reader/homes.js';
 import pkg from '../../../package.json' with { type: 'json' };
 
@@ -1407,42 +1413,233 @@ function resolveAuthorizedUsageHome(bridge, rawHome) {
   return requested;
 }
 
+function discoverStandaloneWorkbenchSessions(ctx, rt, dshHome, storageRoot, archivedSet) {
+  const leaderPreset = rt?.config?.profiles?.leader?.preset ?? 'leaderteam';
+  const bySessionId = new Map();
+  const childIds = new Set();
+  const teamsRoot = storageRoot ? path.join(path.resolve(storageRoot), 'teams') : null;
+  const teamDirs = [];
+
+  if (teamsRoot && fs.existsSync(teamsRoot)) {
+    try {
+      for (const entry of fs.readdirSync(teamsRoot, { withFileTypes: true })) {
+        if (!entry.isDirectory()) continue;
+        const entryDir = path.join(teamsRoot, entry.name);
+        if (!fs.existsSync(path.join(entryDir, 'members.jsonl')) && !fs.existsSync(path.join(entryDir, 'team.json'))) {
+          continue;
+        }
+        teamDirs.push(entry.name);
+        try {
+          const members = foldMembers(readJsonl(path.join(entryDir, 'members.jsonl')).records);
+          for (const m of members.values()) {
+            if (m?.childId) childIds.add(String(m.childId));
+          }
+        } catch {}
+      }
+    } catch {}
+  }
+
+  if (dshHome && fs.existsSync(path.join(dshHome, 'sessions'))) {
+    const listed = listSessions(dshHome, { storageRoot: storageRoot || undefined });
+    for (const s of listed) {
+      const sid = String(s?.id ?? '').trim();
+      if (!sid) continue;
+      if (s.isChild) {
+        childIds.add(sid);
+        continue;
+      }
+      if (childIds.has(sid) || archivedSet.has(sid)) continue;
+      const isTeamSess = s.kind === 'team' || Boolean(storageRoot && TeamStore.exists(storageRoot, sid));
+      bySessionId.set(sid, {
+        sessionId: sid,
+        title: s.title ?? null,
+        cwd: s.cwd ?? null,
+        agentPreset: isTeamSess ? leaderPreset : null,
+        updatedAt: s.lastActivityMs ?? s.startedAtMs ?? null,
+        isTeam: isTeamSess,
+        persistedMode: false,
+      });
+    }
+  }
+
+  for (const dirName of teamDirs) {
+    const dirPath = path.join(teamsRoot, dirName);
+    let teamJson = null;
+    try {
+      const tf = path.join(dirPath, 'team.json');
+      if (fs.existsSync(tf)) teamJson = JSON.parse(fs.readFileSync(tf, 'utf8'));
+    } catch {}
+    const sid = String(teamJson?.sessionId ?? teamJson?.teamId ?? dirName).trim();
+    if (!sid || childIds.has(sid) || archivedSet.has(sid)) continue;
+    if (teamJson?.parentSessionId || teamJson?.origin === 'subagent') continue;
+    const existing = bySessionId.get(sid);
+    if (existing) {
+      existing.isTeam = true;
+      existing.agentPreset = existing.agentPreset ?? leaderPreset;
+      if (!existing.cwd && (teamJson?.workspace || teamJson?.cwd)) {
+        existing.cwd = teamJson.workspace ?? teamJson.cwd;
+      }
+      if (!existing.title && typeof teamJson?.title === 'string' && teamJson.title.trim()) {
+        existing.title = teamJson.title.trim();
+      }
+      continue;
+    }
+    let updatedAt = Date.parse(teamJson?.updatedAt ?? teamJson?.createdAt ?? '');
+    if (!Number.isFinite(updatedAt)) {
+      try {
+        updatedAt = Math.round(fs.statSync(dirPath).mtimeMs);
+      } catch {
+        updatedAt = null;
+      }
+    }
+    bySessionId.set(sid, {
+      sessionId: sid,
+      title: typeof teamJson?.title === 'string' && teamJson.title.trim() ? teamJson.title.trim() : null,
+      cwd: teamJson?.workspace ?? teamJson?.cwd ?? null,
+      agentPreset: leaderPreset,
+      updatedAt: Number.isFinite(updatedAt) ? updatedAt : null,
+      isTeam: true,
+      persistedMode: false,
+    });
+  }
+
+  if (storageRoot) {
+    const modesDir = path.join(path.resolve(storageRoot), 'session-modes');
+    if (fs.existsSync(modesDir)) {
+      try {
+        for (const f of fs.readdirSync(modesDir)) {
+          if (!f.endsWith('.json')) continue;
+          try {
+            const parsed = JSON.parse(fs.readFileSync(path.join(modesDir, f), 'utf8'));
+            const sid = typeof parsed?.sessionId === 'string' ? parsed.sessionId.trim() : '';
+            if (!sid || childIds.has(sid) || archivedSet.has(sid)) continue;
+            const parsedMs = Date.parse(parsed.updatedAt ?? parsed.createdAt ?? '');
+            const updatedAt = Number.isFinite(parsedMs) ? parsedMs : null;
+            const existing = bySessionId.get(sid);
+            if (existing) {
+              existing.persistedMode = true;
+              existing.agentPreset = existing.agentPreset ?? leaderPreset;
+              if (existing.updatedAt == null && updatedAt != null) {
+                existing.updatedAt = updatedAt;
+              }
+            } else {
+              bySessionId.set(sid, {
+                sessionId: sid,
+                title: null,
+                cwd: null,
+                agentPreset: leaderPreset,
+                updatedAt,
+                isTeam: Boolean(TeamStore.exists(storageRoot, sid)),
+                persistedMode: true,
+              });
+            }
+          } catch {}
+        }
+      } catch {}
+    }
+  }
+
+  const sessions = [];
+  for (const item of bySessionId.values()) {
+    const sid = item.sessionId;
+    const durableRows = dshHome ? findDurableSessionRows(dshHome, sid) : null;
+    const durableMeta = durableRows
+      ? extractSessionMetaFromRows(durableRows)
+      : { agentPreset: null, origin: undefined, openTurn: false };
+    if (durableMeta.origin === 'subagent') continue;
+    let persistedMode = Boolean(item.persistedMode);
+    if (!persistedMode && storageRoot) {
+      try {
+        persistedMode = Boolean(readSessionModeRecord(storageRoot, sid).persisted);
+      } catch (err) {
+        if (err?.code === 'SESSION_MODE_CORRUPT') persistedMode = true;
+      }
+    }
+    const isTeamSess = Boolean(item.isTeam || (storageRoot && TeamStore.exists(storageRoot, sid)));
+    const agentPreset = durableMeta.agentPreset ?? ((isTeamSess || persistedMode) ? leaderPreset : (item.agentPreset ?? null));
+    const isKnownLt = typeof agentPreset === 'string' && agentPreset.trim()
+      ? agentPreset.trim() === leaderPreset
+      : Boolean(isTeamSess || persistedMode);
+    const modeState = safeInspectSessionItemMode(ctx, rt, sid, {
+      agentPreset,
+      origin: durableMeta.origin,
+      passiveRunning: Boolean(durableMeta.openTurn),
+      sessionExists: true,
+      isLtSession: isKnownLt,
+    });
+    sessions.push({
+      sessionId: sid,
+      title: item.title ?? null,
+      cwd: item.cwd ?? null,
+      agentPreset,
+      updatedAt: item.updatedAt ?? (modeState.updatedAt ? (Date.parse(modeState.updatedAt) || null) : null),
+      isTeam: isTeamSess,
+      executionMode: modeState.mode,
+      isLtSession: modeState.isLtSession,
+      canSwitchMode: modeState.canSwitch,
+      modeBusyReason: modeState.busyReason,
+      modeState,
+    });
+  }
+
+  sessions.sort(
+    (a, b) =>
+      (b.updatedAt ?? 0) - (a.updatedAt ?? 0) ||
+      String(a.sessionId).localeCompare(String(b.sessionId)),
+  );
+  return sessions;
+}
+
 export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) {
+  const getDshHome = () => {
+    if (typeof options.dshHome === 'string' && options.dshHome.trim()) {
+      return path.resolve(options.dshHome.trim());
+    }
+    return resolveDshHomeFromCtx(ctx, rt);
+  };
+
   const getStorageRoot = () => {
-    if (options.dshHome) return path.join(path.resolve(options.dshHome), 'leaderteam');
+    const configuredRoot = typeof rt?.config?.storage?.root === 'string' && rt.config.storage.root.trim()
+      ? rt.config.storage.root.trim()
+      : null;
+    if (configuredRoot) {
+      const baseHome = getDshHome() || process.cwd();
+      return path.resolve(baseHome, configuredRoot);
+    }
+    if (options.dshHome) return resolveStorageRoot(path.resolve(options.dshHome));
     if (rt?.storageRoot) return rt.storageRoot;
-    const home = resolveDshHomeFromCtx(ctx, rt) || path.join(process.cwd(), '.lt-standalone');
-    return path.join(home, 'leaderteam');
+    const home = getDshHome() || path.join(process.cwd(), '.lt-standalone');
+    return resolveStorageRoot(home);
   };
 
   const ensureConfigLoaded = () => {
-    if (options.dshHome) {
-      rt.storageRoot = path.join(path.resolve(options.dshHome), 'leaderteam');
-    }
     if (options.configPath && rt?.configPath !== path.resolve(options.configPath)) {
       rt.configPath = path.resolve(options.configPath);
       rt.config = null;
     }
     if (rt?.config && rt?.configPath && fs.existsSync(rt.configPath)) {
       syncRuntimeConfig(rt);
+      if (options.dshHome || rt.config?.storage?.root) {
+        rt.storageRoot = getStorageRoot();
+      }
       return;
     }
     const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
-    const dshHome = resolveDshHomeFromCtx(ctx, rt);
+    const dshHome = getDshHome();
     const { configPath } = resolveOrBootstrapConfigPath({
       explicitConfigPath: options.configPath || null,
       dshHome,
       bundledDefaultConfigPath: path.join(repoRoot, 'config', 'leaderteam.config.json'),
     });
-    rt.storageRoot = getStorageRoot();
     bindRuntimeConfigFile(rt, configPath, loadConfig(configPath));
+    rt.storageRoot = getStorageRoot();
   };
 
   const getGatewayMgr = () => getOrCreateGatewayManager(getStorageRoot());
   const getUsageBridge = () => {
     const storageRoot = getStorageRoot();
     const bridge = getOrCreateHengzhangBridge(storageRoot, {
-      dshHome: resolveDshHomeFromCtx(ctx, rt),
+      dshHome: getDshHome(),
       gatewayManager: getGatewayMgr(),
     });
     const prefs = readUiPreferences(storageRoot);
@@ -1939,39 +2136,8 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
           return okEnvelope({ liveHost: true, workspaces, sessions });
         }
 
-        // Standalone fallback: list durable root sessions via Hengzhang
-        const dshHome = resolveDshHomeFromCtx(ctx, rt);
-        const leaderPreset = rt?.config?.profiles?.leader?.preset ?? 'leaderteam';
-        const usageSessions = await getUsageBridge().getSessions();
-        const sessions = (usageSessions.sessions ?? [])
-          .filter(s => !s.isChild && !archivedSet.has(String(s.id)))
-          .map(s => {
-            const sid = String(s.id);
-            const durableRows = dshHome ? findDurableSessionRows(dshHome, sid) : null;
-            const durableMeta = durableRows ? extractSessionMetaFromRows(durableRows) : { agentPreset: null, origin: undefined };
-            let persistedMode = false;
-            try {
-              persistedMode = Boolean(rt?.storageRoot && readSessionModeRecord(rt.storageRoot, sid).persisted);
-            } catch {}
-            const agentPreset = durableMeta.agentPreset ?? ((s.kind === 'team' || persistedMode) ? leaderPreset : null);
-            const modeState = safeInspectSessionItemMode(ctx, rt, sid, {
-              agentPreset,
-              origin: durableMeta.origin,
-            });
-            return {
-              sessionId: sid,
-              title: s.title ?? null,
-              cwd: s.cwd ?? null,
-              agentPreset,
-              updatedAt: s.lastActivityMs ?? s.startedAtMs ?? null,
-              isTeam: s.kind === 'team' || TeamStore.exists(rt.storageRoot, sid),
-              executionMode: modeState.mode,
-              isLtSession: modeState.isLtSession,
-              canSwitchMode: modeState.canSwitch,
-              modeBusyReason: modeState.busyReason,
-              modeState,
-            };
-          });
+        // Standalone fallback: pure local session + team + session-mode scan (independent of Hengzhang usage toggle)
+        const sessions = discoverStandaloneWorkbenchSessions(ctx, rt, getDshHome(), getStorageRoot(), archivedSet);
         return okEnvelope({ liveHost: false, workspaces, sessions });
       } catch (e) {
         return errFromException('WORKBENCH_SESSIONS_FAILED', e);
@@ -1985,7 +2151,7 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
         const sessionId = String(body.sessionId || '').trim();
         if (!sessionId) return errEnvelope('BAD_REQUEST', 'sessionId is required');
 
-        const dshHome = resolveDshHomeFromCtx(ctx, rt);
+        const dshHome = getDshHome();
         const sessionController = getHostService(ctx, 'sessionController');
         const sessionsRegistry = getHostService(ctx, 'sessions');
 
@@ -2253,7 +2419,7 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
             );
           }
           ensureConfigLoaded();
-          const dshHome = resolveDshHomeFromCtx(ctx, rt);
+          const dshHome = getDshHome();
           if (!url.searchParams.has('sessionId') || normAction === 'list') {
             const sessions = await collectKnownSessionModeItems(ctx, rt, dshHome);
             return okEnvelope({
@@ -2270,7 +2436,7 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
 
         const body = await parseJsonRequest(request, { allowGet: true });
         ensureConfigLoaded();
-        const dshHome = resolveDshHomeFromCtx(ctx, rt);
+        const dshHome = getDshHome();
         const action = String(body.action || (body.mode !== undefined ? 'set' : 'get')).trim().toLowerCase();
 
         if (action === 'list') {

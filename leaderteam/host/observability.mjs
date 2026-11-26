@@ -2,7 +2,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import zlib from 'node:zlib';
-import { TeamStore, readJsonl } from '../core/store.mjs';
+import { TeamStore, readJsonl, resolveTeamStoreLogicalId } from '../core/store.mjs';
 import { decodeSessionModeSegment } from '../core/session-mode.mjs';
 import { isInside } from '../core/paths.mjs';
 import { resolveCanonicalRouteFromHostSelection } from './runtime.mjs';
@@ -276,8 +276,15 @@ export function recentTeamObservability(ctx,rt,limit=8) {
   const root=path.join(rt.storageRoot,'teams');let dirs;
   try {
     dirs=fs.readdirSync(root,{withFileTypes:true})
-      .filter(d=>d.isDirectory() && TeamStore.exists(rt.storageRoot,d.name))
-      .map(d=>({id:d.name,time:fs.statSync(path.join(root,d.name)).mtimeMs}))
+      .filter(d=>{
+        if (!d.isDirectory()) return false;
+        const dirPath=path.join(root,d.name);
+        return fs.existsSync(path.join(dirPath,'members.jsonl')) || fs.existsSync(path.join(dirPath,'team.json'));
+      })
+      .map(d=>({
+        id:resolveTeamStoreLogicalId(rt.storageRoot,d.name),
+        time:fs.statSync(path.join(root,d.name)).mtimeMs,
+      }))
       .sort((a,b)=>b.time-a.time);
   } catch { return []; }
   return dirs.slice(0,limit).map(d=>{try{return teamObservability(ctx,rt,d.id);}catch(e){return{teamId:d.id,error:e.message};}});

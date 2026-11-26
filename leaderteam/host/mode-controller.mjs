@@ -15,7 +15,7 @@ import {
   readSessionModeHistory,
 } from '../core/session-mode.mjs';
 import { runtime, baseRuntime, teamStore, runtimeForTeam } from './runtime.mjs';
-import { reconcileStaleMembers, currentTaskSeq, syncLeaderAgentMode, isLeaderRoot } from './roles.mjs';
+import { ACTIVE_MEMBER_STATES, isMemberStaleForRuntime, currentTaskSeq, syncLeaderAgentMode, isLeaderRoot } from './roles.mjs';
 
 export {
   EXECUTION_MODES,
@@ -188,12 +188,35 @@ export function inspectSessionModeState(ctx, rt = runtime(), sessionId, options 
   const liveAgent = (liveActor?.role === 'leader' ? liveActor.agent : null) ?? hostAgents?.get?.(sessionId) ?? null;
 
   const leaderPreset = baseRt?.config?.profiles?.leader?.preset ?? 'leaderteam';
+  const sessionsSvc = getHostService(ctx, 'sessions');
+  const liveSession = sessionsSvc?.get?.(sessionId) ?? liveAgent?.session ?? null;
+  const hasPersistedStoreOrMode = Boolean(
+    rec.persisted
+    || corruptOnDisk
+    || baseRt?.workbenchCreatedSessionIds?.has?.(sessionId)
+    || (baseRt?.storageRoot && TeamStore.exists(baseRt.storageRoot, sessionId)),
+  );
   let isLtSession = true;
   let notLtReason = null;
 
   if ((liveActor && liveActor.role !== 'leader') || liveAgent?.session?.header?.origin === 'subagent' || options.origin === 'subagent') {
     isLtSession = false;
     notLtReason = 'Subagent sessions cannot switch execution mode independently';
+  } else if (options.sessionExists === false) {
+    isLtSession = false;
+    notLtReason = 'Session does not exist';
+  } else if (
+    options.standaloneLookup === true
+    && !liveActor
+    && !liveAgent
+    && !liveSession
+    && !hasPersistedStoreOrMode
+    && options.sessionExists !== true
+    && options.isLtSession !== true
+    && !options.agentPreset
+  ) {
+    isLtSession = false;
+    notLtReason = 'Session does not exist';
   } else if (baseRt?.surface === 'headless') {
     if (process.env.LEADERTEAM_HEADLESS_LEADER === '0' && options.isLtSession !== true) {
       isLtSession = false;
@@ -201,8 +224,6 @@ export function inspectSessionModeState(ctx, rt = runtime(), sessionId, options 
     }
   } else {
     const presets = getHostService(ctx, 'agentPresets');
-    const sessionsSvc = getHostService(ctx, 'sessions');
-    const liveSession = sessionsSvc?.get?.(sessionId) ?? liveAgent?.session ?? null;
     let preset = typeof presets?.presetForSession === 'function' && liveSession
       ? presets.presetForSession(liveSession)
       : undefined;
@@ -218,6 +239,16 @@ export function inspectSessionModeState(ctx, rt = runtime(), sessionId, options 
     } else if (options.isLtSession === false) {
       isLtSession = false;
       notLtReason = 'Not a LeaderTeam session';
+    } else if (
+      !liveActor
+      && !liveAgent
+      && !liveSession
+      && !hasPersistedStoreOrMode
+      && options.sessionExists !== true
+      && options.isLtSession !== true
+    ) {
+      isLtSession = false;
+      notLtReason = 'Session does not exist';
     }
   }
 
@@ -239,10 +270,11 @@ export function inspectSessionModeState(ctx, rt = runtime(), sessionId, options 
     const store = baseRt === runtime()
       ? teamStore(sessionId)
       : (baseRt.stores?.get?.(sessionId) ?? new TeamStore(baseRt.storageRoot, sessionId));
-    reconcileStaleMembers(baseRt, store);
     for (const [cid, m] of store.members().entries()) {
       if (typeof cid === 'string' && cid) memberChildIds.add(cid);
-      if (BUSY_MEMBER_STATUSES.has(m.status) || BUSY_MEMBER_GOV_STATES.has(m.governanceState)) {
+      const isPausedOrGovBusy = m.status === 'paused' || BUSY_MEMBER_GOV_STATES.has(m.governanceState);
+      const isActiveUnstale = ACTIVE_MEMBER_STATES.has(m.status) && !isMemberStaleForRuntime(baseRt, store, m);
+      if (isPausedOrGovBusy || isActiveUnstale) {
         activeMembersCount += 1;
       }
     }
@@ -430,7 +462,7 @@ export function switchSessionExecutionMode(ctx, rt = runtime(), sessionId, targe
   const taskSeqHint = Math.max(safeCurrentTaskSeq(ctx, sessionId), maxStoreSeq);
 
   if (state.mode === nextMode && !options.forcePersist && !diskCorrupt) {
-    if (options.persistInitial === true) {
+    if (options.persistInitial === true && !existingRec?.persisted) {
       const rec = writeSessionModeRecord(baseRt.storageRoot, sessionId, nextMode, {
         initial: true,
         source: options.source ?? 'create',

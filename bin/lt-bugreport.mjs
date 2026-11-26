@@ -278,23 +278,10 @@ function selectTeamDirectory(storageRoot, explicitTeamId, fsImpl = fs) {
   const teamsRoot = path.join(storageRoot, 'teams');
   if (explicitTeamId) {
     const cleanId = encodeTeamStoreId(explicitTeamId, storageRoot);
-    const candidates = [cleanId];
-    if (
-      typeof explicitTeamId === 'string'
-      && explicitTeamId !== cleanId
-      && /^[A-Za-z0-9._~-]{1,192}$/.test(explicitTeamId)
-      && explicitTeamId !== '.'
-      && explicitTeamId !== '..'
-      && !explicitTeamId.includes('..')
-    ) {
-      candidates.push(explicitTeamId);
-    }
-    for (const cid of candidates) {
-      const dir = path.join(teamsRoot, cid);
-      try {
-        if (fsImpl.existsSync(dir) && fsImpl.statSync(dir).isDirectory()) return dir;
-      } catch {}
-    }
+    const dir = path.join(teamsRoot, cleanId);
+    try {
+      if (fsImpl.existsSync(dir) && fsImpl.statSync(dir).isDirectory()) return dir;
+    } catch {}
     return null;
   }
   let entries;
