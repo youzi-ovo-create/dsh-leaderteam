@@ -6,109 +6,168 @@
     <title>Leader Team — 工程治理与模型工作台</title>
     <script>
       (function bootLtTheme() {
-        function hexToRgb(hex) {
-          var m = String(hex || '').trim().replace(/^#/, '');
-          if (m.length === 3) {
-            return [parseInt(m[0] + m[0], 16), parseInt(m[1] + m[1], 16), parseInt(m[2] + m[2], 16)];
-          }
-          if (m.length >= 6) {
-            return [parseInt(m.slice(0, 2), 16), parseInt(m.slice(2, 4), 16), parseInt(m.slice(4, 6), 16)];
-          }
-          return null;
+        function normHex(h, fb) {
+          var s = String(h || '').trim().replace(/^#/, '');
+          if (/^[0-9a-fA-F]{3}$/.test(s)) return ('#' + s[0] + s[0] + s[1] + s[1] + s[2] + s[2]).toUpperCase();
+          if (/^[0-9a-fA-F]{6}$/.test(s)) return ('#' + s).toUpperCase();
+          return fb;
         }
-        function relLum(rgb) {
-          if (!rgb) return null;
-          var norm = rgb.map(function (v) {
+        function hexToRgb(h) {
+          var s = normHex(h, '#000000').slice(1);
+          var n = parseInt(s, 16);
+          return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+        }
+        function rgbToHex(rgb) {
+          return '#' + rgb.map(function (v) {
+            v = Math.max(0, Math.min(255, Math.round(v)));
+            return (v < 16 ? '0' : '') + v.toString(16);
+          }).join('').toUpperCase();
+        }
+        function mix(a, b, t) {
+          var x = hexToRgb(a), y = hexToRgb(b);
+          return rgbToHex([0, 1, 2].map(function (i) { return x[i] * (1 - t) + y[i] * t; }));
+        }
+        function lum(h) {
+          return hexToRgb(h).map(function (v) {
             var c = v / 255;
             return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
-          });
-          return 0.2126 * norm[0] + 0.7152 * norm[1] + 0.0722 * norm[2];
+          }).reduce(function (a, v, i) { return a + v * [0.2126, 0.7152, 0.0722][i]; }, 0);
+        }
+        function cr(a, b) {
+          var la = lum(a), lb = lum(b);
+          return (Math.max(la, lb) + 0.05) / (Math.min(la, lb) + 0.05);
+        }
+        function ensure(fg, bg, target, toward) {
+          var c = normHex(fg, '#000000'), i = 0;
+          while (cr(c, bg) < target && i < 40) { c = mix(c, toward, 0.08); i++; }
+          return c;
         }
         try {
-          var raw = localStorage.getItem('lt-ui-preferences-v1');
-          if (!raw) return;
-          var prefs = JSON.parse(raw);
+          var rawApp = localStorage.getItem('lt.appearance');
+          var rawLegacy = localStorage.getItem('lt-ui-preferences-v1');
+          var prefs = rawApp ? JSON.parse(rawApp) : (rawLegacy ? JSON.parse(rawLegacy) : null);
+          if (!prefs) return;
           var allowed = ['white', 'dark', 'heluoxu', 'custom'];
-          var theme = prefs && allowed.indexOf(prefs.theme) >= 0 ? prefs.theme : 'white';
+          var theme = allowed.indexOf(prefs.theme) >= 0 ? prefs.theme : 'white';
           var html = document.documentElement;
           var root = html.style;
           html.setAttribute('data-lt-theme', theme);
-          if (theme === 'custom' && prefs.customTheme) {
-            var ct = prefs.customTheme;
-            html.setAttribute('data-lt-heading', ct.headingFontMode === 'sans' ? 'sans' : 'serif');
-            html.setAttribute(
-              'data-lt-corners',
-              ['sharp', 'balanced', 'pill-cta'].indexOf(ct.cornerStyle) >= 0 ? ct.cornerStyle : 'balanced'
-            );
-            html.setAttribute(
-              'data-lt-density',
-              ['compact', 'standard', 'comfortable'].indexOf(ct.density) >= 0 ? ct.density : 'standard'
-            );
-            if (ct.canvasColor) root.setProperty('--user-bg-canvas', ct.canvasColor);
-            if (ct.surfaceColor) root.setProperty('--user-bg-surface', ct.surfaceColor);
-            if (ct.inkColor) root.setProperty('--user-fg-primary', ct.inkColor);
-            if (ct.accentColor) root.setProperty('--user-accent', ct.accentColor);
-            if (ct.dangerColor) root.setProperty('--user-danger', ct.dangerColor);
-            var inkLum = relLum(hexToRgb(ct.inkColor));
-            root.setProperty('--user-fg-on-ink', inkLum !== null && inkLum > 0.45 ? '#141619' : '#FFFFFF');
-            var surfLum = relLum(hexToRgb(ct.surfaceColor));
-            var isDarkSurf = surfLum !== null && surfLum < 0.25;
-            root.colorScheme = isDarkSurf ? 'dark' : 'light';
-            var semProps = [
-              '--lt-info',
-              '--lt-info-bg',
-              '--lt-success',
-              '--lt-success-bg',
-              '--lt-warning',
-              '--lt-warning-bg',
-              '--lt-danger',
-              '--lt-danger-bg',
-              '--lt-seal'
-            ];
-            if (isDarkSurf) {
-              var dLum = relLum(hexToRgb(ct.dangerColor));
-              var ratio =
-                dLum !== null
-                  ? (Math.max(dLum, surfLum) + 0.05) / (Math.min(dLum, surfLum) + 0.05)
-                  : 0;
-              var safeDanger = ratio >= 4.5 && ct.dangerColor ? ct.dangerColor : '#DF7A72';
-              root.setProperty('--lt-info', '#6CB2CE');
-              root.setProperty('--lt-info-bg', 'color-mix(in srgb, #6CB2CE 16%, var(--lt-bg-surface))');
-              root.setProperty('--lt-success', '#63B692');
-              root.setProperty('--lt-success-bg', 'color-mix(in srgb, #63B692 16%, var(--lt-bg-surface))');
-              root.setProperty('--lt-warning', '#E0AD56');
-              root.setProperty('--lt-warning-bg', 'color-mix(in srgb, #E0AD56 16%, var(--lt-bg-surface))');
-              root.setProperty('--lt-danger', safeDanger);
-              root.setProperty('--lt-danger-bg', 'color-mix(in srgb, ' + safeDanger + ' 16%, var(--lt-bg-surface))');
-              root.setProperty('--lt-seal', safeDanger);
-            } else {
-              for (var i = 0; i < semProps.length; i++) root.removeProperty(semProps[i]);
-            }
+          var ct = prefs.customTheme || null;
+          if (theme === 'custom' && ct) {
+            var C = normHex(ct.canvasColor, '#F1F2EF');
+            var S = normHex(ct.surfaceColor, '#FFFFFF');
+            var I = normHex(ct.inkColor, '#17191C');
+            var rawA = normHex(ct.accentColor, '#3D6B5A');
+            var rawD = normHex(ct.dangerColor, '#B2372C');
+            var dark = lum(S) < 0.22;
+            var heading = ct.headingFontMode === 'sans' ? 'sans' : 'serif';
+            var corners = ['sharp', 'balanced', 'pill-cta'].indexOf(ct.cornerStyle) >= 0 ? ct.cornerStyle : 'balanced';
+            var density = ['compact', 'standard', 'comfortable'].indexOf(ct.density) >= 0 ? ct.density : 'comfortable';
+            html.setAttribute('data-lt-heading', heading);
+            html.setAttribute('data-lt-display', heading);
+            html.setAttribute('data-lt-corners', corners);
+            html.setAttribute('data-lt-density', density);
+
+            root.setProperty('--seed-canvas', C);
+            root.setProperty('--seed-surface', S);
+            root.setProperty('--seed-ink', I);
+            root.setProperty('--seed-accent', rawA);
+            root.setProperty('--seed-danger', rawD);
+            root.setProperty('--user-bg-canvas', C);
+            root.setProperty('--user-bg-surface', S);
+            root.setProperty('--user-fg-primary', I);
+            root.setProperty('--user-accent', rawA);
+            root.setProperty('--user-danger', rawD);
+            root.setProperty('--user-fg-on-ink', lum(I) > 0.45 ? '#141619' : '#FFFFFF');
+
+            var primary = ensure(I, S, 12, dark ? '#FFFFFF' : '#000000');
+            var secondary = ensure(mix(primary, S, 0.28), S, 7, primary);
+            var muted = ensure(mix(primary, S, 0.42), C, 4.5, primary);
+            var inkRgb = hexToRgb(primary).join(',');
+            var A = ensure(rawA, S, 4.5, dark ? '#FFFFFF' : '#000000');
+            var accRgb = hexToRgb(A).join(',');
+            var onAcc = cr('#FFFFFF', A) >= cr('#111111', A) ? '#FFFFFF' : '#111111';
+            var succBase = dark ? '#62B892' : '#2B6F57';
+            var warnBase = dark ? '#DDAB55' : '#8F620E';
+            var sBg = mix(S, succBase, dark ? 0.14 : 0.1);
+            var wBg = mix(S, warnBase, dark ? 0.14 : 0.1);
+            var dBg = mix(S, rawD, dark ? 0.14 : 0.1);
+            var succ = ensure(succBase, sBg, 4.5, dark ? '#FFFFFF' : '#000000');
+            var warn = ensure(warnBase, wBg, 4.5, dark ? '#FFFFFF' : '#000000');
+            var dang = ensure(rawD, dBg, 4.5, dark ? '#FFFFFF' : '#000000');
+            var rMap = {
+              sharp: ['1px', '2px', '3px', '6px', '2px'],
+              balanced: ['3px', '4px', '6px', '10px', '6px'],
+              'pill-cta': ['4px', '6px', '10px', '14px', '999px']
+            };
+            var rv = rMap[corners] || rMap.balanced;
+            var derived = {
+              '--lt-bg-canvas': C,
+              '--lt-bg-surface': S,
+              '--lt-bg-subtle': mix(S, C, 0.45),
+              '--lt-bg-elevated': dark ? mix(S, I, 0.06) : S,
+              '--lt-bg-input': dark ? mix(S, '#000000', 0.15) : S,
+              '--lt-bg-inset': mix(C, I, dark ? 0.03 : 0.035),
+              '--lt-fg-primary': primary,
+              '--lt-fg-secondary': secondary,
+              '--lt-fg-muted': muted,
+              '--lt-fg-disabled': mix(primary, S, 0.62),
+              '--lt-fg-on-ink': S,
+              '--lt-bg-hover': 'rgba(' + inkRgb + ',' + (dark ? 0.06 : 0.045) + ')',
+              '--lt-bg-pressed': 'rgba(' + inkRgb + ',' + (dark ? 0.1 : 0.08) + ')',
+              '--lt-border-subtle': 'rgba(' + inkRgb + ',' + (dark ? 0.09 : 0.085) + ')',
+              '--lt-border-strong': 'rgba(' + inkRgb + ',' + (dark ? 0.17 : 0.16) + ')',
+              '--lt-border-control': mix(S, primary, dark ? 0.26 : 0.3),
+              '--lt-border-control-hover': mix(S, primary, 0.48),
+              '--lt-accent': A,
+              '--lt-accent-strong': mix(A, dark ? '#FFFFFF' : '#000000', 0.2),
+              '--lt-accent-subtle': 'rgba(' + accRgb + ',0.12)',
+              '--lt-bg-selected': 'rgba(' + accRgb + ',0.11)',
+              '--lt-focus': 'rgba(' + accRgb + ',0.45)',
+              '--lt-on-accent': onAcc,
+              '--lt-info': A,
+              '--lt-info-bg': mix(S, A, dark ? 0.14 : 0.09),
+              '--lt-success': succ,
+              '--lt-success-bg': sBg,
+              '--lt-warning': warn,
+              '--lt-warning-bg': wBg,
+              '--lt-danger': dang,
+              '--lt-danger-bg': dBg,
+              '--lt-seal': dang,
+              '--lt-brand': A,
+              '--lt-code-fg': primary,
+              '--lt-code-key': A,
+              '--lt-code-str': succ,
+              '--lt-code-num': warn,
+              '--lt-code-com': muted,
+              '--lt-diff-add-bg': sBg,
+              '--lt-diff-del-bg': dBg,
+              '--lt-chart-1': A,
+              '--lt-chart-grid': 'rgba(' + inkRgb + ',0.07)',
+              '--lt-scrim': dark ? 'rgba(0,0,0,0.5)' : 'rgba(0,0,0,0.28)',
+              '--lt-radius-xs': rv[0],
+              '--lt-radius-sm': rv[1],
+              '--lt-radius-md': rv[2],
+              '--lt-radius-lg': rv[3],
+              '--lt-radius-btn': rv[4]
+            };
+            Object.keys(derived).forEach(function (k) { root.setProperty(k, derived[k]); });
+            root.colorScheme = dark ? 'dark' : 'light';
           } else {
             html.removeAttribute('data-lt-heading');
             html.removeAttribute('data-lt-corners');
-            html.removeAttribute('data-lt-density');
-            var clearProps = [
-              '--lt-info',
-              '--lt-info-bg',
-              '--lt-success',
-              '--lt-success-bg',
-              '--lt-warning',
-              '--lt-warning-bg',
-              '--lt-danger',
-              '--lt-danger-bg',
-              '--lt-seal'
-            ];
-            for (var j = 0; j < clearProps.length; j++) root.removeProperty(clearProps[j]);
+            if (prefs.density === 'compact') html.setAttribute('data-lt-density', 'compact');
+            else html.removeAttribute('data-lt-density');
+            if (prefs.display === 'sans') html.setAttribute('data-lt-display', 'sans');
+            else html.removeAttribute('data-lt-display');
             root.removeProperty('color-scheme');
           }
         } catch (e) {}
       })();
     </script>
-    <script type="module" crossorigin src="./assets/index-CUKDdNcX.js"></script>
+    <script type="module" crossorigin src="./assets/index-CSC9ySuR.js"></script>
     <link rel="modulepreload" crossorigin href="./assets/react-DHz4kLit.js">
-    <link rel="modulepreload" crossorigin href="./assets/echarts-ClPwX7rX.js">
-    <link rel="stylesheet" crossorigin href="./assets/index-BQ0MgRxN.css">
+    <link rel="stylesheet" crossorigin href="./assets/index-B_Wxs3ZT.css">
   </head>
   <body>
     <div id="root"></div>

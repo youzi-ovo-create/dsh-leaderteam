@@ -181,26 +181,129 @@
           return pair[0];
         };
 
-    function PanelIcon(props) {
+    function OriginMark(props) {
       const size = (props && typeof props.size === 'number') ? props.size : 18;
+      const ink = (props && props.ink) || 'currentColor';
+      const brand = (props && props.brand) || '#9C5B2E';
       return h(
         'svg',
         {
           width: size,
           height: size,
-          viewBox: '0 0 24 24',
+          viewBox: '0 0 22 22',
           fill: 'none',
-          stroke: 'currentColor',
-          strokeWidth: 1.8,
-          strokeLinecap: 'round',
-          strokeLinejoin: 'round',
+          'aria-hidden': 'true',
+          style: { flexShrink: 0 },
         },
-        h('rect', { x: 3, y: 3, width: 7, height: 7, rx: 1.5 }),
-        h('rect', { x: 14, y: 3, width: 7, height: 7, rx: 1.5 }),
-        h('rect', { x: 8.5, y: 14, width: 7, height: 7, rx: 1.5 }),
-        h('path', { d: 'M6.5 10v2.5h11V10' }),
-        h('path', { d: 'M12 12.5V14' })
+        h('circle', { cx: 11, cy: 6, r: 4.25, stroke: ink, strokeWidth: 1.5 }),
+        h('line', { x1: 11, y1: 12.6, x2: 11, y2: 21, stroke: brand, strokeWidth: 1.5, strokeLinecap: 'round' })
       );
+    }
+
+    function resolvePanelTokens() {
+      let theme = 'white';
+      try {
+        const raw = typeof localStorage !== 'undefined' ? (localStorage.getItem('lt.appearance') || localStorage.getItem('lt-ui-preferences-v1')) : null;
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          if (parsed && (parsed.theme === 'dark' || parsed.theme === 'heluoxu' || parsed.theme === 'white')) {
+            theme = parsed.theme;
+          }
+        }
+      } catch {}
+      try {
+        if (theme === 'white' && typeof document !== 'undefined' && document && document.documentElement) {
+          const cls = String(document.documentElement.className || '');
+          const dt = document.documentElement.getAttribute && document.documentElement.getAttribute('data-theme');
+          if (/\bdark\b/i.test(cls) || dt === 'dark') {
+            theme = 'dark';
+          } else if (typeof window !== 'undefined' && window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {
+            theme = 'dark';
+          }
+        }
+      } catch {}
+
+      if (theme === 'dark') {
+        return {
+          bgCanvas: '#0D0F12',
+          bgSubtle: '#121519',
+          bgSurface: '#16191E',
+          bgInset: '#101317',
+          fgPrimary: '#E5E8EC',
+          fgSecondary: '#AAB2BC',
+          fgMuted: '#8A939E',
+          borderSubtle: 'rgba(230,234,239,0.09)',
+          borderControl: '#434B56',
+          accent: '#6FB1C9',
+          onAccent: '#081317',
+          info: '#6FB1C9',
+          infoBg: 'rgba(111,177,201,0.14)',
+          success: '#62B892',
+          successBg: 'rgba(98,184,146,0.14)',
+          warning: '#DDAB55',
+          warningBg: 'rgba(221,171,85,0.14)',
+          danger: '#EE8577',
+          dangerBg: 'rgba(238,133,119,0.14)',
+          seal: '#E28C79',
+          brand: '#D29A68',
+          radiusBtn: '6px',
+        };
+      }
+      if (theme === 'heluoxu') {
+        return {
+          bgCanvas: '#ECE8DF',
+          bgSubtle: '#F2EFE8',
+          bgSurface: '#F8F6F1',
+          bgInset: '#EFEBE3',
+          fgPrimary: '#1A1916',
+          fgSecondary: '#504D46',
+          fgMuted: '#6A665E',
+          borderSubtle: 'rgba(26,25,22,0.11)',
+          borderControl: '#ABA597',
+          accent: '#9C5B2E',
+          onAccent: '#FFFDF9',
+          info: '#2A657C',
+          infoBg: '#E6EEF0',
+          success: '#36705A',
+          successBg: '#E5EFE8',
+          warning: '#8A6113',
+          warningBg: '#F5EBD6',
+          danger: '#A3263F',
+          dangerBg: '#F6E6E8',
+          seal: '#92544E',
+          brand: '#9C5B2E',
+          radiusBtn: '999px',
+        };
+      }
+      return {
+        bgCanvas: '#F2F3F5',
+        bgSubtle: '#F8F9FA',
+        bgSurface: '#FFFFFF',
+        bgInset: '#F3F5F7',
+        fgPrimary: '#15191E',
+        fgSecondary: '#47505A',
+        fgMuted: '#67707B',
+        borderSubtle: 'rgba(21,25,30,0.09)',
+        borderControl: '#B4BBC3',
+        accent: '#2A657C',
+        onAccent: '#FFFFFF',
+        info: '#2A657C',
+        infoBg: '#E9F2F5',
+        success: '#2B6F57',
+        successBg: '#E7F3ED',
+        warning: '#8F620E',
+        warningBg: '#FBF2DF',
+        danger: '#B2372C',
+        dangerBg: '#FBECEA',
+        seal: '#A63D2F',
+        brand: '#9C5B2E',
+        radiusBtn: '6px',
+      };
+    }
+
+    function PanelIcon(props) {
+      const size = (props && typeof props.size === 'number') ? props.size : 18;
+      return h(OriginMark, { size, ink: 'currentColor', brand: '#9C5B2E' });
     }
 
     function TabTitle() {
@@ -598,29 +701,34 @@
       };
 
       const models = (data && Array.isArray(data.unifiedModels)) ? data.unifiedModels : [];
+      const tok = resolvePanelTokens();
+      const firstSid = sessionModes && sessionModes[0] && sessionModes[0].sessionId ? sessionModes[0].sessionId : '';
+      const ltNativeHref = firstSid ? ('./lt/#/workbench?session=' + encodeURIComponent(firstSid)) : './lt/';
       const cardStyle = {
-        border: '1px solid rgba(128,128,128,0.25)',
-        borderRadius: '8px',
-        padding: compact ? '10px' : '14px',
-        marginBottom: '12px',
-        background: 'rgba(128,128,128,0.04)',
+        border: '1px solid ' + tok.borderSubtle,
+        borderRadius: '6px',
+        padding: compact ? '10px 12px' : '14px 16px',
+        marginBottom: '10px',
+        background: tok.bgSurface,
+        color: tok.fgPrimary,
       };
       const btnStyle = (primary) => ({
-        padding: '5px 10px',
-        borderRadius: '6px',
-        border: '1px solid rgba(128,128,128,0.35)',
-        background: primary ? '#2563eb' : 'transparent',
-        color: primary ? '#ffffff' : 'inherit',
+        padding: compact ? '4px 9px' : '5px 11px',
+        borderRadius: tok.radiusBtn,
+        border: '1px solid ' + (primary ? tok.accent : tok.borderControl),
+        background: primary ? tok.accent : tok.bgSurface,
+        color: primary ? tok.onAccent : tok.fgPrimary,
         cursor: 'pointer',
         fontSize: '12px',
+        fontWeight: 500,
         marginRight: '6px',
       });
       const inputStyle = {
         padding: '4px 8px',
-        borderRadius: '5px',
-        border: '1px solid rgba(128,128,128,0.35)',
-        background: 'transparent',
-        color: 'inherit',
+        borderRadius: '4px',
+        border: '1px solid ' + tok.borderControl,
+        background: tok.bgSurface,
+        color: tok.fgPrimary,
         fontSize: '12px',
       };
 
@@ -631,44 +739,61 @@
             padding: compact ? '10px' : '18px 22px',
             height: '100%',
             overflowY: 'auto',
-            fontSize: '13px',
+            fontSize: compact ? '12.5px' : '13px',
             lineHeight: 1.5,
             boxSizing: 'border-box',
+            background: tok.bgSubtle,
+            color: tok.fgPrimary,
+            fontVariantNumeric: 'tabular-nums',
           },
         },
-        // Header
+        // Header (Heluo 始 mark + compact actions)
         h(
           'div',
-          { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '8px', marginBottom: '12px' } },
-          h('div', null,
-            h('div', { style: { fontSize: compact ? '15px' : '18px', fontWeight: 700 } }, 'LeaderTeam 控制台'),
-            h('div', { style: { fontSize: '11px', opacity: 0.7 } }, '上游动态模型 · 可拆卸插件 · 工程计时 · 外部计划归档与复审')
+          {
+            style: {
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              flexWrap: 'wrap',
+              gap: '8px',
+              marginBottom: '10px',
+              paddingBottom: '10px',
+              borderBottom: '1px solid ' + tok.borderSubtle,
+            },
+          },
+          h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px' } },
+            h(OriginMark, { size: compact ? 18 : 22, ink: tok.fgPrimary, brand: tok.brand }),
+            h('div', null,
+              h('div', { style: { fontSize: compact ? '14px' : '16px', fontWeight: 600, color: tok.fgPrimary } }, 'Leader Team'),
+              h('div', { style: { fontSize: '11px', color: tok.fgMuted } }, '河洛 · 上游模型 · 双模式 · 可拆卸模块 · 外部归档')
+            )
           ),
-          h('div', null,
+          h('div', { style: { display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: '4px' } },
             isHttpWebSurface()
               ? h(
                 'a',
                 {
-                  href: './lt/',
+                  href: ltNativeHref,
                   style: {
                     display: 'inline-block',
-                    padding: '5px 12px',
-                    borderRadius: '6px',
-                    border: '1px solid #9C5B2E',
-                    background: '#141619',
-                    color: '#FFFFFF',
+                    padding: compact ? '4px 10px' : '5px 12px',
+                    borderRadius: tok.radiusBtn,
+                    border: '1px solid ' + tok.accent,
+                    background: tok.accent,
+                    color: tok.onAccent,
                     textDecoration: 'none',
-                    fontWeight: 600,
+                    fontWeight: 500,
                     fontSize: '12px',
-                    marginRight: '8px',
+                    marginRight: '6px',
                   },
-                  title: '切换至 LT 原生工作台（共享同一运行时与活跃团队，切换零中断）',
+                  title: '携带当前会话切换至 LT 原生工作台（共享运行时与活跃团队，切换零中断）',
                 },
-                '切换至 LT 原生工作台 ↗'
+                '打开 /lt/ ↗'
               )
               : null,
             h('button', { style: btnStyle(false), onClick: () => loadState({ forceDiscover: true }), disabled: loading }, loading ? '刷新中…' : '刷新状态'),
-            h('button', { style: btnStyle(true), onClick: () => onDiscoverUpstream(true), disabled: loading }, '探测上游模型 (/v1/models)')
+            h('button', { style: btnStyle(false), onClick: () => onDiscoverUpstream(true), disabled: loading }, '探测上游模型 (/v1/models)')
           )
         ),
         h(
@@ -680,18 +805,20 @@
               justifyContent: 'space-between',
               gap: '8px',
               padding: '8px 12px',
-              marginBottom: '12px',
-              borderLeft: '2px solid #9C5B2E',
-              background: 'rgba(156, 91, 46, 0.08)',
+              marginBottom: '10px',
+              borderLeft: '2px solid ' + tok.brand,
+              borderRadius: '4px',
+              background: tok.infoBg,
+              color: tok.fgSecondary,
               fontSize: '12px',
             },
           },
-          h('span', null, 'LT V2.2.x 原生工作台已就绪：提供完整网关与多 Key 管理、角色回退链配置、实时治理轴线、衡账分析及四套河洛序主题，与当前 DSH 前端共享同一会话与团队。'),
+          h('span', null, 'LT 原生工作台提供完整 Magpie 网关、多 Key 池、角色回退链、规划拓扑、衡账分析及四套河洛主题，与当前 DSH 前端共享同一会话与团队。'),
           isHttpWebSurface()
-            ? h('a', { href: './lt/', style: { color: '#9C5B2E', fontWeight: 600, whiteSpace: 'nowrap', textDecoration: 'none' } }, '立即进入 /lt/ →')
-            : h('span', { style: { color: '#9C5B2E', fontWeight: 600, whiteSpace: 'nowrap' } }, '终端运行 npx lt-ui 打开独立工作台')
+            ? h('a', { href: ltNativeHref, style: { color: tok.accent, fontWeight: 600, whiteSpace: 'nowrap', textDecoration: 'none' } }, '进入 /lt/ →')
+            : h('span', { style: { color: tok.accent, fontWeight: 600, whiteSpace: 'nowrap' } }, '终端运行 npx lt-ui')
         ),
-        error ? h('div', { style: { padding: '8px 10px', borderRadius: '6px', background: 'rgba(220,38,38,0.15)', color: '#ef4444', marginBottom: '10px', fontSize: '12px' } }, '错误：' + error) : null,
+        error ? h('div', { style: { padding: '8px 10px', borderRadius: '6px', background: tok.dangerBg, color: tok.danger, marginBottom: '10px', fontSize: '12px' } }, '错误：' + error) : null,
         (() => {
           const localOvParts = summarizeLocalOverrideParts(data && data.configSnapshot && data.configSnapshot.localOverrides);
           if (!warningMsg && localOvParts.length === 0) return null;
@@ -705,8 +832,8 @@
                 gap: '8px',
                 padding: '8px 10px',
                 borderRadius: '6px',
-                background: 'rgba(245,158,11,0.15)',
-                border: '1px solid rgba(245,158,11,0.45)',
+                background: tok.warningBg,
+                color: tok.fgPrimary,
                 marginBottom: '10px',
                 fontSize: '12px',
               },
@@ -721,11 +848,11 @@
               : null
           );
         })(),
-        notice ? h('div', { style: { padding: '8px 10px', borderRadius: '6px', background: 'rgba(22,163,74,0.15)', color: '#22c55e', marginBottom: '10px', fontSize: '12px' } }, notice) : null,
+        notice ? h('div', { style: { padding: '8px 10px', borderRadius: '6px', background: tok.successBg, color: tok.success, marginBottom: '10px', fontSize: '12px' } }, notice) : null,
         // Navigation Tabs
         h(
           'div',
-          { style: { display: 'flex', gap: '6px', flexWrap: 'wrap', marginBottom: '14px', borderBottom: '1px solid rgba(128,128,128,0.2)', paddingBottom: '8px' } },
+          { style: { display: 'flex', gap: '4px', flexWrap: 'wrap', marginBottom: '12px', borderBottom: '1px solid ' + tok.borderSubtle, paddingBottom: '8px' } },
           [
             ['models', '模型与角色 (' + models.length + ')'],
             ['usage', '实际模型与用量'],
@@ -746,11 +873,11 @@
               h('strong', null, '会话内执行模式 (Single / Team)'),
               h('button', { style: btnStyle(false), onClick: onRefreshSessionModes, disabled: loading || Object.keys(switchingMap || {}).length > 0 }, '刷新会话模式')
             ),
-            h('div', { style: { fontSize: '11px', opacity: 0.78, marginBottom: '8px' } },
+            h('div', { style: { fontSize: '11.5px', color: tok.fgMuted, marginBottom: '8px' } },
               '仅在会话空闲时允许在 Team（领队编排 + 子代理并发 + 双评审）与 Single（主代理直执 + 安全门守护 · 零团队开销）之间热切换；0 次模型调用。'
             ),
             sessionModes.length === 0
-              ? h('div', { style: { fontSize: '12px', opacity: 0.7 } }, '暂无活跃或最近的会话记录。创建 LeaderTeam 会话后可在此一键切换 Single / Team。')
+              ? h('div', { style: { fontSize: '12px', color: tok.fgMuted } }, '暂无活跃或最近的会话记录。创建 LeaderTeam 会话后可在此一键切换 Single / Team。')
               : sessionModes.map(s => {
                 const ms = s.modeState || {};
                 const isLt = s.isLtSession !== false && ms.isLtSession !== false;
@@ -770,8 +897,8 @@
                       alignItems: 'center',
                       flexWrap: 'wrap',
                       gap: '8px',
-                      padding: '7px 0',
-                      borderTop: '1px solid rgba(128,128,128,0.15)',
+                      padding: '8px 0',
+                      borderTop: '1px solid ' + tok.borderSubtle,
                       fontSize: '12px',
                     },
                   },
@@ -783,10 +910,11 @@
                         {
                           style: {
                             padding: '1px 6px',
-                            borderRadius: '4px',
-                            border: '1px solid ' + (!isLt ? 'rgba(128,128,128,0.4)' : curMode === 'single' ? '#2563eb' : '#9C5B2E'),
-                            color: !isLt ? 'inherit' : curMode === 'single' ? '#2563eb' : '#9C5B2E',
-                            fontSize: '11px',
+                            borderRadius: '3px',
+                            border: '1px solid ' + (!isLt ? tok.borderControl : curMode === 'single' ? tok.seal : 'transparent'),
+                            background: !isLt ? 'transparent' : curMode === 'single' ? 'transparent' : tok.infoBg,
+                            color: !isLt ? tok.fgMuted : curMode === 'single' ? tok.seal : tok.info,
+                            fontSize: '10.5px',
                             fontWeight: 600,
                           },
                         },
@@ -794,7 +922,7 @@
                       ),
                       h(
                         'span',
-                        { style: { fontSize: '11px', opacity: 0.78, color: canSwitch ? '#22c55e' : '#f59e0b' } },
+                        { style: { fontSize: '11px', color: !isLt ? tok.fgMuted : (canSwitch ? tok.success : tok.warning) } },
                         !isLt ? '非 LT 预设会话' : (canSwitch ? '● 空闲可切换' : '● 忙碌锁定')
                       )
                     ),

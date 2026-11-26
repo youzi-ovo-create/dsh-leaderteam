@@ -1157,30 +1157,35 @@ test('Stage 7 Frontend Regressions (V223-UI-05, UI-06, UI-08): WorkbenchView HUD
     };
     applyThemeToDom('custom', darkSeeds);
     assert.equal(globalThis.document.documentElement.style.colorScheme, 'dark');
-    assert.equal(domStyle.get('--lt-info'), '#6CB2CE');
-    assert.equal(domStyle.get('--lt-info-bg'), 'color-mix(in srgb, #6CB2CE 16%, var(--lt-bg-surface))');
-    assert.equal(domStyle.get('--lt-success'), '#63B692');
-    assert.equal(domStyle.get('--lt-warning'), '#E0AD56');
-    assert.equal(domStyle.get('--lt-danger'), '#DF7A72');
+    assert.ok(domStyle.get('--lt-fg-primary'));
+    assert.ok(domStyle.get('--lt-info'));
+    assert.ok(domStyle.get('--lt-info-bg'));
+    assert.ok(domStyle.get('--lt-success'));
+    assert.ok(domStyle.get('--lt-warning'));
+    assert.ok(domStyle.get('--lt-danger'));
+    assert.ok(domStyle.get('--lt-danger-bg'));
 
-    // WCAG AA >= 4.5:1 check on `#1A1E26` (and blended 16% `#6CB2CE` info badge background `#273641`)
-    assert.ok(computeContrastRatio('#6CB2CE', '#273641') >= 4.5, 'Single badge info text on 16% mixed dark bg must pass 4.5:1');
-    assert.ok(computeContrastRatio('#63B692', '#1A1E26') >= 4.5, 'Idle mode bar success text on dark surface must pass 4.5:1');
-    assert.ok(computeContrastRatio('#E0AD56', '#1A1E26') >= 4.5, 'Warning lock text on dark surface must pass 4.5:1');
-    assert.ok(computeContrastRatio('#DF7A72', '#1A1E26') >= 4.5, 'Danger/seal text on dark surface must pass 4.5:1');
+    // Heluo deriveCustom WCAG AA/AAA guard-rails on dark custom theme (`#1A1E26` surface, low-contrast `#A3263F` danger seed auto-lifted >= 4.5:1)
+    assert.ok(computeContrastRatio(domStyle.get('--lt-fg-primary'), '#1A1E26') >= 12, 'Primary ink on dark surface must pass 12:1');
+    assert.ok(computeContrastRatio(domStyle.get('--lt-fg-secondary'), '#1A1E26') >= 7, 'Secondary ink on dark surface must pass 7:1');
+    assert.ok(computeContrastRatio(domStyle.get('--lt-fg-muted'), '#0F1115') >= 4.5, 'Muted ink on dark canvas must pass 4.5:1');
+    assert.ok(computeContrastRatio(domStyle.get('--lt-info'), '#1A1E26') >= 4.5, 'Info/accent text on dark surface must pass 4.5:1');
+    assert.ok(computeContrastRatio(domStyle.get('--lt-success'), domStyle.get('--lt-success-bg')) >= 4.5, 'Success text on derived dark success-bg must pass 4.5:1');
+    assert.ok(computeContrastRatio(domStyle.get('--lt-warning'), domStyle.get('--lt-warning-bg')) >= 4.5, 'Warning text on derived dark warning-bg must pass 4.5:1');
+    assert.ok(computeContrastRatio(domStyle.get('--lt-danger'), domStyle.get('--lt-danger-bg')) >= 4.5, 'Auto-lifted danger text on derived dark danger-bg must pass 4.5:1');
+    assert.notEqual(domStyle.get('--lt-danger'), '#A3263F', 'Low-contrast crimson seed must be auto-lifted on dark surface');
 
-    // Switching to light custom (`#FFFFFF`) removes dark inline semantic overrides
-    applyThemeToDom('custom', { ...darkSeeds, surfaceColor: '#FFFFFF', inkColor: '#141619' });
+    // Switching to light custom (`#FFFFFF`) derives light colorScheme and preserves WCAG AA guard-rails
+    applyThemeToDom('custom', { ...darkSeeds, surfaceColor: '#FFFFFF', canvasColor: '#F2F3F5', inkColor: '#141619' });
     assert.equal(globalThis.document.documentElement.style.colorScheme, 'light');
-    for (const k of ['--lt-info', '--lt-info-bg', '--lt-success', '--lt-warning', '--lt-danger', '--lt-seal']) {
-      assert.equal(domStyle.has(k), false, `Light custom must remove inline ${k}`);
-    }
+    assert.ok(computeContrastRatio(domStyle.get('--lt-fg-primary'), '#FFFFFF') >= 12);
+    assert.ok(computeContrastRatio(domStyle.get('--lt-danger'), domStyle.get('--lt-danger-bg')) >= 4.5);
 
-    // Re-apply dark custom, then switch to `'white'` -> removes all inline overrides
+    // Re-apply dark custom, then switch to `'white'` -> removes all inline custom overrides
     applyThemeToDom('custom', darkSeeds);
-    assert.equal(domStyle.get('--lt-info'), '#6CB2CE');
+    assert.ok(domStyle.has('--lt-info'));
     applyThemeToDom('white', darkSeeds);
-    for (const k of ['--lt-info', '--lt-info-bg', '--lt-success', '--lt-warning', '--lt-danger', '--lt-seal']) {
+    for (const k of ['--lt-info', '--lt-info-bg', '--lt-success', '--lt-warning', '--lt-danger', '--lt-seal', '--lt-bg-surface', '--lt-fg-primary']) {
       assert.equal(domStyle.has(k), false, `Preset theme must remove inline ${k}`);
     }
   } finally {
@@ -1190,7 +1195,7 @@ test('Stage 7 Frontend Regressions (V223-UI-05, UI-06, UI-08): WorkbenchView HUD
     else globalThis.localStorage = prevStorage;
   }
 
-  // Verify built `web-dist/index.html` `bootLtTheme` also applies dark custom semantic overrides
+  // Verify built `web-dist/index.html` `bootLtTheme` also applies dark custom WCAG AA overrides synchronously
   const distIndexHtml = fs.readFileSync(path.join(resolveLtWebDistDir(), 'index.html'), 'utf8');
   const bootScript = distIndexHtml.match(/<script>([\s\S]*?)<\/script>/)[1];
   const bootStyle = new Map();
@@ -1219,9 +1224,9 @@ test('Stage 7 Frontend Regressions (V223-UI-05, UI-06, UI-08): WorkbenchView HUD
       },
     },
   });
-  assert.equal(bootStyle.get('--lt-info'), '#6CB2CE');
-  assert.equal(bootStyle.get('--lt-success'), '#63B692');
-  assert.equal(bootStyle.get('--lt-danger'), '#DF7A72');
+  assert.ok(computeContrastRatio(bootStyle.get('--lt-info'), '#1A1E26') >= 4.5);
+  assert.ok(computeContrastRatio(bootStyle.get('--lt-success'), bootStyle.get('--lt-success-bg')) >= 4.5);
+  assert.ok(computeContrastRatio(bootStyle.get('--lt-danger'), bootStyle.get('--lt-danger-bg')) >= 4.5);
 
   // 2. V223-UI-06 (`leaderteam-panel/client.js`): Concurrent row switches keep in-flight rows & refresh button locked
   {

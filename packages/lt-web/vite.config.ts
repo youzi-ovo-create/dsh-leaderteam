@@ -21,7 +21,6 @@ export default defineConfig({
       output: {
         manualChunks: {
           react: ['react', 'react-dom'],
-          echarts: ['echarts'],
         },
       },
     },

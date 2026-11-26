@@ -1,18 +1,46 @@
-import React, { useState, useEffect } from 'react';
-import { callLtApi, formatNumber, type HydratedBundle } from '../lib/api';
+import React, { useEffect, useState } from 'react';
+import { callLtApi, type HydratedBundle } from '../lib/api';
+import { Icon, type IconName } from '../components/Icon';
+import { StageHead } from '../components/AppShell';
+import { Dialog } from '../components/Overlays';
+import { UnknownValue } from '../components/UnknownValue';
 import type { RoleAssignment } from '../types/lt-public-v1';
+
+function formatContextCompact(n: number | null | undefined): React.ReactNode {
+  if (typeof n !== 'number' || !Number.isFinite(n) || n <= 0) {
+    return <UnknownValue reason="上游未声明上下文或输出上限" />;
+  }
+  if (n >= 1_000_000) {
+    return `${(n / 1_048_576).toFixed(n % 1_048_576 ? 1 : 0)}M`;
+  }
+  return `${Math.round(n / 1000)}K`;
+}
 
 export function ModelsRolesView({
   bundle,
   onRefreshBundle,
+  step = 'models',
+  saveTarget: propSaveTarget,
+  onChangeSaveTarget,
+  ctxOpen = true,
+  onToggleCtx,
+  onNextStep,
+  onNotify,
 }: {
   bundle: HydratedBundle;
   onRefreshBundle: () => Promise<void>;
+  step?: 'models' | 'roles';
+  saveTarget?: 'local' | 'base';
+  onChangeSaveTarget?: (next: 'local' | 'base') => void;
+  ctxOpen?: boolean;
+  onToggleCtx?: () => void;
+  onNextStep?: () => void;
+  onNotify?: (message: string, icon?: IconName) => void;
 }) {
   const [search, setSearch] = useState('');
   const [sourceFilter, setSourceFilter] = useState<string>('all');
   const [selectedEntries, setSelectedEntries] = useState<Set<string>>(new Set());
-  const [saveTarget, setSaveTarget] = useState<'local' | 'base'>('local');
+  const [localSaveTarget, setLocalSaveTarget] = useState<'local' | 'base'>(propSaveTarget || 'local');
   const [draftPool, setDraftPool] = useState<string[]>([]);
   const [draftRoles, setDraftRoles] = useState<Record<string, RoleAssignment>>({});
   const [leaderPolicy, setLeaderPolicy] = useState<string>('warn');
@@ -22,6 +50,13 @@ export function ModelsRolesView({
   const [warnings, setWarnings] = useState<string[]>([]);
   const [shadowedByLocal, setShadowedByLocal] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [showClearConfirm, setShowClearConfirm] = useState(false);
+
+  const saveTarget = propSaveTarget ?? localSaveTarget;
+  const setSaveTarget = (next: 'local' | 'base') => {
+    setLocalSaveTarget(next);
+    if (onChangeSaveTarget) onChangeSaveTarget(next);
+  };
 
   useEffect(() => {
     if (isDirty) return;
@@ -30,7 +65,8 @@ export function ModelsRolesView({
     setLeaderPolicy(bundle.runtime.leaderModelPolicy || 'warn');
   }, [bundle, isDirty]);
 
-  const localOverrides = bundle.runtime.localOverrides || (bundle.runtime.syncState as any)?.localOverrides || null;
+  const localOverrides =
+    bundle.runtime.localOverrides || (bundle.runtime.syncState as any)?.localOverrides || null;
   const activeLocalOverrideItems: string[] = [];
   if (localOverrides?.exists) {
     if (localOverrides.executionPool) activeLocalOverrideItems.push('team.executionPool');
@@ -39,6 +75,7 @@ export function ModelsRolesView({
     if (localOverrides.models?.length) activeLocalOverrideItems.push(`models(${localOverrides.models.join(', ')})`);
   }
   const hasActiveLocalOverrides = activeLocalOverrideItems.length > 0;
+  const overriddenRolesSet = new Set<string>(localOverrides?.roles || []);
 
   const filteredModels = bundle.models.filter(m => {
     if (sourceFilter !== 'all' && m.sourceKind !== sourceFilter) return false;
@@ -53,6 +90,11 @@ export function ModelsRolesView({
   });
 
   const poolModels = bundle.models.filter(m => m.inModelPool);
+
+  function notify(msg: string, icon: IconName = 'check') {
+    setNotice(msg);
+    if (onNotify) onNotify(msg, icon);
+  }
 
   function toggleEntrySelection(entryId: string) {
     setSelectedEntries(prev => {
@@ -88,9 +130,10 @@ export function ModelsRolesView({
         setDraftPool(prev => [...new Set([...prev, ...syncedPool])]);
       }
       if (res.warnings?.length) setWarnings(res.warnings);
-      setNotice(
-        `已将 ${res.syncedCount} 个模型导入 LT 模型目录与执行池（自动完成 off -> "none" 推理档位映射）` +
-          (isDirty ? '；已保留当前未保存的角色草稿' : ''),
+      notify(
+        `已同步 ${res.syncedCount} 个模型至模型池与执行池（自动完成 off → "none" 推理档位映射）` +
+          (isDirty ? '；已保留当前未保存草稿' : ''),
+        'refresh',
       );
       setSelectedEntries(new Set());
       await onRefreshBundle();
@@ -208,8 +251,9 @@ export function ModelsRolesView({
       setShadowedByLocal(shadowed);
       setWarnings(warns);
       setIsDirty(false);
-      setNotice(
-        `已事务化写入 ${saveTarget === 'local' ? 'leaderteam.local.json' : 'leaderteam.config.json + YAML 补丁'}（执行池实时生效，治理角色对新建团队生效）`,
+      notify(
+        `已写入 ${saveTarget === 'local' ? 'leaderteam.local.json' : 'leaderteam.config.json + YAML 补丁'}（执行池实时生效，治理角色对新建团队生效）`,
+        'check',
       );
       await onRefreshBundle();
     } catch (e: any) {
@@ -231,7 +275,8 @@ export function ModelsRolesView({
         changes: { clearLocalOverrides: true },
       });
       setIsDirty(false);
-      setNotice('已清除本机覆盖 (leaderteam.local.json 中的模型、执行池与角色覆盖)，正式基准配置已立即生效');
+      setShowClearConfirm(false);
+      notify('已清除全部本机覆盖，基准配置已立即生效', 'check');
       await onRefreshBundle();
     } catch (e: any) {
       setError(`清除本机覆盖失败：${e.message}`);
@@ -242,307 +287,540 @@ export function ModelsRolesView({
 
   function effortsForRoute(routeId: string): string[] {
     const found = bundle.models.find(m => m.routeId === routeId);
-    return found?.efforts.supported?.length ? found.efforts.supported : ['none', 'off', 'low', 'medium', 'high', 'xhigh', 'max'];
+    return found?.efforts.supported?.length
+      ? found.efforts.supported
+      : ['none', 'off', 'low', 'medium', 'high', 'xhigh', 'max'];
   }
 
-  return (
-    <div>
-      <div className="lt-section-header">
-        <div>
-          <div className="lt-section-kicker">Model Catalog & 7-Role Matrix</div>
-          <h1 className="lt-section-title">统一模型目录、成员执行池与角色回退链配置</h1>
-          <p className="lt-section-desc">
-            严格区分供应商、凭据引用、模型来源与上游模型 ID，同名模型绝不自动合并；支持将 Magpie 发现的模型一键加入 LT 模型池并用于旧 Core 七角色配置。
-          </p>
+  const leadingToggle =
+    !ctxOpen && onToggleCtx ? (
+      <button
+        type="button"
+        className="btn btn-ghost btn-icon btn-sm"
+        onClick={onToggleCtx}
+        title="展开步骤栏（Ctrl+B）"
+      >
+        <Icon name="panelL" />
+      </button>
+    ) : undefined;
+
+  const layerLensNode = (
+    <div className="callout" style={{ marginBottom: 20, alignItems: 'center' }}>
+      <Icon name="layers" />
+      <span className="grow">
+        写入目标：<b>{saveTarget === 'local' ? '本机覆盖层' : '基础配置'}</b>{' '}
+        <span className="mono t-meta">
+          {saveTarget === 'local' ? 'leaderteam.local.json' : 'leaderteam.config.json'}
+        </span>
+        {hasActiveLocalOverrides && (
+          <>
+            {' · '}
+            <span style={{ color: 'var(--lt-warning)' }}>
+              本机覆盖活跃（{activeLocalOverrideItems.join('、')}）
+            </span>
+          </>
+        )}
+      </span>
+      {!propSaveTarget && (
+        <div className="seg seg-sm">
+          <button
+            type="button"
+            aria-pressed={saveTarget === 'local'}
+            onClick={() => setSaveTarget('local')}
+          >
+            本机覆盖
+          </button>
+          <button
+            type="button"
+            aria-pressed={saveTarget === 'base'}
+            onClick={() => setSaveTarget('base')}
+          >
+            基础配置
+          </button>
         </div>
-        <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
-          <select className="lt-select" style={{ width: 210 }} value={saveTarget} onChange={e => setSaveTarget(e.target.value as 'local' | 'base')}>
-            <option value="local">写入本机覆盖 (leaderteam.local.json)</option>
-            <option value="base">写入基准配置 + 同步 YAML 模板</option>
-          </select>
-          {hasActiveLocalOverrides && (
+      )}
+      {hasActiveLocalOverrides && (
+        <button
+          type="button"
+          className="btn btn-sm"
+          disabled={busy}
+          onClick={() => setShowClearConfirm(true)}
+        >
+          清除全部本机覆盖
+        </button>
+      )}
+    </div>
+  );
+
+  const feedbackBanners = (
+    <>
+      {error && (
+        <div className="callout danger" style={{ marginBottom: 14 }}>
+          <Icon name="alert" />
+          <span className="grow">{error}</span>
+          <button type="button" className="btn btn-ghost btn-sm" onClick={() => setError(null)}>
+            关闭
+          </button>
+        </div>
+      )}
+      {(shadowedByLocal.length > 0 || warnings.length > 0) && (
+        <div className="callout warning" style={{ marginBottom: 14 }}>
+          <Icon name="alert" />
+          <div className="grow">
+            {shadowedByLocal.length > 0 && (
+              <div>
+                基准配置已更新，但以下字段正被本机覆盖遮蔽：
+                <span className="mono">[{shadowedByLocal.join(', ')}]</span>。
+              </div>
+            )}
+            {warnings.length > 0 && <div>{warnings.join('；')}</div>}
+          </div>
+          <button
+            type="button"
+            className="btn btn-ghost btn-sm"
+            onClick={() => {
+              setShadowedByLocal([]);
+              setWarnings([]);
+            }}
+          >
+            关闭
+          </button>
+        </div>
+      )}
+      {notice && (
+        <div className="callout info" style={{ marginBottom: 14 }}>
+          <Icon name="info" />
+          <span className="grow">{notice}</span>
+          <button type="button" className="btn btn-ghost btn-sm" onClick={() => setNotice(null)}>
+            关闭
+          </button>
+        </div>
+      )}
+    </>
+  );
+
+  return (
+    <>
+      {step === 'models' ? (
+        <>
+          <StageHead
+            overline="接入 · 3 / 4"
+            title="模型目录与执行池"
+            leading={leadingToggle}
+            right={
+              <div className="row" style={{ gap: 8 }}>
+                {selectedEntries.size > 0 && (
+                  <button
+                    type="button"
+                    className="btn btn-sm"
+                    disabled={busy}
+                    onClick={() => void handleSyncMagpieToLt(false)}
+                  >
+                    导入勾选 ({selectedEntries.size})
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className="btn btn-sm"
+                  disabled={busy}
+                  onClick={() => void handleSyncMagpieToLt(true)}
+                >
+                  <Icon name="refresh" className="icon-14" />
+                  从 Magpie 发现并同步
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-sm btn-primary"
+                  disabled={busy}
+                  onClick={() => void handleSaveRuntimeConfig()}
+                >
+                  {busy ? '保存中…' : isDirty ? '保存执行池变更' : '保存执行池'}
+                </button>
+              </div>
+            }
+          />
+          <div className="stage-body">
+            <div className="stage-pad">
+              {layerLensNode}
+              {feedbackBanners}
+
+              <div className="row" style={{ gap: 10, marginBottom: 12, flexWrap: 'wrap' }}>
+                <div className="seg seg-sm" role="radiogroup" aria-label="模型来源筛选">
+                  {[
+                    ['all', '全部'],
+                    ['magpie', 'Magpie'],
+                    ['direct', '直连'],
+                    ['external-gateway', '外部网关'],
+                    ['host-settings', 'DSH 宿主'],
+                  ].map(([id, lbl]) => (
+                    <button
+                      key={id}
+                      type="button"
+                      aria-pressed={sourceFilter === id}
+                      onClick={() => setSourceFilter(id)}
+                    >
+                      {lbl}
+                    </button>
+                  ))}
+                </div>
+                <label className="search" style={{ width: 240 }}>
+                  <Icon name="search" />
+                  <input
+                    className="input input-sm"
+                    placeholder="搜索模型或路由…"
+                    value={search}
+                    onChange={e => setSearch(e.target.value)}
+                  />
+                </label>
+                <span className="grow" />
+                <span className="t-meta">
+                  池内 <b className="num">{poolModels.length}</b> · 执行池{' '}
+                  <b className="num">{draftPool.length}</b>
+                </span>
+              </div>
+
+              <div className="tbl-wrap">
+                <table className="tbl">
+                  <thead>
+                    <tr>
+                      <th style={{ width: 32 }}>选</th>
+                      <th>模型 / 路由</th>
+                      <th>来源</th>
+                      <th>能力</th>
+                      <th className="r">上下文</th>
+                      <th className="r">最大输出</th>
+                      <th>推理档位</th>
+                      <th>档次</th>
+                      <th title="进入 LT 模型目录，可被角色绑定">模型池</th>
+                      <th title="可被团队派发给执行成员">执行池</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {filteredModels.map(m => {
+                      const inExec = draftPool.includes(m.routeId);
+                      return (
+                        <tr
+                          key={m.entryId}
+                          aria-selected={selectedEntries.has(m.entryId) ? 'true' : undefined}
+                        >
+                          <td>
+                            <input
+                              type="checkbox"
+                              className="check"
+                              checked={selectedEntries.has(m.entryId)}
+                              onChange={() => toggleEntrySelection(m.entryId)}
+                            />
+                          </td>
+                          <td>
+                            <div className="col" style={{ gap: 1 }}>
+                              <b className="t-small">{m.displayName}</b>
+                              <span className="mono t-meta">{m.routeId}</span>
+                            </div>
+                          </td>
+                          <td>
+                            <div className="col" style={{ gap: 1 }}>
+                              <span className="mono t-meta">{m.providerId}</span>
+                              <span className="t-meta" style={{ fontSize: 10.5 }}>
+                                {m.sourceKind}
+                              </span>
+                            </div>
+                          </td>
+                          <td>
+                            <span className="row" style={{ gap: 6 }}>
+                              {(
+                                [
+                                  ['eye', m.capabilities.vision, '视觉'],
+                                  ['doc', m.capabilities.pdf, 'PDF'],
+                                  ['wrench', m.capabilities.toolCall, '工具调用'],
+                                  ['spark', m.capabilities.reasoning, '推理'],
+                                ] as Array<[IconName, boolean, string]>
+                              ).map(([icName, on, tip]) => (
+                                <span
+                                  key={icName}
+                                  title={`${tip}${on ? '' : '（不支持）'}`}
+                                  style={{
+                                    color: on ? 'var(--lt-fg-secondary)' : 'var(--lt-fg-disabled)',
+                                    opacity: on ? 1 : 0.4,
+                                  }}
+                                >
+                                  <Icon name={icName} className="icon-14" />
+                                </span>
+                              ))}
+                            </span>
+                          </td>
+                          <td className="r num">{formatContextCompact(m.limits.contextWindow)}</td>
+                          <td className="r num">{formatContextCompact(m.limits.maxOutputTokens)}</td>
+                          <td>
+                            <span className="mono t-meta">{m.efforts.supported.join(' · ')}</span>
+                            {m.efforts.wireEffortMap?.off === 'none' && (
+                              <span className="badge sm outline" style={{ marginLeft: 4 }}>
+                                off→none
+                              </span>
+                            )}
+                          </td>
+                          <td>
+                            <span className="badge sm outline">{m.tier}</span>
+                          </td>
+                          <td>
+                            {m.inModelPool ? (
+                              <span className="badge sm success">池内</span>
+                            ) : (
+                              <span className="t-meta">待导入</span>
+                            )}
+                          </td>
+                          <td>
+                            <label className="switch">
+                              <input
+                                type="checkbox"
+                                checked={inExec}
+                                disabled={!m.inModelPool}
+                                title={m.inModelPool ? '切换是否允许子智能体成员调度此模型' : '请先同步入模型池'}
+                                onChange={() => toggleExecutionPoolRoute(m.routeId)}
+                              />
+                              <span className="track" />
+                            </label>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+
+              <div className="row" style={{ gap: 12, marginTop: 16, flexWrap: 'wrap' }}>
+                <div className="field" style={{ width: 320 }}>
+                  <label className="label">
+                    领队模型策略 <span className="mono t-meta">leaderModelPolicy</span>
+                  </label>
+                  <select
+                    className="select"
+                    value={leaderPolicy}
+                    onChange={e => {
+                      setIsDirty(true);
+                      setLeaderPolicy(e.target.value);
+                    }}
+                  >
+                    <option value="warn">提醒模式 (warn)</option>
+                    <option value="enforce">强制与领队角色一致 (enforce)</option>
+                    <option value="off">不限制 (off)</option>
+                  </select>
+                </div>
+                <span className="grow" />
+                {onNextStep && (
+                  <button type="button" className="btn btn-primary" onClick={onNextStep}>
+                    下一步：绑定角色 <Icon name="chevR" className="icon-14" />
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
+        </>
+      ) : (
+        <>
+          <StageHead
+            overline="接入 · 4 / 4"
+            title="角色路由"
+            leading={leadingToggle}
+            right={
+              <div className="row" style={{ gap: 8 }}>
+                {isDirty && (
+                  <button
+                    type="button"
+                    className="btn btn-sm"
+                    disabled={busy}
+                    onClick={() => {
+                      setIsDirty(false);
+                      setDraftPool([...(bundle.runtime.modelPool.executionPool || [])]);
+                      setDraftRoles(structuredClone(bundle.runtime.roleAssignments || {}));
+                      setLeaderPolicy(bundle.runtime.leaderModelPolicy || 'warn');
+                    }}
+                  >
+                    重置草稿
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className="btn btn-sm btn-primary"
+                  disabled={busy}
+                  onClick={() => void handleSaveRuntimeConfig()}
+                >
+                  {busy ? '保存中…' : '保存角色路由'}
+                </button>
+              </div>
+            }
+          />
+          <div className="stage-body">
+            <div className="stage-pad" style={{ maxWidth: 1180 }}>
+              {layerLensNode}
+              {feedbackBanners}
+
+              <div className="card">
+                {bundle.capabilities.supportedRoles.map((roleMeta, i) => {
+                  const cur = draftRoles[roleMeta.roleId] || { route: '', effort: 'none', fallback: [] };
+                  const isOverridden = overriddenRolesSet.has(roleMeta.roleId);
+                  return (
+                    <div
+                      key={roleMeta.roleId}
+                      style={{
+                        display: 'grid',
+                        gridTemplateColumns: '210px minmax(0, 1fr) 120px',
+                        gap: 16,
+                        padding: '14px 16px',
+                        alignItems: 'start',
+                        borderTop: i > 0 ? '1px solid var(--lt-border-subtle)' : undefined,
+                      }}
+                    >
+                      <div className="col" style={{ gap: 3 }}>
+                        <span className="row" style={{ gap: 8 }}>
+                          <b>{roleMeta.label}</b>
+                          <span className="mono t-meta">{roleMeta.roleId}</span>
+                        </span>
+                        <span className="t-meta" style={{ lineHeight: 1.5 }}>
+                          {roleMeta.description}
+                        </span>
+                      </div>
+
+                      <div className="col" style={{ gap: 6 }}>
+                        <div className="chain">
+                          <span className="chain-hop primary">
+                            <span className="hop-idx">主</span>
+                            <select
+                              className="hop-route-sel"
+                              aria-label={`${roleMeta.roleId} 主路由`}
+                              value={cur.route}
+                              onChange={e => updateRolePrimary(roleMeta.roleId, 'route', e.target.value)}
+                            >
+                              <option value="">— 选择路由 —</option>
+                              {bundle.models.map(m => (
+                                <option key={m.entryId} value={m.routeId}>
+                                  {m.routeId}
+                                </option>
+                              ))}
+                            </select>
+                            <select
+                              aria-label={`${roleMeta.roleId} 推理强度`}
+                              value={cur.effort}
+                              onChange={e => updateRolePrimary(roleMeta.roleId, 'effort', e.target.value)}
+                            >
+                              {effortsForRoute(cur.route).map(ef => (
+                                <option key={ef} value={ef}>
+                                  {ef}
+                                </option>
+                              ))}
+                            </select>
+                          </span>
+
+                          {roleMeta.supportsFallbacks &&
+                            (cur.fallback || []).map((fb, idx) => (
+                              <React.Fragment key={idx}>
+                                <span className="chain-arrow">→</span>
+                                <span className="chain-hop">
+                                  <span className="hop-idx">{idx + 1}</span>
+                                  <select
+                                    className="hop-route-sel"
+                                    aria-label={`${roleMeta.roleId} 备选 ${idx + 1}`}
+                                    value={fb.route}
+                                    onChange={e => updateRoleFallback(roleMeta.roleId, idx, 'route', e.target.value)}
+                                  >
+                                    {bundle.models.map(m => (
+                                      <option key={m.entryId} value={m.routeId}>
+                                        {m.routeId}
+                                      </option>
+                                    ))}
+                                  </select>
+                                  <select
+                                    aria-label={`${roleMeta.roleId} 备选 ${idx + 1} 强度`}
+                                    value={fb.effort}
+                                    onChange={e => updateRoleFallback(roleMeta.roleId, idx, 'effort', e.target.value)}
+                                  >
+                                    {effortsForRoute(fb.route).map(ef => (
+                                      <option key={ef} value={ef}>
+                                        {ef}
+                                      </option>
+                                    ))}
+                                  </select>
+                                  <button
+                                    type="button"
+                                    className="hop-x"
+                                    aria-label="移除备选"
+                                    onClick={() => removeRoleFallback(roleMeta.roleId, idx)}
+                                  >
+                                    <Icon name="x" className="icon-14" />
+                                  </button>
+                                </span>
+                              </React.Fragment>
+                            ))}
+
+                          {roleMeta.supportsFallbacks &&
+                            (cur.fallback || []).length < roleMeta.maxFallbacks && (
+                              <button
+                                type="button"
+                                className="chain-add"
+                                onClick={() => addRoleFallback(roleMeta.roleId)}
+                              >
+                                <Icon name="plus" className="icon-14" />
+                                备选
+                              </button>
+                            )}
+                        </div>
+                      </div>
+
+                      <div className="col" style={{ alignItems: 'flex-end', gap: 6 }}>
+                        {isOverridden ? (
+                          <span className="layer local">local</span>
+                        ) : (
+                          <span className="layer base">base</span>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+
+              <div className="row" style={{ marginTop: 16, gap: 10 }}>
+                <span className="t-meta">保存后事务化写入所选配置层，并同步至 DSH 设置（新建团队生效）。</span>
+                <span className="grow" />
+                <span className="row t-meta" style={{ gap: 6 }}>
+                  <Icon name="check" className="icon-14" />
+                  {bundle.runtime.syncState.dshSettingsSynced ? '已同步' : '待同步'}
+                  {bundle.runtime.syncState.governanceHash && (
+                    <>
+                      {' · '}
+                      <span className="mono">gov {bundle.runtime.syncState.governanceHash.slice(0, 8)}</span>
+                    </>
+                  )}
+                </span>
+              </div>
+            </div>
+          </div>
+        </>
+      )}
+
+      <Dialog
+        open={showClearConfirm}
+        onClose={() => setShowClearConfirm(false)}
+        title="清除全部本机覆盖？"
+        footer={
+          <>
+            <button type="button" className="btn" onClick={() => setShowClearConfirm(false)}>
+              取消
+            </button>
             <button
               type="button"
-              className="lt-btn lt-btn-danger"
+              className="btn btn-primary"
               disabled={busy}
               onClick={() => void handleClearLocalOverrides()}
             >
-              清除本机覆盖 (Clear Local Overrides)
+              清除并恢复基础值
             </button>
-          )}
-          {isDirty && (
-            <button
-              type="button"
-              className="lt-btn"
-              disabled={busy}
-              onClick={() => {
-                setIsDirty(false);
-                setDraftPool([...(bundle.runtime.modelPool.executionPool || [])]);
-                setDraftRoles(structuredClone(bundle.runtime.roleAssignments || {}));
-                setLeaderPolicy(bundle.runtime.leaderModelPolicy || 'warn');
-              }}
-            >
-              重置未保存修改
-            </button>
-          )}
-          <button className="lt-btn lt-btn-primary" disabled={busy} onClick={() => void handleSaveRuntimeConfig()}>
-            {busy ? '保存中…' : '保存执行池与角色配置'}
-          </button>
-        </div>
-      </div>
-
-      {error && <div className="lt-banner lt-banner-danger"><span>{error}</span><button className="lt-btn lt-btn-sm" onClick={() => setError(null)}>关闭</button></div>}
-      {(shadowedByLocal.length > 0 || warnings.length > 0 || (saveTarget === 'base' && hasActiveLocalOverrides)) && (
-        <div className="lt-banner lt-banner-warn">
-          <div>
-            {shadowedByLocal.length > 0 ? (
-              <div>
-                <strong>注意（本机覆盖遮蔽）：</strong>基准配置已更新，但当前运行时仍被 <code>leaderteam.local.json</code> 覆盖项遮蔽：
-                <code className="lt-mono" style={{ marginLeft: 4 }}>[{shadowedByLocal.join(', ')}]</code>。
-              </div>
-            ) : saveTarget === 'base' && hasActiveLocalOverrides ? (
-              <div>
-                <strong>提示：</strong>检测到 <code>leaderteam.local.json</code> 存在覆盖项（<code>{activeLocalOverrideItems.join('、')}</code>），运行时优先级高于基准配置。
-              </div>
-            ) : null}
-            {warnings.length > 0 && (
-              <div style={{ marginTop: shadowedByLocal.length > 0 ? 4 : 0 }}>{warnings.join('；')}</div>
-            )}
-          </div>
-          <div style={{ display: 'flex', gap: 6, flexShrink: 0 }}>
-            {hasActiveLocalOverrides && (
-              <button className="lt-btn lt-btn-sm lt-btn-danger" disabled={busy} onClick={() => void handleClearLocalOverrides()}>
-                清除本机覆盖 (Clear Local Overrides)
-              </button>
-            )}
-            {(shadowedByLocal.length > 0 || warnings.length > 0) && (
-              <button
-                className="lt-btn lt-btn-sm"
-                onClick={() => {
-                  setShadowedByLocal([]);
-                  setWarnings([]);
-                }}
-              >
-                关闭
-              </button>
-            )}
-          </div>
-        </div>
-      )}
-      {notice && <div className="lt-banner"><span>{notice}</span><button className="lt-btn lt-btn-sm" onClick={() => setNotice(null)}>关闭</button></div>}
-
-      {/* 1. 7-Role Governance & Execution Matrix */}
-      <div className="lt-card lt-card-authority" style={{ marginBottom: 20 }}>
-        <div className="lt-card-title">
-          <span>角色模型与多级故障回退链 ({bundle.capabilities.supportedRoles.length} 席角色)</span>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, fontWeight: 400 }}>
-            <span>Leader 模型策略:</span>
-            <select
-              className="lt-select"
-              style={{ width: 150, height: 28 }}
-              value={leaderPolicy}
-              onChange={e => {
-                setIsDirty(true);
-                setLeaderPolicy(e.target.value);
-              }}
-            >
-              <option value="warn">提醒 (warn)</option>
-              <option value="enforce">强制一致 (enforce)</option>
-              <option value="off">不限制 (off)</option>
-            </select>
-          </div>
-        </div>
-
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(330px, 1fr))', gap: 12 }}>
-          {bundle.capabilities.supportedRoles.map(roleMeta => {
-            const cur = draftRoles[roleMeta.roleId] || { route: '', effort: 'none', fallback: [] };
-            const availEfforts = effortsForRoute(cur.route);
-            return (
-              <div
-                key={roleMeta.roleId}
-                style={{
-                  padding: '12px 14px',
-                  border: '1px solid var(--lt-border-subtle)',
-                  borderRadius: 'var(--lt-radius-sm)',
-                  background: 'var(--lt-bg-subtle)',
-                }}
-              >
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 4 }}>
-                  <strong>{roleMeta.label}</strong>
-                  <span className="lt-mono" style={{ fontSize: 11, color: 'var(--lt-fg-muted)' }}>{roleMeta.roleId}</span>
-                </div>
-                <div style={{ fontSize: 11.5, color: 'var(--lt-fg-secondary)', marginBottom: 8 }}>{roleMeta.description}</div>
-
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 96px', gap: 6 }}>
-                  <select
-                    className="lt-select lt-mono"
-                    style={{ fontSize: 12 }}
-                    value={cur.route}
-                    onChange={e => updateRolePrimary(roleMeta.roleId, 'route', e.target.value)}
-                  >
-                    <option value="">-- 选择主路由 --</option>
-                    {bundle.models.map(m => (
-                      <option key={m.entryId} value={m.routeId}>
-                        {m.routeId} [{m.sourceKind}]
-                      </option>
-                    ))}
-                  </select>
-                  <select
-                    className="lt-select lt-mono"
-                    style={{ fontSize: 12 }}
-                    value={cur.effort}
-                    onChange={e => updateRolePrimary(roleMeta.roleId, 'effort', e.target.value)}
-                  >
-                    {availEfforts.map(ef => (
-                      <option key={ef} value={ef}>{ef}</option>
-                    ))}
-                  </select>
-                </div>
-
-                {roleMeta.supportsFallbacks && (
-                  <div style={{ marginTop: 8 }}>
-                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: 11, color: 'var(--lt-fg-muted)' }}>
-                      <span>故障/限流回退链 ({(cur.fallback || []).length}/{roleMeta.maxFallbacks})</span>
-                      {(cur.fallback || []).length < roleMeta.maxFallbacks && (
-                        <button type="button" className="lt-btn lt-btn-sm" onClick={() => addRoleFallback(roleMeta.roleId)}>
-                          + 回退槽
-                        </button>
-                      )}
-                    </div>
-                    {(cur.fallback || []).map((fb, idx) => (
-                      <div key={idx} style={{ display: 'grid', gridTemplateColumns: '1fr 84px 28px', gap: 4, marginTop: 6 }}>
-                        <select
-                          className="lt-select lt-mono"
-                          style={{ height: 28, fontSize: 11.5 }}
-                          value={fb.route}
-                          onChange={e => updateRoleFallback(roleMeta.roleId, idx, 'route', e.target.value)}
-                        >
-                          {bundle.models.map(m => (
-                            <option key={m.entryId} value={m.routeId}>{m.routeId}</option>
-                          ))}
-                        </select>
-                        <select
-                          className="lt-select lt-mono"
-                          style={{ height: 28, fontSize: 11.5 }}
-                          value={fb.effort}
-                          onChange={e => updateRoleFallback(roleMeta.roleId, idx, 'effort', e.target.value)}
-                        >
-                          {effortsForRoute(fb.route).map(ef => (
-                            <option key={ef} value={ef}>{ef}</option>
-                          ))}
-                        </select>
-                        <button
-                          type="button"
-                          className="lt-btn lt-btn-sm lt-btn-danger"
-                          onClick={() => removeRoleFallback(roleMeta.roleId, idx)}
-                        >
-                          ×
-                        </button>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-            );
-          })}
-        </div>
-      </div>
-
-      {/* 2. Unified 4-Dimension Model Catalog & Pool Sync */}
-      <div className="lt-card">
-        <div className="lt-card-title" style={{ flexWrap: 'wrap' }}>
-          <span>统一模型目录 ({filteredModels.length} / {bundle.models.length}) · 执行池已选 {draftPool.length} 项</span>
-          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-            <input
-              className="lt-input"
-              style={{ width: 210, height: 30 }}
-              placeholder="搜索模型路由 / 供应商 / ID…"
-              value={search}
-              onChange={e => setSearch(e.target.value)}
-            />
-            <select className="lt-select" style={{ width: 150, height: 30 }} value={sourceFilter} onChange={e => setSourceFilter(e.target.value)}>
-              <option value="all">全部来源</option>
-              <option value="magpie">Magpie 网关</option>
-              <option value="direct">直连 API</option>
-              <option value="host-settings">DSH 宿主已注册</option>
-            </select>
-            <button
-              className="lt-btn"
-              disabled={busy || selectedEntries.size === 0}
-              onClick={() => void handleSyncMagpieToLt(false)}
-            >
-              导入勾选 ({selectedEntries.size}) 至模型池
-            </button>
-            <button className="lt-btn lt-btn-primary" disabled={busy} onClick={() => void handleSyncMagpieToLt(true)}>
-              一键同步全部 Magpie 模型入池
-            </button>
-          </div>
-        </div>
-
-        <div className="lt-table-wrap">
-          <table className="lt-table">
-            <thead>
-              <tr>
-                <th style={{ width: 34 }}>选</th>
-                <th>执行池</th>
-                <th>LT 路由标识 (routeId)</th>
-                <th>来源 (source)</th>
-                <th>供应商 / 凭据域</th>
-                <th>上游模型 ID</th>
-                <th>推理档位 (wire 安全)</th>
-                <th className="lt-right">上下文 / 输出</th>
-              </tr>
-            </thead>
-            <tbody>
-              {filteredModels.map(m => {
-                const inExec = draftPool.includes(m.routeId);
-                return (
-                  <tr key={m.entryId} data-selected={selectedEntries.has(m.entryId)}>
-                    <td>
-                      <input
-                        type="checkbox"
-                        checked={selectedEntries.has(m.entryId)}
-                        onChange={() => toggleEntrySelection(m.entryId)}
-                      />
-                    </td>
-                    <td>
-                      <input
-                        type="checkbox"
-                        checked={inExec}
-                        disabled={!m.inModelPool}
-                        title={m.inModelPool ? '切换是否允许子智能体成员调度此模型' : '请先导入至 LT 模型目录'}
-                        onChange={() => toggleExecutionPoolRoute(m.routeId)}
-                      />
-                    </td>
-                    <td>
-                      <strong className="lt-mono">{m.routeId}</strong>
-                      <div style={{ fontSize: 11, color: 'var(--lt-fg-secondary)' }}>
-                        {m.displayName} {m.capabilities.vision && <span className="lt-tag">视觉</span>}
-                      </div>
-                    </td>
-                    <td><span className="lt-tag">{m.sourceKind}</span></td>
-                    <td>
-                      <div>{m.providerDisplayName}</div>
-                      <div className="lt-mono" style={{ fontSize: 10.5, color: 'var(--lt-fg-muted)' }}>{m.credentialScope}</div>
-                    </td>
-                    <td className="lt-mono" style={{ fontSize: 12 }}>{m.upstreamModelId}</td>
-                    <td className="lt-mono" style={{ fontSize: 11.5 }}>
-                      {m.efforts.supported.join(', ')}
-                      {m.efforts.wireEffortMap?.off === 'none' && (
-                        <span className="lt-tag" style={{ marginLeft: 4 }}>off→"none"</span>
-                      )}
-                    </td>
-                    <td className="lt-right lt-mono" style={{ fontSize: 11.5 }}>
-                      {m.limits.contextWindow ? `${formatNumber(m.limits.contextWindow)}` : '未知'} /{' '}
-                      {m.limits.maxOutputTokens ? `${formatNumber(m.limits.maxOutputTokens)}` : '未知'}
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        </div>
-      </div>
-    </div>
+          </>
+        }
+      >
+        <p className="t-small secondary" style={{ margin: 0 }}>
+          将清除 <span className="mono">leaderteam.local.json</span> 中的本机覆盖项（
+          <span className="mono">{activeLocalOverrideItems.join(', ')}</span>），正式基准配置将立即恢复生效。
+        </p>
+      </Dialog>
+    </>
   );
 }

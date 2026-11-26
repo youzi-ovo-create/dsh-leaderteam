@@ -13,6 +13,12 @@ import type {
   ThemePresetId,
   UiPreferences,
 } from '../types/lt-public-v1';
+import {
+  applyAppearanceToDom,
+  computeContrastRatio as themeComputeContrastRatio,
+  type DensityMode,
+  type DisplayFontMode,
+} from './theme.ts';
 
 export class LtApiError extends Error {
   readonly code: string;
@@ -75,8 +81,6 @@ export interface HydratedBundle {
     lastSyncError: string | null;
   };
 }
-
-const LOCAL_PREFS_KEY = 'lt-ui-preferences-v1';
 
 export function resolveApiPrefix(): string {
   if (typeof window === 'undefined') return '/api/lt/v1';
@@ -148,124 +152,69 @@ export async function switchWorkbenchSessionMode(
   });
 }
 
-function hexToRgb(hex: string): [number, number, number] | null {
-  const m = String(hex || '').trim().replace(/^#/, '');
-  if (m.length === 3) {
-    return [parseInt(m[0] + m[0], 16), parseInt(m[1] + m[1], 16), parseInt(m[2] + m[2], 16)];
-  }
-  if (m.length >= 6) {
-    return [parseInt(m.slice(0, 2), 16), parseInt(m.slice(2, 4), 16), parseInt(m.slice(4, 6), 16)];
-  }
-  return null;
-}
-
-function relativeLuminance([r, g, b]: [number, number, number]): number {
-  const norm = [r, g, b].map(v => {
-    const c = v / 255;
-    return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
-  });
-  return 0.2126 * norm[0] + 0.7152 * norm[1] + 0.0722 * norm[2];
-}
-
 export function computeContrastRatio(hexA: string, hexB: string): number {
-  const a = hexToRgb(hexA);
-  const b = hexToRgb(hexB);
-  if (!a || !b) return 10;
-  const la = relativeLuminance(a);
-  const lb = relativeLuminance(b);
-  const lighter = Math.max(la, lb);
-  const darker = Math.min(la, lb);
-  return Number(((lighter + 0.05) / (darker + 0.05)).toFixed(2));
+  return themeComputeContrastRatio(hexA, hexB);
 }
 
-const CUSTOM_DARK_SEMANTIC_PROPS = [
-  '--lt-info',
-  '--lt-info-bg',
-  '--lt-success',
-  '--lt-success-bg',
-  '--lt-warning',
-  '--lt-warning-bg',
-  '--lt-danger',
-  '--lt-danger-bg',
-  '--lt-seal',
-] as const;
-
-export function applyThemeToDom(theme: ThemePresetId, customTheme: CustomThemeSeeds): void {
-  if (typeof document === 'undefined') return;
-  const html = document.documentElement;
-  const st = html.style;
-  html.setAttribute('data-lt-theme', theme);
-
-  if (theme === 'custom') {
-    html.setAttribute('data-lt-heading', customTheme.headingFontMode || 'serif');
-    html.setAttribute('data-lt-corners', customTheme.cornerStyle || 'balanced');
-    html.setAttribute('data-lt-density', customTheme.density || 'standard');
-    st.setProperty('--user-bg-canvas', customTheme.canvasColor);
-    st.setProperty('--user-bg-surface', customTheme.surfaceColor);
-    st.setProperty('--user-fg-primary', customTheme.inkColor);
-    st.setProperty('--user-accent', customTheme.accentColor);
-    st.setProperty('--user-danger', customTheme.dangerColor);
-    const inkRgb = hexToRgb(customTheme.inkColor);
-    const inkLum = inkRgb ? relativeLuminance(inkRgb) : 0.05;
-    st.setProperty('--user-fg-on-ink', inkLum > 0.45 ? '#141619' : '#FFFFFF');
-    const surfHex = customTheme.surfaceColor || '#FFFFFF';
-    const surfRgb = hexToRgb(surfHex);
-    const isDarkSurface = Boolean(surfRgb && relativeLuminance(surfRgb) < 0.25);
-    st.colorScheme = isDarkSurface ? 'dark' : 'light';
-    if (isDarkSurface) {
-      const rawDanger = customTheme.dangerColor || '#DF7A72';
-      const safeDanger = computeContrastRatio(rawDanger, surfHex) >= 4.5 ? rawDanger : '#DF7A72';
-      st.setProperty('--lt-info', '#6CB2CE');
-      st.setProperty('--lt-info-bg', 'color-mix(in srgb, #6CB2CE 16%, var(--lt-bg-surface))');
-      st.setProperty('--lt-success', '#63B692');
-      st.setProperty('--lt-success-bg', 'color-mix(in srgb, #63B692 16%, var(--lt-bg-surface))');
-      st.setProperty('--lt-warning', '#E0AD56');
-      st.setProperty('--lt-warning-bg', 'color-mix(in srgb, #E0AD56 16%, var(--lt-bg-surface))');
-      st.setProperty('--lt-danger', safeDanger);
-      st.setProperty('--lt-danger-bg', `color-mix(in srgb, ${safeDanger} 16%, var(--lt-bg-surface))`);
-      st.setProperty('--lt-seal', safeDanger);
-    } else {
-      for (const prop of CUSTOM_DARK_SEMANTIC_PROPS) {
-        st.removeProperty(prop);
-      }
-    }
-  } else {
-    html.removeAttribute('data-lt-heading');
-    html.removeAttribute('data-lt-corners');
-    html.removeAttribute('data-lt-density');
-    st.removeProperty('--user-bg-canvas');
-    st.removeProperty('--user-bg-surface');
-    st.removeProperty('--user-fg-primary');
-    st.removeProperty('--user-accent');
-    st.removeProperty('--user-danger');
-    st.removeProperty('--user-fg-on-ink');
-    for (const prop of CUSTOM_DARK_SEMANTIC_PROPS) {
-      st.removeProperty(prop);
-    }
-    st.removeProperty('color-scheme');
-  }
-
-  try {
-    localStorage.setItem(LOCAL_PREFS_KEY, JSON.stringify({ theme, customTheme }));
-  } catch {}
+export function applyThemeToDom(
+  theme: ThemePresetId,
+  customTheme: CustomThemeSeeds,
+  globalOverride?: { density?: DensityMode; display?: DisplayFontMode },
+): void {
+  applyAppearanceToDom(theme, customTheme, globalOverride);
 }
 
 export function formatDurationMs(ms: number | null | undefined): string {
   if (typeof ms !== 'number' || !Number.isFinite(ms) || ms < 0) return '—';
-  if (ms < 1000) return `${Math.round(ms)}ms`;
+  if (ms < 1000) return `${Math.round(ms)} ms`;
   const sec = Math.floor(ms / 1000);
   if (sec < 60) return `${sec}s`;
   const min = Math.floor(sec / 60);
-  if (min < 60) return `${min}m ${sec % 60}s`;
-  return `${Math.floor(min / 60)}h ${min % 60}m`;
+  if (min < 60) return `${min}m ${String(sec % 60).padStart(2, '0')}s`;
+  return `${Math.floor(min / 60)}h ${String(min % 60).padStart(2, '0')}m`;
 }
 
 export function formatNumber(n: number | null | undefined): string {
-  if (typeof n !== 'number' || !Number.isFinite(n)) return '未知';
+  if (typeof n !== 'number' || !Number.isFinite(n)) return '—';
   return n.toLocaleString('en-US');
 }
 
+export function formatTokensCompact(n: number | null | undefined): { value: string; unit: string } | null {
+  if (typeof n !== 'number' || !Number.isFinite(n)) return null;
+  if (n >= 1e6) return { value: (n / 1e6).toFixed(2), unit: 'M' };
+  if (n >= 1e3) return { value: (n / 1e3).toFixed(1), unit: 'k' };
+  return { value: String(Math.round(n)), unit: '' };
+}
+
 export function formatCny(n: number | null | undefined): string {
-  if (typeof n !== 'number' || !Number.isFinite(n)) return '未知';
-  return `¥${n.toFixed(4)}`;
+  if (typeof n !== 'number' || !Number.isFinite(n)) return '—';
+  if (Math.abs(n) > 0 && Math.abs(n) < 0.01) return `¥${n.toFixed(4)}`;
+  return `¥${n.toFixed(Math.abs(n) < 1 ? 3 : 2)}`;
+}
+
+export function formatClockTime(ms: number | null | undefined): string {
+  if (typeof ms !== 'number' || !Number.isFinite(ms) || ms <= 0) return '';
+  const d = new Date(ms);
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mm = String(d.getMinutes()).padStart(2, '0');
+  return `${hh}:${mm}`;
+}
+
+export function formatRelativeGroup(ms: number | null | undefined): '今天' | '昨天' | '更早' {
+  if (typeof ms !== 'number' || !Number.isFinite(ms) || ms <= 0) return '更早';
+  const now = new Date();
+  const startToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  const startYesterday = startToday - 86_400_000;
+  if (ms >= startToday) return '今天';
+  if (ms >= startYesterday) return '昨天';
+  return '更早';
+}
+
+export function formatSessionUpdatedLabel(ms: number | null | undefined): string {
+  if (typeof ms !== 'number' || !Number.isFinite(ms) || ms <= 0) return '—';
+  const grp = formatRelativeGroup(ms);
+  if (grp === '今天') return formatClockTime(ms);
+  if (grp === '昨天') return '昨天';
+  const d = new Date(ms);
+  return `${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
