@@ -138,12 +138,18 @@ export function onAgentCreated(ctx, { agent }) {
         const plan = readCurrentPlan(rt.storageRoot, actor.teamId, seq);
         return `Current full task plan: ${currentPlanFile(rt.storageRoot, actor.teamId, seq)}. ${plan ? 'Read this file after context compaction; it is the source of plan review.' : 'Write the full plan using team_note(scope="current_plan", path="plan.md").'}`;
       } }));
-    disposers.push(prompt.context?.({
-      name: 'leaderteam:concurrency',
-      order: 130,
-      interpolate: false,
-      text: () => rt.formatLeaderContext?.(actor.teamId) ?? '',
-    }));
+    if (typeof rt.formatLeaderGovernanceSlot === 'function' || typeof rt.formatLeaderConcurrencySlot === 'function' || typeof rt.formatLeaderTimerSlot === 'function') {
+      disposers.push(prompt.context?.({ name: 'leaderteam:governance', order: 127, interpolate: false, text: () => rt.formatLeaderGovernanceSlot?.(actor.teamId) ?? '' }));
+      disposers.push(prompt.context?.({ name: 'leaderteam:concurrency', order: 130, interpolate: false, text: () => rt.formatLeaderConcurrencySlot?.(actor.teamId) ?? '' }));
+      disposers.push(prompt.context?.({ name: 'leaderteam:timer', order: 131, interpolate: false, text: () => rt.formatLeaderTimerSlot?.(actor.teamId) ?? '' }));
+    } else {
+      disposers.push(prompt.context?.({
+        name: 'leaderteam:concurrency',
+        order: 130,
+        interpolate: false,
+        text: () => rt.formatLeaderContext?.(actor.teamId) ?? '',
+      }));
+    }
     leaderPromptDisposers.set(agent, disposers);
     if (cfg.team.rollingPlanning && isPluginActive(rt, 'consensus')) {
       rt.recoverExecutionReviews?.(actor, currentTaskSeq(ctx, actor.teamId));

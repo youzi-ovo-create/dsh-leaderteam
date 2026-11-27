@@ -772,7 +772,10 @@ export async function startModelConfigServer(options = {}) {
           dryRun: Boolean(body.dryRun),
         });
         if (!syncRes.ok) {
-          return sendJson(res, 409, { error: syncRes.stderr || syncRes.stdout || 'Desktop sync failed', details: syncRes });
+          return sendJson(res, 409, {
+            error: syncRes.error || syncRes.stderr || syncRes.stdout || 'Desktop sync failed',
+            details: syncRes,
+          });
         }
         return sendJson(res, 200, syncRes);
       }

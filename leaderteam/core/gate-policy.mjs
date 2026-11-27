@@ -37,6 +37,78 @@ const BARE_CONTINUE = /^(?:请)?(?:继续|继续吧|继续做|继续执行|接�
 export function isBareContinueMessage(text) {
   return BARE_CONTINUE.test(String(text ?? '').trim());
 }
+
+const NETWORK_FORBIDDEN_RE = /(?:禁止|不得|不要|不准|不允许|切勿)(?:使用)?(?:联网|访问网络|网络访问|外网|上网|web_search|web_fetch)|(?:必须|全程|完全)(?:离线|断网)|纯离线|(?:do\s+not|don't|must\s+not|never|forbid(?:den)?\s+to)\s+(?:use\s+)?(?:the\s+)?(?:internet|network|web(?:\s+search|\s+fetch|\s+access)?)|offline[\s-]+only|no\s+(?:internet|network|external\s+network|web\s+access)\s+allowed/i;
+const NETWORK_RESTORED_RE = /(?:允许|恢复|可以)(?:使用)?(?:联网|访问网络|外网|上网|web_search|web_fetch)|allow\s+(?:internet|network|web(?:\s+access)?)/i;
+export const DIRECT_EXEC_EPISTEMIC_NOTE = ' [policy boundary only: direct_exec lacks permission for external paths/network; does NOT indicate host capability absence]';
+
+/** True when the user's messages explicitly prohibit network/web access (unless re-enabled in a later message). Pure. */
+export function isNetworkForbiddenByUser(texts) {
+  let forbidden = false;
+  for (const text of Array.isArray(texts) ? texts : []) {
+    const s = String(text ?? '');
+    if (NETWORK_FORBIDDEN_RE.test(s)) forbidden = true;
+    else if (forbidden && NETWORK_RESTORED_RE.test(s)) forbidden = false;
+  }
+  return forbidden;
+}
+
+/** Deterministic SSRF / local-file guard for `web_fetch` URLs. Allows only public http(s) targets. Pure. */
+export function inspectWebFetchUrlSafety(rawUrl) {
+  if (typeof rawUrl !== 'string' || !rawUrl.trim()) {
+    return { safe: false, reason: 'web_fetch requires a non-empty http(s) URL' };
+  }
+  let u;
+  try { u = new URL(rawUrl.trim()); } catch {
+    return { safe: false, reason: `web_fetch URL is invalid: ${truncate(rawUrl, 120)}` };
+  }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') {
+    return { safe: false, reason: `web_fetch only permits http/https URLs (got "${u.protocol}")` };
+  }
+  if (u.username || u.password) {
+    return { safe: false, reason: 'web_fetch forbids embedded URL credentials' };
+  }
+  const host = u.hostname.replace(/^\[|\]$/g, '').replace(/\.+$/, '').toLowerCase();
+  if (!host) return { safe: false, reason: 'web_fetch URL has an empty host' };
+  if (host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local') || host.endsWith('.internal')) {
+    return { safe: false, reason: `web_fetch forbids local/internal host "${host}"` };
+  }
+  // IPv6 loopback, unspecified, ULA (fc00::/7), link-local (fe80::/10), and IPv4-mapped loopback/private
+  if (host.includes(':')) {
+    if (
+      host === '::'
+      || host === '::1'
+      || /^f[cd][0-9a-f]{0,2}:/.test(host)
+      || /^fe[89ab][0-9a-f]:/.test(host)
+      || host.startsWith('::ffff:')
+    ) {
+      return { safe: false, reason: `web_fetch forbids loopback/private IPv6 address "${host}"` };
+    }
+    return { safe: true, url: u.href };
+  }
+  // IPv4 dotted-quad check (plus integer/octal single-token numeric IPs)
+  if (/^\d+$/.test(host) || /^0x[0-9a-f]+$/i.test(host)) {
+    return { safe: false, reason: `web_fetch forbids non-standard numeric IP host "${host}"` };
+  }
+  const ipv4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+  if (ipv4) {
+    const octets = ipv4.slice(1).map(Number);
+    if (octets.some(n => n > 255)) return { safe: false, reason: `web_fetch invalid IPv4 address "${host}"` };
+    const [a, b] = octets;
+    if (
+      a === 0
+      || a === 10
+      || a === 127
+      || (a === 169 && b === 254)
+      || (a === 172 && b >= 16 && b <= 31)
+      || (a === 192 && b === 168)
+      || (a === 100 && b >= 64 && b <= 127)
+    ) {
+      return { safe: false, reason: `web_fetch forbids loopback/private/link-local IPv4 address "${host}"` };
+    }
+  }
+  return { safe: true, url: u.href };
+}
 export function parseReadGrants(texts, platform = process.platform, homeDir = null) {
   const out = [];
   const effectiveHome = homeDir ?? (platform !== 'win32' ? (process.env.HOME || os.homedir()) : null);
@@ -2636,6 +2708,10 @@ export function classifySandboxBoundary(input, config) {
   if (tool === 'job_kill') {
     return { confined: true, reason: 'session-scoped sandbox background job termination' };
   }
+  if (tool === 'web_search' || tool === 'web_fetch') {
+    // evaluateHardRules already enforced user network-prohibition checks and public http(s) SSRF safety.
+    return { confined: true, reason: `read-only public ${tool} verified by deterministic URL/task rules` };
+  }
   if (config.gate.shellTools.includes(tool)) {
     const res = inspectShellSandboxConfinement(args, workspace, realWorkspace, config, platform, realOf, tool, fsImpl, actor);
     if (res.confined && typeof args?.command === 'string' && hasUnconfinedInlineInterpreter(args, workspace, realWorkspace, platform, tool, realOf)) {
@@ -2742,7 +2818,7 @@ export function evaluateDirectExecSafetyGate(input, config) {
       isDirectExec: true,
     });
     if (directEscape) {
-      return { decision: 'deny', by: 'rule:direct-exec-sandbox-lock', risk: 'high', reason: directEscape.reason };
+      return { decision: 'deny', by: 'rule:direct-exec-sandbox-lock', risk: 'high', reason: `${directEscape.reason}${DIRECT_EXEC_EPISTEMIC_NOTE}` };
     }
     const directConfinement = inspectShellSandboxConfinement(
       args,
@@ -2756,7 +2832,7 @@ export function evaluateDirectExecSafetyGate(input, config) {
       actor ?? { role: 'direct_exec', writeScope: directWriteScope },
     );
     if (!directConfinement.confined && (directConfinement.hardDenyInDirectExec || (!DIRECT_EXEC_AMBIGUOUS_SHELL_RE.test(command) && scannedDirect.substitutions.length === 0))) {
-      return { decision: 'deny', by: 'rule:direct-exec-sandbox-lock', risk: 'high', reason: directConfinement.reason };
+      return { decision: 'deny', by: 'rule:direct-exec-sandbox-lock', risk: 'high', reason: `${directConfinement.reason}${DIRECT_EXEC_EPISTEMIC_NOTE}` };
     }
     if (SECRET_FILE_BASENAME_RE.test(command.replace(/\\/g, '/'))) {
       return { decision: 'deny', by: 'rule:direct-exec-secret-file', risk: 'high', reason: 'safety gate blocked direct-exec shell access to sensitive credential/key file' };
@@ -2870,7 +2946,7 @@ export function evaluateHardRules(input, config) {
     const realTarget = realOf(target);
     if (actor.role === 'direct_exec') {
       if (!isInside(target, workspace, platform) || !isInside(realTarget, realWorkspace, platform)) {
-        return { rule: 'direct-exec-sandbox-lock', reason: `direct execution model is strictly forbidden from leaving the workspace sandbox: ${target}` };
+        return { rule: 'direct-exec-sandbox-lock', reason: `direct execution model is strictly forbidden from leaving the workspace sandbox: ${target}${DIRECT_EXEC_EPISTEMIC_NOTE}` };
       }
     }
     if (globals.some(g => isInside(target, g, platform)) || realGlobals.some(g => isInside(realTarget, g, platform))) return { rule: 'path-in-global-refs', reason: `global references are read-only: ${target}` };
@@ -2904,7 +2980,7 @@ export function evaluateHardRules(input, config) {
       const realTarget = realOf(target);
       if (actor.role === 'direct_exec') {
         if (!isInside(target, workspace, platform) || !isInside(realTarget, realWorkspace, platform)) {
-          return { rule: 'direct-exec-sandbox-lock', reason: `direct execution model is strictly forbidden from reading or searching outside the workspace sandbox: ${target}` };
+          return { rule: 'direct-exec-sandbox-lock', reason: `direct execution model is strictly forbidden from reading or searching outside the workspace sandbox: ${target}${DIRECT_EXEC_EPISTEMIC_NOTE}` };
         }
       } else {
         const lexOk = isInside(target, workspace, platform) || globals.some(g => isInside(target, g, platform));
@@ -2992,10 +3068,26 @@ export function evaluateHardRules(input, config) {
     if (actor.role === 'direct_exec') {
       const confinement = inspectShellSandboxConfinement(args, workspace, realWorkspace, config, platform, realOf, tool, fsImpl, actor);
       if (!confinement.confined) {
-        return { rule: 'direct-exec-sandbox-lock', reason: `direct execution model is strictly forbidden from leaving the workspace sandbox (${confinement.reason})` };
+        return { rule: 'direct-exec-sandbox-lock', reason: `direct execution model is strictly forbidden from leaving the workspace sandbox (${confinement.reason})${DIRECT_EXEC_EPISTEMIC_NOTE}` };
       }
       if (DIRECT_EXEC_INDIRECT_BYPASS_RE.test(command)) {
-        return { rule: 'direct-exec-sandbox-lock', reason: 'direct execution model cannot spawn detached processes, subshells, network listeners, or indirect bypass channels' };
+        return { rule: 'direct-exec-sandbox-lock', reason: `direct execution model cannot spawn detached processes, subshells, network listeners, or indirect bypass channels${DIRECT_EXEC_EPISTEMIC_NOTE}` };
+      }
+    }
+  }
+  if (tool === 'web_search' || tool === 'web_fetch') {
+    const texts = typeof input.userTexts === 'function' ? input.userTexts() : input.userTexts;
+    if (isNetworkForbiddenByUser(texts)) {
+      return { rule: 'network-forbidden-by-user', reason: `user task explicitly forbids network/web access (${tool})` };
+    }
+    if (tool === 'web_search') {
+      if (typeof args?.query !== 'string' || !args.query.trim()) {
+        return { rule: 'web-search-query-missing', reason: 'web_search requires a non-empty query string' };
+      }
+    } else {
+      const urlSafety = inspectWebFetchUrlSafety(args?.url);
+      if (!urlSafety.safe) {
+        return { rule: 'web-fetch-url-blocked', reason: urlSafety.reason };
       }
     }
   }

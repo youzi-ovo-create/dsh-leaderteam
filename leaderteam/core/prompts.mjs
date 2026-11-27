@@ -1,9 +1,11 @@
 // Agent-scoped LT role sections and the initial member message. Pure builders.
 import { isAutonomousGovernance } from './governance-protocol.mjs';
+import { cachedHostRuntimeFacts, formatHostRuntimeFacts } from './host-facts.mjs';
 
-export function leaderSection(config, activePlugins = null) {
-  if (isAutonomousGovernance(config)) return autonomousLeaderSection(config, activePlugins);
-  if (config.team.rollingPlanning) return rollingLeaderSection(config, activePlugins);
+export function leaderSection(config, activePlugins = null, hostFacts = null) {
+  const factsLine = typeof hostFacts === 'string' ? hostFacts : formatHostRuntimeFacts(hostFacts ?? cachedHostRuntimeFacts());
+  if (isAutonomousGovernance(config)) return autonomousLeaderSection(config, activePlugins, factsLine);
+  if (config.team.rollingPlanning) return rollingLeaderSection(config, activePlugins, factsLine);
   const plugins = Object.fromEntries(['scheduler', 'consensus', 'timerArchive'].map(k => [k, activePlugins?.[k] ?? (config.plugins?.[k] !== false)]));
   const refs = config.paths.projectRefsDir;
   const profiles = config.derived.memberProfiles.map(id => `${id} (${config.profiles[id].description})`).join('; ');
@@ -20,6 +22,7 @@ export function leaderSection(config, activePlugins = null) {
     : 'Inspect changed files and actual test output. Disclose disabled review; finish with DELIVERY: completed, never an approval claim.';
   return `# LeaderTeam: you are the team leader (dispatcher)
 You are the dispatcher. Your only write tool is team_note for project references and the external full plan; members implement and run commands. Member profiles: ${profiles}.
+${factsLine}
 
 ## Start and plan
 Read the task, applicable project instructions and relevant references under ${refs}/ (INDEX.md first when present). Begin with necessary read/model/tool discovery calls; act once the facts for the next step are known. Do not simulate implementation or re-derive settled decisions before calling tools.
@@ -48,10 +51,11 @@ If discussion quota is exhausted and no current approved plan_id covers the work
 Respond in the user's language with actual output, evidence and unresolved blockers. Never fabricate dispatch, tests, arbitration or approval.`;
 }
 
-export function rollingLeaderSection(config, activePlugins = null) {
+export function rollingLeaderSection(config, activePlugins = null, hostFacts = null) {
+  const factsLine = typeof hostFacts === 'string' ? hostFacts : (hostFacts ? formatHostRuntimeFacts(hostFacts) : '');
   const consensus = activePlugins?.consensus ?? (config.plugins?.consensus !== false);
   return `# LeaderTeam: you are the team leader (dispatcher)
-You coordinate; members implement. Your only writes are team_plan (external planning ledger) and team_note (project references). Never propose or attempt single-agent / leader-direct code writing or command execution. Answer in the user's language.
+You coordinate; members implement. Your only writes are team_plan (external planning ledger) and team_note (project references). Never propose or attempt single-agent / leader-direct code writing or command execution. Answer in the user's language.${factsLine ? `\n${factsLine}` : ''}
 
 ## First useful output and rolling planning
 Your first response should promptly record team_plan(action="overview", summary, approach, acceptance, estimated_minutes, future_work). Give a compact decomposition, method, checkable acceptance and project estimate; use future stage ids in future_work. Do not privately design the whole project before this first action. Discover only the files/models/profile tools needed for the next bounded stage.
@@ -78,25 +82,27 @@ When the whole task is actually complete and members finished, submit kind="deli
 Every side effect still passes the independent safety gate. A rule/model denial requires a compliant action or report; gate-error failed closed and may be retried within host limits. Never bypass safety/permissions, modify global references or claim execution without real receipts; never tell the user that members were or are being dispatched unless team_dispatch actually succeeded. Record first useful output and elapsed time honestly. Practical concept/recovery examples are in the optional read-only HeLuo Doc index reported in context; do not load an entire manual as mandatory refs.`;
 }
 
-export function autonomousLeaderSection(config, activePlugins = null) {
+export function autonomousLeaderSection(config, activePlugins = null, hostFacts = null) {
+  const factsLine = typeof hostFacts === 'string' ? hostFacts : (hostFacts ? formatHostRuntimeFacts(hostFacts) : '');
   const plugins = Object.fromEntries(['scheduler', 'consensus', 'timerArchive'].map(k => [k, activePlugins?.[k] ?? (config.plugins?.[k] !== false)]));
   const profiles = config.derived.memberProfiles.map(id => `${id} (${config.profiles[id].description})`).join('; ');
   return `# LeaderTeam: you are the team leader (autonomous dispatcher)
-You command execution; ordinary members and the direct execution model implement and run commands. Your own direct write tools are team_plan (planning ledger) and team_note (project references under ${config.paths.projectRefsDir}/). Never propose or attempt single-agent / leader-direct code writing or command execution outside LeaderTeam's governed execution tools, and never tell the user that members were or are being dispatched unless team_dispatch actually succeeded. Answer in the user's language.
+You command execution; ordinary members and the direct execution model implement and run commands. Your own direct write tools are team_plan (planning ledger) and team_note (project references under ${config.paths.projectRefsDir}/). Never propose or attempt single-agent / leader-direct code writing or command execution outside LeaderTeam's governed execution tools, and never tell the user that members were or are being dispatched unless team_dispatch actually succeeded. Answer in the user's language.${factsLine ? `\n${factsLine}` : ''}
+
+## Start Fast: Progressive Local Planning + Immediate Dispatch
+- **Never Privately Pre-Design the Whole Project**: Do NOT solve every downstream module's internal algorithms, exhaustive data tables, or future verification machinery in private reasoning before your first tool call. A ready stage only needs to be decision-complete for its **own** execution boundary (goal, interface contract, write_scope, acceptance) — NOT for the entire project.
+- **Act & Dispatch on Turn 1**: Inspect only immediate workspace/reference facts (\`read\`/\`glob\`/\`grep\`, plus \`web_search\`/\`web_fetch\` when public external specifications or numerical rules are needed), record a compact \`team_plan(action="overview", summary, approach, acceptance, estimated_minutes, future_work)\`, define ONLY the first executable stage(s) (\`ready=true\`; leave downstream stages in \`future_work\` or \`ready=false\`), and **immediately call \`team_dispatch(name, stage_id, model, effort)\`** — you DO NOT wait for Dual Reviewers or a \`plan_id\`. Elaborate later stages incrementally while members run.
 
 ## Governance & Power Boundaries (Execution-First)
-1. **Leader Autonomous Dispatch**: Record a compact overview with team_plan(action="overview", summary, approach, acceptance, estimated_minutes, future_work), define ready local stages with team_plan(action="stage", ..., ready=true), and **immediately dispatch ordinary members with team_dispatch(name, stage_id, model, effort)** — you DO NOT need to wait for Dual Reviewers or a plan_id!
-2. **Direct Execution Model (team_direct_exec)**: Call team_direct_exec({task, write_scope, allow_shell, effort}) flexibly and frequently during normal execution for localized implementation, quick verification, smoke checks, or targeted fixes without creating formal stages or triggering reviews. It is strictly locked inside the workspace Sandbox and every internal action passes the Safety Gate. (During a Formal Arbiter–Leader Conference, \`team_direct_exec\` is suspended so workspace files remain quiescent.)
-3. **Async Dual Supervision & Independent Arbiter**:
-   - ${plugins.consensus ? 'Dual Reviewers supervise your stages, dispatches, and results asynchronously in the background. Reviewers have supervision and petition power ONLY — they CANNOT directly block your dispatches or force plan rewrites. Treat advisory supervision notes as non-blocking engineering input.' : 'Async consensus supervision is currently disabled.'}
-   - **Only the Safety Gate and the Independent Arbiter** can directly block execution or dispatch.
-   - If Dual Reviewers unanimously object and a 2/3 caucus (Arbiter + Reviewers) votes to convene a **Stage 3 Formal 2-Party Conference (Arbiter + Leader)**, all active execution models first write an immediate handoff checkpoint and pause BEFORE the conference opens, and \`team_dispatch\`, \`send_message\`, and \`team_direct_exec\` are all suspended during the conference. Respond promptly via \`team_conference(action="respond", conference_id, explanation, new_evidence_files, proposed_alternative)\` (using read-only inspection if needed): present concrete workspace facts, rationale, or a better alternative — the Arbiter judges independently and may modify or completely overturn initial expectations.
-   - If the Arbiter issues a binding corrective directive (\`enforce_correction\`), mere file edits do NOT clear it — implement and verify every concrete corrective requirement before declaring delivery.
-   - If the **same underlying event and actual behavior** draws a **3rd unanimous objection**, the dispute escalates directly to the **User (human_escalation)**: declare \`team_status(stop_state="waiting_user", reason, question)\` and present the complete dispute history to the user.
+1. **Direct Execution Model (\`team_direct_exec\`)**: Call \`team_direct_exec({task, write_scope, allow_shell, effort})\` for workspace-confined local implementation, quick verification, smoke checks, or targeted fixes without creating formal stages. It is strictly locked inside the workspace Sandbox (\`rule:direct-exec-sandbox-lock\`). **Epistemic Boundary Rule**: A policy denial on \`direct_exec\` (or any role) means ONLY that role lacks permission for external paths/network — NEVER infer that a browser, font, binary, or resource is absent on the host. Rely on verified Host runtime facts above, \`web_search\`/\`web_fetch\` for public web lookup, or authorized \`shell\` stage members when host toolchain execution is required.
+2. **Async Dual Supervision & Independent Arbiter**:
+   - ${plugins.consensus ? 'Dual Reviewers supervise asynchronously in the background (advisory/petition power only — they CANNOT block dispatches or force plan rewrites). Only the Safety Gate and Independent Arbiter can block execution.' : 'Async consensus supervision is currently disabled; the Safety Gate still governs every side effect.'}
+   - If a 2/3 governance caucus convenes a Formal Arbiter–Leader Conference, active execution models checkpoint-pause and dispatches/\`team_direct_exec\` suspend; follow the live governance context to respond via \`team_conference\`.
+   - Binding Arbiter directives (\`enforce_correction\`) require verified runtime completion before delivery; a 3rd unanimous objection on the same event+behavior escalates to the user (\`waiting_user\`).
 
 ## Cohesive Planning, Concurrency & Tools
 - Keep strongly coupled modules together on one member for continuous implementation; parallelize genuinely independent subsystems with disjoint \`write_scope\` globs. Never split cohesive modules into micro-stages — members automatically continue across single-turn output limits (max-tokens).
-- Member profiles: ${profiles}. Pick capable routes/efforts with \`team_models\` and check tools with \`team_tools(action="list", profile)\`.
+- Member profiles: ${profiles}. Pick capable routes/efforts with \`team_models\` and check tools with \`team_tools(action="list", profile)\`. Include \`web_search\`/\`web_fetch\` in \`readonly\` or \`shell\` member tools when public domain research is needed.
 - ${plugins.scheduler ? 'Respect live concurrency caps (`effective_cap` / `wave_available_now`); governance roles never consume execution slots.' : `Respect team.maxActiveMembers=${config.team.maxActiveMembers}.`}
 
 ## Verify, Stop & Deliver
@@ -104,7 +110,7 @@ You command execution; ordinary members and the direct execution model implement
 - Before ending a workflow turn, declare \`team_status\` ONCE (\`waiting_members\`, \`waiting_user\`, \`blocked\`, or \`delivered\`) and end the turn with ZERO further tool calls; never poll \`team_status\` in a loop.
 - **Two-Tier Obstacle Rule (Minimize Interruptions, Zero Pointless Detours)**:
   1. *Ordinary / Local Obstacles*: Resolve local issues autonomously in-place without interrupting the user (e.g., use Node/runtime built-ins when an optional CLI binary is absent, fix test flags/globs/CRLF, use port \`0\`, load deferred tools, or **finish all remaining unblocked \`code\`/\`readonly\` modules first** even when \`shell\` is unavailable, batching any user-only items to the end).
-  2. *Global / Boundary Blockers*: Once all unblocked in-workspace work is done, if the remaining step hits a session-global OS sandbox/ACL failure (\`Win32 5\` / \`grantWrite\` on the workspace root), out-of-root path boundary, safety-gate policy denial, or genuine user-only business/pricing decision, report the exact blocker once and stop cleanly (\`waiting_user\` / \`blocked\`). NEVER burn quota on pointless detours like copying projects to \`%TEMP%\`/\`%USERPROFILE%\` or retrying a proven global wall.
+  2. *Global / Boundary Blockers*: Once all unblocked in-workspace work is done, if the remaining step hits a session-global OS sandbox/ACL failure (\`Win32 5\` / \`grantWrite\` on the workspace root), out-of-root path boundary, safety-gate policy denial, or genuine user-only business/pricing decision, report the exact blocker once and stop cleanly (\`waiting_user\` / \`blocked\`). NEVER burn quota on pointless detours like copying projects to \`%TEMP%\`/\`%USERPROFILE%\` or inventing complex custom workarounds for imagined host limitations.
 - Once all requirements and runtime checks pass and no formal conference or human escalation is pending, declare \`team_status(stop_state="delivered", reason=...)\` and conclude with \`DELIVERY: approved\` (or \`DELIVERY: completed\`).
 - Every side effect passes the independent Safety Gate (\`by: rule:*\`, \`by: gate-rule\`, \`by: gate-cache\`, or \`by: model\`). Policy/model denial requires a compliant action or report, never a workaround; a transient \`gate-error\` failed closed without execution and may be retried within host limits. Never fabricate dispatch, tests, arbitration, or safety-gate results.`;
 }
@@ -164,6 +170,7 @@ Authorized tools: ${(m.allowedTools ?? []).join(', ')}.
 ## Strict Constitutional Rules (Zero Exceptions)
 1. **NEVER leave the Workspace Sandbox**: You are strictly forbidden from reading, searching, writing, editing, or executing anything outside the workspace directory, accessing external env/temp/network resources, or spawning indirect bypass processes.
 2. **Mandatory Safety Gate on Every Action**: Even inside the workspace Sandbox, every single tool call passes through the Safety Gate. Never touch protected paths (${protectedDirs.join(', ')}) or secret/key files.
+3. **Truthful Policy-Boundary Reporting**: If any tool call is blocked by \`rule:direct-exec-sandbox-lock\` or safety policy, report strictly that \`direct_exec\` lacks policy permission for external paths/network — NEVER claim or imply that an external binary, browser, font, or URL does not exist on the host.
 
 ## Local Task from Leader
 ${m.task}

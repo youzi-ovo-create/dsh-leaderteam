@@ -153,7 +153,7 @@ export class Gate {
     const cfg = rt.config;
     const unreadRefs = actor.role === 'member' ? (actor.refs ?? []).filter(r => !(rt.reads.get(agent.id)?.has(pathKey(r)))) : [];
     const cwd = typeof agent?.session?.header?.cwd === 'string' ? agent.session.header.cwd : actor.cwd;
-    const userTexts = actor.role === 'leader' ? () => userMessageTexts(this.ctx, actor.teamId) : undefined; // read grants; evaluated only when a leader read leaves the standing roots
+    const userTexts = (actor.role === 'leader' || name === 'web_search' || name === 'web_fetch') ? () => userMessageTexts(this.ctx, actor.teamId) : undefined;
     const rawSessionId = typeof agent?.session?.id === 'string' ? agent.session.id : (typeof agent?.session?.header?.id === 'string' ? agent.session.header.id : '');
     const ownSpillSessionSegment = rawSessionId ? `session-${createHash('sha256').update(rawSessionId).digest('hex').slice(0, 12)}` : undefined;
     const hit = evaluateHardRules({ tool: name, args, actor: { ...actor, unreadRefs }, cwd, platform: process.platform, userTexts, spillTmpRoot: os.tmpdir(), ownSpillSessionSegment }, cfg);

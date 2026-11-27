@@ -12,6 +12,7 @@ import { fileSignature, readSessionFile } from './decode.js';
 import { homeLabel, listKnownHomes, samePath } from './homes.js';
 
 const SESSION_FILE = 'session.v4.jsonl.zstd';
+const MAX_SAFE_SEGMENT_LEN = 192;
 
 export function loadPricingFile(file) {
   const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -120,20 +121,129 @@ export function loadHome(home) {
   return { home, files, sessions, byId };
 }
 
-export function teamDir(home, sessionId, options = {}) {
-  return path.join(resolveTeamsRoot(home, options), sessionId);
+export function encodeDshSegment(value) {
+  const s = String(value ?? '');
+  if (!s) return '';
+  if (s === '.') return '~002E';
+  if (s === '..') return '~002E~002E';
+  return s.replace(/[^A-Za-z0-9._-]/g, (ch) => `~${ch.charCodeAt(0).toString(16).toUpperCase().padStart(4, '0')}`);
 }
 
-export function isTeam(home, sessionId, options = {}) {
-  const dir = teamDir(home, sessionId, options);
+function encodeRawSafeSegment(s) {
+  let out = '';
+  for (let i = 0; i < s.length; i++) {
+    const code = s.charCodeAt(i);
+    const ch = s[i];
+    const isDotHazard = ch === '.' && (i === 0 || s[i - 1] === '.' || s[i + 1] === '.');
+    if (!isDotHazard && ch !== '~' && /^[A-Za-z0-9._-]$/.test(ch)) {
+      out += ch;
+    } else {
+      out += '~' + code.toString(16).toUpperCase().padStart(4, '0');
+    }
+  }
+  return out;
+}
+
+function compactEncodedSegment(encoded, rawId, sliceLen = 128) {
+  let prefix = encoded.slice(0, sliceLen);
+  const lastTilde = prefix.lastIndexOf('~');
+  if (lastTilde >= 0 && prefix.length - lastTilde < 5) {
+    prefix = prefix.slice(0, lastTilde);
+  }
+  while (prefix.endsWith('.')) prefix = prefix.slice(0, -1);
+  const digest = createHash('sha256').update(String(rawId)).digest('hex').slice(0, 32);
+  return `${prefix || 'sid'}~h${digest}`;
+}
+
+export function encodeSafeTeamSegment(value) {
+  const s = String(value ?? '');
+  if (!s) return '';
+  if (
+    s.length <= MAX_SAFE_SEGMENT_LEN
+    && !s.startsWith('.')
+    && !s.includes('..')
+    && /^[A-Za-z0-9._-]+$/.test(s)
+  ) {
+    return s;
+  }
+  if (s === '.') return '~002E';
+  if (s === '..') return '~002E~002E';
+  const out = encodeRawSafeSegment(s);
+  if (out.length > MAX_SAFE_SEGMENT_LEN) {
+    return compactEncodedSegment(out, s, 128);
+  }
+  return out;
+}
+
+function candidateTeamDirMatchesOwner(candDir, seg, raw) {
+  const meta = readJson(path.join(candDir, 'team.json'));
+  if (typeof meta?.sessionId === 'string' && meta.sessionId.trim()) {
+    return meta.sessionId.trim() === raw;
+  }
+  const gateRows = readJsonl(path.join(candDir, 'gate.jsonl'));
+  const gateOwner = gateRows.find((r) => typeof r?.teamId === 'string' && r.teamId.trim())?.teamId?.trim() ?? null;
+  if (gateOwner) {
+    return gateOwner === raw;
+  }
+  if (seg === raw && /~[0-9A-F]{4}|~h[0-9a-f]{32}/.test(raw)) {
+    return false;
+  }
+  return true;
+}
+
+export function teamDir(home, sessionId, options = {}) {
+  const teamsRoot = path.resolve(resolveTeamsRoot(home, options));
+  const raw = String(sessionId ?? '');
+  if (!raw || raw.includes('\0')) return path.join(teamsRoot, '__invalid__');
+  const safeSeg = encodeSafeTeamSegment(raw);
+  if (safeSeg) {
+    const safeCand = path.resolve(teamsRoot, safeSeg);
+    if (path.dirname(safeCand) === teamsRoot && fs.existsSync(safeCand)) {
+      return safeCand;
+    }
+  }
+
+  const altCandidates = [];
+  const rawEncoded = raw !== '.' && raw !== '..' ? encodeRawSafeSegment(raw) : '';
+  if (rawEncoded.length > MAX_SAFE_SEGMENT_LEN) {
+    const alt120 = compactEncodedSegment(rawEncoded, raw, 120);
+    if (alt120 && alt120 !== safeSeg && !altCandidates.includes(alt120)) altCandidates.push(alt120);
+  }
+  for (const seg of [
+    encodeDshSegment(raw),
+    !/[\\/]/.test(raw) && raw !== '.' && raw !== '..' && !raw.startsWith('.') && !raw.includes('..') ? raw : ''
+  ]) {
+    if (seg && seg !== safeSeg && seg.length <= 255 && !altCandidates.includes(seg)) {
+      altCandidates.push(seg);
+    }
+  }
+  for (const seg of altCandidates) {
+    const cand = path.resolve(teamsRoot, seg);
+    if (path.dirname(cand) === teamsRoot && fs.existsSync(cand) && candidateTeamDirMatchesOwner(cand, seg, raw)) {
+      return cand;
+    }
+  }
+
+  const fallbackSeg = safeSeg || altCandidates[0] || '__invalid__';
+  return path.resolve(teamsRoot, fallbackSeg);
+}
+
+export function readGovernanceCalls(usageFile) {
+  if (!usageFile || !fs.existsSync(usageFile)) return [];
+  return readJsonl(usageFile).filter((record) => record && typeof record === 'object' && record.role !== 'leader');
+}
+
+function isTeamDirPath(dir) {
   try {
     if (!fs.statSync(dir).isDirectory()) return false;
   } catch {
     return false;
   }
-  return (
-    fs.existsSync(path.join(dir, 'members.jsonl')) || fs.existsSync(path.join(dir, 'team.json'))
-  );
+  return fs.existsSync(path.join(dir, 'members.jsonl')) || fs.existsSync(path.join(dir, 'team.json'));
+}
+
+export function isTeam(home, sessionId, options = {}) {
+  return isTeamDirPath(teamDir(home, sessionId, options));
 }
 
 export function listTeamIds(home, options = {}) {
@@ -148,14 +258,30 @@ export function listTeamIds(home, options = {}) {
   }
 }
 
-function collectMemberOwnerMap(home, _data = null, options = {}) {
+function collectMemberOwnerMap(home, data = null, options = {}) {
   const memberToTeam = new Map();
-  for (const teamId of listTeamIds(home, options)) {
-    if (!isTeam(home, teamId, options)) continue;
+  const teamsRoot = path.resolve(resolveTeamsRoot(home, options));
+  const dirToSessionId = new Map();
+  if (data?.sessions) {
+    for (const s of data.sessions) {
+      if (!s?.id || s.header?.parentSession) continue;
+      dirToSessionId.set(path.resolve(teamDir(home, s.id, options)), s.id);
+    }
+  }
+  for (const dirName of listTeamIds(home, options)) {
+    const dir = path.resolve(teamsRoot, dirName);
+    if (path.dirname(dir) !== teamsRoot || !isTeamDirPath(dir)) continue;
     try {
-      const members = foldMembers(readJsonl(path.join(teamDir(home, teamId, options), 'members.jsonl')));
+      const meta = readJson(path.join(dir, 'team.json'));
+      const ownerId =
+        (typeof meta?.sessionId === 'string' && meta.sessionId.trim() ? meta.sessionId.trim() : null)
+        ?? dirToSessionId.get(dir)
+        ?? (!dirName.includes('~h')
+          ? dirName.replace(/~([0-9A-F]{4})/g, (_m, hex) => String.fromCharCode(parseInt(hex, 16)))
+          : (meta?.teamId ?? dirName));
+      const members = foldMembers(readJsonl(path.join(dir, 'members.jsonl')));
       for (const member of members.values()) {
-        if (member.childId) memberToTeam.set(member.childId, teamId);
+        if (member.childId) memberToTeam.set(member.childId, ownerId);
       }
     } catch {
       // keep scanning other teams
@@ -177,14 +303,14 @@ function teamMeta(home, sessionId, options = {}) {
   const dir = teamDir(home, sessionId, options);
   const team = readJson(path.join(dir, 'team.json'));
   const timer = readJson(path.join(dir, 'timer.json'));
+  const resolvedTeamId =
+    (typeof team?.sessionId === 'string' && team.sessionId.trim() ? team.sessionId.trim() : null)
+    ?? (typeof team?.teamId === 'string' && !team.teamId.includes('~h') ? team.teamId : null)
+    ?? sessionId;
   return {
-    teamId: team?.teamId ?? sessionId,
+    teamId: resolvedTeamId,
     activeSec: Number.isFinite(timer?.teamActiveMs) ? Math.round(timer.teamActiveMs / 1000) : null
   };
-}
-
-function readGovernanceCalls(usageFile) {
-  return readJsonl(usageFile);
 }
 
 function replayAgreementOutcome(events) {
@@ -194,7 +320,7 @@ function replayAgreementOutcome(events) {
   const maxRounds = Number.isInteger(created.maxRounds) && created.maxRounds >= 1 ? created.maxRounds : 1;
   const maxArbiterAttempts = Number.isInteger(created.maxArbiterAttempts) && created.maxArbiterAttempts >= 1 ? created.maxArbiterAttempts : 1;
   const taskSeq = Number.isInteger(created.taskSeq) && created.taskSeq >= 1 ? created.taskSeq : 1;
-  let state = {
+  const state = {
     id: created.id,
     kind: created.kind,
     maxRounds,
@@ -312,6 +438,33 @@ function computeApprovedDeliveryTimes(agreementsFile) {
   return out;
 }
 
+function resolveModeHistoryFile(home, sessionId, options = {}) {
+  const raw = String(sessionId ?? '');
+  if (!raw || raw.includes('\0')) return null;
+  const seg = encodeSafeTeamSegment(raw);
+  if (!seg) return null;
+  const modesRoot = path.resolve(resolveStorageRoot(home, options), 'session-modes');
+  const file = path.resolve(modesRoot, `${seg}.jsonl`);
+  return path.dirname(file) === modesRoot ? file : null;
+}
+
+function computeSessionModeBoundaries(home, sessionId, options = {}) {
+  if (Array.isArray(options?.modeBoundaries)) return options.modeBoundaries;
+  const historyFile = resolveModeHistoryFile(home, sessionId, options);
+  if (!historyFile || !fs.existsSync(historyFile)) return undefined;
+  const out = [];
+  for (const r of readJsonl(historyFile)) {
+    if (!r || r.fromMode !== 'single' || r.toMode !== 'team') continue;
+    const atMs = typeof r.at === 'string' ? Date.parse(r.at) : Number(r.atMs);
+    if (!Number.isFinite(atMs)) continue;
+    out.push({
+      atMs,
+      taskSeqHint: Number.isInteger(r.taskSeqHint) && r.taskSeqHint >= 1 ? r.taskSeqHint : null
+    });
+  }
+  return out.length > 0 ? out : undefined;
+}
+
 function gateSummaryOf(gateRecords, governance) {
   let allow = 0;
   let deny = 0;
@@ -365,22 +518,6 @@ function gatewaySignatureOf(gatewayRecords) {
   return `gw:${gatewayRecords.length}:${maxSeq}:${hash.digest('hex').slice(0, 16)}:${lastId}`;
 }
 
-function readSignature(home, sessionId, sessions, options = {}) {
-  const resolvedTeamsRoot = resolveTeamsRoot(home, options);
-  const dir = path.join(resolvedTeamsRoot, sessionId);
-  return signatureOf([
-    `teamsRoot:${resolvedTeamsRoot}`,
-    ...sessions.filter(Boolean).map((session) => `${session.file}:${session.sig}`),
-    fileSignature(path.join(dir, 'members.jsonl')),
-    fileSignature(path.join(dir, 'usage.jsonl')),
-    fileSignature(path.join(dir, 'gate.jsonl')),
-    fileSignature(path.join(dir, 'agreements.jsonl')),
-    fileSignature(path.join(dir, 'timer.json')),
-    fileSignature(path.join(dir, 'team.json')),
-    options?.modeBoundaries ? JSON.stringify(options.modeBoundaries) : ''
-  ]);
-}
-
 function getCachedOrCompute(cacheKey, compute) {
   if (REPORT_CACHE.has(cacheKey)) return REPORT_CACHE.get(cacheKey);
   const val = compute();
@@ -392,10 +529,44 @@ function getCachedOrCompute(cacheKey, compute) {
   return val;
 }
 
+export function readSignature(home, sessionId, sessions, options = {}) {
+  const resolvedTeamsRoot = resolveTeamsRoot(home, options);
+  const dir = teamDir(home, sessionId, options);
+  const modeHistoryFile = resolveModeHistoryFile(home, sessionId, options);
+  const parts = [
+    `teamsRoot:${resolvedTeamsRoot}`,
+    ...sessions.filter(Boolean).map((session) => `${session.file}:${session.sig}`)
+  ];
+  if (isTeam(home, sessionId, options)) {
+    parts.push(
+      fileSignature(path.join(dir, 'members.jsonl')),
+      fileSignature(path.join(dir, 'usage.jsonl')),
+      fileSignature(path.join(dir, 'gate.jsonl')),
+      fileSignature(path.join(dir, 'agreements.jsonl')),
+      fileSignature(path.join(dir, 'timer.json')),
+      fileSignature(path.join(dir, 'team.json'))
+    );
+  } else {
+    const usageFile = path.join(dir, 'usage.jsonl');
+    const gateFile = path.join(dir, 'gate.jsonl');
+    const agreementsFile = path.join(dir, 'agreements.jsonl');
+    if (fs.existsSync(usageFile)) parts.push(fileSignature(usageFile));
+    if (fs.existsSync(gateFile)) parts.push(fileSignature(gateFile));
+    if (fs.existsSync(agreementsFile)) parts.push(fileSignature(agreementsFile));
+  }
+  if (modeHistoryFile && fs.existsSync(modeHistoryFile)) {
+    parts.push(`modeHist:${fileSignature(modeHistoryFile)}`);
+  }
+  if (options?.modeBoundaries) {
+    parts.push(JSON.stringify(options.modeBoundaries));
+  }
+  return signatureOf(parts);
+}
+
 function buildTeamResult(home, data, sessionId, pricing, options = {}) {
   const leader = data.byId.get(sessionId);
   const resolvedTeamsRoot = resolveTeamsRoot(home, options);
-  const dir = path.join(resolvedTeamsRoot, sessionId);
+  const dir = teamDir(home, sessionId, options);
   const membersFile = path.join(dir, 'members.jsonl');
   const usageFile = path.join(dir, 'usage.jsonl');
   const gateFile = path.join(dir, 'gate.jsonl');
@@ -425,6 +596,7 @@ function buildTeamResult(home, data, sessionId, pricing, options = {}) {
     const approvedDeliveryTimes = options.approvedDeliveryTimes instanceof Map
       ? options.approvedDeliveryTimes
       : computeApprovedDeliveryTimes(agreementsFile);
+    const modeBoundaries = computeSessionModeBoundaries(home, sessionId, options);
     const report = buildReport({
       home,
       sessionId,
@@ -432,7 +604,7 @@ function buildTeamResult(home, data, sessionId, pricing, options = {}) {
       governance,
       members,
       approvedDeliveryTimes,
-      modeBoundaries: options.modeBoundaries,
+      modeBoundaries,
       pricing,
       gatewayRecords: options.gatewayRecords,
       kind: 'team'
@@ -482,7 +654,7 @@ function buildSessionResult(home, data, sessionId, pricing, options = {}) {
   const root = data.byId.get(sessionId);
   const sessions = collectDescendants(data, root);
   const resolvedTeamsRoot = resolveTeamsRoot(home, options);
-  const dir = path.join(resolvedTeamsRoot, sessionId);
+  const dir = teamDir(home, sessionId, options);
   const usageFile = path.join(dir, 'usage.jsonl');
   const gateFile = path.join(dir, 'gate.jsonl');
   const agreementsFile = path.join(dir, 'agreements.jsonl');
@@ -496,6 +668,7 @@ function buildSessionResult(home, data, sessionId, pricing, options = {}) {
     const approvedDeliveryTimes = options.approvedDeliveryTimes instanceof Map
       ? options.approvedDeliveryTimes
       : (fs.existsSync(agreementsFile) ? computeApprovedDeliveryTimes(agreementsFile) : undefined);
+    const modeBoundaries = computeSessionModeBoundaries(home, sessionId, options);
     const report = buildReport({
       home,
       sessionId,
@@ -503,7 +676,7 @@ function buildSessionResult(home, data, sessionId, pricing, options = {}) {
       governance,
       gateSummary,
       approvedDeliveryTimes,
-      modeBoundaries: options.modeBoundaries,
+      modeBoundaries,
       pricing,
       gatewayRecords: options.gatewayRecords,
       kind: 'session'
@@ -590,7 +763,7 @@ export function listSessions(home, pricingOrOptions = defaultPricing, maybeOptio
     row.memberCount =
       report.meta.kind === 'team'
         ? (report.team?.membersTotal ?? 0)
-        : report.agents.filter((a) => a.group === 'subagents').length;
+        : report.agents.filter((agent) => agent.group === 'subagents').length;
     row.signature = signature;
     rows.push(row);
   }
@@ -645,7 +818,11 @@ export function homesInfo(explicit, options = {}) {
   for (const home of listKnownHomes(explicit)) {
     const homeOpts = explicit && samePath(home, explicit) ? options : {};
     const files = walkSessions(path.join(home, 'sessions'));
-    const teamCount = listTeamIds(home, homeOpts).filter((id) => isTeam(home, id, homeOpts)).length;
+    const teamsRoot = path.resolve(resolveTeamsRoot(home, homeOpts));
+    const teamCount = listTeamIds(home, homeOpts).filter((dirName) => {
+      const dir = path.resolve(teamsRoot, dirName);
+      return path.dirname(dir) === teamsRoot && isTeamDirPath(dir);
+    }).length;
     out.push({
       path: home,
       label: homeLabel(home),

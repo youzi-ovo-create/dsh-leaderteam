@@ -61,10 +61,10 @@ export function checkLeaderModel(config, selection) {
       ? (actual.effort === null || actual.effort === 'none')
       : (actual.effort === configured.effort);
     if (!effortMatches) {
-      return { ...base, status: actual.effort === null ? 'unknown' : 'mismatch', blocked: policy === 'enforce', message: `leader reasoning effort is ${actual.effort ?? 'Auto/unknown'}; configured ${configured.effort}. Select that effort or update roles.leader.effort.` };
+      return { ...base, status: actual.effort === null ? 'unknown' : 'mismatch', blocked: policy === 'enforce', message: `leader reasoning effort is ${actual.effort ?? 'Auto/unknown'}; configured ${configured.effort}. Select that effort, align in LeaderTeam Console, or update roles.leader.effort (team_status with stop_state="blocked" or "waiting_user" remains allowed to report cleanly).` };
     }
     return { ...base, status: 'match', blocked: false };
   }
-  const message = `this LeaderTeam session runs ${actual.provider}/${actual.model}, but the configured leader is ${configured.provider}/${configured.model} (${configured.effort}). Switch this session's model to it, or change roles.leader in leaderteam.config.json.`;
+  const message = `this LeaderTeam session runs ${actual.provider}/${actual.model}, but the configured leader is ${configured.provider}/${configured.model} (${configured.effort}). Switch this session's model to it, align in LeaderTeam Console, or change roles.leader in leaderteam.config.json (team_status with stop_state="blocked" or "waiting_user" remains allowed to report cleanly).`;
   return { ...base, status: 'mismatch', blocked: policy === 'enforce', message };
 }

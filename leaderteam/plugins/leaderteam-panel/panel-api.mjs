@@ -4,18 +4,32 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { PLAN_CATEGORIES, PLAN_LIFECYCLE_STATES } from '../../core/constants.mjs';
 import { TeamStore } from '../../core/store.mjs';
+import { checkLeaderModel } from '../../core/models.mjs';
 import { computeTimerSnapshot, resolveNowMs } from '../../core/timer.mjs';
 import { resolvePlanArchiveRoot, PlanArchiveStore } from '../../core/plan-archive.mjs';
 import { inspectModelConfiguration, applyModelConfigChanges } from '../../core/model-config-writer.mjs';
+import { resolveModelTarget } from '../../core/upstream-models.mjs';
 import { recentTeamObservability } from '../../host/observability.mjs';
 import {
   runtime,
+  baseRuntime,
   syncRuntimeConfig,
   activePluginsMap,
   isPluginActive,
   refreshUpstreamCatalog,
+  runtimeForTeam,
+  teamStore,
+  isTeamExecutionStarted,
+  rebindUnstartedTeamGovernance,
+  rebindAllUnstartedTeams,
+  resolveCanonicalRouteFromHostSelection,
 } from '../../host/runtime.mjs';
-import { collectCombinedDiscoveredModels, syncActiveModelsToDshHost } from './public-api.mjs';
+import {
+  collectCombinedDiscoveredModels,
+  enrichChangesWithDiscoveredProviders,
+  syncActiveModelsToDshHost,
+} from './public-api.mjs';
+import { resolveMagpieGatewayHostProvider } from '../../gateway/index.mjs';
 
 export const PANEL_ROUTES = Object.freeze({
   STATE: '/api/leaderteam-panel/state',
@@ -117,6 +131,35 @@ function collectRecentTeamTimers(rt, maxTeams = 30) {
   return rows.slice(0, maxTeams);
 }
 
+function collectLeaderSessionChecks(_ctx, rt) {
+  const base = baseRuntime(rt);
+  if (!base?.config || !base?.storageRoot) return [];
+  const rows = [];
+  for (const actor of base.actors?.values() ?? []) {
+    if (actor?.role !== 'leader' || !actor.agent) continue;
+    try {
+      const sessionId = actor.teamId;
+      const store = teamStore(sessionId);
+      const started = isTeamExecutionStarted(store);
+      const teamCfg = runtimeForTeam(sessionId).config;
+      const sel = actor.agent.model?.current?.();
+      const check = checkLeaderModel(teamCfg, sel);
+      rows.push({
+        sessionId,
+        workspace: actor.cwd ?? null,
+        started,
+        status: check.status,
+        blocked: check.blocked,
+        policy: check.policy,
+        configured: check.configured,
+        actual: check.actual,
+        message: check.message ?? null,
+      });
+    } catch {}
+  }
+  return rows;
+}
+
 export async function buildPanelStateSnapshot(ctx, rt = runtime(), { probeEndpoints = false, forceDiscover = false } = {}) {
   syncRuntimeConfig(rt);
   if (!rt?.config || !rt?.configPath) {
@@ -152,6 +195,7 @@ export async function buildPanelStateSnapshot(ctx, rt = runtime(), { probeEndpoi
     };
 
   // Merge configured models + upstream DSH & live Magpie discovered models into a unified selector catalog
+  const magpieHostProv = resolveMagpieGatewayHostProvider(rt.config);
   const byRoute = new Map();
   for (const m of configSnapshot.models) {
     byRoute.set(m.route, {
@@ -186,7 +230,7 @@ export async function buildPanelStateSnapshot(ctx, rt = runtime(), { probeEndpoi
         usedByRoles: [],
         overriddenInLocal: false,
         onlyInLocal: false,
-        source: dm.source ?? 'magpie',
+        source: dm.source ?? (dm.provider === magpieHostProv ? 'magpie' : 'dsh'),
         registeredInDsh: Boolean(dm.registeredInDsh),
       });
     }
@@ -199,8 +243,9 @@ export async function buildPanelStateSnapshot(ctx, rt = runtime(), { probeEndpoi
     configSnapshot,
     unifiedModels: [...byRoute.values()],
     upstreamCatalog: catalog ?? { discoveredAt: null, providers: [], models: [], endpointErrors: [] },
+    leaderSessionChecks: collectLeaderSessionChecks(ctx, rt),
     timers: collectRecentTeamTimers(rt),
-    teams: recentTeamObservability(ctx,rt),
+    teams: recentTeamObservability(ctx, rt),
     archive: archiveView,
   };
 }
@@ -244,40 +289,94 @@ export function createPanelHandlers(ctx, rt = runtime()) {
         syncRuntimeConfig(rt);
         const { gwStatus, discoveredModels } = await collectCombinedDiscoveredModels(ctx, rt);
         const target = body.target === 'base' ? 'base' : 'local';
-        const changes = isPlainObj(body.changes) ? body.changes : {};
-        const applyResult = applyModelConfigChanges(changes, {
-          configFile: rt.configPath,
-          target,
-          dryRun: Boolean(body.dryRun),
-          discoveredModels,
-        });
-        let dshSettingsSync = { synced: false, reason: 'dry-run' };
-        const warnings = [...(applyResult.warnings ?? [])];
+        const rawChanges = isPlainObj(body.changes) ? body.changes : {};
+        const alignReq = isPlainObj(rawChanges.alignLeaderSession) ? rawChanges.alignLeaderSession : null;
+        const cleanRawChanges = { ...rawChanges };
+        delete cleanRawChanges.alignLeaderSession;
+
+        if (alignReq?.mode === 'config-to-session' && typeof alignReq.sessionId === 'string') {
+          const base = baseRuntime(rt);
+          const actor = base.actors?.get(alignReq.sessionId);
+          const sel = actor?.agent?.model?.current?.();
+          if (!sel || !sel.provider || !sel.model) {
+            return errReply('BAD_REQUEST', '无法读取该会话当前所选模型');
+          }
+          const route = resolveCanonicalRouteFromHostSelection(rt.config, sel.provider, sel.model);
+          const spec = rt.config.models?.[route] ?? (discoveredModels ?? []).find(m => m.route === route);
+          const effort = sel.reasoningEffort || spec?.defaultEffort || spec?.efforts?.[0] || 'none';
+          if (!rt.config.models?.[route]) {
+            cleanRawChanges.upsertModels = [
+              ...(Array.isArray(cleanRawChanges.upsertModels) ? cleanRawChanges.upsertModels : []),
+              {
+                route,
+                provider: sel.provider,
+                upstreamModel: sel.model,
+                efforts: Array.isArray(spec?.efforts) && spec.efforts.length ? spec.efforts : [effort],
+                defaultEffort: effort,
+                enableInPool: false,
+              },
+            ];
+          }
+          cleanRawChanges.setRoles = [
+            ...(Array.isArray(cleanRawChanges.setRoles) ? cleanRawChanges.setRoles.filter(r => r?.role !== 'leader') : []),
+            { role: 'leader', route, effort },
+          ];
+        }
+
+        const changes = enrichChangesWithDiscoveredProviders(cleanRawChanges, rt.config, discoveredModels);
+        const hasWriterChanges = Object.keys(changes).length > 0;
+        const applyResult = hasWriterChanges
+          ? applyModelConfigChanges(changes, {
+            configFile: rt.configPath,
+            target,
+            dryRun: Boolean(body.dryRun),
+            discoveredModels,
+          })
+          : null;
+        let dshSettingsSync = { synced: false, reason: body.dryRun ? 'dry-run' : 'unchanged' };
+        let alignedSession = null;
+        const warnings = [...(applyResult?.warnings ?? [])];
         if (!body.dryRun) {
           syncRuntimeConfig(rt);
-          dshSettingsSync = await syncActiveModelsToDshHost(
-            ctx,
-            rt,
-            applyResult.effective,
-            discoveredModels,
-            gwStatus,
-          );
-          if (
-            !dshSettingsSync.synced &&
-            dshSettingsSync.reason &&
-            !['settings-service-unavailable', 'no-host-context'].includes(dshSettingsSync.reason)
-          ) {
-            warnings.push(`DSH settings live-sync warning: ${dshSettingsSync.reason}`);
+          if (applyResult) {
+            dshSettingsSync = await syncActiveModelsToDshHost(
+              ctx,
+              rt,
+              applyResult.effective,
+              discoveredModels,
+              gwStatus,
+            );
+            if (
+              !dshSettingsSync.synced &&
+              dshSettingsSync.reason &&
+              !['settings-service-unavailable', 'no-host-context'].includes(dshSettingsSync.reason)
+            ) {
+              warnings.push(`DSH settings live-sync warning: ${dshSettingsSync.reason}`);
+            }
+            await refreshUpstreamCatalog(ctx, rt, { force: true }).catch(() => null);
           }
-          await refreshUpstreamCatalog(ctx, rt, { force: true }).catch(() => null);
+          rebindAllUnstartedTeams(ctx, rt, { alignBlankSessions: true });
+          if (alignReq && typeof alignReq.sessionId === 'string') {
+            const base = baseRuntime(rt);
+            const actor = base.actors?.get(alignReq.sessionId);
+            if (!isTeamExecutionStarted(teamStore(alignReq.sessionId))) {
+              rebindUnstartedTeamGovernance(rt, alignReq.sessionId);
+            }
+            if (alignReq.mode === 'session-to-config' && actor?.agent?.model?.select) {
+              const teamCfg = runtimeForTeam(alignReq.sessionId).config;
+              const targetSel = resolveModelTarget(teamCfg, teamCfg.roles.leader.route, teamCfg.roles.leader.effort);
+              actor.agent.model.select(targetSel);
+              alignedSession = { sessionId: alignReq.sessionId, mode: 'session-to-config', selected: targetSel };
+            } else if (alignReq.mode === 'config-to-session') {
+              alignedSession = { sessionId: alignReq.sessionId, mode: 'config-to-session' };
+            }
+          }
         }
         const state = await buildPanelStateSnapshot(ctx, rt);
         return okReply({
-          applyResult: {
-            ...applyResult,
-            warnings,
-          },
-          shadowedByLocal: applyResult.shadowedByLocal ?? [],
+          applyResult: applyResult ? { ...applyResult, warnings } : null,
+          alignedSession,
+          shadowedByLocal: applyResult?.shadowedByLocal ?? [],
           warnings,
           dshSettingsSync,
           state,

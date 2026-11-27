@@ -158,7 +158,7 @@ function fallbackConcurrencySnapshot(cfg, store, rt, teamId) {
   };
 }
 
-async function leaderOf(ctx, exec) {
+async function leaderOf(ctx, exec, { allowBlockedStopReport = false } = {}) {
   let rt = requireReady();
   const base = baseRuntime(rt);
   if (base.initialSettingsSyncPromise) {
@@ -173,7 +173,7 @@ async function leaderOf(ctx, exec) {
   rt = runtimeForTeam(actor.teamId);
   const leaderModel = checkLeaderModel(rt.config, currentSelection(agent));
   const cfg = rt.config;
-  if (leaderModel.blocked) throw new Error(`LeaderTeam leader model check failed: ${leaderModel.message}`);
+  if (leaderModel.blocked && !allowBlockedStopReport) throw new Error(`LeaderTeam leader model check failed: ${leaderModel.message}`);
   try { touchTeamTimer(ctx, actor.teamId, actor.cwd, rt); } catch {}
   return { rt, cfg, actor, store: teamStore(actor.teamId), leaderModel };
 }
@@ -1696,7 +1696,8 @@ export function registerTeamTools(ctx) {
     },
     output: jsonCompact,
     async execute(_args, exec) {
-      const { rt, cfg, actor, store, leaderModel } = await leaderOf(ctx, exec);
+      const isDiagnosticBlockedStop = Boolean(_args && (_args.stop_state === 'blocked' || _args.stop_state === 'waiting_user'));
+      const { rt, cfg, actor, store, leaderModel } = await leaderOf(ctx, exec, { allowBlockedStopReport: isDiagnosticBlockedStop });
       reconcileStaleMembers(rt, store);
       const taskSeq = currentTaskSeq(ctx, actor.teamId);
       const events = exec.agent.session?.snapshotEvents?.() ?? [];
@@ -1744,6 +1745,7 @@ export function registerTeamTools(ctx) {
               : 'Stop declaration recorded. If no useful planning or permitted dispatch remains, finish this turn NOW with one short status sentence and ZERO further tool calls; host completion/review notices will wake you automatically.',
           },
           active_members: activeMembers.map(m => ({ name: m.name, child_id: m.child_id, status: m.status })),
+          ...(leaderModel.blocked ? { leader_model_blocked: true, leader_model: leaderModelView(leaderModel) } : {}),
           ...(planning?.pending_execution_reviews.length ? { pending_execution_reviews: planning.pending_execution_reviews } : {}),
         };
       }
