@@ -367,3 +367,130 @@ test('Cross-Platform Release Tag Governance: windows-vX.Y.Z vs linux-vX.Y.Z stri
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 });
+
+test('DSH 0.2.2-rc.1 Empirical Fact 3: openai-compatible discovery (sim-reasoner-v1/sim-flash-v2), reserved builtin ID avoidance, non-reasoning effort omission, and conditional agentDefaultModel sync', async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'lt-v223-fact3-'));
+  try {
+    const dshHome = path.join(tmp, 'dsh-home');
+    const storageRoot = path.join(dshHome, 'leaderteam');
+    const configPath = path.join(storageRoot, 'config', 'leaderteam.config.json');
+    const bundledDefaultConfigPath = path.join(REPO_ROOT, 'config', 'leaderteam.config.json');
+
+    let savedLlmData = null;
+    let savedDefaultSel = null;
+    const savedCreds = new Map();
+
+    // Direct property services (`ctx.settings`, `ctx.credentials`, `ctx.agentDefaultModel`, `ctx.llm`) as in DSH 0.2.2-rc.1
+    const mockCtxUnavailableDefault = {
+      credentials: {
+        set: async (k, v) => savedCreds.set(k, v),
+      },
+      settings: {
+        describe: () => ({
+          namespaces: [{ ns: 'llm-pi-ai', data: { providers: {} } }],
+        }),
+        update: async (_ns, data) => {
+          savedLlmData = data;
+        },
+      },
+      llm: {
+        listModels: async () => [], // current default model has no credentials -> unavailable!
+      },
+      agentDefaultModel: {
+        getSelection: async () => ({ provider: 'deepseek-official', model: 'deepseek-chat' }),
+        saveSelection: async sel => {
+          savedDefaultSel = sel;
+        },
+      },
+    };
+
+    const simCred = 'sim-gateway-token-20261127';
+    const setupRes = await applyQuickOnboardingSetup({
+      ctx: mockCtxUnavailableDefault,
+      storageRoot,
+      dshHome,
+      configPath,
+      bundledDefaultConfigPath,
+      providerId: 'openai-compatible',
+      apiKey: simCred,
+      customBaseURL: 'http://127.0.0.1:19876', // without /v1 -> probe resolves /v1/models and preserves /v1!
+      verifyConnectivity: false, // auto-probes custom baseURL even without verifyConnectivity checkbox!
+      fetchImpl: async url => {
+        if (String(url) === 'http://127.0.0.1:19876/v1/models') {
+          return new Response(
+            JSON.stringify({
+              data: [
+                { id: 'sim-reasoner-v1', context_window: 262144, max_output_tokens: 32768 },
+                { id: 'sim-flash-v2', context_window: 131072, max_output_tokens: 16384 },
+              ],
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          );
+        }
+        return new Response('Not Found', { status: 404 });
+      },
+      env: {},
+    });
+
+    assert.equal(setupRes.applied, true);
+    assert.equal(setupRes.provider.id, 'openai-compatible');
+    assert.equal(setupRes.provider.reasoningRoute, 'openai-compatible/sim-reasoner-v1');
+    assert.equal(setupRes.provider.chatRoute, 'openai-compatible/sim-flash-v2');
+    assert.equal(savedCreds.get('OPENAI_COMPATIBLE_API_KEY'), simCred);
+
+    const compatProv = savedLlmData?.providers?.['openai-compatible'];
+    assert.ok(compatProv, 'openai-compatible registered in llm-pi-ai');
+    assert.equal(compatProv.baseURL, 'http://127.0.0.1:19876/v1', 'preserves /v1 in custom gateway baseURL');
+    assert.equal(compatProv.apiKeyEnv, 'OPENAI_COMPATIBLE_API_KEY', 'keeps valid apiKeyEnv without clearApiKeyEnv');
+
+    const reasonerEntry = compatProv.models.find(m => m.id === 'sim-reasoner-v1');
+    const flashEntry = compatProv.models.find(m => m.id === 'sim-flash-v2');
+    assert.ok(reasonerEntry && flashEntry);
+    assert.deepEqual(reasonerEntry.reasoningEfforts, { low: 'low', medium: 'medium', high: 'high' });
+    assert.equal('reasoningEfforts' in flashEntry, false, 'non-reasoning model MUST NOT emit { off: "none" }');
+    assert.equal(savedDefaultSel?.provider, 'openai-compatible');
+    assert.equal(savedDefaultSel?.model, 'sim-reasoner-v1');
+
+    // Verify reserved builtin DSH adapter IDs (`deepseek-official`, `deepseek-account`) are NEVER written to `llm-pi-ai`,
+    // and existing available default model is NOT overwritten when `onlyIfNoAvailableDefault: true`
+    let secondDefaultSaveCount = 0;
+    const mockCtxWithAvailableDefault = {
+      settings: mockCtxUnavailableDefault.settings,
+      llm: {
+        listModels: async prov => (prov === 'openai-compatible' ? [{ id: 'sim-reasoner-v1' }] : []),
+      },
+      agentDefaultModel: {
+        getSelection: async () => ({ provider: 'openai-compatible', model: 'sim-reasoner-v1' }),
+        saveSelection: async () => {
+          secondDefaultSaveCount += 1;
+        },
+      },
+    };
+
+    await syncUpstreamModelsToDshSettings(
+      mockCtxWithAvailableDefault,
+      [
+        { route: 'deepseek-official/deepseek-chat', provider: 'deepseek-official', upstreamModel: 'deepseek-chat', efforts: ['none'] },
+        { route: 'deepseek-account/deepseek-chat', provider: 'deepseek-account', upstreamModel: 'deepseek-chat', efforts: ['off'] },
+        { route: 'deepseek/deepseek-flash', provider: 'deepseek', upstreamModel: 'deepseek-flash', efforts: ['off'] },
+      ],
+      'deepseek',
+      {
+        providerTemplates: {
+          deepseek: { displayName: 'DeepSeek', api: 'openai-completions', baseURL: 'https://api.deepseek.com', apiKeyEnv: 'DEEPSEEK_API_KEY' },
+        },
+        defaultSelection: { provider: 'deepseek', model: 'deepseek-flash' },
+        syncDefaultModel: true,
+        onlyIfNoAvailableDefault: true,
+      },
+    );
+
+    assert.equal('deepseek-official' in savedLlmData.providers, false, 'never writes reserved deepseek-official');
+    assert.equal('deepseek-account' in savedLlmData.providers, false, 'never writes reserved deepseek-account');
+    const dsFlash = savedLlmData.providers.deepseek.models.find(m => m.id === 'deepseek-flash');
+    assert.equal('reasoningEfforts' in dsFlash, false, 'efforts:["off"] without thinking levels never emits { off: "none" }');
+    assert.equal(secondDefaultSaveCount, 0, 'preserves already-available host default model');
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});

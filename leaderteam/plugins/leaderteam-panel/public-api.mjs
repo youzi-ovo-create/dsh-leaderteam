@@ -3533,6 +3533,9 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
             customBaseURL: body.customBaseURL || '',
             collabPresetId: body.collabPresetId || 'balanced-team',
             verifyConnectivity: Boolean(body.verifyConnectivity),
+            discoveredModels: Array.isArray(body.discoveredModels)
+              ? body.discoveredModels
+              : (Array.isArray(body.models) ? body.models : null),
             fetchImpl: options.fetchImpl ?? globalThis.fetch,
           });
           if (rt?.configPath && rt?.config) {

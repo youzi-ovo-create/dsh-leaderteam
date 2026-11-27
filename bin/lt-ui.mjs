@@ -103,9 +103,21 @@ function readBoundedBody(req, maxBytes = MAX_BODY_BYTES) {
 }
 
 function sendPayloadTooLargeAndDestroy(req, res, maxBytes = MAX_BODY_BYTES) {
+  let discarded = 0;
+  const maxDrainBytes = Math.max(maxBytes * 4, 8 * 1024 * 1024);
+  const onDrainData = chunk => {
+    discarded += chunk.length;
+    if (discarded > maxDrainBytes) {
+      req.removeListener('data', onDrainData);
+      try { req.destroy(); } catch {}
+    }
+  };
+  req.on('data', onDrainData);
+  try { req.resume(); } catch {}
   const timer = setTimeout(() => {
+    req.removeListener('data', onDrainData);
     try { req.destroy(); } catch {}
-  }, 50);
+  }, 300);
   timer.unref?.();
   res.writeHead(413, {
     'Content-Type': 'application/json; charset=utf-8',
@@ -118,8 +130,12 @@ function sendPayloadTooLargeAndDestroy(req, res, maxBytes = MAX_BODY_BYTES) {
       error: { code: 'PAYLOAD_TOO_LARGE', message: `Request body exceeds ${maxBytes} bytes` },
     }),
     () => {
-      clearTimeout(timer);
-      try { req.destroy(); } catch {}
+      const finTimer = setTimeout(() => {
+        clearTimeout(timer);
+        req.removeListener('data', onDrainData);
+        try { req.destroy(); } catch {}
+      }, 150);
+      finTimer.unref?.();
     },
   );
 }

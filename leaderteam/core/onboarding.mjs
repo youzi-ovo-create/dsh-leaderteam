@@ -9,6 +9,7 @@ import { writeFileAtomic } from './store.mjs';
 import { loadConfig } from './config.mjs';
 import { applyModelConfigChanges } from './model-config-writer.mjs';
 import {
+  RESERVED_DSH_BUILTIN_PROVIDER_IDS,
   canonicalRouteFor,
   inferEffortsFromMetadata,
   inferModelFamily,
@@ -22,8 +23,27 @@ import {
 
 export const ONBOARDING_STATE_FILENAME = 'onboarding.json';
 
-export const QUICK_PROVIDER_PRESETS = Object.freeze(
-  SOLO_PROVIDER_PRESETS.map(p =>
+export const OPENAI_COMPATIBLE_PRESET = Object.freeze({
+  id: 'openai-compatible',
+  envVars: ['OPENAI_COMPATIBLE_API_KEY', 'OPENAI_API_KEY'],
+  provider: 'openai-compatible',
+  displayName: 'OpenAI 兼容接口',
+  catalogRoute: false,
+  api: 'openai-completions',
+  defaultBaseURL: 'https://api.openai.com/v1',
+  family: 'other',
+  reasoningRoute: 'openai-compatible/gpt-4.1',
+  reasoningLabel: '主力推理 / 编码模型',
+  reasoningEfforts: ['none'],
+  reasoningDefaultEffort: 'none',
+  chatRoute: 'openai-compatible/gpt-4.1-mini',
+  chatLabel: '轻量对话 / 快速模型',
+  chatEfforts: ['none'],
+  chatDefaultEffort: 'none',
+});
+
+export const QUICK_PROVIDER_PRESETS = Object.freeze([
+  ...SOLO_PROVIDER_PRESETS.map(p =>
     Object.freeze({
       id: p.id,
       provider: p.provider,
@@ -52,7 +72,20 @@ export const QUICK_PROVIDER_PRESETS = Object.freeze(
               : '前往 platform.openai.com 获取 API Key，自动配置 GPT-4.1 与 GPT-4.1 Mini。',
     }),
   ),
-);
+  Object.freeze({
+    id: OPENAI_COMPATIBLE_PRESET.id,
+    provider: OPENAI_COMPATIBLE_PRESET.provider,
+    displayName: OPENAI_COMPATIBLE_PRESET.displayName,
+    envVar: OPENAI_COMPATIBLE_PRESET.envVars[0],
+    defaultBaseURL: OPENAI_COMPATIBLE_PRESET.defaultBaseURL,
+    reasoningRoute: OPENAI_COMPATIBLE_PRESET.reasoningRoute,
+    reasoningLabel: OPENAI_COMPATIBLE_PRESET.reasoningLabel,
+    chatRoute: OPENAI_COMPATIBLE_PRESET.chatRoute,
+    chatLabel: OPENAI_COMPATIBLE_PRESET.chatLabel,
+    keyPlaceholder: 'sk-...',
+    guideHint: '支持任意 OpenAI /v1/chat/completions 兼容网关（请在高级选项填写包含 /v1 的接口地址，将自动探测可用模型）。',
+  }),
+]);
 
 export const TEAM_COLLAB_PRESETS = Object.freeze([
   Object.freeze({
@@ -334,6 +367,7 @@ export async function probeProviderKeyConnectivity({
       Authorization: `Bearer ${String(apiKey || '').trim()}`,
       Accept: 'application/json',
     };
+    let usedPrimaryV1Url = true;
     let res = await fetchImpl(primaryModelsUrl, {
       method: 'GET',
       headers: reqHeaders,
@@ -345,7 +379,10 @@ export async function probeProviderKeyConnectivity({
         headers: reqHeaders,
         signal: ac.signal,
       }).catch(() => null);
-      if (fallbackRes) res = fallbackRes;
+      if (fallbackRes) {
+        res = fallbackRes;
+        usedPrimaryV1Url = false;
+      }
     }
     if (res.status === 401 || res.status === 403) {
       return {
@@ -381,9 +418,14 @@ export async function probeProviderKeyConnectivity({
         discoveredModels = parseUpstreamModelsPayload(bodyJson);
       } catch {}
     }
+    const resolvedBaseURL =
+      usedPrimaryV1Url && !/\/v\d+$/i.test(cleanBase) && !/api\.deepseek\.com$/i.test(cleanBase)
+        ? `${cleanBase}/v1`
+        : cleanBase;
     return {
       ok: true,
       status: res.status,
+      resolvedBaseURL,
       models: discoveredModels,
       message: 'API Key 连通性校验通过！',
     };
@@ -404,9 +446,10 @@ export async function probeProviderKeyConnectivity({
 
 export function detectConfiguredCredentialPresence({ dshHome = null, env = process.env, fsImpl = fs } = {}) {
   const detectedEnvVars = [];
-  for (const preset of SOLO_PROVIDER_PRESETS) {
+  const allPresets = [...SOLO_PROVIDER_PRESETS, OPENAI_COMPATIBLE_PRESET];
+  for (const preset of allPresets) {
     for (const v of preset.envVars) {
-      if (typeof env?.[v] === 'string' && env[v].trim().length > 0) {
+      if (typeof env?.[v] === 'string' && env[v].trim().length > 0 && !detectedEnvVars.includes(v)) {
         detectedEnvVars.push(v);
       }
     }
@@ -417,7 +460,7 @@ export function detectConfiguredCredentialPresence({ dshHome = null, env = proce
       if (!fsImpl.existsSync(f)) continue;
       try {
         const txt = fsImpl.readFileSync(f, 'utf8');
-        for (const preset of SOLO_PROVIDER_PRESETS) {
+        for (const preset of allPresets) {
           for (const v of preset.envVars) {
             if (new RegExp(`(?:^|\\s)${v}\\s*[:=]`, 'm').test(txt) && !detectedEnvVars.includes(v)) {
               detectedEnvVars.push(v);
@@ -491,29 +534,60 @@ export async function applyQuickOnboardingSetup({
   customBaseURL = '',
   collabPresetId = 'balanced-team',
   verifyConnectivity = false,
+  discoveredModels = null,
   fetchImpl = globalThis.fetch,
   env = process.env,
 } = {}) {
-  const preset = SOLO_PROVIDER_PRESETS.find(p => p.id === providerId || p.provider === providerId) ?? SOLO_PROVIDER_PRESETS[0];
+  const rawProvId = String(providerId || 'deepseek').trim();
+  // Avoid reserved DSH builtin adapter IDs (`deepseek-official`, `deepseek-account`)
+  const normalizedProvId = RESERVED_DSH_BUILTIN_PROVIDER_IDS.has(rawProvId) ? 'deepseek' : rawProvId;
+  const preset =
+    (normalizedProvId === 'openai-compatible' ? OPENAI_COMPATIBLE_PRESET : null) ??
+    SOLO_PROVIDER_PRESETS.find(p => p.id === normalizedProvId || p.provider === normalizedProvId) ??
+    SOLO_PROVIDER_PRESETS[0];
   const collab = TEAM_COLLAB_PRESETS.find(c => c.id === collabPresetId) ?? TEAM_COLLAB_PRESETS[0];
   const cleanKey = String(apiKey ?? '').trim();
   const hasExplicitCustomBaseURL = Boolean(String(customBaseURL ?? '').trim());
-  const effectiveBaseURL = String(customBaseURL ?? '').trim() || preset.defaultBaseURL;
+  let effectiveBaseURL = String(customBaseURL ?? '').trim().replace(/\/+$/, '') || preset.defaultBaseURL;
 
-  let endpointDiscoveredModels = [];
-  if (verifyConnectivity && cleanKey) {
+  let endpointDiscoveredModels = Array.isArray(discoveredModels)
+    ? discoveredModels
+        .map(m => {
+          if (typeof m === 'string' && m.trim()) return { id: m.trim(), name: m.trim() };
+          if (m && typeof m === 'object' && typeof m.id === 'string' && m.id.trim()) {
+            return { ...m, id: m.id.trim(), name: (typeof m.name === 'string' && m.name.trim()) ? m.name.trim() : m.id.trim() };
+          }
+          return null;
+        })
+        .filter(Boolean)
+    : [];
+
+  const shouldAutoProbeCustom =
+    endpointDiscoveredModels.length === 0 &&
+    cleanKey &&
+    typeof fetchImpl === 'function' &&
+    (verifyConnectivity || hasExplicitCustomBaseURL || preset.id === 'openai-compatible');
+
+  if (shouldAutoProbeCustom) {
     const probe = await probeProviderKeyConnectivity({
       baseURL: effectiveBaseURL,
       apiKey: cleanKey,
       fetchImpl,
+      timeoutMs: verifyConnectivity ? 8000 : 3500,
     });
     if (!probe.ok) {
-      const err = new Error(probe.message);
-      err.code = probe.code || 'CONNECTIVITY_CHECK_FAILED';
-      throw err;
-    }
-    if (Array.isArray(probe.models) && probe.models.length > 0) {
-      endpointDiscoveredModels = probe.models;
+      if (verifyConnectivity) {
+        const err = new Error(probe.message);
+        err.code = probe.code || 'CONNECTIVITY_CHECK_FAILED';
+        throw err;
+      }
+    } else {
+      if (probe.resolvedBaseURL && (hasExplicitCustomBaseURL || preset.id === 'openai-compatible')) {
+        effectiveBaseURL = probe.resolvedBaseURL;
+      }
+      if (Array.isArray(probe.models) && probe.models.length > 0) {
+        endpointDiscoveredModels = probe.models;
+      }
     }
   }
 
@@ -543,16 +617,18 @@ export async function applyQuickOnboardingSetup({
   }
 
   const baseRaw = JSON.parse(fs.readFileSync(bundledDefaultConfigPath, 'utf8'));
-  let effectivePreset = hasExplicitCustomBaseURL
+  let effectivePreset = hasExplicitCustomBaseURL || preset.id === 'openai-compatible'
     ? { ...preset, defaultBaseURL: effectiveBaseURL }
     : preset;
 
-  // When live `/v1/models` returned real model IDs and the static preset's models aren't served by this endpoint
-  // (e.g. `deepseek-reasoner` + `deepseek-chat` or custom OpenAI-compatible gateway models), adapt starter routes automatically!
+  // When live `/v1/models` or explicit `discoveredModels` provided real model IDs and the static preset's models
+  // aren't served by this endpoint (e.g. `deepseek-reasoner` + `deepseek-chat`, `sim-reasoner-v1` + `sim-flash-v2`, `zcode/GLM-5.4`),
+  // adapt starter routes & efforts automatically!
   if (endpointDiscoveredModels.length > 0) {
     const discoveredIdSet = new Set(endpointDiscoveredModels.map(m => m.id));
-    const staticReasoningUpstream = preset.models?.[preset.reasoningRoute]?.upstreamModel ?? preset.reasoningRoute;
-    const staticChatUpstream = preset.models?.[preset.chatRoute]?.upstreamModel ?? preset.chatRoute;
+    const stripStaticProv = r => (r.startsWith(`${preset.provider}/`) ? r.slice(preset.provider.length + 1) : r);
+    const staticReasoningUpstream = preset.reasoningUpstreamModel ?? stripStaticProv(preset.reasoningRoute);
+    const staticChatUpstream = preset.chatUpstreamModel ?? stripStaticProv(preset.chatRoute);
     const pair = selectDiscoveredStarterPair(endpointDiscoveredModels, preset.provider);
     if (pair && (!discoveredIdSet.has(staticReasoningUpstream) || !discoveredIdSet.has(staticChatUpstream))) {
       const adaptedModels = {};
@@ -587,14 +663,27 @@ export async function applyQuickOnboardingSetup({
         if (dm.id === pair.chatModel.id) adaptedChatRoute = route;
       }
       if (adaptedReasoningRoute && adaptedChatRoute) {
+        const rSpec = adaptedModels[adaptedReasoningRoute];
+        const cSpec = adaptedModels[adaptedChatRoute];
         effectivePreset = {
           ...effectivePreset,
+          family: rSpec.family || effectivePreset.family || 'other',
           reasoningRoute: adaptedReasoningRoute,
-          reasoningLabel: adaptedModels[adaptedReasoningRoute].label,
-          reasoningEffort: adaptedModels[adaptedReasoningRoute].defaultEffort || 'none',
+          reasoningUpstreamModel: rSpec.upstreamModel,
+          reasoningLabel: rSpec.label,
+          reasoningEfforts: rSpec.efforts,
+          reasoningDefaultEffort: rSpec.defaultEffort || 'none',
+          reasoningContextWindow: rSpec.contextWindow,
+          reasoningMaxTokens: rSpec.maxTokens,
+          reasoningVision: Boolean(rSpec.vision),
           chatRoute: adaptedChatRoute,
-          chatLabel: adaptedModels[adaptedChatRoute].label,
-          chatEffort: adaptedModels[adaptedChatRoute].defaultEffort || 'none',
+          chatUpstreamModel: cSpec.upstreamModel,
+          chatLabel: cSpec.label,
+          chatEfforts: cSpec.efforts,
+          chatDefaultEffort: cSpec.defaultEffort || 'none',
+          chatContextWindow: cSpec.contextWindow,
+          chatMaxTokens: cSpec.maxTokens,
+          chatVision: Boolean(cSpec.vision),
           models: adaptedModels,
         };
       }
@@ -678,11 +767,23 @@ export async function applyQuickOnboardingSetup({
   const effectiveEnv = { ...readDshEnvCredentialsMap({ dshHome, env }), ...env };
   if (cleanKey) effectiveEnv[preset.envVars[0]] = cleanKey;
   const providerTemplates = buildSoloProviderSettingsTemplates(effectiveEnv);
+  if (!providerTemplates[preset.provider]) {
+    const activeEnvKey =
+      preset.envVars.find(k => typeof effectiveEnv?.[k] === 'string' && effectiveEnv[k].trim().length > 0) ??
+      preset.envVars[0];
+    providerTemplates[preset.provider] = {
+      displayName: preset.displayName ?? preset.provider,
+      apiKeyEnv: activeEnvKey,
+      api: preset.api ?? 'openai-completions',
+      baseURL: effectiveBaseURL,
+      forceBaseURL: true,
+    };
+  }
   if (effectiveBaseURL && providerTemplates[preset.provider]) {
     if (hasExplicitCustomBaseURL || !preset.catalogRoute) {
       providerTemplates[preset.provider].baseURL = effectiveBaseURL;
     }
-    if (hasExplicitCustomBaseURL) {
+    if (hasExplicitCustomBaseURL || preset.id === 'openai-compatible') {
       providerTemplates[preset.provider].forceBaseURL = true;
       providerTemplates[preset.provider].api = providerTemplates[preset.provider].api || preset.api || 'openai-completions';
     }
@@ -709,6 +810,7 @@ export async function applyQuickOnboardingSetup({
       providerTemplates,
       defaultSelection: defaultLeaderSelection,
       syncDefaultModel: true,
+      onlyIfNoAvailableDefault: true,
     }).catch(err => ({ synced: false, reason: err instanceof Error ? err.message : String(err), updatedProviders: [] }));
   }
   let diskProfileSync = null;
