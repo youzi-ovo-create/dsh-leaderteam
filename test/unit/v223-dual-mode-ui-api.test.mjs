@@ -23,7 +23,7 @@ import { registerHooks } from 'node:module';
 import { loadConfig } from '../../leaderteam/core/config.mjs';
 import { TeamStore, appendJsonl } from '../../leaderteam/core/store.mjs';
 import { runtime, bindRuntimeConfigFile } from '../../leaderteam/host/runtime.mjs';
-import { validateContractBundle } from '../../../lt-shared-contracts/tests/contract-validator.mjs';
+import { SHARED_CONTRACTS_ROOT, validateContractBundle } from './companion-paths.mjs';
 
 registerHooks({
   resolve(specifier, context, nextResolve) {
@@ -75,7 +75,7 @@ function withTestRuntime(targetRt, fn) {
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '..', '..');
-const contractsRoot = path.resolve(repoRoot, '..', 'lt-shared-contracts');
+const contractsRoot = SHARED_CONTRACTS_ROOT;
 
 function makeTempSandbox(t, label = 'case') {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), `lt-s5-ui-${label}-`));
@@ -1100,7 +1100,15 @@ test('Stage 7 Regressions (V223-UI-01, UI-02, UI-03, UI-04, UI-07, RT-07): cold 
       const outsideDummy = path.join(tmpDir, 'outside-mode.json');
       fs.writeFileSync(outsideDummy, '{}');
       const symlinkSid = 'session-escape-probe';
-      fs.symlinkSync(outsideDummy, path.join(modesDir, `${symlinkSid}.json`));
+      const probePath = path.join(modesDir, `${symlinkSid}.json`);
+      try {
+        fs.symlinkSync(outsideDummy, probePath);
+      } catch (err) {
+        if (err?.code !== 'EPERM') throw err;
+        const outsideEscapeDir = path.join(tmpDir, 'outside-mode-dir');
+        fs.mkdirSync(outsideEscapeDir, { recursive: true });
+        fs.symlinkSync(outsideEscapeDir, probePath, 'junction');
+      }
       hostSessionsList.push({
         sessionId: symlinkSid,
         cwd: workspaceDir,
@@ -1115,7 +1123,7 @@ test('Stage 7 Regressions (V223-UI-01, UI-02, UI-03, UI-04, UI-07, RT-07): cold 
       assert.equal(escRow.canSwitchMode, false);
       assert.notEqual(escRow.modeBusyReason, 'Invalid session identifier');
       assert.match(escRow.modeBusyReason, /symlink|outside|escape/i);
-      fs.rmSync(path.join(modesDir, `${symlinkSid}.json`), { force: true });
+      try { fs.unlinkSync(probePath); } catch { try { fs.rmdirSync(probePath); } catch {} }
     });
   });
 });
@@ -1769,7 +1777,7 @@ test('Stage 9 Product Regressions (S8-E2E-01a/b/c, S8-E2E-02, S8-E2E-03, S8-E2E-
   const esbuild = webRequire('esbuild');
   const { buildSoloKeyStarterConfig, SOLO_PROVIDER_PRESETS } = await import('../../leaderteam/core/solo-key.mjs');
   const { startModelConfigServer } = await import('../../leaderteam/core/model-config-ui.mjs');
-  const { startMockMagpieServer } = await import('../../../lt-shared-contracts/mocks/mock-magpie-server.mjs');
+  const { startMockMagpieServer } = await import('./companion-paths.mjs');
   const { buildPublicModelCatalog } = await import('../../leaderteam/gateway/index.mjs');
 
   const tmpDir = makeTempSandbox(t, 's9-prod');

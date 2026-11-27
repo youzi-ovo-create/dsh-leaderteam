@@ -335,16 +335,23 @@ test('SessionModeStore: default team mode with zero disk writes, safe segment en
   assert.equal(hist[1].source, 'panel-ui');
   assert.equal(hist[1].taskSeqHint, 2);
 
-  // Symlink escape inside session-modes is deterministically rejected
+  // Symlink/junction escape inside session-modes is deterministically rejected
   const outsideFile = path.join(tmp, 'outside-secret.json');
   fs.writeFileSync(outsideFile, JSON.stringify({ v: 1, sessionId: 'sym-sess', mode: 'single' }));
   const symTarget = path.join(storageRoot, 'session-modes', `${encodeSessionModeSegment('sym-sess')}.json`);
-  fs.symlinkSync(outsideFile, symTarget);
+  try {
+    fs.symlinkSync(outsideFile, symTarget);
+  } catch (err) {
+    if (err?.code !== 'EPERM') throw err;
+    const outsideEscapeDir = path.join(tmp, 'outside-escape-dir');
+    fs.mkdirSync(outsideEscapeDir, { recursive: true });
+    fs.symlinkSync(outsideEscapeDir, symTarget, 'junction');
+  }
   assert.throws(
     () => readSessionModeRecord(storageRoot, 'sym-sess'),
     err => err?.code === 'SESSION_MODE_PATH_ESCAPE',
   );
-  fs.unlinkSync(symTarget);
+  try { fs.unlinkSync(symTarget); } catch { fs.rmdirSync(symTarget); }
 
   // Cold reload recovery via getSessionExecutionMode
   store.write('sess-cold-1', 'single', { source: 'cli', taskSeqHint: 1 });
@@ -1524,16 +1531,23 @@ test('Stage 7 V223-RT-07, V223-RT-08 & V223-UI-03: corrupt session-mode file qua
   assert.ok(filesAfterRecover.some(f => f.startsWith(`${encodeSessionModeSegment(corruptSid)}.json.corrupt.`)), 'corrupt file must be quarantined');
   assert.equal(readSessionModeRecord(storageRoot, corruptSid).mode, 'team');
 
-  // Symlink escape MUST remain strictly fatal (SESSION_MODE_PATH_ESCAPE) and never overwrite symlink target
+  // Symlink/junction escape MUST remain strictly fatal (SESSION_MODE_PATH_ESCAPE) and never overwrite symlink target
   const outsideSecret = path.join(tmp, 'outside-target.json');
   fs.writeFileSync(outsideSecret, 'KEEP_ME');
   const symSid = 'sess-symlink-escape';
   const symStateFile = path.join(modesDir, `${encodeSessionModeSegment(symSid)}.json`);
-  fs.symlinkSync(outsideSecret, symStateFile);
+  try {
+    fs.symlinkSync(outsideSecret, symStateFile);
+  } catch (err) {
+    if (err?.code !== 'EPERM') throw err;
+    const outsideEscapeDir = path.join(tmp, 'outside-escape-dir-2');
+    fs.mkdirSync(outsideEscapeDir, { recursive: true });
+    fs.symlinkSync(outsideEscapeDir, symStateFile, 'junction');
+  }
   assert.throws(() => inspectSessionModeState(ctx, rt, symSid), err => err?.code === 'SESSION_MODE_PATH_ESCAPE');
   assert.throws(() => writeSessionModeRecord(storageRoot, symSid, 'single'), err => err?.code === 'SESSION_MODE_PATH_ESCAPE');
   assert.equal(fs.readFileSync(outsideSecret, 'utf8'), 'KEEP_ME');
-  fs.unlinkSync(symStateFile);
+  try { fs.unlinkSync(symStateFile); } catch { fs.rmdirSync(symStateFile); }
 
   // 2. V223-RT-08: Colon, slash, tilde, and 240-char session IDs work across pure Single, Gate.record, Single -> Team, and observability
   for (const trickySid of ['ns:session/alpha~1', `long:${'x'.repeat(235)}`]) {

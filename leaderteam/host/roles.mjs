@@ -7,7 +7,7 @@ import { TeamStore } from '../core/store.mjs';
 import { leaderSection, memberSection, directExecSection, singleModeSection } from '../core/prompts.mjs';
 import { readSessionModeHistory } from '../core/session-mode.mjs';
 import { getSessionExecutionMode } from './mode-controller.mjs';
-import { resolvePath, pathKey } from '../core/paths.mjs';
+import { resolvePath, pathKey, realpathBestEffort } from '../core/paths.mjs';
 import { truncate } from '../core/redact.mjs';
 import { CAPABILITY_TOOLS } from '../core/tool-policy.mjs';
 import { DIRECT_EXEC_ALLOWED_TOOLS, LEADER_AUTONOMOUS_TOOLS } from '../core/constants.mjs';
@@ -21,6 +21,7 @@ import { frontierState, frontierView, frontierNeedsPlanning, frontierHasDispatch
 import { formatFrontierContext } from './planning.mjs';
 import { hasAdmissibleFrontierWork, hasAdmissibleNonShellFrontierWork, hasUnfinishedNonShellPlanWork, resolveSendMessageTargetId } from './activation.mjs';
 import { createAgentCircuitState, recordToolOutcomeInCircuit, recordTurnEndInCircuit } from '../core/circuit-breaker.mjs';
+import { isHostShellInitFailureResult, recordShellToolResultForTeam } from '../core/shell-circuit-breaker.mjs';
 import { runCircuitInvestigation } from './investigator.mjs';
 import { isAutonomousGovernance, replayGovernanceState } from '../core/governance-protocol.mjs';
 import {
@@ -789,7 +790,7 @@ async function maybeAutoContinueLeader(ctx, rt, actor, agent) {
       }
       if (ev?.type === 'tool/result') {
         const txt = eventContentBlocks(ev).filter(b => b?.type === 'text').map(b => b.text).join('\n');
-        if (/consensus cannot run:|plan agreement limit \d+ reached|discussion limit \d+ reached|workspace OS sandbox initialization failed/i.test(txt)) {
+        if (/consensus cannot run:|plan agreement limit \d+ reached|discussion limit \d+ reached|workspace OS sandbox initialization failed|\[HOST_SHELL_CHANNEL_UNAVAILABLE\]/i.test(txt)) {
           hitHardTerminalBlocker = true;
         }
       }
@@ -1541,11 +1542,20 @@ export function onToolResult(exec, result) {
     return;
   }
   const errorText = (result?.content ?? []).filter(b => b.type === 'text').map(b => b.text).join('\n');
+  const shellTools = rt.config?.gate?.shellTools;
+  const isShellInitFailure = Boolean(caller?.teamId && exec?.name && isHostShellInitFailureResult(exec.name, result, shellTools));
+  if (isShellInitFailure) {
+    recordShellToolResultForTeam(rt, caller.teamId, exec.name, result, {
+      shellTools,
+      callId: exec.callId ?? null,
+      actorRole: caller.role,
+    });
+  }
   const isSingleModeLeader = Boolean(caller?.role === 'leader' && getSessionExecutionMode(rt, caller.teamId) === 'single');
   if (caller && caller.teamId && rt.storageRoot && exec?.name) {
     try {
       const cbState = ensureCircuitState(rt, exec.agent.id, caller.role);
-      const ok = !result?.isError && !result?.error;
+      const ok = !result?.isError && !result?.error && !isShellInitFailure;
       const gateRuleMatch = /\((rule:[^)]+|model|gate-error)\)/.exec(errorText);
       if (gateRuleMatch?.[1] === 'rule:conference-checkpoint-pause') {
         return;
@@ -1630,17 +1640,27 @@ export function onToolResult(exec, result) {
   if (exec.name === 'read_image') {
     const requested = resolvePath(exec.arguments?.file_path ?? exec.arguments?.path, actor.cwd, process.platform);
     if (requested === null) return;
+    const realRequested = realpathBestEffort(requested, process.platform);
     let set = rt.reads.get(exec.agent.id);
     if (!set) { set = new Set(); rt.reads.set(exec.agent.id, set); }
     set.add(pathKey(requested, process.platform));
+    set.add(pathKey(realRequested, process.platform));
     return;
   }
   const meta = readWindowMeta(result.meta);
   if (!meta) return;
   const p = resolvePath(meta.path, actor.cwd, process.platform);
   const requested = resolvePath(exec.arguments?.file_path ?? exec.arguments?.path, actor.cwd, process.platform);
-  if (p === null || requested === null || pathKey(p, process.platform) !== pathKey(requested, process.platform)) return;
-  const key = pathKey(p, process.platform);
+  if (p === null || requested === null) return;
+  const realP = realpathBestEffort(p, process.platform);
+  const realRequested = realpathBestEffort(requested, process.platform);
+  if (
+    pathKey(p, process.platform) !== pathKey(requested, process.platform)
+    && pathKey(realP, process.platform) !== pathKey(realRequested, process.platform)
+  ) {
+    return;
+  }
+  const key = pathKey(realP, process.platform);
   const intervals = mergeIntervals(rt.readProgress?.get(exec.agent.id)?.get(key) ?? [], meta.lines.map(({ number }) => [number, number]));
   if (!isFileCovered(intervals, meta.totalLines)) {
     rt.readProgress ??= new Map();
@@ -1652,6 +1672,9 @@ export function onToolResult(exec, result) {
   let set = rt.reads.get(exec.agent.id);
   if (!set) { set = new Set(); rt.reads.set(exec.agent.id, set); }
   set.add(key);
+  set.add(pathKey(p, process.platform));
+  set.add(pathKey(requested, process.platform));
+  set.add(pathKey(realRequested, process.platform));
   rt.readProgress?.get(exec.agent.id)?.delete(key);
 }
 function appendShellFailureInstruction(agent, reason, prompt = resolveAgentSystemPrompt(agent)) {

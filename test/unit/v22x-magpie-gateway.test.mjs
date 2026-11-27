@@ -21,7 +21,7 @@ import { findFreeLoopbackPort } from '../../leaderteam/gateway/magpie-process.mj
 import { applyModelConfigChanges } from '../../leaderteam/core/model-config-writer.mjs';
 import { loadConfig } from '../../leaderteam/core/config.mjs';
 import { buildSoloKeyStarterConfig, SOLO_PROVIDER_PRESETS } from '../../leaderteam/core/solo-key.mjs';
-import { startMockMagpieServer } from '../../../lt-shared-contracts/mocks/mock-magpie-server.mjs';
+import { startMockMagpieServer } from './companion-paths.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '..', '..');

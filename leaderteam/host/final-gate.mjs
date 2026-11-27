@@ -23,10 +23,11 @@ import {
   replayGovernanceState,
   checkGovernanceExecutionGate,
 } from '../core/governance-protocol.mjs';
+import { checkShellCircuitBreakerForTeam, recordShellToolResultForTeam } from '../core/shell-circuit-breaker.mjs';
 import { frontierState } from '../core/frontier.mjs';
 import { boundJson, sanitizeArguments } from '../core/redact.mjs';
 import { GATE_DENIED_CODE, GATE_DENIED_NAME } from '../core/constants.mjs';
-import { pathKey, resolvePath } from '../core/paths.mjs';
+import { pathKey, resolvePath, realpathBestEffort } from '../core/paths.mjs';
 import { isProtectedLeaderTeamConfigPath } from '../core/session-config.mjs';
 import { readQuotaStateFile } from '../core/quota.mjs';
 import { quotaGate } from '../core/models.mjs';
@@ -177,7 +178,8 @@ export function installFinalGate(supportedVersionsOrOptions) {
         exec.arguments = frozenJsonCopy({ ...args, agent: targetMember.hostAgentName });
       }
     }
-    const isShell = Boolean(runtimeForTeam(actor.teamId).config?.gate?.shellTools?.includes(name));
+    const shellTools = runtimeForTeam(actor.teamId).config?.gate?.shellTools;
+    const isShell = Boolean(shellTools?.includes(name));
     const sessionKey = actor.teamId ?? agent?.id ?? null;
     const baseRtForFlight = runtime();
     if (sessionKey) {
@@ -196,7 +198,24 @@ export function installFinalGate(supportedVersionsOrOptions) {
       }
     }
     try {
-      return await original.call(this, exec);
+      const res = await original.call(this, exec);
+      if (isShell && actor.teamId) {
+        recordShellToolResultForTeam(baseRtForFlight, actor.teamId, name, res, {
+          shellTools,
+          callId: exec.callId ?? null,
+          actorRole: actor.role,
+        });
+      }
+      return res;
+    } catch (err) {
+      if (isShell && actor.teamId) {
+        recordShellToolResultForTeam(baseRtForFlight, actor.teamId, name, err, {
+          shellTools,
+          callId: exec.callId ?? null,
+          actorRole: actor.role,
+        });
+      }
+      throw err;
     } finally {
       if (sessionKey && baseRtForFlight.inFlightToolDispatchesByTeam) {
         const nextToolCnt = (baseRtForFlight.inFlightToolDispatchesByTeam.get(sessionKey) ?? 1) - 1;
@@ -235,7 +254,12 @@ export class Gate {
     syncRuntimeConfig();
     const rt = runtimeForTeam(actor.teamId);
     const cfg = rt.config;
-    const unreadRefs = actor.role === 'member' ? (actor.refs ?? []).filter(r => !(rt.reads.get(agent.id)?.has(pathKey(r)))) : [];
+    const shellBroken = checkShellCircuitBreakerForTeam(rt, actor.teamId, name, cfg?.gate?.shellTools);
+    if (shellBroken) return { rule: shellBroken.rule, reason: shellBroken.reason };
+    const readSet = rt.reads.get(agent.id);
+    const unreadRefs = actor.role === 'member'
+      ? (actor.refs ?? []).filter(r => !(readSet?.has(pathKey(r)) || readSet?.has(pathKey(realpathBestEffort(r)))))
+      : [];
     const cwd = typeof agent?.session?.header?.cwd === 'string' ? agent.session.header.cwd : actor.cwd;
     const baseRt = runtime();
     // Enforce Agent-vs-User separation at filesystem boundary: agents may NEVER mutate LeaderTeam global or session config files.

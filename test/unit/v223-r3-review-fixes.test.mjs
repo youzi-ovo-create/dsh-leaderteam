@@ -92,9 +92,19 @@ const {
   computeTodayUsageSummary,
 } = await import('../../packages/lt-web/src/lib/api.ts');
 
+const ORIG_TEST_CWD = process.cwd();
+
 function makeTempDir(t, suffix = '') {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), `lt-r3-${suffix}`));
-  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  t.after(() => {
+    try {
+      const cur = process.cwd();
+      if (cur === dir || cur.startsWith(dir + path.sep)) {
+        process.chdir(ORIG_TEST_CWD);
+      }
+    } catch {}
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+  });
   return dir;
 }
 
@@ -137,6 +147,7 @@ test('R3-BE-01 [P1]: relative storage.root stays invariant across entry-core ini
   const prevDshHome = process.env.DSH_HOME;
   const cleanups = [];
   t.after(() => {
+    try { rt.configWatch?.close?.(); } catch {}
     for (const fn of cleanups.reverse()) {
       try { fn(); } catch {}
     }

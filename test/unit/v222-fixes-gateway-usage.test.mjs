@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import http from 'node:http';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import zlib from 'node:zlib';
 import { execFileSync, spawn } from 'node:child_process';
@@ -11,11 +12,13 @@ import {
   MagpieGatewayManager,
   MagpieClient,
   getOrCreateGatewayManager,
+  evaluateMagpieVersionCompatibility,
   buildPublicProviders,
   buildPublicModelCatalog,
   normalizeMagpieUsageRow,
   sanitizeMaskedPreview,
   discoverSystemMagpieBinary,
+  detectBinaryVersion,
 } from '../../leaderteam/gateway/index.mjs';
 import {
   HengzhangUsageBridge,
@@ -23,8 +26,7 @@ import {
   toPublicLogicalUsageRecords,
 } from '../../leaderteam/usage/index.mjs';
 import { defaultPricing, buildReport } from '../../packages/lt-usage/index.mjs';
-import { startMockMagpieServer } from '../../../lt-shared-contracts/mocks/mock-magpie-server.mjs';
-import { validateContractBundle, scanNoSecretLeakage } from '../../../lt-shared-contracts/tests/contract-validator.mjs';
+import { SHARED_CONTRACTS_ROOT, startMockMagpieServer, validateContractBundle, scanNoSecretLeakage } from './companion-paths.mjs';
 import { createPublicContractHandlers } from '../../leaderteam/plugins/leaderteam-panel/public-api.mjs';
 import { loadConfig } from '../../leaderteam/core/config.mjs';
 import { bindRuntimeConfigFile } from '../../leaderteam/host/runtime.mjs';
@@ -38,7 +40,7 @@ function computeSha256File(file) {
 }
 
 function mkStage2Sandbox(suffix) {
-  return fs.mkdtempSync(path.join('/tmp', `lt-s2-gw-${suffix}-`));
+  return fs.mkdtempSync(path.join(os.tmpdir(), `lt-s2-gw-${suffix}-`));
 }
 
 function isPidAlive(pid) {
@@ -185,7 +187,7 @@ test('CT-01 & CT-02 & GW-07 & GW-08: sanitizeMaskedPreview, external key clearin
       dshDiscoveredModels,
     });
     const baseSnap = JSON.parse(
-      fs.readFileSync(path.resolve(repoRoot, '..', 'lt-shared-contracts', 'mocks', 'mock-v2.2-oss-snapshot.json'), 'utf8'),
+      fs.readFileSync(path.join(SHARED_CONTRACTS_ROOT, 'mocks', 'mock-v2.2-oss-snapshot.json'), 'utf8'),
     );
     const liveEnvelope = {
       ok: true,
@@ -441,6 +443,11 @@ test('Live Magpie 0.1.4731 binary verification: GW-01..06 & HZ-01 (providerJSON 
     t.skip('No local Magpie binary installed on this host');
     return;
   }
+  const sysMagpieVer = detectBinaryVersion(sysMagpie);
+  if (!evaluateMagpieVersionCompatibility(sysMagpieVer).compatible) {
+    t.skip(`Local Magpie binary (${sysMagpieVer || 'unknown'}) is older than 0.1.4731 usage-feed baseline`);
+    return;
+  }
 
   const tmpDir = mkStage2Sandbox('live-magpie');
   const relay = await startLocalDummyUpstreamRelay();
@@ -688,7 +695,7 @@ test('Live Magpie 0.1.4731 binary verification: GW-01..06 & HZ-01 (providerJSON 
     assert.match(scrubbedStatus.lastError.message, /&k=\[REDACTED\]/);
 
     const schemaJson = JSON.parse(
-      fs.readFileSync(path.resolve(repoRoot, '..', 'lt-shared-contracts', 'schemas', 'lt-public-v1.schema.json'), 'utf8'),
+      fs.readFileSync(path.join(SHARED_CONTRACTS_ROOT, 'schemas', 'lt-public-v1.schema.json'), 'utf8'),
     );
     assert.ok(Array.isArray(schemaJson.oneOf) && schemaJson.oneOf.length === 2);
     for (const defName of ['Capabilities', 'Gateway', 'ProviderDescriptor', 'ModelCatalogEntry', 'RuntimeSnapshot', 'LogicalUsageRecord', 'FlatBundleSnapshot', 'LiveBundleEnvelope']) {
@@ -708,7 +715,7 @@ test('Live Magpie 0.1.4731 binary verification: GW-01..06 & HZ-01 (providerJSON 
 
 test('Stage 4 Re-Audit Fixes (S3-UIGW-01, S3-UIGW-02, S3-UIGW-03, S3-UIGW-06): live Magpie 0.1.4731 test-provider latency + scanNoSecretLeakage on providersMutate + mutate-key protocol/plan/refs + REPORT_CACHE in-place upsert invalidation + sync configure/start _stoppingPids drain', async t => {
   const sysMagpie = discoverSystemMagpieBinary();
-  const tmpDir = fs.mkdtempSync(path.join('/tmp', 'lt-s4-uigw-gw-'));
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lt-s4-uigw-gw-'));
   const relay = await startLocalDummyUpstreamRelay();
   const mockSrv = await startMockMagpieServer({
     initialUsageRows: [
@@ -800,7 +807,7 @@ test('Stage 4 Re-Audit Fixes (S3-UIGW-01, S3-UIGW-02, S3-UIGW-03, S3-UIGW-06): l
     assert.ok(repAfter.publicRecords[0].cost.actualUsd > 0);
     assert.ok(ovAfter.overview.totals.costActualCny?.total > 0, 'Overview REPORT_CACHE must also invalidate on in-place upsert');
 
-    if (!sysMagpie) {
+    if (!sysMagpie || !evaluateMagpieVersionCompatibility(detectBinaryVersion(sysMagpie)).compatible) {
       return;
     }
 

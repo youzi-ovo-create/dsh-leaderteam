@@ -10,12 +10,14 @@ import { getOrCreateGatewayManager } from '../../leaderteam/gateway/index.mjs';
 import { HengzhangUsageBridge } from '../../leaderteam/usage/hengzhang-bridge.mjs';
 import { createPublicContractHandlers } from '../../leaderteam/plugins/leaderteam-panel/public-api.mjs';
 import { extractReceipts, resolveStorageRoot } from '../../packages/lt-usage/index.mjs';
-import { startMockMagpieServer } from '../../../lt-shared-contracts/mocks/mock-magpie-server.mjs';
-import { validateContractBundle } from '../../../lt-shared-contracts/tests/contract-validator.mjs';
+import {
+  LT_USAGE_PLUGIN_ROOT,
+  startMockMagpieServer,
+  validateContractBundle,
+} from './companion-paths.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '..', '..');
-const ossRoot = path.resolve(repoRoot, '..');
 
 function writeZstdSession(sessionDir, rows) {
   fs.mkdirSync(sessionDir, { recursive: true });
@@ -25,7 +27,7 @@ function writeZstdSession(sessionDir, rows) {
 
 test('R2-SH-01: bundled packages/lt-usage stays synced with lt-usage-plugin and computes accurate taskSeq across host injections, control messages, and delivery agreements', () => {
   // 1. Verify byte-for-byte sync between lt-usage-plugin and leaderteam-v2.2-dev/packages/lt-usage
-  const pluginCoreDir = path.join(ossRoot, 'lt-usage-plugin', 'packages', 'core', 'src');
+  const pluginCoreDir = path.join(LT_USAGE_PLUGIN_ROOT, 'packages', 'core', 'src');
   const bundledCoreDir = path.join(repoRoot, 'packages', 'lt-usage', 'core');
   if (fs.existsSync(pluginCoreDir)) {
     for (const file of fs.readdirSync(pluginCoreDir)) {
@@ -38,7 +40,7 @@ test('R2-SH-01: bundled packages/lt-usage stays synced with lt-usage-plugin and 
     }
     for (const file of ['decode.js', 'homes.js', 'service.js']) {
       const expected = fs
-        .readFileSync(path.join(ossRoot, 'lt-usage-plugin', 'packages', 'reader', 'src', file), 'utf8')
+        .readFileSync(path.join(LT_USAGE_PLUGIN_ROOT, 'packages', 'reader', 'src', file), 'utf8')
         .replace(/from\s+['"]@lt-usage\/core['"]/g, "from '../core/index.js'");
       assert.equal(
         fs.readFileSync(path.join(repoRoot, 'packages', 'lt-usage', 'reader', file), 'utf8'),

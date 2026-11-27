@@ -7,11 +7,15 @@ import zlib from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 import { HengzhangUsageBridge } from '../../leaderteam/usage/index.mjs';
 import { MagpieGatewayManager } from '../../leaderteam/gateway/index.mjs';
-import { startMockMagpieServer } from '../../../lt-shared-contracts/mocks/mock-magpie-server.mjs';
-import { validateContractBundle } from '../../../lt-shared-contracts/tests/contract-validator.mjs';
+import {
+  SHARED_CONTRACTS_ROOT,
+  LT_USAGE_PLUGIN_ROOT,
+  startMockMagpieServer,
+  validateContractBundle,
+} from './companion-paths.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const hengzhangFixtureHome = path.resolve(__dirname, '..', '..', '..', 'lt-usage-plugin', 'fixtures', 'test-home');
+const hengzhangFixtureHome = path.join(LT_USAGE_PLUGIN_ROOT, 'fixtures', 'test-home');
 
 function writeZstdSession(sessionDir, rows) {
   fs.mkdirSync(sessionDir, { recursive: true });
@@ -166,7 +170,7 @@ test('HengzhangUsageBridge: reconciles DSH zstd sessions + LT sidecars + Magpie 
 
     // 4. Public `LogicalUsageRecord[]` passes shared `lt.public.v1` contract validator
     const mockBundle = JSON.parse(
-      fs.readFileSync(path.resolve(__dirname, '..', '..', '..', 'lt-shared-contracts', 'mocks', 'mock-v2.2-oss-snapshot.json'), 'utf8'),
+      fs.readFileSync(path.join(SHARED_CONTRACTS_ROOT, 'mocks', 'mock-v2.2-oss-snapshot.json'), 'utf8'),
     );
     mockBundle.usageRecords = repRes.publicRecords;
     const valid = validateContractBundle(mockBundle);

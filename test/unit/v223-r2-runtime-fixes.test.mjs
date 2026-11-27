@@ -545,6 +545,34 @@ test('R2-V223-06: writeSessionModeRecord appends audit history BEFORE updating s
     assert.equal(hist[0].toMode, 'single');
     assert.equal(hist[1].fromMode, 'single');
     assert.equal(hist[1].toMode, 'team');
+  } else {
+    // On Windows (where chmod 0o444 may or may not block appendFileSync depending on ACLs), deterministically fail appendFileSync first
+    fs.chmodSync(historyFile, 0o644);
+    const origAppend = fs.appendFileSync;
+    fs.appendFileSync = (targetPath, ...rest) => {
+      if (path.resolve(String(targetPath)) === path.resolve(historyFile)) {
+        const err = new Error('Simulated EACCES on historyFile append');
+        err.code = 'EACCES';
+        throw err;
+      }
+      return origAppend(targetPath, ...rest);
+    };
+    try {
+      assert.throws(
+        () => switchSessionExecutionMode(ctx, rt, sid, 'team', { source: 'ui-toggle' }),
+        err => err?.code === 'EACCES' || err?.code === 'EPERM',
+      );
+    } finally {
+      fs.appendFileSync = origAppend;
+    }
+    const afterFailRec = readSessionModeRecord(storageRoot, sid);
+    assert.equal(afterFailRec.mode, 'single', 'stateFile must remain untouched when historyFile append fails');
+    assert.equal(afterFailRec.switchCount, 0);
+
+    const retried = switchSessionExecutionMode(ctx, rt, sid, 'team', { source: 'ui-toggle-retry' });
+    assert.equal(retried.changed, true);
+    assert.equal(retried.modeState.mode, 'team');
+    assert.equal(retried.modeState.switchCount, 1);
   }
 
   // 2. Rollback verification: if `writeFileAtomic(stateFile)` fails AFTER `appendJsonl(historyFile)` succeeded,
@@ -581,7 +609,8 @@ test('R2-V223-07b & Forward-Merged R2-SH-01..04: zero duplicate single->single a
     const pkgJson = JSON.parse(fs.readFileSync(path.join(repoRoot, rel), 'utf8'));
     assert.equal(pkgJson.version, '2.2.3', `${rel} must remain at 2.2.3`);
   }
-  const schemaText = fs.readFileSync(path.join(ossRoot, 'lt-shared-contracts/schemas/lt-public-v1.schema.json'), 'utf8');
+  const { SHARED_CONTRACTS_ROOT } = await import('./companion-paths.mjs');
+  const schemaText = fs.readFileSync(path.join(SHARED_CONTRACTS_ROOT, 'schemas/lt-public-v1.schema.json'), 'utf8');
   assert.match(schemaText, /"1\.1\.0"/);
 
   const tmp = makeTempSandbox(t, 'r2-07b');
