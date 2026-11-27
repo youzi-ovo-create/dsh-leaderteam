@@ -5,18 +5,21 @@ import { fileURLToPath } from 'node:url';
 import { loadConfig, validateConfig, routeProvider } from '../core/config.mjs';
 import { hashJson, deepFreeze } from '../core/canonical.mjs';
 import { TeamStore, encodeTeamStoreId, resolveTeamStoreLogicalId, writeFileAtomic } from '../core/store.mjs';
-import { readSessionModeRecord } from '../core/session-mode.mjs';
+import { readSessionModeRecord, decodeSessionModeSegment } from '../core/session-mode.mjs';
 import { discoverRuntimeModels, enrichConfigModelsFromCatalog, mergeUpstreamModelsIntoConfig, resolveModelTarget } from '../core/upstream-models.mjs';
 import { DETACHABLE_PLUGINS } from '../core/constants.mjs';
 import { currentPlanRoot } from '../core/current-plan.mjs';
 import {
   assertUserConfigPrincipal,
+  isProcessPidDead,
   readSessionConfigRecord,
   hasActiveSessionOverride,
   hasPendingSessionOverride,
   applySessionPatchToConfig,
   mutateSessionConfig,
   flushPendingSessionConfig,
+  withSessionConfigLock,
+  hasLiveCrossProcessActiveTurn,
 } from '../core/session-config.mjs';
 
 const KEY = Symbol.for('leaderteam.runtime.v1');
@@ -199,11 +202,31 @@ export function runtimeForTeam(teamId) {
       catch (writeError) { if (writeError.code !== 'EEXIST') throw writeError; record = JSON.parse(fs.readFileSync(file, 'utf8')); }
     }
     if (record.v !== 1 || hashJson(record.config) !== record.sourceSha256) throw new Error('frozen team governance snapshot is corrupt; refusing to replace it with live defaults');
-    view = { snapshot: validateConfig(record.config), sourceSha256: record.sourceSha256, live: null, sessionSig: null, mixed: null, proxy: null };
+    view = {
+      snapshot: validateConfig(record.config),
+      sourceSha256: record.sourceSha256,
+      govSig: fileSignature(file),
+      live: null,
+      sessionSig: null,
+      mixed: null,
+      proxy: null,
+    };
     view.proxy = new Proxy(rt, {
       get(target, property, receiver) {
         if (property === BASE_RUNTIME) return target;
         if (property !== 'config') return Reflect.get(target, property, receiver);
+        const curGovSig = fileSignature(file);
+        if (curGovSig !== 'missing' && curGovSig !== view.govSig) {
+          try {
+            const diskGov = JSON.parse(fs.readFileSync(file, 'utf8'));
+            if (diskGov?.v === 1 && hashJson(diskGov.config) === diskGov.sourceSha256) {
+              view.snapshot = validateConfig(diskGov.config);
+              view.sourceSha256 = diskGov.sourceSha256;
+              view.govSig = curGovSig;
+              view.live = null;
+            }
+          } catch {}
+        }
         const curSessionRec = readSessionConfigRecord(target.storageRoot, teamId);
         const curSessionSig = curSessionRec.updatedAt ?? '';
         if (view.live !== target.config || view.catalog !== target.upstreamCatalog || view.sessionSig !== curSessionSig) {
@@ -567,6 +590,14 @@ export function inspectSessionBusyForConfig(rt = runtime(), teamId, { ignoreLead
   if (!ignoreLeaderRunning && agent && ['running', 'streaming', 'thinking'].includes(String(agent.status || '').toLowerCase())) {
     reasons.push('leader_turn_running');
   }
+  if (baseRt.storageRoot && !reasons.includes('leader_turn_running')) {
+    const crossTurn = hasLiveCrossProcessActiveTurn(baseRt.storageRoot, teamId, {
+      includeSelf: !ignoreLeaderRunning,
+    });
+    if (crossTurn.active) {
+      reasons.push('leader_turn_running');
+    }
+  }
   if ((baseRt.inFlightToolDispatchesByTeam?.get?.(teamId) ?? 0) > 0) {
     reasons.push('tool_dispatch_in_flight');
   }
@@ -579,7 +610,13 @@ export function inspectSessionBusyForConfig(rt = runtime(), teamId, { ignoreLead
   if (baseRt.storageRoot && TeamStore.exists(baseRt.storageRoot, teamId)) {
     try {
       const store = teamStore(teamId);
-      const hasActive = [...store.members().values()].some(m => ACTIVE_MEMBER_SET.has(m.status));
+      const hasActive = [...store.members().values()].some(m => {
+        if (!ACTIVE_MEMBER_SET.has(m.status)) return false;
+        if (Number.isInteger(m.ownerPid) && m.ownerPid > 0 && m.ownerPid !== process.pid && isProcessPidDead(m.ownerPid)) {
+          return false;
+        }
+        return true;
+      });
       if (hasActive) reasons.push('active_team_members');
     } catch {}
   }
@@ -592,6 +629,55 @@ export function inspectSessionBusyForConfig(rt = runtime(), teamId, { ignoreLead
   return { busy: reasons.length > 0, reasons };
 }
 
+function resolveLiveLeaderAgentForSession(ctx, baseRt, sessionId) {
+  if (!sessionId) return null;
+  const actor = baseRt?.actors?.get?.(sessionId);
+  if (actor?.role === 'leader' && actor.agent) return actor.agent;
+  if (actor && actor.role !== 'leader') return null;
+  const hostAgent = baseRt?.hostAgents?.get?.(sessionId) ?? null;
+  if (hostAgent) {
+    if (hostAgent.session?.header?.origin === 'subagent') return null;
+    return hostAgent;
+  }
+  if (ctx) {
+    try {
+      const agentsSvc = typeof ctx.get === 'function' ? ctx.get('agents') : ctx.agents;
+      const cand = agentsSvc?.get?.(sessionId) ?? null;
+      if (cand && cand.session?.header?.origin !== 'subagent') return cand;
+    } catch {}
+  }
+  return null;
+}
+
+/**
+ * Synchronize the DSH host Agent's selected leader model (`agent.model.select(...)`) with LeaderTeam's
+ * effective configuration for an idle session so subsequent turns never fall back to a stale selection.
+ */
+export function syncIdleLeaderAgentModelToEffectiveConfig(ctx, rt = runtime(), sessionId) {
+  const baseRt = baseRuntime(rt);
+  if (!baseRt?.config || !sessionId) return { selected: false };
+  const liveAgent = resolveLiveLeaderAgentForSession(ctx, baseRt, sessionId);
+  if (!liveAgent || typeof liveAgent.model?.select !== 'function') {
+    return { selected: false, reason: 'no-live-agent' };
+  }
+  const effCfg = effectiveSessionConfig(baseRt, sessionId) ?? effectiveRuntimeConfig(baseRt) ?? baseRt.config;
+  const leaderRole = effCfg?.roles?.leader;
+  if (!leaderRole?.route) return { selected: false, reason: 'no-leader-route' };
+  try {
+    const tgt = resolveModelTarget(effCfg, leaderRole.route, leaderRole.effort);
+    if (!tgt?.provider || !tgt?.model) return { selected: false, reason: 'unresolved-target' };
+    const selection = {
+      provider: tgt.provider,
+      model: tgt.model,
+      ...(tgt.reasoningEffort ? { reasoningEffort: tgt.reasoningEffort } : {}),
+    };
+    liveAgent.model.select(selection);
+    return { selected: true, target: selection };
+  } catch (err) {
+    return { selected: false, error: err };
+  }
+}
+
 /**
  * Atomically refresh `teams/<storeId>/governance.json` and invalidate cached `teamConfigViews`
  * for an IDLE session on user-initiated configuration changes. Refuses agent calls and refuses
@@ -600,6 +686,8 @@ export function inspectSessionBusyForConfig(rt = runtime(), teamId, { ignoreLead
 export function rebindTeamGovernanceSnapshot(rt = runtime(), teamId, {
   principal,
   forceAtSafeBoundary = false,
+  ctx = null,
+  syncAgentModel = false,
 } = {}) {
   const baseRt = baseRuntime(rt);
   if (!baseRt?.config || !baseRt?.storageRoot || !teamId) return { rebound: false, reason: 'uninitialized' };
@@ -613,42 +701,59 @@ export function rebindTeamGovernanceSnapshot(rt = runtime(), teamId, {
   try { storeId = encodeTeamStoreId(teamId, baseRt.storageRoot); } catch { return { rebound: false, reason: 'bad-id' }; }
   const key = `${baseRt.storageRoot}:${storeId}`;
   const govFile = path.join(baseRt.storageRoot, 'teams', storeId, 'governance.json');
-  if (fs.existsSync(govFile)) {
-    const sessionRec = readSessionConfigRecord(baseRt.storageRoot, teamId);
-    const mergedCfg = applySessionPatchToConfig(baseRt.config, sessionRec);
-    const cleanCfg = structuredClone(mergedCfg);
-    delete cleanCfg.derived;
-    let prevCreatedAt = new Date().toISOString();
-    try {
-      const prev = JSON.parse(fs.readFileSync(govFile, 'utf8'));
-      if (prev?.createdAt) prevCreatedAt = prev.createdAt;
-    } catch {}
-    const nextRecord = {
-      v: 1,
-      createdAt: prevCreatedAt,
-      updatedAt: new Date().toISOString(),
-      updatedBy: verified.source,
-      sourceSha256: hashJson(cleanCfg),
-      config: cleanCfg,
-    };
-    writeFileAtomic(govFile, JSON.stringify(nextRecord, null, 1));
-  }
+  withSessionConfigLock(baseRt.storageRoot, teamId, () => {
+    if (fs.existsSync(govFile)) {
+      const sessionRec = readSessionConfigRecord(baseRt.storageRoot, teamId);
+      const mergedCfg = applySessionPatchToConfig(baseRt.config, sessionRec);
+      const cleanCfg = structuredClone(mergedCfg);
+      delete cleanCfg.derived;
+      let prevCreatedAt = new Date().toISOString();
+      try {
+        const prev = JSON.parse(fs.readFileSync(govFile, 'utf8'));
+        if (prev?.createdAt) prevCreatedAt = prev.createdAt;
+      } catch {}
+      const nextRecord = {
+        v: 1,
+        createdAt: prevCreatedAt,
+        updatedAt: new Date().toISOString(),
+        updatedBy: verified.source,
+        sourceSha256: hashJson(cleanCfg),
+        config: cleanCfg,
+      };
+      writeFileAtomic(govFile, JSON.stringify(nextRecord, null, 1));
+    }
+  });
   baseRt.teamConfigViews?.delete?.(key);
+  if (syncAgentModel) {
+    syncIdleLeaderAgentModelToEffectiveConfig(ctx, baseRt, teamId);
+  }
   return { rebound: true, busy: false };
 }
 
 /**
- * Refresh governance snapshots for all currently IDLE sessions after a User saves global settings,
- * so idle sessions immediately reflect updated roles/models while executing sessions remain protected.
+ * Refresh governance snapshots and live DSH leader model selections for all currently IDLE sessions
+ * after a User saves global settings, so idle sessions immediately reflect updated roles/models while
+ * executing sessions remain protected.
  */
-export function rebindAllIdleSessionsOnGlobalUserSave(rt = runtime(), { principal } = {}) {
+export function rebindAllIdleSessionsOnGlobalUserSave(rt = runtime(), { principal, ctx = null } = {}) {
   const baseRt = baseRuntime(rt);
   if (!baseRt?.config || !baseRt?.storageRoot) return { reboundIds: [], skippedBusyIds: [] };
   assertUserConfigPrincipal(principal);
+  baseRt.lastGlobalUserConfigSaveAtMs = Date.now();
   const candidateIds = new Set([
     ...(baseRt.stores?.keys?.() ?? []),
     ...(baseRt.actors?.keys?.() ?? []),
+    ...(baseRt.hostAgents?.keys?.() ?? []),
+    ...(baseRt.workbenchCreatedSessionIds ?? []),
   ]);
+  if (ctx) {
+    try {
+      const agentsSvc = typeof ctx.get === 'function' ? ctx.get('agents') : ctx.agents;
+      if (typeof agentsSvc?.keys === 'function') {
+        for (const k of agentsSvc.keys()) candidateIds.add(k);
+      }
+    } catch {}
+  }
   const teamsDir = path.join(baseRt.storageRoot, 'teams');
   if (fs.existsSync(teamsDir)) {
     try {
@@ -659,11 +764,35 @@ export function rebindAllIdleSessionsOnGlobalUserSave(rt = runtime(), { principa
       }
     } catch {}
   }
+  const modesDir = path.join(baseRt.storageRoot, 'session-modes');
+  if (fs.existsSync(modesDir)) {
+    try {
+      for (const f of fs.readdirSync(modesDir)) {
+        if (!f.endsWith('.json')) continue;
+        try {
+          const parsed = JSON.parse(fs.readFileSync(path.join(modesDir, f), 'utf8'));
+          if (typeof parsed?.sessionId === 'string' && parsed.sessionId.trim()) {
+            candidateIds.add(parsed.sessionId.trim());
+            continue;
+          }
+        } catch {}
+        try {
+          candidateIds.add(decodeSessionModeSegment(f.slice(0, -'.json'.length)));
+        } catch {}
+      }
+    } catch {}
+  }
   const reboundIds = [];
   const skippedBusyIds = [];
   for (const tid of candidateIds) {
     if (!tid) continue;
-    const res = rebindTeamGovernanceSnapshot(baseRt, tid, { principal });
+    const actor = baseRt.actors?.get?.(tid);
+    if (actor && actor.role !== 'leader') continue;
+    const res = rebindTeamGovernanceSnapshot(baseRt, tid, {
+      principal,
+      ctx,
+      syncAgentModel: true,
+    });
     if (res.rebound) reboundIds.push(tid);
     else if (res.busy) skippedBusyIds.push(tid);
   }
@@ -688,6 +817,71 @@ export function effectiveSessionConfig(rt = runtime(), sessionId) {
   return hasActiveSessionOverride(sessionRec)
     ? applySessionPatchToConfig(baseCfg, sessionRec)
     : baseCfg;
+}
+
+function resolveLatestLtConfigChangeMsForSession(baseRt, sessionId) {
+  let latestMs = 0;
+  if (!baseRt?.storageRoot || !sessionId) return latestMs;
+  const sessionRec = readSessionConfigRecord(baseRt.storageRoot, sessionId);
+  if (sessionRec?.updatedAt && sessionRec.updatedBy !== 'dsh-host-picker') {
+    const t = Date.parse(sessionRec.updatedAt);
+    if (Number.isFinite(t) && t > latestMs) latestMs = t;
+  }
+  if (!hasActiveSessionOverride(sessionRec)) {
+    if (Number.isFinite(baseRt.lastGlobalUserConfigSaveAtMs) && baseRt.lastGlobalUserConfigSaveAtMs > latestMs) {
+      latestMs = baseRt.lastGlobalUserConfigSaveAtMs;
+    }
+    try {
+      const storeId = encodeTeamStoreId(sessionId, baseRt.storageRoot);
+      const govFile = path.join(baseRt.storageRoot, 'teams', storeId, 'governance.json');
+      if (fs.existsSync(govFile)) {
+        const gov = JSON.parse(fs.readFileSync(govFile, 'utf8'));
+        if (gov?.updatedAt && gov.updatedBy !== 'dsh-host-picker') {
+          const gt = Date.parse(gov.updatedAt);
+          if (Number.isFinite(gt) && gt > latestMs) latestMs = gt;
+        }
+      }
+    } catch {}
+    for (const cfgCandidate of [baseRt.configWatch?.localPath, baseRt.configPath]) {
+      if (!cfgCandidate) continue;
+      try {
+        if (fs.existsSync(cfgCandidate)) {
+          const st = fs.statSync(cfgCandidate);
+          if (Number.isFinite(st.mtimeMs) && st.mtimeMs > latestMs) {
+            latestMs = st.mtimeMs;
+          }
+        }
+      } catch {}
+    }
+  }
+  return latestMs;
+}
+
+function inspectSessionHostModelSelectionAge(agent) {
+  if (typeof agent?.session?.snapshotEvents !== 'function') {
+    return { hasSessionEvents: false, hasRecordedSelection: null, lastSelectionMs: null };
+  }
+  try {
+    const evs = agent.session.snapshotEvents();
+    if (!Array.isArray(evs)) {
+      return { hasSessionEvents: false, hasRecordedSelection: null, lastSelectionMs: null };
+    }
+    let lastSelectionMs = null;
+    let found = false;
+    for (let i = evs.length - 1; i >= 0; i--) {
+      const ev = evs[i];
+      if (ev?.type === 'model/selection') {
+        found = true;
+        if (typeof ev.time === 'number' && Number.isFinite(ev.time)) {
+          lastSelectionMs = ev.time;
+        }
+        break;
+      }
+    }
+    return { hasSessionEvents: true, hasRecordedSelection: found, lastSelectionMs };
+  } catch {
+    return { hasSessionEvents: false, hasRecordedSelection: null, lastSelectionMs: null };
+  }
 }
 
 export function syncSessionLeaderSelectionFromHost(_ctx, rt = runtime(), agent, {
@@ -718,6 +912,33 @@ export function syncSessionLeaderSelectionFromHost(_ctx, rt = runtime(), agent, 
     : (selEffort === null || selEffort === cfg.roles.leader.effort);
   if (sel.provider === target.provider && sel.model === target.model && effortMatches) {
     return { synced: false, alreadyMatched: true };
+  }
+
+  // Guard against stale pre-reset / pre-global-save DSH session model selections (or unrecorded host defaults)
+  // overwriting newer user-saved LeaderTeam configuration on existing cold or idle sessions.
+  const hostSelAge = inspectSessionHostModelSelectionAge(agent);
+  if (hostSelAge.hasSessionEvents) {
+    const latestLtMs = resolveLatestLtConfigChangeMsForSession(baseRt, agent.id);
+    const opts = agent.options;
+    const hasExplicitPlainHeadlessModel =
+      baseRt.surface === 'headless' &&
+      Boolean(opts?.model) &&
+      typeof Object.getOwnPropertyDescriptor(opts, 'model')?.get !== 'function';
+    const hostSelStale =
+      (hostSelAge.hasRecordedSelection === false && !hasExplicitPlainHeadlessModel) ||
+      (hostSelAge.lastSelectionMs !== null && latestLtMs > hostSelAge.lastSelectionMs);
+    if (hostSelStale) {
+      if (typeof agent.model?.select === 'function' && target?.provider && target?.model) {
+        try {
+          agent.model.select({
+            provider: target.provider,
+            model: target.model,
+            ...(target.reasoningEffort ? { reasoningEffort: target.reasoningEffort } : {}),
+          });
+        } catch {}
+      }
+      return { synced: false, refreshedHostFromLtConfig: true };
+    }
   }
 
   const route = resolveCanonicalRouteFromHostSelection(cfg, sel.provider, sel.model, `${sel.provider}/${sel.model}`);
@@ -782,14 +1003,16 @@ export function syncSessionLeaderSelectionFromHost(_ctx, rt = runtime(), agent, 
 }
 
 /**
- * Flush any staged `pendingPatch` once a session reaches a safe idle boundary (`onLeaderTurnEnd` / `onAgentStatus`).
+ * Flush any staged `pendingPatch` once a session reaches a safe idle boundary (`onLeaderTurnEnd` / `onAgentStatus` / crash recovery).
  */
-export function flushPendingSessionConfigAtSafeBoundary(_ctx, rt = runtime(), sessionId) {
+export function flushPendingSessionConfigAtSafeBoundary(ctx, rt = runtime(), sessionId, {
+  ignoreLeaderRunning = false,
+} = {}) {
   const baseRt = baseRuntime(rt);
   if (!baseRt?.config || !baseRt?.storageRoot || !sessionId) return { flushed: false };
   const rec = readSessionConfigRecord(baseRt.storageRoot, sessionId);
   if (!hasPendingSessionOverride(rec)) return { flushed: false };
-  const busyCheck = inspectSessionBusyForConfig(baseRt, sessionId);
+  const busyCheck = inspectSessionBusyForConfig(baseRt, sessionId, { ignoreLeaderRunning });
   if (busyCheck.busy) return { flushed: false, busy: true, reasons: busyCheck.reasons };
 
   const res = flushPendingSessionConfig({
@@ -802,19 +1025,9 @@ export function flushPendingSessionConfigAtSafeBoundary(_ctx, rt = runtime(), se
     rebindTeamGovernanceSnapshot(baseRt, sessionId, {
       principal: { kind: 'user', source: 'dsh-host-picker' },
       forceAtSafeBoundary: true,
+      ctx,
+      syncAgentModel: true,
     });
-    const actor = baseRt.actors?.get?.(sessionId);
-    const agent = actor?.agent ?? baseRt.hostAgents?.get?.(sessionId) ?? null;
-    if (agent && typeof agent.model?.select === 'function' && res.effectiveConfig?.roles?.leader) {
-      try {
-        const tgt = resolveModelTarget(
-          res.effectiveConfig,
-          res.effectiveConfig.roles.leader.route,
-          res.effectiveConfig.roles.leader.effort,
-        );
-        agent.model.select(tgt);
-      } catch {}
-    }
   }
   return res;
 }

@@ -2,6 +2,28 @@
 
 本项目的所有重要版本变更均记录于此文件，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [2.2.4] - 2026-11-27 (`linux-v2.2.4`)
+
+基于公开发行基线 `linux-v2.2.3`（完整保留 `openai-compatible` 自定义中转 `/v1/models` 发现、`web_fetch` 21 项领队工具及历代设计原则 `DP-01`..`DP-06`），合入全部 9 项探索性缺陷修复（`O1`–`O9`），并完成 11 项独立审计问题（`R1`–`R11`）与公开安装脚本入口缺陷（`PUB-01`）的全量修复：
+
+### Fixed
+- **安装、升级、降级兼容与备份回滚（`O5`–`O7`、`R1`、`R2`、`R4`、`R7`、`R8`、`PUB-01`）**：
+  - 区分历史 `< 2.2.2` 内嵌面板版（如公开 V2.2.1）与 `>= 2.2.2` 独立工作台版的快照结构校验，完整 V2.2.1 备份可无损回滚，同时继续拦截缺失关键文件或哈希篡改的损坏快照；
+  - 即使旧版备份缺少 `fileHashes` 清单，也解析 `web-dist/index.html` 中引用的本地 `.js/.mjs/.css` 资产并校验文件存在且非空，缺失主工作台脚本时严格拒绝回滚（`CORRUPT_BACKUP_SNAPSHOT`）；
+  - 降级至旧版 R3 时自动将 `leaderModelPolicy: "follow"` 降级为 `"warn"` 并记录兼容标记，通过一键安装器（`lt-installer` / `install-leaderteam.sh`）、升级器或宿主机启动（`entry-core.mjs`）升回 V2.2.4 后自动幂等恢复 `"follow"`（不覆写用户显式设置的 `"enforce"`）；
+  - 更新器严格筛选主插件包资产（`dsh-leaderteam*.tgz`），过滤辅助包（如 `lt-usage-plugin-*.tgz`）与异架构包（`armv7l`/`armhf`/`ia32`/`riscv64` 等），并按 `(track, platform, arch, includePrerelease)` 隔离更新检查缓存，避免稳定版与预发布版缓存串用；
+  - 修复 `install-leaderteam.sh` 与 `installer.mjs`，支持 GitHub Release 下载目录中仅放置 `install-leaderteam.sh` + `dsh-leaderteam-*.tgz` 或解压后的 `package/` 目录时直接引导安装并自动识别同目录离线包（`LT_INSTALLER_SOURCE_DIR`）。
+- **跨进程配置并发、活跃回合护栏与孤儿会话收敛（`O4`、`O8`、`O9`、`R5`、`R6`）**：
+  - 多进程并发保存会话配置采用原子锁（`withSessionConfigLock`）保护，消除写丢失与审计漏记；异常重启后在首回合前自动冲刷已暂存的 `pendingOverride` 并在全局保存/重置时同步温/冷 DSH 会话；
+  - 跨 `public-api.mjs` 与 `panel-api.mjs` 统一拒绝不存在会话与升级前遗留孤儿 `session-configs/<ghost>.json`（`404 SESSION_NOT_FOUND`），并在新建同名会话时自动清理早于 `createdAt` 的历史孤儿配置；
+  - 跨进程只读识别 `<storageRoot>/active-turns/*--<pid>.json` 活进程标记（0 磁盘写入），确保另一进程运行中回合能正确触发会话配置安全边界暂存及 `GET /workbench/mode` 忙碌拦截，并自动忽略已退出死 PID 残留。
+- **衡账失败计费口径与总览一致性（`O2`、`R3`）**：
+  - 保留失败但已产生实际 Token 消耗的治理审查调用的真实计费金额与 Token 计数，并同步修正 `overview.totals`、`overview.sessions`、`overview.byModel` 与 `overview.today` 对 `callsSucceeded === 0` 场景的口径，确保已定价失败调用如实计入金额、未定价失败调用诚实展示未知（`null`，绝不伪装为 `¥0`）。
+- **网关同步、工作台草稿/错误横幅会话隔离与公开版能力保真（`O1`、`O3`、`R9`、`R10`、`R11`）**：
+  - 修改托管 Magpie 网关端口或启动网关时自动同步 DSH 宿主 `providers.magpie.baseURL`；
+  - `WorkbenchView` 将发送草稿与异步错误/操作反馈按会话隔离（零新增禁用 React Hook），会话 A 延迟返回的 HTTP 200 或 503 绝不污染或清空会话 B 的草稿与错误横幅；
+  - 完整继承 `linux-v2.2.3` 全部能力，确保 `openai-compatible` 自定义中转在首次保存及复用已保存凭据重新保存时均可发现并配置真实 `/v1/models`（如 `local-reasoner`），Team 领队完整保留 `web_fetch`（21 项工具）与 Single 模式 11 项直连工具。
+
 ## [2.2.3] - 2026-11-27 (`linux-v2.2.3` / `v2.2.3`)
 
 会话内 `Single / Team` 双模协同、河洛（Heluo）原生控制台 v2、Magpie 网关与衡账（`lt-usage`）融合、历代设计原则（`DP-01`..`DP-06`）防退化护栏、DSH 模型选择器全链路同步修复，以及跨平台独立发行版（`Apache-2.0`）：

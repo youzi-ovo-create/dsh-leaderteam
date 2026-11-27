@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { loadConfig } from './core/config.mjs';
 import { writeFileAtomic } from './core/store.mjs';
 import { resolveOrBootstrapConfigPath, buildSoloProviderSettingsTemplates } from './core/solo-key.mjs';
-import { buildAutoAdoptedLocalOverrideFromDshModels, readSessionConfigRecord, hasActiveSessionOverride } from './core/session-config.mjs';
+import { buildAutoAdoptedLocalOverrideFromDshModels, readSessionConfigRecord, hasActiveSessionOverride, clearAllProcessActiveTurns } from './core/session-config.mjs';
 import { isPluginActive, runtimeForTeam, runtime, bindRuntimeConfigFile, syncRuntimeConfig, refreshUpstreamCatalog, effectiveRuntimeConfig, syncSessionLeaderSelectionFromHost, flushPendingSessionConfigAtSafeBoundary, rebindAllIdleSessionsOnGlobalUserSave, isTeamExecutionStarted, rebindUnstartedTeamGovernance } from './host/runtime.mjs';
 import { syncUpstreamModelsToDshSettings, resolveModelTarget } from './core/upstream-models.mjs';
 import { onAgentCreated, onAgentPresetSelected, onAgentDisposed, onAgentStatus, onAgentError, onSessionEvent, onToolResult, shouldApplyDefaultLeaderModel } from './host/roles.mjs';
@@ -19,6 +19,8 @@ import { resetShellCircuitBreakerForTeam } from './core/shell-circuit-breaker.mj
 import { formatLeaderGovernanceContext, resolveHumanEscalationOnUserTurn, retryDeferredSupervisions } from './host/governance.mjs';
 import { teamStore } from './host/runtime.mjs';
 import { currentTaskSeq, userMessageTexts } from './host/roles.mjs';
+import { getOrCreateGatewayManager } from './gateway/index.mjs';
+import { reconcileConfigForTargetCapabilities } from './core/updater.mjs';
 import pkg from './package.json' with { type: 'json' };
 
 let hostError;
@@ -56,6 +58,17 @@ export function apply(ctx, config) {
     bundledDefaultConfigPath,
   });
   const configPath = resolvedCfg.configPath;
+  // Restore compat-downgraded leaderModelPolicy ('warn' -> 'follow') if upgrading back via installer or raw `dsh plugin add`
+  try {
+    const compatRoots = new Set();
+    if (home) compatRoots.add(path.resolve(home, 'leaderteam'));
+    if (configPath && path.basename(path.dirname(configPath)) === 'config') {
+      compatRoots.add(path.resolve(path.dirname(path.dirname(configPath))));
+    }
+    for (const rootCand of compatRoots) {
+      reconcileConfigForTargetCapabilities(rootCand, { supportsFollowPolicy: true });
+    }
+  } catch {}
   bindRuntimeConfigFile(rt, configPath, loadConfig(configPath));
   rt.bootstrapMode = resolvedCfg.mode;
   rt.cordisCompositionMode = config?.modular === true;
@@ -72,6 +85,7 @@ export function apply(ctx, config) {
   rt.logger = ctx.logger;
   rt.hostAgents = ctx.agents ?? null;
   rt.liveProcessMemberIds = new Set();
+  rt.liveRunningTurnSessions = new Set();
   rt.planningDisposed = false;
   rt.currentPlanningTaskSeq = teamId => currentTaskSeq(ctx, teamId);
   rt.createUserMessage = hostLlm?.createUserMessage ?? null;
@@ -216,7 +230,7 @@ export function apply(ctx, config) {
   if (!rt.cordisCompositionMode && rt.config.plugins?.scheduler !== false) {
     ctx.effect(() => hostConcurrency.startConcurrencyWatchers(ctx), { label: 'leaderteam-core concurrency' });
   }
-  ctx.effect(() => () => { disposePlanning(rt); rt.gate = new ClosedGate(ctx); rt.startupReady = null; rt.hostAgents = null; rt.liveProcessMemberIds = null; }, { label: 'leaderteam-core gate' });
+  ctx.effect(() => () => { clearAllProcessActiveTurns(rt.storageRoot); disposePlanning(rt); rt.gate = new ClosedGate(ctx); rt.startupReady = null; rt.hostAgents = null; rt.liveProcessMemberIds = null; rt.liveRunningTurnSessions = null; }, { label: 'leaderteam-core gate' });
   const ready = Object.freeze({ coreVersion: pkg.version, modular: rt.cordisCompositionMode });
   rt.startupReady = ready;
   ctx.provide('leaderteamReady', ready);
@@ -225,6 +239,20 @@ export function apply(ctx, config) {
     if (!eff || rt.planningDisposed) return null;
     const defaultProvider = eff.magpie?.provider ?? 'magpie';
     const providerTemplates = buildSoloProviderSettingsTemplates(process.env);
+    if (rt.storageRoot && fs.existsSync(path.join(rt.storageRoot, 'gateway'))) {
+      try {
+        const rawGwUrl = getOrCreateGatewayManager(rt.storageRoot).getActiveEndpoints()?.gatewayUrl;
+        if (rawGwUrl) {
+          providerTemplates[defaultProvider] = {
+            displayName: 'Magpie Gateway',
+            api: 'openai-completions',
+            baseURL: `${rawGwUrl.replace(/\/+$/, '')}/v1`,
+            headers: { Authorization: 'Bearer magpie-leaderteam' },
+            clearApiKeyEnv: true,
+          };
+        }
+      } catch {}
+    }
     const modelsToSync = Object.entries(eff.models ?? {}).map(([route, spec]) => ({
       route,
       provider: spec.provider ?? defaultProvider,

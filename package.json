@@ -1,6 +1,6 @@
 {
   "name": "dsh-leaderteam",
-  "version": "2.2.3",
+  "version": "2.2.4",
   "description": "Autonomous multi-agent governance, 0ms deterministic host safety gate, and 4-bucket physical token ledger for DeepSeek Harness (Linux & Windows).",
   "license": "Apache-2.0",
   "type": "module",

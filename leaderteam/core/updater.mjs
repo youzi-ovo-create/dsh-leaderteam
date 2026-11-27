@@ -10,6 +10,8 @@ import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { writeFileAtomic } from './store.mjs';
+import { hashJson } from './canonical.mjs';
+import { isProcessPidDead } from './session-config.mjs';
 import {
   parseDshSemver,
   compareDshSemver,
@@ -172,7 +174,12 @@ export function inspectTgzPackage(tgzFileOrBuffer, fsImpl = fs) {
 
   const files = [];
   const extractedTexts = new Map();
-  const wantedTextPaths = new Set(['package/package.json', 'package/leaderteam/package.json', 'package/cordis.patch.yml']);
+  const wantedTextPaths = new Set([
+    'package/package.json',
+    'package/leaderteam/package.json',
+    'package/cordis.patch.yml',
+    'package/leaderteam/core/config.mjs',
+  ]);
   let offset = 0;
   let paxPathOverride = null;
 
@@ -247,6 +254,20 @@ export function inspectTgzPackage(tgzFileOrBuffer, fsImpl = fs) {
     try { internalPkg = JSON.parse(internalRaw); } catch {}
   }
 
+  if (
+    files.includes('package/leaderteam/plugins/leaderteam-panel/public-api.mjs') &&
+    !files.includes('package/leaderteam/plugins/leaderteam-panel/web-dist/index.html')
+  ) {
+    const err = new Error('安装包不完整：缺少工作台前端入口 leaderteam/plugins/leaderteam-panel/web-dist/index.html');
+    err.code = 'INCOMPLETE_BUNDLE_ASSETS';
+    throw err;
+  }
+
+  const configMjsText = extractedTexts.get('package/leaderteam/core/config.mjs');
+  const supportsFollowPolicy = typeof configMjsText === 'string'
+    ? /['"]follow['"]/.test(configMjsText)
+    : true;
+
   const nativeFiles = files.filter(f => f.startsWith('package/leaderteam/native/') && f.endsWith('.node'));
   const declaredTrack = internalPkg?.leaderteam?.distributionTrack;
   const inferredTrack =
@@ -268,6 +289,7 @@ export function inspectTgzPackage(tgzFileOrBuffer, fsImpl = fs) {
     supportedCoreRange: internalPkg?.leaderteam?.supportedCoreRange ?? rootPkg.engines?.dsh ?? null,
     compatibilityPolicy: internalPkg?.leaderteam?.compatibilityPolicy ?? null,
     hasCordisPatch: Boolean(extractedTexts.get('package/cordis.patch.yml')),
+    supportsFollowPolicy,
     nativeFiles: nativeFiles.map(f => path.posix.basename(f)),
     fileCount: files.length,
   };
@@ -426,7 +448,7 @@ export function normalizeUpdaterPlatform(rawPlatform = process.platform) {
 export function parseReleaseTagForPlatform(rawTag) {
   const tag = String(rawTag ?? '').trim();
   if (!tag) return null;
-  const prefMatch = /^(windows|linux)-v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$/i.exec(tag);
+  const prefMatch = /^(windows|linux|darwin)-v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$/i.exec(tag);
   if (prefMatch) {
     const prefix = prefMatch[1].toLowerCase();
     const version = prefMatch[2];
@@ -435,7 +457,7 @@ export function parseReleaseTagForPlatform(rawTag) {
       tagName: tag,
       version,
       prefix,
-      platformScope: prefix === 'windows' ? 'win32' : 'linux',
+      platformScope: prefix === 'windows' ? 'win32' : prefix,
     };
   }
   const legacyMatch = /^v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$/i.exec(tag);
@@ -485,17 +507,64 @@ export function assertTargetReleaseTagMatchesPlatform(targetVersion, platform = 
   return parsed;
 }
 
-function normalizeReleaseEntry(rel, track) {
+function classifyTgzAssetPlatform(assetName) {
+  const stem = String(assetName ?? '').trim().replace(/\.tgz$/i, '').toLowerCase();
+  const osMatch = /(?:^|[-_.])(linux|windows|win32|win|darwin|macos|osx|freebsd|openbsd|netbsd|sunos|aix)(?=$|[-_.])/.exec(stem);
+  const archMatch = /(?:^|[-_.])(x86_64|amd64|x64|aarch64|arm64|armv7l|armv7|armhf|armv6l|arm32|arm|ia32|i686|i386|x86|386|riscv64|ppc64le|ppc64|s390x|loong64|mips64el|mips64|mips)(?=$|[-_.])/.exec(stem);
+  const rawOs = osMatch ? osMatch[1] : null;
+  const rawArch = archMatch ? archMatch[1] : null;
+  const assetPlatform =
+    rawOs === 'linux'
+      ? 'linux'
+      : rawOs === 'windows' || rawOs === 'win32' || rawOs === 'win'
+        ? 'win32'
+        : rawOs === 'darwin' || rawOs === 'macos' || rawOs === 'osx'
+          ? 'darwin'
+          : rawOs;
+  const assetArch =
+    rawArch === 'x64' || rawArch === 'amd64' || rawArch === 'x86_64'
+      ? 'x64'
+      : rawArch === 'arm64' || rawArch === 'aarch64'
+        ? 'arm64'
+        : rawArch === 'ia32' || rawArch === 'x86' || rawArch === 'i386' || rawArch === 'i686' || rawArch === '386'
+          ? 'ia32'
+          : rawArch;
+  return { assetPlatform, assetArch };
+}
+
+function isPrimaryLeaderTeamTarballName(assetName) {
+  const name = String(assetName ?? '').trim();
+  return /^dsh-leaderteam(?:[-_.].*)?\.tgz$/i.test(name);
+}
+
+function selectPlatformCompatibleTgzAsset(assets, { platform = process.platform, arch = process.arch } = {}) {
+  const normPlat = normalizeUpdaterPlatform(platform);
+  const normArch = String(arch ?? process.arch).trim().toLowerCase();
+  const candidates = [];
+  for (const a of Array.isArray(assets) ? assets : []) {
+    if (!a || typeof a.name !== 'string' || !isPrimaryLeaderTeamTarballName(a.name)) continue;
+    const { assetPlatform, assetArch } = classifyTgzAssetPlatform(a.name);
+    if (assetPlatform && assetPlatform !== normPlat) continue;
+    if (assetArch && assetArch !== normArch) continue;
+    let score = 100;
+    if (assetPlatform === normPlat && assetArch === normArch) score += 40;
+    else if (assetPlatform === normPlat && !assetArch) score += 25;
+    else if (!assetPlatform && assetArch === normArch) score += 15;
+    else if (!assetPlatform && !assetArch) score += 10;
+    candidates.push({ asset: a, score });
+  }
+  candidates.sort((x, y) => y.score - x.score);
+  return candidates[0]?.asset ?? null;
+}
+
+function normalizeReleaseEntry(rel, track, { platform = process.platform, arch = process.arch } = {}) {
   if (!rel || typeof rel !== 'object' || rel.draft) return null;
   const rawTag = String(rel.tag_name ?? '').trim();
   const parsedTag = parseReleaseTagForPlatform(rawTag);
   if (!parsedTag) return null;
   const cleanVersion = parsedTag.version;
   const assets = Array.isArray(rel.assets) ? rel.assets : [];
-  const tgzAsset =
-    assets.find(a => typeof a?.name === 'string' && /^dsh-leaderteam-.*\.tgz$/i.test(a.name)) ??
-    assets.find(a => typeof a?.name === 'string' && a.name.endsWith('.tgz')) ??
-    null;
+  const tgzAsset = selectPlatformCompatibleTgzAsset(assets, { platform, arch });
   const sumsAsset =
     assets.find(a => typeof a?.name === 'string' && /^SHA256SUMS/i.test(a.name)) ??
     null;
@@ -539,6 +608,7 @@ function normalizeReleaseEntry(rel, track) {
 export function selectReleasesForPlatform(rawList, {
   track = 'open-source',
   platform = process.platform,
+  arch = process.arch,
   includePrerelease = false,
   targetVersion = null,
 } = {}) {
@@ -546,7 +616,7 @@ export function selectReleasesForPlatform(rawList, {
   const parsedTarget = assertTargetReleaseTagMatchesPlatform(targetVersion, normPlat);
 
   const normalized = (Array.isArray(rawList) ? rawList : [rawList])
-    .map(r => normalizeReleaseEntry(r, track))
+    .map(r => normalizeReleaseEntry(r, track, { platform: normPlat, arch }))
     .filter(r => r !== null && (includePrerelease || !r.prerelease || (parsedTarget && r.version === parsedTarget.version)));
 
   const allowedForPlat = normalized.filter(r => {
@@ -590,6 +660,7 @@ export async function checkForUpdates({
   storageRoot = null,
   track = null,
   platform = process.platform,
+  arch = process.arch,
   targetVersion = null,
   includePrerelease = false,
   force = false,
@@ -599,6 +670,8 @@ export async function checkForUpdates({
   cacheTtlMs = DEFAULT_CHECK_CACHE_TTL_MS,
 } = {}) {
   const normPlat = normalizeUpdaterPlatform(platform);
+  const normArch = String(arch ?? process.arch).trim().toLowerCase();
+  const wantPre = Boolean(includePrerelease);
   assertTargetReleaseTagMatchesPlatform(targetVersion, normPlat);
   const installed = readInstalledVersionInfo(pluginRoot);
   const queryTrack = track && UPDATE_TRACKS[track] ? track : installed.track;
@@ -606,7 +679,7 @@ export async function checkForUpdates({
   const isCrossTrackPreview = queryTrack !== installed.track;
 
   const cacheFile = storageRoot && !targetVersion
-    ? path.join(resolveUpdaterDir(storageRoot), `check-cache-${queryTrack}-${normPlat}.json`)
+    ? path.join(resolveUpdaterDir(storageRoot), `check-cache-${queryTrack}-${normPlat}-${normArch}-${wantPre ? 'pre' : 'stable'}.json`)
     : null;
 
   if (!force && !targetVersion && !apiUrlOverride && cacheFile && fs.existsSync(cacheFile)) {
@@ -618,7 +691,9 @@ export async function checkForUpdates({
         age >= 0 &&
         age < cacheTtlMs &&
         cached.installedVersion === installed.version &&
-        cached.platform === normPlat
+        cached.platform === normPlat &&
+        (!cached.targetPlatform || cached.targetPlatform === `${normPlat}-${normArch}`) &&
+        Boolean(cached.includePrerelease) === wantPre
       ) {
         return { ...cached, fromCache: true };
       }
@@ -652,12 +727,15 @@ export async function checkForUpdates({
   const releases = selectReleasesForPlatform(rawList, {
     track: queryTrack,
     platform: normPlat,
-    includePrerelease,
+    arch: normArch,
+    includePrerelease: wantPre,
     targetVersion,
   });
 
-  const latest = releases.find(r => r.asset?.downloadUrl) ?? releases[0] ?? null;
-  const hasUpdate = latest
+  const selectableReleases = releases.filter(r => r.asset?.downloadUrl);
+  const allRawReleasesLackAssets = rawList.every(r => !Array.isArray(r?.assets) || r.assets.length === 0);
+  const latest = selectableReleases[0] ?? (releases.length > 0 && allRawReleasesLackAssets ? releases[0] : null);
+  const hasUpdate = latest && (latest.asset?.downloadUrl || allRawReleasesLackAssets)
     ? (
         targetVersion
           ? latest.version !== installed.version || queryTrack !== installed.track
@@ -672,6 +750,8 @@ export async function checkForUpdates({
     checkedAt,
     fromCache: false,
     platform: normPlat,
+    targetPlatform: `${normPlat}-${normArch}`,
+    includePrerelease: wantPre,
     installedVersion: installed.version,
     installedTrack: installed.track,
     installedTrackInfo: installed.trackInfo,
@@ -702,24 +782,91 @@ export async function checkForUpdates({
   return result;
 }
 
-export function isRuntimeIdleForUpgrade(rt) {
-  if (!rt) return { idle: true, reasons: [] };
+export function isRuntimeIdleForUpgrade(rt, { storageRoot = null, fsImpl = fs } = {}) {
   const reasons = [];
-  if (rt.liveProcessMemberIds instanceof Set && rt.liveProcessMemberIds.size > 0) {
-    reasons.push(`当前有 ${rt.liveProcessMemberIds.size} 个团队执行成员正在运行`);
-  }
-  if (rt.inFlightShellCallsBySession instanceof Map && rt.inFlightShellCallsBySession.size > 0) {
-    reasons.push('当前有正在执行的受控终端工具调用');
-  }
-  if (rt.actors instanceof Map) {
-    for (const actor of rt.actors.values()) {
-      const status = typeof actor?.agent?.status === 'function' ? actor.agent.status() : actor?.agent?.status;
-      if (status === 'running' || status === 'busy' || status === 'streaming') {
-        reasons.push(`会话 ${actor.teamId || ''} 主代理正在执行回合`);
-        break;
+  if (rt) {
+    if (rt.liveProcessMemberIds instanceof Set && rt.liveProcessMemberIds.size > 0) {
+      reasons.push(`当前有 ${rt.liveProcessMemberIds.size} 个团队执行成员正在运行`);
+    }
+    if (rt.inFlightShellCallsBySession instanceof Map && rt.inFlightShellCallsBySession.size > 0) {
+      reasons.push('当前有正在执行的受控终端工具调用');
+    }
+    if (rt.actors instanceof Map) {
+      for (const actor of rt.actors.values()) {
+        const status = typeof actor?.agent?.status === 'function' ? actor.agent.status() : actor?.agent?.status;
+        if (status === 'running' || status === 'busy' || status === 'streaming') {
+          reasons.push(`会话 ${actor.teamId || ''} 主代理正在执行回合`);
+          break;
+        }
       }
     }
   }
+
+  // Cross-process active-turn guard (protects live DSH Web sessions against external CLI `lt-update`)
+  const effStorageRoot = storageRoot ?? rt?.storageRoot ?? null;
+  if (effStorageRoot) {
+    const activeTurnsDir = path.join(effStorageRoot, 'active-turns');
+    if (fsImpl.existsSync(activeTurnsDir)) {
+      try {
+        for (const entry of fsImpl.readdirSync(activeTurnsDir)) {
+          if (!entry.endsWith('.json')) continue;
+          const full = path.join(activeTurnsDir, entry);
+          try {
+            const parsed = JSON.parse(fsImpl.readFileSync(full, 'utf8'));
+            const pid = parsed?.pid;
+            if (Number.isInteger(pid) && pid > 0) {
+              if (pid !== process.pid && isProcessPidDead(pid)) {
+                try { fsImpl.rmSync(full, { force: true }); } catch {}
+                continue;
+              }
+              reasons.push(`会话 ${parsed.sessionId || ''} 正在活跃执行回合（宿主进程 PID ${pid}）`);
+              break;
+            }
+          } catch {}
+        }
+      } catch {}
+    }
+
+    if (reasons.length === 0) {
+      const teamsDir = path.join(effStorageRoot, 'teams');
+      if (fsImpl.existsSync(teamsDir)) {
+        try {
+          for (const d of fsImpl.readdirSync(teamsDir, { withFileTypes: true })) {
+            if (!d.isDirectory()) continue;
+            const mFile = path.join(teamsDir, d.name, 'members.jsonl');
+            if (!fsImpl.existsSync(mFile)) continue;
+            try {
+              const latestByChild = new Map();
+              for (const line of fsImpl.readFileSync(mFile, 'utf8').split(/\r?\n/)) {
+                if (!line.trim()) continue;
+                try {
+                  const rec = JSON.parse(line);
+                  if (!rec?.childId) continue;
+                  if (rec.type === 'member') {
+                    latestByChild.set(rec.childId, { status: rec.status ?? 'starting', ownerPid: rec.ownerPid ?? null });
+                  } else if (rec.type === 'member-status' && latestByChild.has(rec.childId)) {
+                    latestByChild.get(rec.childId).status = rec.status;
+                  }
+                } catch {}
+              }
+              let foundLiveMember = false;
+              for (const m of latestByChild.values()) {
+                if (!['starting', 'started', 'running'].includes(m.status)) continue;
+                if (Number.isInteger(m.ownerPid) && m.ownerPid > 0) {
+                  if (m.ownerPid !== process.pid && isProcessPidDead(m.ownerPid)) continue;
+                  reasons.push(`团队子代理正在运行（宿主进程 PID ${m.ownerPid}）`);
+                  foundLiveMember = true;
+                  break;
+                }
+              }
+              if (foundLiveMember) break;
+            } catch {}
+          }
+        } catch {}
+      }
+    }
+  }
+
   return { idle: reasons.length === 0, reasons };
 }
 
@@ -733,6 +880,304 @@ function copyDirRecursiveSync(src, dest) {
     if (entry.isDirectory()) copyDirRecursiveSync(s, d);
     else if (entry.isFile()) fs.copyFileSync(s, d);
   }
+}
+
+function computeDirectoryFileHashes(rootDir, fsImpl = fs) {
+  const fileHashes = {};
+  const walk = (curDir, relPrefix) => {
+    const entries = fsImpl.readdirSync(curDir, { withFileTypes: true });
+    entries.sort((a, b) => a.name.localeCompare(b.name));
+    for (const entry of entries) {
+      if (entry.name === '.git' || entry.name === 'node_modules') continue;
+      if (entry.isSymbolicLink()) continue;
+      const full = path.join(curDir, entry.name);
+      const rel = relPrefix ? `${relPrefix}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) {
+        walk(full, rel);
+      } else if (entry.isFile()) {
+        fileHashes[rel] = computeFileSha256(full, fsImpl);
+      }
+    }
+  };
+  if (fsImpl.existsSync(rootDir)) {
+    walk(rootDir, '');
+  }
+  return {
+    fileCount: Object.keys(fileHashes).length,
+    fileHashes,
+  };
+}
+
+function extractWebDistReferencedAssets(htmlText) {
+  const refs = [];
+  const seen = new Set();
+  const attrRe = /<(?:script|link)\b[^>]*(?:\bsrc|\bhref)\s*=\s*["']([^"']+)["'][^>]*>/gi;
+  let m;
+  while ((m = attrRe.exec(String(htmlText ?? ''))) !== null) {
+    const raw = String(m[1] ?? '').trim();
+    if (!raw || /^(?:https?:|data:|blob:|mailto:|#|\/\/)/i.test(raw)) continue;
+    const clean = raw.split(/[?#]/)[0].replace(/^\.\//, '').replace(/^\/+/, '');
+    if (!clean) continue;
+    if (!/\.(?:m?js|css)$/i.test(clean)) continue;
+    if (!seen.has(clean)) {
+      seen.add(clean);
+      refs.push(clean);
+    }
+  }
+  return refs;
+}
+
+export function verifyBackupSnapshotIntegrity(backupRecord, fsImpl = fs) {
+  const snapDir = backupRecord?.pluginSnapshotDir;
+  if (!snapDir || !fsImpl.existsSync(snapDir)) {
+    return { intact: false, reason: '备份目录不存在', missing: ['plugin-package'], tampered: [] };
+  }
+  const missing = [];
+  const tampered = [];
+  const requiredBase = ['package.json', 'cordis.patch.yml', 'leaderteam/package.json'];
+
+  let rootPkg = null;
+  const rootPkgPath = path.join(snapDir, 'package.json');
+  if (fsImpl.existsSync(rootPkgPath)) {
+    try {
+      rootPkg = JSON.parse(fsImpl.readFileSync(rootPkgPath, 'utf8'));
+    } catch {
+      rootPkg = null;
+    }
+  }
+
+  const backupVersion =
+    (typeof rootPkg?.version === 'string' && rootPkg.version.trim()) ||
+    (typeof backupRecord?.fromVersion === 'string' && backupRecord.fromVersion.trim()) ||
+    null;
+  const panelDir = path.join(snapDir, 'leaderteam', 'plugins', 'leaderteam-panel');
+  const webDistDir = path.join(panelDir, 'web-dist');
+  const hasFileHashManifest = Boolean(
+    backupRecord?.fileHashes &&
+      typeof backupRecord.fileHashes === 'object' &&
+      !Array.isArray(backupRecord.fileHashes) &&
+      Object.keys(backupRecord.fileHashes).length > 0,
+  );
+  const expectsWebWorkbench = Boolean(
+    (backupVersion && (compareDshSemver(backupVersion, '2.2.2') ?? 0) >= 0) ||
+      rootPkg?.bin?.['lt-ui'] ||
+      (hasFileHashManifest && (
+        'leaderteam/plugins/leaderteam-panel/public-api.mjs' in backupRecord.fileHashes ||
+        'leaderteam/plugins/leaderteam-panel/web-dist/index.html' in backupRecord.fileHashes
+      )) ||
+      fsImpl.existsSync(webDistDir) ||
+      fsImpl.existsSync(path.join(panelDir, 'public-api.mjs')),
+  );
+
+  if (fsImpl.existsSync(panelDir)) {
+    requiredBase.push('leaderteam/entry-core.mjs');
+    if (expectsWebWorkbench) {
+      requiredBase.push(
+        'leaderteam/plugins/leaderteam-panel/public-api.mjs',
+        'leaderteam/plugins/leaderteam-panel/web-dist/index.html',
+      );
+      if (rootPkg?.bin?.['lt-ui'] || fsImpl.existsSync(path.join(webDistDir, 'assets'))) {
+        requiredBase.push(
+          'leaderteam/plugins/leaderteam-panel/index.mjs',
+          'leaderteam/plugins/leaderteam-panel/client.js',
+        );
+      }
+    } else {
+      // Historical < 2.2.2 packages (e.g. V2.2.0 / V2.2.1) shipped the embedded DSH panel only
+      // without public-api.mjs or web-dist/index.html.
+      requiredBase.push(
+        'leaderteam/plugins/leaderteam-panel/index.mjs',
+        'leaderteam/plugins/leaderteam-panel/client.js',
+      );
+    }
+  }
+
+  for (const rel of requiredBase) {
+    const full = path.join(snapDir, ...rel.split('/'));
+    if (!fsImpl.existsSync(full)) {
+      missing.push(rel);
+      continue;
+    }
+    try {
+      const st = fsImpl.statSync(full);
+      if (!st.isFile() || st.size <= 0) tampered.push(rel);
+    } catch {
+      missing.push(rel);
+    }
+  }
+  if (!missing.includes('package.json')) {
+    if (!rootPkg || rootPkg?.name !== 'dsh-leaderteam' || !rootPkg?.dsh?.bundle) {
+      if (!tampered.includes('package.json')) tampered.push('package.json');
+    }
+  }
+
+  // Verify local JS/CSS assets referenced by web-dist/index.html (protects legacy backups without fileHashes too!)
+  const indexHtmlPath = path.join(webDistDir, 'index.html');
+  if (expectsWebWorkbench && fsImpl.existsSync(indexHtmlPath) && !tampered.includes('leaderteam/plugins/leaderteam-panel/web-dist/index.html')) {
+    try {
+      const htmlText = fsImpl.readFileSync(indexHtmlPath, 'utf8');
+      const assetRefs = extractWebDistReferencedAssets(htmlText);
+      const hasScriptAsset = assetRefs.some(r => /\.(?:m?js)$/i.test(r));
+      const mustHaveScriptAsset = Boolean(
+        rootPkg?.bin?.['lt-ui'] ||
+          fsImpl.existsSync(path.join(webDistDir, 'assets')) ||
+          /<script\b/i.test(htmlText),
+      );
+      if (mustHaveScriptAsset && !hasScriptAsset) {
+        tampered.push('leaderteam/plugins/leaderteam-panel/web-dist/index.html');
+      } else {
+        const resolvedWebDist = path.resolve(webDistDir);
+        for (const relAsset of assetRefs) {
+          const fullAsset = path.resolve(resolvedWebDist, relAsset);
+          if (fullAsset !== resolvedWebDist && !fullAsset.startsWith(`${resolvedWebDist}${path.sep}`)) {
+            tampered.push(`leaderteam/plugins/leaderteam-panel/web-dist/${relAsset}`);
+            continue;
+          }
+          const manifestRel = `leaderteam/plugins/leaderteam-panel/web-dist/${relAsset.replace(/\\/g, '/')}`;
+          if (!fsImpl.existsSync(fullAsset)) {
+            if (!missing.includes(manifestRel)) missing.push(manifestRel);
+            continue;
+          }
+          try {
+            const st = fsImpl.statSync(fullAsset);
+            if (!st.isFile() || st.size <= 0) {
+              if (!tampered.includes(manifestRel)) tampered.push(manifestRel);
+            }
+          } catch {
+            if (!missing.includes(manifestRel)) missing.push(manifestRel);
+          }
+        }
+      }
+    } catch {
+      tampered.push('leaderteam/plugins/leaderteam-panel/web-dist/index.html');
+    }
+  }
+
+  if (hasFileHashManifest) {
+    const { fileHashes: actualHashes } = computeDirectoryFileHashes(snapDir, fsImpl);
+    for (const [rel, expectedSha] of Object.entries(backupRecord.fileHashes)) {
+      if (!(rel in actualHashes)) {
+        if (!missing.includes(rel)) missing.push(rel);
+      } else if (actualHashes[rel] !== expectedSha) {
+        if (!tampered.includes(rel)) tampered.push(rel);
+      }
+    }
+  }
+  if (missing.length > 0 || tampered.length > 0) {
+    const parts = [];
+    if (missing.length > 0) parts.push(`缺失文件 [${missing.slice(0, 5).join(', ')}]`);
+    if (tampered.length > 0) parts.push(`校验异常 [${tampered.slice(0, 5).join(', ')}]`);
+    return {
+      intact: false,
+      reason: `备份快照不完整或已损坏（${parts.join('；')}）`,
+      missing,
+      tampered,
+    };
+  }
+  return { intact: true, reason: null, missing: [], tampered: [] };
+}
+
+export function doesDirectorySupportFollowPolicy(pluginDir, fsImpl = fs) {
+  if (!pluginDir) return true;
+  const cfgMjs = path.join(pluginDir, 'leaderteam', 'core', 'config.mjs');
+  if (!fsImpl.existsSync(cfgMjs)) return true;
+  try {
+    return /['"]follow['"]/.test(fsImpl.readFileSync(cfgMjs, 'utf8'));
+  } catch {
+    return true;
+  }
+}
+
+export function reconcileConfigForTargetCapabilities(storageRoot, { supportsFollowPolicy = true } = {}) {
+  if (!storageRoot) return;
+  const compatFile = path.join(resolveUpdaterDir(storageRoot), 'compat-downgraded-policy.json');
+  const configDir = path.join(storageRoot, 'config');
+  const teamsDir = path.join(storageRoot, 'teams');
+
+  if (!supportsFollowPolicy) {
+    let record = { v: 1, files: {}, teams: {} };
+    if (fs.existsSync(compatFile)) {
+      try {
+        const prev = JSON.parse(fs.readFileSync(compatFile, 'utf8'));
+        if (prev && typeof prev === 'object') {
+          record = {
+            v: 1,
+            files: { ...(prev.files || {}) },
+            teams: { ...(prev.teams || {}) },
+          };
+        }
+      } catch {}
+    }
+    let changedAny = false;
+    for (const cfgName of ['leaderteam.config.json', 'leaderteam.local.json']) {
+      const full = path.join(configDir, cfgName);
+      if (!fs.existsSync(full)) continue;
+      try {
+        const parsed = JSON.parse(fs.readFileSync(full, 'utf8'));
+        if (parsed?.team?.leaderModelPolicy === 'follow') {
+          parsed.team.leaderModelPolicy = 'warn';
+          writeFileAtomic(full, `${JSON.stringify(parsed, null, 2)}\n`);
+          record.files[cfgName] = 'follow';
+          changedAny = true;
+        }
+      } catch {}
+    }
+    if (fs.existsSync(teamsDir)) {
+      try {
+        for (const d of fs.readdirSync(teamsDir, { withFileTypes: true })) {
+          if (!d.isDirectory()) continue;
+          const govFile = path.join(teamsDir, d.name, 'governance.json');
+          if (!fs.existsSync(govFile)) continue;
+          try {
+            const parsed = JSON.parse(fs.readFileSync(govFile, 'utf8'));
+            if (parsed?.v === 1 && parsed?.config?.team?.leaderModelPolicy === 'follow') {
+              parsed.config.team.leaderModelPolicy = 'warn';
+              parsed.sourceSha256 = hashJson(parsed.config);
+              writeFileAtomic(govFile, JSON.stringify(parsed, null, 1));
+              record.teams[d.name] = 'follow';
+              changedAny = true;
+            }
+          } catch {}
+        }
+      } catch {}
+    }
+    if (changedAny) {
+      fs.mkdirSync(path.dirname(compatFile), { recursive: true });
+      writeFileAtomic(compatFile, `${JSON.stringify(record, null, 2)}\n`);
+    }
+    return;
+  }
+
+  if (!fs.existsSync(compatFile)) return;
+  try {
+    const record = JSON.parse(fs.readFileSync(compatFile, 'utf8'));
+    for (const [cfgName, origPolicy] of Object.entries(record?.files || {})) {
+      if (origPolicy !== 'follow') continue;
+      const full = path.join(configDir, cfgName);
+      if (!fs.existsSync(full)) continue;
+      try {
+        const parsed = JSON.parse(fs.readFileSync(full, 'utf8'));
+        if (parsed?.team?.leaderModelPolicy === 'warn') {
+          parsed.team.leaderModelPolicy = 'follow';
+          writeFileAtomic(full, `${JSON.stringify(parsed, null, 2)}\n`);
+        }
+      } catch {}
+    }
+    for (const [teamDir, origPolicy] of Object.entries(record?.teams || {})) {
+      if (origPolicy !== 'follow') continue;
+      const govFile = path.join(teamsDir, teamDir, 'governance.json');
+      if (!fs.existsSync(govFile)) continue;
+      try {
+        const parsed = JSON.parse(fs.readFileSync(govFile, 'utf8'));
+        if (parsed?.v === 1 && parsed?.config?.team?.leaderModelPolicy === 'warn') {
+          parsed.config.team.leaderModelPolicy = 'follow';
+          parsed.sourceSha256 = hashJson(parsed.config);
+          writeFileAtomic(govFile, JSON.stringify(parsed, null, 1));
+        }
+      } catch {}
+    }
+    fs.rmSync(compatFile, { force: true });
+  } catch {}
 }
 
 export function createPreUpgradeBackup({
@@ -751,6 +1196,7 @@ export function createPreUpgradeBackup({
   // 1. Copy installed plugin package directory (without node_modules/.git) for 100% offline rollback
   const pkgSnapshotDir = path.join(backupDir, 'plugin-package');
   copyDirRecursiveSync(pluginRoot, pkgSnapshotDir);
+  const { fileCount, fileHashes } = computeDirectoryFileHashes(pkgSnapshotDir);
 
   // 2. Snapshot user configs (note: upgrade never overwrites these, but snapshot protects rollback)
   const configDir = path.join(storageRoot, 'config');
@@ -784,6 +1230,8 @@ export function createPreUpgradeBackup({
     toTrack: targetTrack,
     profileDir: profileDir || null,
     pluginSnapshotDir: pkgSnapshotDir,
+    fileCount,
+    fileHashes,
   };
   writeFileAtomic(path.join(backupDir, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`);
   return { backupId, backupDir, manifest };
@@ -937,7 +1385,7 @@ export async function performOneClickUpgrade({
   assertTargetReleaseTagMatchesPlatform(targetVersion, platform);
 
   if (!allowBusy) {
-    const idleCheck = isRuntimeIdleForUpgrade(rt);
+    const idleCheck = isRuntimeIdleForUpgrade(rt, { storageRoot });
     if (!idleCheck.idle) {
       const err = new Error(`为保证会话与团队记录完整性，请等待当前运行中的任务完成后再执行升级：${idleCheck.reasons.join('；')}`);
       err.code = 'UPGRADE_BUSY';
@@ -1074,10 +1522,16 @@ export async function performOneClickUpgrade({
       },
     });
 
+    const targetSupportsFollow = staged.inspection.supportsFollowPolicy !== false;
+
     const runRollback = async failureReason => {
       let rollbackOk = false;
       let rollbackError = null;
       try {
+        const snapIntegrity = verifyBackupSnapshotIntegrity(backup.manifest);
+        if (!snapIntegrity.intact) {
+          throw new Error(snapIntegrity.reason);
+        }
         if (typeof installerHook === 'function') {
           await installerHook({
             mode: 'rollback',
@@ -1113,6 +1567,9 @@ export async function performOneClickUpgrade({
           }
         }
         restoreConfigSnapshotIfMissing(backup.backupDir, storageRoot);
+        reconcileConfigForTargetCapabilities(storageRoot, {
+          supportsFollowPolicy: doesDirectorySupportFollowPolicy(backup.manifest.pluginSnapshotDir),
+        });
       } catch (rbErr) {
         rollbackError = rbErr.message;
       }
@@ -1147,6 +1604,7 @@ export async function performOneClickUpgrade({
           dshHome,
         });
         restoreConfigSnapshotIfMissing(backup.backupDir, storageRoot);
+        reconcileConfigForTargetCapabilities(storageRoot, { supportsFollowPolicy: targetSupportsFollow });
         const completed = {
           ok: true,
           mode: 'hook',
@@ -1199,6 +1657,7 @@ export async function performOneClickUpgrade({
               throw new Error(addRes?.error?.diagnostic || '安装新版插件包失败');
             }
             restoreConfigSnapshotIfMissing(backup.backupDir, storageRoot);
+            reconcileConfigForTargetCapabilities(storageRoot, { supportsFollowPolicy: targetSupportsFollow });
             writeUpdaterState(storageRoot, {
               phase: 'succeeded',
               activeUpgrade: null,
@@ -1244,6 +1703,7 @@ export async function performOneClickUpgrade({
           throw new Error(addRes?.error?.diagnostic || '宿主插件管理器安装返回失败');
         }
         restoreConfigSnapshotIfMissing(backup.backupDir, storageRoot);
+        reconcileConfigForTargetCapabilities(storageRoot, { supportsFollowPolicy: targetSupportsFollow });
         const completed = {
           ok: true,
           mode: 'plugin-manager-restart',
@@ -1309,6 +1769,7 @@ export async function performOneClickUpgrade({
     }
 
     restoreConfigSnapshotIfMissing(backup.backupDir, storageRoot);
+    reconcileConfigForTargetCapabilities(storageRoot, { supportsFollowPolicy: targetSupportsFollow });
     const completed = {
       ok: true,
       mode: 'dsh-cli',
@@ -1355,7 +1816,7 @@ export async function rollbackToSavedBackup({
   installerHook = null,
 } = {}) {
   if (!storageRoot) throw new Error('storageRoot is required for rollback');
-  const idleCheck = isRuntimeIdleForUpgrade(rt);
+  const idleCheck = isRuntimeIdleForUpgrade(rt, { storageRoot });
   if (!idleCheck.idle) {
     const err = new Error(`请等待当前任务空闲后再执行版本回滚：${idleCheck.reasons.join('；')}`);
     err.code = 'ROLLBACK_BUSY';
@@ -1372,6 +1833,16 @@ export async function rollbackToSavedBackup({
     throw err;
   }
 
+  const integrity = verifyBackupSnapshotIntegrity(chosen);
+  if (!integrity.intact) {
+    const err = new Error(`无法执行回滚：${integrity.reason}。当前运行安装保持不变。`);
+    err.code = 'CORRUPT_BACKUP_SNAPSHOT';
+    err.statusCode = 422;
+    err.details = integrity;
+    throw err;
+  }
+
+  const targetSupportsFollow = doesDirectorySupportFollowPolicy(chosen.pluginSnapshotDir);
   const rootCtx = ctx?.root ?? ctx;
   const pluginManager = typeof rootCtx?.get === 'function' ? rootCtx.get('pluginManager') : null;
   const hasHmr = Boolean(typeof rootCtx?.get === 'function' && rootCtx.get('hmr'));
@@ -1393,6 +1864,7 @@ export async function rollbackToSavedBackup({
           await pluginManager.removeBundle('dsh-leaderteam').catch(() => null);
           await pluginManager.installBundle(chosen.pluginSnapshotDir, { enabled: true });
           restoreConfigSnapshotIfMissing(chosen.backupDir, storageRoot);
+          reconcileConfigForTargetCapabilities(storageRoot, { supportsFollowPolicy: targetSupportsFollow });
           writeUpdaterState(storageRoot, {
             phase: 'rolled_back',
             activeUpgrade: null,
@@ -1437,6 +1909,7 @@ export async function rollbackToSavedBackup({
   }
 
   restoreConfigSnapshotIfMissing(chosen.backupDir, storageRoot);
+  reconcileConfigForTargetCapabilities(storageRoot, { supportsFollowPolicy: targetSupportsFollow });
   writeUpdaterState(storageRoot, {
     phase: 'rolled_back',
     activeUpgrade: null,

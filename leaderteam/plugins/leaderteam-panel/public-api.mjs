@@ -36,17 +36,22 @@ import {
   syncRuntimeConfig,
   activePluginsMap,
   refreshUpstreamCatalog,
+  effectiveRuntimeConfig,
   inspectSessionBusyForConfig,
   effectiveSessionConfig,
   rebindTeamGovernanceSnapshot,
   rebindAllIdleSessionsOnGlobalUserSave,
+  syncIdleLeaderAgentModelToEffectiveConfig,
+  flushPendingSessionConfigAtSafeBoundary,
 } from '../../host/runtime.mjs';
 import {
+  sessionConfigPath,
   readSessionConfigRecord,
   hasActiveSessionOverride,
   hasPendingSessionOverride,
   mutateSessionConfig,
   buildAutoAdoptedLocalOverrideFromDshModels,
+  hasLiveCrossProcessActiveTurn,
 } from '../../core/session-config.mjs';
 import {
   EXECUTION_MODES,
@@ -1272,6 +1277,13 @@ export async function resolveHostSessionModeHints(ctx, rt, sessionId, dshHome = 
     }
   }
 
+  if (!hints.passiveRunning && baseRt?.storageRoot) {
+    const crossTurn = hasLiveCrossProcessActiveTurn(baseRt.storageRoot, sessionId, { includeSelf: false });
+    if (crossTurn.active) {
+      hints.passiveRunning = true;
+    }
+  }
+
   hints.standaloneLookup = !sessionController;
   hints.sessionExists = Boolean(sessionExists);
   return hints;
@@ -2092,6 +2104,30 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
         const body = await parseJsonRequest(request);
         const mgr = getGatewayMgr();
         const action = String(body.action || 'health');
+        const syncHostGatewayEndpoints = async status => {
+          if (!ctx) return null;
+          try {
+            ensureConfigLoaded();
+            let discoveredModels = rt?.upstreamCatalog?.models ?? [];
+            if (status?.state === 'running') {
+              const combined = await collectCombinedDiscoveredModels(ctx, rt, mgr).catch(() => null);
+              if (combined?.discoveredModels) discoveredModels = combined.discoveredModels;
+            }
+            return await syncActiveModelsToDshHost(
+              ctx,
+              rt,
+              effectiveRuntimeConfig(rt) ?? rt.config,
+              discoveredModels,
+              status,
+            );
+          } catch (syncErr) {
+            return {
+              synced: false,
+              reason: syncErr instanceof Error ? syncErr.message : String(syncErr),
+              updatedProviders: [],
+            };
+          }
+        };
 
         if (action === 'install') {
           const res = await mgr.install({
@@ -2102,7 +2138,8 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
         }
         if (action === 'start') {
           const status = await mgr.start({ allocateDynamicPortsIfBusy: body.dynamicPorts !== false });
-          return okEnvelope({ status });
+          const dshSettingsSync = await syncHostGatewayEndpoints(status);
+          return okEnvelope({ status, ...(dshSettingsSync ? { dshSettingsSync } : {}) });
         }
         if (action === 'stop') {
           const status = await mgr.stop();
@@ -2110,11 +2147,14 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
         }
         if (action === 'restart') {
           const status = await mgr.restart({ allocateDynamicPortsIfBusy: body.dynamicPorts !== false });
-          return okEnvelope({ status });
+          const dshSettingsSync = await syncHostGatewayEndpoints(status);
+          return okEnvelope({ status, ...(dshSettingsSync ? { dshSettingsSync } : {}) });
         }
         if (action === 'configure') {
           mgr.configure(body.config || body);
-          return okEnvelope({ status: await mgr.getStatus() });
+          const status = await mgr.getStatus();
+          const dshSettingsSync = await syncHostGatewayEndpoints(status);
+          return okEnvelope({ status, ...(dshSettingsSync ? { dshSettingsSync } : {}) });
         }
         if (action === 'check-compatibility') {
           const compat = await mgr.checkCompatibility();
@@ -2122,15 +2162,21 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
         }
         if (action === 'rollback') {
           const rb = await mgr.rollback();
-          return okEnvelope({ rollback: rb, status: await mgr.getStatus() });
+          const status = await mgr.getStatus();
+          const dshSettingsSync = await syncHostGatewayEndpoints(status);
+          return okEnvelope({ rollback: rb, status, ...(dshSettingsSync ? { dshSettingsSync } : {}) });
         }
         if (action === 'save-external') {
           const list = mgr.saveExternalGateway(body.gateway || body);
-          return okEnvelope({ externalGateways: list, status: await mgr.getStatus() });
+          const status = await mgr.getStatus();
+          const dshSettingsSync = await syncHostGatewayEndpoints(status);
+          return okEnvelope({ externalGateways: list, status, ...(dshSettingsSync ? { dshSettingsSync } : {}) });
         }
         if (action === 'remove-external') {
           const list = mgr.removeExternalGateway(body.id);
-          return okEnvelope({ externalGateways: list, status: await mgr.getStatus() });
+          const status = await mgr.getStatus();
+          const dshSettingsSync = await syncHostGatewayEndpoints(status);
+          return okEnvelope({ externalGateways: list, status, ...(dshSettingsSync ? { dshSettingsSync } : {}) });
         }
         return okEnvelope({ status: await mgr.getStatus() });
       } catch (e) {
@@ -2393,9 +2439,6 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
         let idleRebind = { reboundIds: [], skippedBusyIds: [] };
         if (!body.dryRun) {
           syncRuntimeConfig(rt);
-          idleRebind = rebindAllIdleSessionsOnGlobalUserSave(rt, {
-            principal: { kind: 'user', source: 'lt-public-v1' },
-          });
           dshSettingsSync = await syncActiveModelsToDshHost(
             ctx,
             rt,
@@ -2416,6 +2459,10 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
           ) {
             warnings.push(`DSH settings live-sync warning: ${dshSettingsSync.reason}`);
           }
+          idleRebind = rebindAllIdleSessionsOnGlobalUserSave(rt, {
+            principal: { kind: 'user', source: 'lt-public-v1' },
+            ctx,
+          });
         }
         return okEnvelope({
           applyResult: {
@@ -2734,6 +2781,16 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
             )
           : false;
 
+        if (requestedSid && !alreadyExisted && rt?.storageRoot) {
+          // Purge any legacy pre-creation orphan session-config left behind before this session existed (R5)
+          try {
+            const orphanCfgFile = sessionConfigPath(rt.storageRoot, requestedSid);
+            if (orphanCfgFile && fs.existsSync(orphanCfgFile)) {
+              fs.rmSync(orphanCfgFile, { force: true });
+            }
+          } catch {}
+        }
+
         const cleanPreSeededModeFiles = sidToClean => {
           if (!sidToClean || alreadyExisted || !rt?.storageRoot) return;
           try {
@@ -2941,9 +2998,9 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
         const mgr = getGatewayMgr();
         const { gwStatus, discoveredModels } = await collectCombinedDiscoveredModels(ctx, rt, mgr);
 
-        const buildSnap = sid => {
+        const buildSnap = (sid, extraBusy = null) => {
           const rec = readSessionConfigRecord(storageRoot, sid);
-          const busy = inspectSessionBusyForConfig(rt, sid);
+          const busy = extraBusy ?? inspectSessionBusyForConfig(rt, sid);
           const eff = effectiveSessionConfig(rt, sid) ?? rt.config;
           return {
             sessionId: sid,
@@ -2959,6 +3016,32 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
               leaderModelPolicy: eff?.team?.leaderModelPolicy ?? 'follow',
             },
           };
+        };
+
+        const verifyExistingLtSessionAndBusy = async sid => {
+          const dshHome = getDshHome();
+          const hints = await resolveHostSessionModeHints(ctx, rt, sid, dshHome);
+          if (!hints.sessionExists) {
+            throw httpContractError(
+              'SESSION_NOT_FOUND',
+              `Cannot mutate session configuration: session "${sid}" does not exist`,
+              404,
+            );
+          }
+          const modeState = inspectSessionModeState(ctx, rt, sid, hints);
+          if (!modeState.isLtSession) {
+            throw httpContractError(
+              'MODE_NOT_LT_SESSION',
+              modeState.busyReason || `Session "${sid}" is not a LeaderTeam session`,
+              400,
+            );
+          }
+          const rawBusy = inspectSessionBusyForConfig(rt, sid);
+          const reasons = [...rawBusy.reasons];
+          if (modeState.activeTurn && !reasons.includes('leader_turn_running')) {
+            reasons.push('leader_turn_running');
+          }
+          return { busy: reasons.length > 0, reasons, modeState };
         };
 
         if (action === 'auto-adopt-host') {
@@ -2985,7 +3068,7 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
           if (scope === 'session') {
             const sessionId = String(body.sessionId || '').trim();
             if (!sessionId) return errEnvelope('BAD_REQUEST', 'sessionId is required for scope="session"', 400);
-            const busy = inspectSessionBusyForConfig(rt, sessionId);
+            const busy = await verifyExistingLtSessionAndBusy(sessionId);
             const mut = mutateSessionConfig({
               storageRoot,
               sessionId,
@@ -2997,14 +3080,28 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
               busyReasons: busy.reasons,
               discoveredModels,
             });
+            if (ctx) {
+              await syncActiveModelsToDshHost(
+                ctx,
+                rt,
+                mut.targetEffectiveConfig ?? mut.effectiveConfig,
+                discoveredModels,
+                gwStatus,
+              ).catch(() => null);
+            }
             if (mut.appliedImmediately) {
-              rebindTeamGovernanceSnapshot(rt, sessionId, { principal, forceAtSafeBoundary: true });
+              rebindTeamGovernanceSnapshot(rt, sessionId, {
+                principal,
+                forceAtSafeBoundary: true,
+                ctx,
+                syncAgentModel: true,
+              });
             }
             return okEnvelope({
               scope: 'session',
               appliedImmediately: mut.appliedImmediately,
               stagedForSafeBoundary: mut.stagedForSafeBoundary,
-              sessionConfig: buildSnap(sessionId),
+              sessionConfig: buildSnap(sessionId, busy),
             });
           }
 
@@ -3026,11 +3123,11 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
             },
           );
           syncRuntimeConfig(rt);
-          const idleRebind = rebindAllIdleSessionsOnGlobalUserSave(rt, { principal });
           await syncActiveModelsToDshHost(ctx, rt, rt.config, discoveredModels, gwStatus, [], {
             dshHome: getDshHome(),
             syncDefaultModel: true,
           }).catch(() => null);
+          const idleRebind = rebindAllIdleSessionsOnGlobalUserSave(rt, { principal, ctx });
           return okEnvelope({
             scope: 'global',
             idleRebind,
@@ -3042,11 +3139,22 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
         if (!sessionId) return errEnvelope('BAD_REQUEST', 'sessionId is required', 400);
 
         if (action === 'get') {
-          return okEnvelope(buildSnap(sessionId));
+          const dshHome = getDshHome();
+          const hints = await resolveHostSessionModeHints(ctx, rt, sessionId, dshHome);
+          if (!hints.sessionExists) {
+            return errEnvelope('SESSION_NOT_FOUND', `Session "${sessionId}" does not exist`, 404);
+          }
+          const modeState = inspectSessionModeState(ctx, rt, sessionId, hints);
+          const rawBusy = inspectSessionBusyForConfig(rt, sessionId);
+          const reasons = [...rawBusy.reasons];
+          if (modeState.activeTurn && !reasons.includes('leader_turn_running')) {
+            reasons.push('leader_turn_running');
+          }
+          return okEnvelope(buildSnap(sessionId, { busy: reasons.length > 0, reasons }));
         }
 
         if (action === 'set') {
-          const busy = inspectSessionBusyForConfig(rt, sessionId);
+          const busy = await verifyExistingLtSessionAndBusy(sessionId);
           const rawPatch = isPlainObj(body.patch) ? body.patch : {};
           const patch = {
             ...rawPatch,
@@ -3063,31 +3171,33 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
             busyReasons: busy.reasons,
             discoveredModels,
           });
+          await syncActiveModelsToDshHost(
+            ctx,
+            rt,
+            mut.targetEffectiveConfig ?? mut.effectiveConfig,
+            discoveredModels,
+            gwStatus,
+            [],
+            { dshHome: getDshHome() },
+          ).catch(() => null);
           if (mut.appliedImmediately) {
-            rebindTeamGovernanceSnapshot(rt, sessionId, { principal, forceAtSafeBoundary: true });
-            await syncActiveModelsToDshHost(ctx, rt, mut.effectiveConfig, discoveredModels, gwStatus, [], {
-              dshHome: getDshHome(),
-            }).catch(() => null);
-            const baseRt = baseRuntime(rt);
-            const liveAgent = baseRt?.actors?.get?.(sessionId)?.agent ?? baseRt?.hostAgents?.get?.(sessionId) ?? null;
-            if (liveAgent && typeof liveAgent.model?.select === 'function' && patch.roles?.leader) {
-              try {
-                const effCfg = effectiveSessionConfig(rt, sessionId) ?? rt.config;
-                const tgt = resolveModelTarget(effCfg, effCfg.roles.leader.route, effCfg.roles.leader.effort);
-                liveAgent.model.select(tgt);
-              } catch {}
-            }
+            rebindTeamGovernanceSnapshot(rt, sessionId, {
+              principal,
+              forceAtSafeBoundary: true,
+              ctx,
+              syncAgentModel: true,
+            });
           }
           return okEnvelope({
             appliedImmediately: mut.appliedImmediately,
             stagedForSafeBoundary: mut.stagedForSafeBoundary,
             busyReasons: mut.busyReasons,
-            sessionConfig: buildSnap(sessionId),
+            sessionConfig: buildSnap(sessionId, busy),
           });
         }
 
         if (action === 'reset') {
-          const busy = inspectSessionBusyForConfig(rt, sessionId);
+          const busy = await verifyExistingLtSessionAndBusy(sessionId);
           const mut = mutateSessionConfig({
             storageRoot,
             sessionId,
@@ -3098,18 +3208,27 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
             busyReasons: busy.reasons,
           });
           if (mut.appliedImmediately) {
-            rebindTeamGovernanceSnapshot(rt, sessionId, { principal, forceAtSafeBoundary: true });
+            if (ctx) {
+              await syncActiveModelsToDshHost(ctx, rt, rt.config, discoveredModels, gwStatus).catch(() => null);
+            }
+            rebindTeamGovernanceSnapshot(rt, sessionId, {
+              principal,
+              forceAtSafeBoundary: true,
+              ctx,
+              syncAgentModel: true,
+            });
           }
           return okEnvelope({
             appliedImmediately: mut.appliedImmediately,
             stagedForSafeBoundary: mut.stagedForSafeBoundary,
             busyReasons: mut.busyReasons,
-            sessionConfig: buildSnap(sessionId),
+            sessionConfig: buildSnap(sessionId, busy),
           });
         }
 
         if (action === 'promote-to-global') {
-          const snap = buildSnap(sessionId);
+          const busy = await verifyExistingLtSessionAndBusy(sessionId);
+          const snap = buildSnap(sessionId, busy);
           const setRoles = Object.entries(snap.effective.roles).map(([role, spec]) => ({ role, ...spec }));
           applyModelConfigChanges(
             {
@@ -3125,11 +3244,11 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
             },
           );
           syncRuntimeConfig(rt);
-          const idleRebind = rebindAllIdleSessionsOnGlobalUserSave(rt, { principal });
           await syncActiveModelsToDshHost(ctx, rt, rt.config, discoveredModels, gwStatus, [], {
             dshHome: getDshHome(),
             syncDefaultModel: true,
           }).catch(() => null);
+          const idleRebind = rebindAllIdleSessionsOnGlobalUserSave(rt, { principal, ctx });
           if (!snap.isBusy) {
             mutateSessionConfig({
               storageRoot,
@@ -3139,12 +3258,17 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
               principal,
               isBusy: false,
             });
-            rebindTeamGovernanceSnapshot(rt, sessionId, { principal, forceAtSafeBoundary: true });
+            rebindTeamGovernanceSnapshot(rt, sessionId, {
+              principal,
+              forceAtSafeBoundary: true,
+              ctx,
+              syncAgentModel: true,
+            });
           }
           return okEnvelope({
             promoted: true,
             idleRebind,
-            sessionConfig: buildSnap(sessionId),
+            sessionConfig: buildSnap(sessionId, busy),
             runtime: await buildRuntimeSnapshotPayload(ctx, rt),
           });
         }
@@ -3167,6 +3291,31 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
         if (!sessionId || !text) {
           return errEnvelope('BAD_REQUEST', 'sessionId and non-empty text are required');
         }
+        try {
+          ensureConfigLoaded();
+          const storageRoot = getStorageRoot();
+          if (storageRoot && !baseRuntime(rt)?.liveRunningTurnSessions?.has?.(sessionId)) {
+            const pendingCheck = readSessionConfigRecord(storageRoot, sessionId);
+            if (hasPendingSessionOverride(pendingCheck)) {
+              const flushRes = flushPendingSessionConfigAtSafeBoundary(ctx, rt, sessionId);
+              if (flushRes?.flushed && ctx) {
+                const mgr = getGatewayMgr();
+                const { gwStatus, discoveredModels } = await collectCombinedDiscoveredModels(ctx, rt, mgr).catch(() => ({
+                  gwStatus: null,
+                  discoveredModels: rt?.upstreamCatalog?.models ?? [],
+                }));
+                await syncActiveModelsToDshHost(
+                  ctx,
+                  rt,
+                  flushRes.effectiveConfig ?? rt.config,
+                  discoveredModels,
+                  gwStatus,
+                ).catch(() => null);
+                syncIdleLeaderAgentModelToEffectiveConfig(ctx, rt, sessionId);
+              }
+            }
+          }
+        } catch {}
         const ac = new AbortController();
         const res = await sessionController.prompt(
           {

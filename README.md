@@ -1,6 +1,6 @@
 # LeaderTeam for DeepSeek Harness (V2.2)
 
-![Version](https://img.shields.io/badge/version-2.2.3-blue)
+![Version](https://img.shields.io/badge/version-2.2.4-blue)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows-success)
 ![DSH Host](https://img.shields.io/badge/DeepSeek%20Harness-%3E%3D0.2.2--alpha.2%20%3C1.0.0-5b6ee1)
 ![Node.js](https://img.shields.io/badge/node-%3E%3D22.15-339933)

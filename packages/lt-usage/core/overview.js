@@ -16,6 +16,17 @@ function finalizeCost(cost) {
   return out;
 }
 
+function hasPositiveTokenTotal(obj) {
+  return Boolean(
+    obj &&
+    ((obj.inputTokens ?? 0) > 0 ||
+      (obj.cacheReadTokens ?? 0) > 0 ||
+      (obj.cacheWriteTokens ?? 0) > 0 ||
+      (obj.outputTokens ?? 0) > 0 ||
+      (obj.totalTokens ?? 0) > 0)
+  );
+}
+
 export function aggregateOverview(reports, options = {}) {
   const totals = {
     callsTotal: 0,
@@ -36,16 +47,25 @@ export function aggregateOverview(reports, options = {}) {
     costActualUsd: 0,
     cacheSavingsCny: 0
   };
-  let hasKnownSucceededSessionCost = false;
+  let hasAnyBilledSession = false;
+  let hasKnownBilledSessionCost = false;
   const models = new Map();
   const sessions = [];
 
   for (const report of reports ?? []) {
     const t = report?.totals ?? {};
     const reportCallsSucceeded = t.callsSucceeded ?? 0;
-    const reportCostKnown = reportCallsSucceeded === 0 || t.costActualCny != null;
-    if (reportCallsSucceeded > 0 && t.costActualCny != null) {
-      hasKnownSucceededSessionCost = true;
+    const reportHasBilledWork =
+      reportCallsSucceeded > 0 ||
+      hasPositiveTokenTotal(t) ||
+      (t.unpricedCalls ?? 0) > 0 ||
+      (t.unmeteredCalls ?? 0) > 0;
+    const reportCostKnown = !reportHasBilledWork || t.costActualCny != null;
+    if (reportHasBilledWork) {
+      hasAnyBilledSession = true;
+      if (t.costActualCny != null) {
+        hasKnownBilledSessionCost = true;
+      }
     }
     totals.callsTotal += t.callsTotal ?? 0;
     totals.callsSucceeded += reportCallsSucceeded;
@@ -77,6 +97,7 @@ export function aggregateOverview(reports, options = {}) {
           outputTokens: 0,
           totalTokens: 0,
           priced: item.priced,
+          hasBilledWork: false,
           hasKnownCost: false,
           costPeakCny: { input: 0, cacheRead: 0, cacheWrite: 0, output: 0, total: 0 },
           costOffPeakCny: { input: 0, cacheRead: 0, cacheWrite: 0, output: 0, total: 0 },
@@ -88,8 +109,16 @@ export function aggregateOverview(reports, options = {}) {
       model.callsSucceeded += item.callsSucceeded ?? 0;
       model.unmeteredCalls += item.unmeteredCalls ?? 0;
       model.priced = model.priced || item.priced;
-      if ((item.callsSucceeded ?? 0) > 0 && item.costActualCny != null) {
-        model.hasKnownCost = true;
+      const itemHasBilledWork =
+        (item.callsSucceeded ?? 0) > 0 ||
+        hasPositiveTokenTotal(item) ||
+        (item.unmeteredCalls ?? 0) > 0 ||
+        item.costActualCny === null;
+      if (itemHasBilledWork) {
+        model.hasBilledWork = true;
+        if (item.costActualCny != null) {
+          model.hasKnownCost = true;
+        }
       }
       for (const field of TOKEN_FIELDS) model[field] += item[field] ?? 0;
       if (item.costPeakCny != null) addCost(model.costPeakCny, item.costPeakCny);
@@ -124,7 +153,7 @@ export function aggregateOverview(reports, options = {}) {
 
   const tokenDenom = totals.inputTokens + totals.cacheReadTokens;
   totals.cacheHitRatePct = tokenDenom > 0 ? round2((totals.cacheReadTokens / tokenDenom) * 100) : 0;
-  if (totals.callsSucceeded > 0 && !hasKnownSucceededSessionCost) {
+  if (hasAnyBilledSession && !hasKnownBilledSessionCost) {
     totals.costPeakCny = null;
     totals.costOffPeakCny = null;
     totals.costActualCny = null;
@@ -145,7 +174,7 @@ export function aggregateOverview(reports, options = {}) {
   const byModel = [];
   for (const model of models.values()) {
     const denom = model.inputTokens + model.cacheReadTokens;
-    const costAvailable = model.callsSucceeded === 0 ? true : model.hasKnownCost;
+    const costAvailable = !model.hasBilledWork ? true : model.hasKnownCost;
     byModel.push({
       route: model.route,
       ...(model.label ? { label: model.label } : {}),

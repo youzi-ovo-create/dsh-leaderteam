@@ -19,6 +19,8 @@ import {
   inspectTgzPackage,
   checkCandidatePackageCompatibility,
   computeFileSha256,
+  reconcileConfigForTargetCapabilities,
+  doesDirectorySupportFollowPolicy,
 } from './updater.mjs';
 import {
   QUICK_PROVIDER_PRESETS,
@@ -316,7 +318,7 @@ export function inspectInstallerEnvironment({
   }
 
   const bundledTarballs = findBundledLocalTarballs(
-    [process.cwd(), repoRoot, path.dirname(repoRoot), ...extraPackageDirs],
+    [env?.LT_INSTALLER_SOURCE_DIR, process.cwd(), repoRoot, path.dirname(repoRoot), ...extraPackageDirs],
     fsImpl,
   );
 
@@ -455,6 +457,7 @@ export async function runOneClickInstallation({
   let installedVersion = null;
   let installedTrack = track;
   let sha256 = null;
+  let targetSupportsFollow = true;
 
   if (sourceKind === 'local-tgz' || (sourceKind === 'auto' && localTgzPath)) {
     const fullTgz = path.resolve(localTgzPath);
@@ -473,6 +476,7 @@ export async function runOneClickInstallation({
     installedVersion = info.version;
     installedTrack = info.track;
     sha256 = computeFileSha256(fullTgz);
+    targetSupportsFollow = info.supportsFollowPolicy !== false;
   } else if (sourceKind === 'auto' && envSnap.bundledTarballs.length > 0) {
     const first = envSnap.bundledTarballs[0];
     reportStep('verify-package', `发现随附离线安装包 ${first.fileName}，正在校验兼容性…`);
@@ -490,10 +494,12 @@ export async function runOneClickInstallation({
     installedVersion = info.version;
     installedTrack = info.track;
     sha256 = computeFileSha256(first.path);
+    targetSupportsFollow = info.supportsFollowPolicy !== false;
   } else if (sourceKind === 'local-source' || (sourceKind === 'auto' && envSnap.localSourceBundle.available)) {
     installSpec = envSnap.localSourceBundle.path;
     installedVersion = envSnap.localSourceBundle.version;
     installedTrack = 'open-source';
+    targetSupportsFollow = doesDirectorySupportFollowPolicy(envSnap.localSourceBundle.path);
   } else {
     reportStep('download', `正在从 GitHub 下载最新「${UPDATE_TRACKS[track]?.shortLabel || track}」安装包并校验 SHA-256…`);
     const relCheck = await checkForUpdates({
@@ -531,6 +537,7 @@ export async function runOneClickInstallation({
     installedVersion = downloaded.inspection.version;
     installedTrack = downloaded.inspection.track;
     sha256 = downloaded.sha256;
+    targetSupportsFollow = downloaded.inspection.supportsFollowPolicy !== false;
   }
 
   // 4. Execute `dsh plugin --profile <desktop|web> add <installSpec>`
@@ -568,6 +575,11 @@ export async function runOneClickInstallation({
       throw err;
     }
   }
+
+  // Reconcile leaderModelPolicy compatibility record (e.g. restore 'follow' after upgrading back from legacy R3 'warn')
+  try {
+    reconcileConfigForTargetCapabilities(storageRoot, { supportsFollowPolicy: targetSupportsFollow });
+  } catch {}
 
   // 5. Optional: Pre-provision starter API key & Solo-Key config so user doesn't touch CLI at all
   let starterModelConfigured = false;

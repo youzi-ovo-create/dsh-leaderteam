@@ -384,10 +384,19 @@ export class HengzhangUsageBridge {
     const todayDateKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
     let todayCallsTotal = 0;
     let todayCallsSucceeded = 0;
+    let todayBilledCalls = 0;
     let todayUnmeteredCalls = 0;
     let todayUnpricedCalls = 0;
     let todayKnownCostCalls = 0;
     let todayCostCny = 0;
+    const callHasPositiveTokens = call => Boolean(
+      call &&
+      ((call.inputTokens ?? 0) > 0 ||
+        (call.cacheReadTokens ?? 0) > 0 ||
+        (call.cacheWriteTokens ?? 0) > 0 ||
+        (call.outputTokens ?? 0) > 0 ||
+        (call.totalTokens ?? 0) > 0),
+    );
     if (hasSessionsDir && Array.isArray(overview.sessions)) {
       for (const sess of overview.sessions) {
         const lastMs = typeof sess?.lastActivityMs === 'number' ? sess.lastActivityMs : sess?.startedAtMs;
@@ -400,12 +409,14 @@ export class HengzhangUsageBridge {
           if (typeof call?.timeMs !== 'number' || call.timeMs < startOfTodayMs) continue;
           todayCallsTotal += 1;
           if (call.ok !== false) todayCallsSucceeded += 1;
+          const isBilledCall = call.ok !== false || callHasPositiveTokens(call);
+          if (isBilledCall) todayBilledCalls += 1;
           if (call.unmetered) {
             todayUnmeteredCalls += 1;
-          } else if (call.ok !== false && typeof call.costActualCny === 'number' && Number.isFinite(call.costActualCny)) {
+          } else if (isBilledCall && typeof call.costActualCny === 'number' && Number.isFinite(call.costActualCny)) {
             todayCostCny += call.costActualCny;
             todayKnownCostCalls += 1;
-          } else if (call.ok !== false) {
+          } else if (isBilledCall) {
             todayUnpricedCalls += 1;
           }
         }
@@ -420,7 +431,7 @@ export class HengzhangUsageBridge {
         callsSucceeded: todayCallsSucceeded,
         unmeteredCalls: todayUnmeteredCalls,
         unpricedCalls: todayUnpricedCalls,
-        costActualCny: todayCallsSucceeded > 0 && todayKnownCostCalls === 0
+        costActualCny: todayBilledCalls > 0 && todayKnownCostCalls === 0
           ? null
           : Number(todayCostCny.toFixed(4)),
       },

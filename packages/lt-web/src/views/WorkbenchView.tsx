@@ -182,8 +182,26 @@ export function WorkbenchView({
   );
   const [promptMode, setPromptMode] = useState<'queue' | 'steer'>('queue');
   const [busy, setBusy] = useState(false);
-  const [sending, setSending] = useState(false);
-  const [feedback, setFeedback] = useState<string | null>(null);
+  const [sendingBySession, setSendingBySession] = useState<Record<string, boolean>>({});
+  const sending = Boolean(selectedSessionId && sendingBySession[selectedSessionId]);
+  const [globalFeedback, setGlobalFeedback] = useState<string | null>(null);
+  const [feedbackBySession, setFeedbackBySession] = useState<Record<string, string>>({});
+  const feedback = (selectedSessionId && feedbackBySession[selectedSessionId]) || globalFeedback;
+  const setSessionFeedback = useCallback((sid: string | null | undefined, msg: string | null) => {
+    if (!sid) {
+      setGlobalFeedback(msg);
+      return;
+    }
+    setFeedbackBySession(prev => {
+      if (!msg) {
+        if (!(sid in prev)) return prev;
+        const next = { ...prev };
+        delete next[sid];
+        return next;
+      }
+      return { ...prev, [sid]: msg };
+    });
+  }, []);
   const [openTools, setOpenTools] = useState<Record<string, boolean>>({});
   const [epochsBySession, setEpochsBySession] = useState<Record<string, LocalEpochEvent[]>>({});
   const [showLockDetails, setShowLockDetails] = useState(false);
@@ -213,7 +231,15 @@ export function WorkbenchView({
   const promptTextRef = useRef<string>(promptText);
   promptTextRef.current = promptText;
   const localDraftsRef = useRef<Record<string, string>>({ ...(draftsBySession || {}) });
-  if (draftsBySession) {
+  const prevDraftsPropRef = useRef<Record<string, string> | undefined>(draftsBySession);
+  if (draftsBySession && draftsBySession !== prevDraftsPropRef.current) {
+    const prevProp = prevDraftsPropRef.current || {};
+    prevDraftsPropRef.current = draftsBySession;
+    for (const sidKey of Object.keys(prevProp)) {
+      if (!(sidKey in draftsBySession) && sidKey !== selectedSessionId) {
+        delete localDraftsRef.current[sidKey];
+      }
+    }
     for (const [sidKey, draftVal] of Object.entries(draftsBySession)) {
       if (sidKey !== selectedSessionId) {
         localDraftsRef.current[sidKey] = draftVal;
@@ -227,6 +253,23 @@ export function WorkbenchView({
   const streamScrollRef = useRef<HTMLDivElement | null>(null);
   const pinnedToBottomRef = useRef<boolean>(true);
   const prevMessageCountRef = useRef<number>(0);
+
+  const setDraftForSession = useCallback(
+    (sid: string, nextVal: string) => {
+      if (sid) {
+        if (nextVal) localDraftsRef.current[sid] = nextVal;
+        else delete localDraftsRef.current[sid];
+      }
+      if (sid === selectedSessionIdRef.current) {
+        promptTextRef.current = nextVal;
+        setPromptText(nextVal);
+      }
+      if (sid && onDraftChange) {
+        onDraftChange(sid, nextVal);
+      }
+    },
+    [onDraftChange],
+  );
 
   const updatePromptText = useCallback(
     (nextOrUpdater: string | ((prev: string) => string)) => {
@@ -242,6 +285,22 @@ export function WorkbenchView({
       }
     },
     [onDraftChange],
+  );
+
+  const selectSession = useCallback(
+    (nextSid: string) => {
+      if (nextSid === selectedSessionIdRef.current) return;
+      selectedSessionIdRef.current = nextSid;
+      const savedDraft = nextSid
+        ? (localDraftsRef.current[nextSid] ?? draftsBySession?.[nextSid] ?? '')
+        : '';
+      promptTextRef.current = savedDraft;
+      setPromptText(savedDraft);
+      setGlobalFeedback(null);
+      setModeError(null);
+      setSelectedSessionId(nextSid);
+    },
+    [draftsBySession],
   );
 
   const syncModeSnapshotIntoSessionList = useCallback((snap: SessionModeSnapshot) => {
@@ -313,7 +372,7 @@ export function WorkbenchView({
         }
       }
     } catch (e: any) {
-      setFeedback(e.message);
+      setGlobalFeedback(e.message);
     }
   }, [selectedWorkspaceId, applyModeSnapshot]);
 
@@ -405,8 +464,9 @@ export function WorkbenchView({
       setPassiveRunning(Boolean(matched?.modeState?.activeTurn));
       setModeState(matched?.modeState ?? null);
       const savedDraft = selectedSessionId
-        ? (draftsBySession?.[selectedSessionId] ?? localDraftsRef.current[selectedSessionId] ?? '')
+        ? (localDraftsRef.current[selectedSessionId] ?? draftsBySession?.[selectedSessionId] ?? '')
         : '';
+      promptTextRef.current = savedDraft;
       setPromptText(savedDraft);
     } else if (matched?.modeState) {
       applyModeSnapshot(matched.modeState);
@@ -497,7 +557,7 @@ export function WorkbenchView({
           ],
         }));
         const msg = `已切换会话执行模式为 ${res.modeState.mode === 'single' ? 'Single 单代理直执' : 'Team 团队协作'}（0 次模型调用）`;
-        setFeedback(msg);
+        setSessionFeedback(targetSid, msg);
         if (onNotify) onNotify(msg, 'check');
       }
     } catch (err: any) {
@@ -529,7 +589,7 @@ export function WorkbenchView({
     ++modeMutationEpochRef.current;
     ++transcriptReqSeqRef.current;
     setBusy(true);
-    setFeedback(null);
+    setGlobalFeedback(null);
     setModeError(null);
     try {
       const trimmedCwd = newCwd.trim();
@@ -567,12 +627,12 @@ export function WorkbenchView({
       const msg = dualModeEnabled
         ? `已创建新 LeaderTeam 会话：${created.sessionId}（初始模式：${createdMode === 'single' ? 'Single 单代理直执' : 'Team 团队协作'}）`
         : `已创建新 LeaderTeam 会话：${created.sessionId}`;
-      setFeedback(msg);
+      setSessionFeedback(created.sessionId, msg);
       if (onNotify) onNotify(msg, 'check');
     } catch (e: any) {
       ++modeMutationEpochRef.current;
       ++transcriptReqSeqRef.current;
-      setFeedback(`创建会话失败：${e.message}`);
+      setGlobalFeedback(`创建会话失败：${e.message}`);
     } finally {
       setBusy(false);
     }
@@ -580,52 +640,73 @@ export function WorkbenchView({
 
   async function handleSendPrompt(e?: React.FormEvent) {
     if (e) e.preventDefault();
-    if (!selectedSessionId || !promptText.trim()) return;
-    setBusy(true);
-    setSending(true);
-    setFeedback(null);
+    const targetSid = selectedSessionIdRef.current || selectedSessionId;
+    const submittedRaw = promptTextRef.current;
+    const submittedText = submittedRaw.trim();
+    if (!targetSid || !submittedText || sendingBySession[targetSid]) return;
+    setSendingBySession(prev => ({ ...prev, [targetSid]: true }));
+    setSessionFeedback(targetSid, null);
+    setGlobalFeedback(null);
     setModeError(null);
     try {
       await callLtApi('workbench/prompt', {
-        sessionId: selectedSessionId,
-        text: promptText.trim(),
+        sessionId: targetSid,
+        text: submittedText,
         mode: promptMode,
       });
-      updatePromptText('');
-      pinnedToBottomRef.current = true;
-      await Promise.all([loadTranscript(selectedSessionId), loadSessions(), onRefreshBundle()]);
+      const latestDraftForTarget =
+        targetSid === selectedSessionIdRef.current
+          ? promptTextRef.current
+          : (localDraftsRef.current[targetSid] ?? '');
+      if (latestDraftForTarget === submittedRaw) {
+        setDraftForSession(targetSid, '');
+      }
+      if (targetSid === selectedSessionIdRef.current) {
+        pinnedToBottomRef.current = true;
+      }
+      await Promise.all([
+        targetSid === selectedSessionIdRef.current ? loadTranscript(targetSid) : Promise.resolve(),
+        loadSessions(),
+        onRefreshBundle(),
+      ]);
     } catch (err: any) {
-      setFeedback(`发送失败：${err.message}`);
+      setSessionFeedback(targetSid, `发送失败：${err.message}`);
     } finally {
-      setSending(false);
-      setBusy(false);
+      setSendingBySession(prev => {
+        const next = { ...prev };
+        delete next[targetSid];
+        return next;
+      });
     }
   }
 
   async function handleCancelTurn() {
-    if (!selectedSessionId) return;
+    const targetSid = selectedSessionIdRef.current || selectedSessionId;
+    if (!targetSid) return;
     setBusy(true);
     try {
-      await callLtApi('workbench/cancel', { sessionId: selectedSessionId });
+      await callLtApi('workbench/cancel', { sessionId: targetSid });
       const msg = '已向当前会话发送中断请求（保留待处理队列）';
-      setFeedback(msg);
+      setSessionFeedback(targetSid, msg);
       if (onNotify) onNotify(msg, 'stop');
       setEpochsBySession(prev => ({
         ...prev,
-        [selectedSessionId]: [
-          ...(prev[selectedSessionId] || []),
+        [targetSid]: [
+          ...(prev[targetSid] || []),
           {
             id: `ep-cancel-${Date.now()}`,
-            afterMessageCount: messages.length,
+            afterMessageCount: targetSid === selectedSessionIdRef.current ? messages.length : 0,
             icon: 'stop',
             label: '已请求中断当前回合',
             timeText: formatClockTime(Date.now()) || '刚刚',
           },
         ],
       }));
-      await loadTranscript(selectedSessionId);
+      if (targetSid === selectedSessionIdRef.current) {
+        await loadTranscript(targetSid);
+      }
     } catch (err: any) {
-      setFeedback(`中断失败：${err.message}`);
+      setSessionFeedback(targetSid, `中断失败：${err.message}`);
     } finally {
       setBusy(false);
     }
@@ -847,7 +928,7 @@ export function WorkbenchView({
                         type="button"
                         className="list-item"
                         aria-current={selected ? 'true' : undefined}
-                        onClick={() => setSelectedSessionId(s.sessionId)}
+                        onClick={() => selectSession(s.sessionId)}
                       >
                         <span className="col grow" style={{ gap: 4 }}>
                           <span className="row">
@@ -1098,7 +1179,14 @@ export function WorkbenchView({
               <div className="callout info">
                 <Icon name="info" />
                 <span className="grow">{feedback}</span>
-                <button type="button" className="btn btn-ghost btn-sm" onClick={() => setFeedback(null)}>
+                <button
+                  type="button"
+                  className="btn btn-ghost btn-sm"
+                  onClick={() => {
+                    if (selectedSessionId) setSessionFeedback(selectedSessionId, null);
+                    setGlobalFeedback(null);
+                  }}
+                >
                   关闭
                 </button>
               </div>
@@ -1377,7 +1465,7 @@ export function WorkbenchView({
                         ? '输入单代理直执指令（主代理直接读写/命令并受安全门守护）…'
                         : '描述下一步工程目标（支持「最大并发 N」、「允许读取 <路径>」）…'
                   }
-                  disabled={!liveHost || !selectedSessionId || busy}
+                  disabled={!liveHost || !selectedSessionId || busy || sending}
                   value={promptText}
                   onChange={e => updatePromptText(e.target.value)}
                   onCompositionStart={() => {
@@ -1470,7 +1558,7 @@ export function WorkbenchView({
                   <button
                     type="submit"
                     className="btn btn-sm btn-primary"
-                    disabled={!liveHost || !selectedSessionId || !promptText.trim() || busy}
+                    disabled={!liveHost || !selectedSessionId || !promptText.trim() || busy || sending}
                   >
                     <Icon name="send" className="icon-14" />
                     {sending ? '提交中…' : '发送'}
