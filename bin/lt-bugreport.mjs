@@ -373,13 +373,17 @@ const NATIVE_SESSION_FILENAMES = Object.freeze(['session.v4.jsonl.zstd', 'sessio
 function decodeZstdSessionBuffer(buf) {
   if (!buf || buf.length === 0) return '';
   const rawBuf = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
-  try {
-    return zlib.zstdDecompressSync(rawBuf, { maxOutputLength: MAX_NATIVE_SESSION_OUTPUT_BYTES }).toString('utf8');
-  } catch {}
   const starts = [];
   for (let i = 0; i + 3 < rawBuf.length; i++) {
     if (rawBuf[i] === 0x28 && rawBuf[i + 1] === 0xb5 && rawBuf[i + 2] === 0x2f && rawBuf[i + 3] === 0xfd) {
       starts.push(i);
+    }
+  }
+  if (starts.length <= 1) {
+    try {
+      return zlib.zstdDecompressSync(rawBuf, { maxOutputLength: MAX_NATIVE_SESSION_OUTPUT_BYTES }).toString('utf8');
+    } catch {
+      return '';
     }
   }
   const parts = [];

@@ -10,6 +10,8 @@ import { writeFileAtomic } from './store.mjs';
 const LEGACY_HARDCODED_CONTEXT_WINDOW = 131072;
 const LEGACY_HARDCODED_MAX_TOKENS = 16384;
 const VALID_PI_AI_EFFORT_KEYS = new Set(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
+const THINKING_EFFORT_KEYS = new Set(['minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
+export const RESERVED_DSH_BUILTIN_PROVIDER_IDS = new Set(['deepseek-official', 'deepseek-account']);
 const BUILTIN_OPENAI_MODEL_PREFIX_RE = /^(?:gpt-3\.5|gpt-4|gpt-5|o1|o3|o4|codex|chatgpt)/i;
 
 function positiveInt(...candidates) {
@@ -588,6 +590,8 @@ function applyModelsToProvidersMap(curProviders = {}, modelsToEnsure = [], defau
     const prov = item.provider ?? defaultProvider;
     const modelId = item.upstreamModel ?? item.route;
     if (!prov || !modelId) continue;
+    // Never write reserved DSH builtin adapter IDs (`deepseek-official`, `deepseek-account`) into `llm-pi-ai`
+    if (RESERVED_DSH_BUILTIN_PROVIDER_IDS.has(prov)) continue;
     const tpl = providerTemplates?.[prov] ?? null;
     let provObj = nextProviders[prov];
     if ((!provObj || typeof provObj !== 'object') && tpl) {
@@ -649,9 +653,6 @@ function applyModelsToProvidersMap(curProviders = {}, modelsToEnsure = [], defau
     }
 
     const rawEfforts = Array.isArray(item.efforts) ? item.efforts : [];
-    const realEfforts = rawEfforts.filter(e => typeof e === 'string' && e !== 'none' && VALID_PI_AI_EFFORT_KEYS.has(e));
-    const hasNoneWithThinking = realEfforts.length > 0 && rawEfforts.includes('none') && !realEfforts.includes('off');
-    const existingIdx = provObj.models.findIndex(m => (typeof m === 'string' ? m : m?.id) === modelId);
     const rawWireMap = (item.reasoningEfforts && typeof item.reasoningEfforts === 'object' && !Array.isArray(item.reasoningEfforts))
       ? item.reasoningEfforts
       : null;
@@ -660,6 +661,15 @@ function applyModelsToProvidersMap(curProviders = {}, modelsToEnsure = [], defau
           Object.entries(rawWireMap).filter(([k, v]) => VALID_PI_AI_EFFORT_KEYS.has(k) && typeof v === 'string' && v.trim()),
         )
       : null;
+    const hasThinkingCapability =
+      rawEfforts.some(e => typeof e === 'string' && THINKING_EFFORT_KEYS.has(e)) ||
+      Boolean(explicitWireMap && Object.keys(explicitWireMap).some(k => THINKING_EFFORT_KEYS.has(k)));
+    // Non-reasoning models MUST NOT emit `{ off: 'none' }`
+    const realEfforts = hasThinkingCapability
+      ? rawEfforts.filter(e => typeof e === 'string' && e !== 'none' && VALID_PI_AI_EFFORT_KEYS.has(e))
+      : [];
+    const hasNoneWithThinking = realEfforts.length > 0 && rawEfforts.includes('none') && !realEfforts.includes('off');
+    const existingIdx = provObj.models.findIndex(m => (typeof m === 'string' ? m : m?.id) === modelId);
     const reasoningEfforts = realEfforts.length > 0
       ? {
           ...(hasNoneWithThinking ? { off: explicitWireMap?.off ?? 'none' } : {}),
@@ -710,6 +720,13 @@ function applyModelsToProvidersMap(curProviders = {}, modelsToEnsure = [], defau
           cur.reasoningEfforts = nextEff;
           entryChanged = true;
         }
+      } else if (
+        cur.reasoningEfforts &&
+        typeof cur.reasoningEfforts === 'object' &&
+        !Object.keys(cur.reasoningEfforts).some(k => THINKING_EFFORT_KEYS.has(k))
+      ) {
+        delete cur.reasoningEfforts;
+        entryChanged = true;
       }
       if (desiredCtx !== undefined && cur.contextWindow !== desiredCtx) {
         cur.contextWindow = desiredCtx;
@@ -751,7 +768,12 @@ export async function syncUpstreamModelsToDshSettings(ctx, modelsToEnsure = [], 
   const providerTemplates = options?.providerTemplates ?? null;
   const defaultSelection = options?.defaultSelection ?? null;
   const syncDefaultModel = Boolean(options?.syncDefaultModel);
-  const settings = ctx?.get?.('settings');
+  const onlyIfNoAvailableDefault = Boolean(options?.onlyIfNoAvailableDefault);
+  const settings =
+    (typeof ctx?.get === 'function' ? ctx.get('settings') : null) ??
+    ctx?.settings ??
+    (typeof ctx?.root?.get === 'function' ? ctx.root.get('settings') : null) ??
+    null;
   if (!settings || typeof settings.describe !== 'function' || typeof settings.update !== 'function') {
     return { synced: false, reason: 'settings-service-unavailable', updatedProviders: [] };
   }
@@ -790,12 +812,44 @@ export async function syncUpstreamModelsToDshSettings(ctx, modelsToEnsure = [], 
   let defaultModelSynced = false;
   const syncLiveDefaultSelection = async () => {
     if (!syncDefaultModel || !defaultSelection?.provider || !defaultSelection?.model) return;
+    if (RESERVED_DSH_BUILTIN_PROVIDER_IDS.has(String(defaultSelection.provider))) return;
+    const admSvc =
+      (typeof ctx?.get === 'function' ? ctx.get('agentDefaultModel') : null) ??
+      ctx?.agentDefaultModel ??
+      (typeof ctx?.root?.get === 'function' ? ctx.root.get('agentDefaultModel') : null) ??
+      null;
+    const defNs = nsList.find(n => (n?.ns ?? n?.namespace) === 'agent-default-model');
+    if (onlyIfNoAvailableDefault) {
+      let curSel = null;
+      try {
+        curSel =
+          (typeof admSvc?.getSelection === 'function' ? await admSvc.getSelection() : null) ??
+          (typeof admSvc?.current === 'function' ? await admSvc.current() : null) ??
+          admSvc?.selection ??
+          resolveNsPayload(defNs) ??
+          null;
+      } catch {}
+      if (curSel?.provider && curSel?.model) {
+        const llmSvc =
+          (typeof ctx?.get === 'function' ? ctx.get('llm') : null) ??
+          ctx?.llm ??
+          (typeof ctx?.root?.get === 'function' ? ctx.root.get('llm') : null) ??
+          null;
+        if (llmSvc && typeof llmSvc.listModels === 'function') {
+          try {
+            const avail = (await llmSvc.listModels(curSel.provider)) ?? [];
+            if (Array.isArray(avail) && avail.some(m => (typeof m === 'string' ? m : m?.id) === curSel.model)) {
+              return;
+            }
+          } catch {}
+        }
+      }
+    }
     const cleanSel = {
       provider: String(defaultSelection.provider),
       model: String(defaultSelection.model),
       ...(defaultSelection.reasoningEffort ? { reasoningEffort: String(defaultSelection.reasoningEffort) } : {}),
     };
-    const admSvc = ctx?.get?.('agentDefaultModel') ?? ctx?.root?.get?.('agentDefaultModel') ?? null;
     if (admSvc && typeof admSvc.saveSelection === 'function') {
       try {
         await admSvc.saveSelection(cleanSel);
@@ -803,7 +857,6 @@ export async function syncUpstreamModelsToDshSettings(ctx, modelsToEnsure = [], 
         return;
       } catch {}
     }
-    const defNs = nsList.find(n => (n?.ns ?? n?.namespace) === 'agent-default-model');
     if (defNs) {
       try {
         await settings.update(defNs.ns ?? defNs.namespace, cleanSel);
@@ -1258,6 +1311,16 @@ export function syncModelsToDshDiskProfiles({
 
   for (const profName of profileNames) {
     const profDir = path.join(profilesRoot, profName);
+    if (profName === 'desktop' && createDefaultProfilesIfNone) {
+      const desktopPkgFile = path.join(profDir, 'package.json');
+      if (!fsImpl.existsSync(desktopPkgFile)) {
+        writeAtomicWithFs(
+          desktopPkgFile,
+          '{"name":"dsh-profile-desktop","private":true,"dsh":{"profile":{"bundles":["@deepseek-ai/dsh-base","@deepseek-ai/dsh-web-app"]}}}\n',
+          fsImpl,
+        );
+      }
+    }
     const patchFile = path.join(profDir, 'cordis.patch.yml');
     const existed = fsImpl.existsSync(patchFile);
     const prevRaw = existed ? String(fsImpl.readFileSync(patchFile, 'utf8') ?? '') : '';

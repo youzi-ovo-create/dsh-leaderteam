@@ -62,6 +62,7 @@ import {
 } from '../../core/updater.mjs';
 import {
   buildOnboardingSnapshot,
+  probeProviderKeyConnectivity,
   applyQuickOnboardingSetup,
   writePersistedOnboardingRecord,
 } from '../../core/onboarding.mjs';
@@ -813,6 +814,14 @@ export function createPanelHandlers(ctx, rt = runtime(), options = {}) {
         const body = await parseBody(request);
         const action = String(body.action || 'status').trim().toLowerCase();
         const pluginRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
+        if (action === 'probe-key') {
+          return okReply(
+            await probeProviderKeyConnectivity({
+              baseURL: body.baseURL,
+              apiKey: body.apiKey,
+            }),
+          );
+        }
         if (action === 'apply-quick-setup') {
           const applied = await applyQuickOnboardingSetup({
             ctx,
@@ -826,6 +835,9 @@ export function createPanelHandlers(ctx, rt = runtime(), options = {}) {
             customBaseURL: body.customBaseURL || '',
             collabPresetId: body.collabPresetId || 'balanced-team',
             verifyConnectivity: Boolean(body.verifyConnectivity),
+            discoveredModels: Array.isArray(body.discoveredModels)
+              ? body.discoveredModels
+              : (Array.isArray(body.models) ? body.models : null),
           });
           return okReply(applied);
         }

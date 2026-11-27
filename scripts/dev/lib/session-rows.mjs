@@ -10,11 +10,11 @@ export function zstdFrames(buf) {
   if (!buf || buf.length < 4 || buf[0] !== MAGIC[0] || buf[1] !== MAGIC[1] || buf[2] !== MAGIC[2] || buf[3] !== MAGIC[3]) {
     throw new Error('not a zstd stream');
   }
-  try {
-    return zlib.zstdDecompressSync(buf);
-  } catch {}
   const starts = [];
   for (let i = 0; i + 3 < buf.length; i++) if (buf[i] === MAGIC[0] && buf[i + 1] === MAGIC[1] && buf[i + 2] === MAGIC[2] && buf[i + 3] === MAGIC[3]) starts.push(i);
+  if (starts.length === 1) {
+    return zlib.zstdDecompressSync(buf);
+  }
   const out = [];
   let s = 0;
   while (s < starts.length) {

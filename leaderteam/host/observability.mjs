@@ -49,12 +49,16 @@ function extractNativeRowRoute(row, fallbackRoute = null, cfg = null) {
 
 function decodeZstdSessionLog(buf) {
   if (!buf || buf.length === 0) return Buffer.alloc(0);
-  try {
-    return zlib.zstdDecompressSync(buf);
-  } catch {}
   const starts = [];
   for (let i = 0; i + 3 < buf.length; i++) {
     if (buf[i] === 0x28 && buf[i + 1] === 0xb5 && buf[i + 2] === 0x2f && buf[i + 3] === 0xfd) starts.push(i);
+  }
+  if (starts.length <= 1) {
+    try {
+      return zlib.zstdDecompressSync(buf);
+    } catch {
+      throw new Error('cannot decode native session log');
+    }
   }
   const parts = [];
   let n = 0;
