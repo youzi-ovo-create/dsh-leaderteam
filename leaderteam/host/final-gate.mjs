@@ -325,7 +325,7 @@ export class Gate {
       }
       const taskReceipts = receipts.filter(x => (x.taskSeq ?? 1) === taskSeq);
       if (cfg.gate.dedupeDeniedCalls) {
-        const prevDeny = taskReceipts.find(x => x.agentId === agent.id && x.tool === name && x.argsSha256 === base.argsSha256 && x.decision === 'deny' && x.by === 'model');
+        const prevDeny = taskReceipts.find(x => x.agentId === agent.id && x.tool === name && x.argsSha256 === base.argsSha256 && x.decision === 'deny' && (x.by === 'model' || x.by === 'rule:provider-policy-refusal'));
         if (prevDeny) return this.record(base, { decision: 'deny', by: 'rule:duplicate-denied-call', reason: `identical operation was already denied by safety review: ${prevDeny.reason}` });
       }
       // Safety review unavailable N times in a row for this agent: stop calling until the cooldown has passed, so an
@@ -357,17 +357,17 @@ export class Gate {
           return this.record(base, { decision: 'deny', by: 'rule:member-denial-circuit-breaker', reason: `member "${actor.name}" reached the safety-gate denial limit (${cfg.gate.maxDenialsPerMember}); stop retrying and report STATUS: blocked` });
         }
         if (Number.isInteger(cfg.gate.maxReviewsPerMember)) {
-          const memberReviews = taskReceipts.filter(x => x.agentId === agent.id && (x.by === 'model' || x.by === 'gate-error')).length;
+          const memberReviews = taskReceipts.filter(x => x.agentId === agent.id && (x.by === 'model' || x.by === 'gate-error' || x.by === 'rule:provider-policy-refusal')).length;
           if (memberReviews + inFlightMember >= cfg.gate.maxReviewsPerMember) {
             return this.record(base, { decision: 'deny', by: 'rule:gate-budget-exceeded', reason: `member "${actor.name}" reached the safety-review call budget (${cfg.gate.maxReviewsPerMember}) for this task` });
           }
         }
       }
       if (Number.isInteger(cfg.gate.maxReviewsPerTask)) {
-        const totalReviews = taskReceipts.filter(x => x.by === 'model' || x.by === 'gate-error').length;
+        const totalReviews = taskReceipts.filter(x => x.by === 'model' || x.by === 'gate-error' || x.by === 'rule:provider-policy-refusal').length;
         let budget = cfg.gate.maxReviewsPerTask;
         const taskMemberCount = [...teamStore(base.teamId).members().values()].filter(m => (m.taskSeq ?? 1) === taskSeq && m.status !== 'failed').length;
-        const denied = taskReceipts.filter(x=>x.by==='model'&&x.decision==='deny').length;
+        const denied = taskReceipts.filter(x => (x.by === 'model' || x.by === 'rule:provider-policy-refusal') && x.decision === 'deny').length;
         if (taskMemberCount >= 4 && denied <= Math.floor(totalReviews*0.05) && Number.isInteger(cfg.gate.maxReviewsPerMember)) budget=Math.max(budget,taskMemberCount*Math.max(1,Math.floor(cfg.gate.maxReviewsPerMember*0.75)));
         if (totalReviews+inFlightTeam >= budget) return this.record(base, {decision:'deny',by:'rule:gate-budget-exceeded',reason:'team reached the safety-review call budget ('+budget+') for this task'});
       }
@@ -403,7 +403,17 @@ export class Gate {
     const ran = { model: used.route, ...(used.degraded ? { degraded: true, via: used.via } : {}) };
     if (!r.ok) {
       rt.counters.reviewErrors++;
-      return this.record(base, { decision: 'deny', by: 'gate-error', reason: `safety review unavailable after ${r.attempts} attempt(s) (${r.error.kind} ${r.error.code}: ${r.error.message}); failed closed without executing — transient upstream error, safe to retry this call${r.tried.length > 1 ? `; routes tried: ${r.tried.map(x => `${x.route} (${x.skipped ? 'quota' : x.error})`).join(', ')}` : ''}`, ...ran, attempts: r.attempts });
+      const triedNote = r.tried.length > 1 ? `; routes tried: ${r.tried.map(x => `${x.route} (${x.skipped ? 'quota' : x.error})`).join(', ')}` : '';
+      if (r.error?.kind === 'policy') {
+        return this.record(base, {
+          decision: 'deny',
+          by: 'rule:provider-policy-refusal',
+          reason: `safety review refused by provider policy after ${r.attempts} attempt(s) (${r.error.kind} ${r.error.code}: ${r.error.message}); failed closed without executing — non-retryable policy refusal, do not retry this call unchanged${triedNote}`,
+          ...ran,
+          attempts: r.attempts,
+        });
+      }
+      return this.record(base, { decision: 'deny', by: 'gate-error', reason: `safety review unavailable after ${r.attempts} attempt(s) (${r.error.kind} ${r.error.code}: ${r.error.message}); failed closed without executing — transient upstream error, safe to retry this call${triedNote}`, ...ran, attempts: r.attempts });
     }
     if (r.verdict.decision === 'allow') {
       if (actor.role === 'leader' && name === 'team_dispatch' && args.stage_id) {

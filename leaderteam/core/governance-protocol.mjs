@@ -448,6 +448,11 @@ export function buildStage4ReviewPacket({
 // Durable Governance Ledger Replay & Execution / Pause Gate (§2, §5, §6, §7)
 // ============================================================================
 
+function isPolicyRefusalErrorText(errText) {
+  if (typeof errText !== 'string' || !errText.trim()) return false;
+  return /^policy\s*:/i.test(errText.trim()) || /\bCONTENT_REFUSED\b/i.test(errText);
+}
+
 export function replayGovernanceState(events = [], taskSeq = 1) {
   const disputes = new Map();
   const conferences = new Map();
@@ -483,6 +488,16 @@ export function replayGovernanceState(events = [], taskSeq = 1) {
         const sameSnapshot = prev?.dedupeKey === key;
         const opinionA = ev.opinionA ?? (sameSnapshot ? prev?.opinionA : null) ?? null;
         const opinionB = ev.opinionB ?? (sameSnapshot ? prev?.opinionB : null) ?? null;
+        const errorA = opinionA ? null : (ev.errorA ?? (sameSnapshot ? prev?.errorA : null) ?? 'reviewer_a_unavailable');
+        const errorB = opinionB ? null : (ev.errorB ?? (sameSnapshot ? prev?.errorB : null) ?? 'reviewer_b_unavailable');
+        const inferredPolicyRefused = (!opinionA && isPolicyRefusalErrorText(errorA))
+          || (!opinionB && isPolicyRefusalErrorText(errorB));
+        const policyRefused = Boolean(
+          ev.policyRefused !== undefined
+            ? (ev.policyRefused || (sameSnapshot && prev?.policyRefused))
+            : (inferredPolicyRefused || (sameSnapshot && prev?.policyRefused)),
+        );
+        const submittedSpec = ev.submittedSpec ?? ev.retrySpec ?? (sameSnapshot ? prev?.submittedSpec : null) ?? null;
         deferredSupervisions.set(key, {
           supervisionId: ev.supervisionId,
           dedupeKey: key,
@@ -497,9 +512,11 @@ export function replayGovernanceState(events = [], taskSeq = 1) {
           hasValidOpinionB: Boolean(opinionB),
           opinionA,
           opinionB,
-          errorA: opinionA ? null : (ev.errorA ?? (sameSnapshot ? prev?.errorA : null) ?? 'reviewer_a_unavailable'),
-          errorB: opinionB ? null : (ev.errorB ?? (sameSnapshot ? prev?.errorB : null) ?? 'reviewer_b_unavailable'),
-          retrySpec: ev.retrySpec ?? prev?.retrySpec ?? null,
+          errorA,
+          errorB,
+          policyRefused,
+          ...(submittedSpec ? { submittedSpec } : {}),
+          retrySpec: policyRefused ? null : (ev.retrySpec ?? (sameSnapshot ? prev?.retrySpec : null) ?? null),
           at: ev.at ?? null,
         });
       }

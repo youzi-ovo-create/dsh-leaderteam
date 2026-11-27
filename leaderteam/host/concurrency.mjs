@@ -300,7 +300,9 @@ export function evaluateTeamRequestWindow(rt = runtime(), teamId = null, nowMs =
           for (const u of st.usageRecords()) {
             if (!matchesProvider(u?.route ?? null, u?.provider ?? null, u?.hostProvider ?? null)) continue;
             const t = typeof u?.at === 'string' ? Date.parse(u.at) : (typeof u?.atMs === 'number' ? u.atMs : NaN);
-            if (Number.isFinite(t)) timestampsMs.push(t);
+            if (!Number.isFinite(t)) continue;
+            const count = Number.isInteger(u?.attempts) ? Math.max(0, u.attempts) : 1;
+            for (let i = 0; i < count; i++) timestampsMs.push(t);
           }
         } catch {}
       }
