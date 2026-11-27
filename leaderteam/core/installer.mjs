@@ -1,17 +1,31 @@
-// Cross-platform One-Click Installer Engine for LeaderTeam (Issue #2).
-// Auto-discovers Official DSH Desktop & CLI/Web installations, checks dependencies & compatibility,
-// cleans legacy V2.1 patches with backup, installs `.tgz` or local package, provisions optional starter API Key,
+// Cross-platform One-Click Installer Engine for LeaderTeam (Issue #2 + Windows Custom-Path Adaptation).
+// Auto-discovers Official DSH Desktop (including custom Windows paths such as D:\Apps\DeepSeek-Harness,
+// Registry Uninstall entries, env vars, and running processes) & CLI/Web installations, checks dependencies & compatibility,
+// cleans legacy V2.1 patches and stale manual `leaderteam-*` insert rows while preserving provider/model patches
+// and enabling `tool-web`, installs `.tgz` or local package, provisions optional starter API Key & DSH model sync,
 // translates technical errors into beginner-friendly Chinese hints, and launches the client directly.
 // Pure Node.js ESM, zero external dependencies, Apache-2.0.
 
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import zlib from 'node:zlib';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { checkDshHostCompatibility } from '../../bin/lt-doctor.mjs';
-import { detectLegacyProfilePatchConflicts, cleanLegacyProfilePatches } from './legacy-patch-guard.mjs';
-import { getHostCompatibilityMatrix } from './host-compat.mjs';
+import {
+  LEGACY_PATCH_BEGIN,
+  LEGACY_PATCH_END,
+  detectLegacyProfilePatchConflicts,
+  cleanLegacyProfilePatches,
+} from './legacy-patch-guard.mjs';
+import {
+  VERIFIED_CORE_VERSIONS,
+  SUPPORTED_DSH_ENGINE_RANGE,
+  satisfiesDshRange,
+  evaluateHostCompatibility,
+  getHostCompatibilityMatrix,
+} from './host-compat.mjs';
 import {
   UPDATE_TRACKS,
   checkForUpdates,
@@ -19,16 +33,45 @@ import {
   inspectTgzPackage,
   checkCandidatePackageCompatibility,
   computeFileSha256,
+  assertTargetReleaseTagMatchesPlatform,
 } from './updater.mjs';
 import {
   QUICK_PROVIDER_PRESETS,
   persistProviderApiKey,
 } from './onboarding.mjs';
-import { SOLO_PROVIDER_PRESETS, buildSoloKeyStarterConfig } from './solo-key.mjs';
+import {
+  SOLO_PROVIDER_PRESETS,
+  buildSoloKeyStarterConfig,
+  buildSoloProviderSettingsTemplates,
+} from './solo-key.mjs';
+import {
+  resolveModelTarget,
+  syncModelsToDshDiskProfiles,
+} from './upstream-models.mjs';
 import { writeFileAtomic } from './store.mjs';
 
 const THIS_DIR = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_REPO_ROOT = path.resolve(THIS_DIR, '..', '..');
+
+export { UPDATE_TRACKS };
+export const checkReleaseUpdates = checkForUpdates;
+
+const WINDOWS_UNINSTALL_REGISTRY_ROOTS = Object.freeze([
+  'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall',
+  'HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall',
+  'HKLM\\Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall',
+]);
+
+const WINDOWS_DRIVE_SUBPATHS = Object.freeze([
+  ['Apps', 'DeepSeek-Harness'],
+  ['Apps', 'DeepSeek Harness'],
+  ['Program Files', 'DeepSeek Harness'],
+  ['Program Files', 'DeepSeek-Harness'],
+  ['DeepSeek-Harness'],
+  ['DeepSeek Harness'],
+  ['Programs', 'DeepSeek-Harness'],
+  ['Programs', 'DeepSeek Harness'],
+]);
 
 export function resolveDefaultDshHomePath(platform = process.platform, env = process.env) {
   if (env?.DSH_HOME && String(env.DSH_HOME).trim()) {
@@ -45,6 +88,15 @@ export function translateInstallErrorToPlainChinese(rawErrorOrMessage) {
   const msg = String(rawErrorOrMessage instanceof Error ? rawErrorOrMessage.message : rawErrorOrMessage ?? '').trim();
   const lower = msg.toLowerCase();
 
+  if (rawErrorOrMessage?.code === 'PLATFORM_RELEASE_TAG_MISMATCH' || lower.includes('platform_release_tag_mismatch')) {
+    return {
+      code: 'PLATFORM_RELEASE_TAG_MISMATCH',
+      title: '目标发行标签与当前操作系统平台不匹配',
+      friendlyMessage: msg,
+      suggestion: 'Windows 请使用 windows-vX.Y.Z（如 windows-v2.2.3），Linux 请使用 linux-vX.Y.Z。',
+      rawDetail: msg,
+    };
+  }
   if (lower.includes('sha256_mismatch') || lower.includes('sha-256')) {
     return {
       code: 'SHA256_MISMATCH',
@@ -63,12 +115,19 @@ export function translateInstallErrorToPlainChinese(rawErrorOrMessage) {
       rawDetail: msg,
     };
   }
-  if (lower.includes('ebusy') || lower.includes('eperm') || lower.includes('still running in this profile') || lower.includes('lock')) {
+  if (
+    lower.includes('ebusy') ||
+    lower.includes('eperm') ||
+    lower.includes('still running in this profile') ||
+    lower.includes('deepseek harness.exe') ||
+    lower.includes('正在运行') ||
+    lower.includes('lock')
+  ) {
     return {
       code: 'CLIENT_RUNNING_OR_LOCKED',
-      title: 'DeepSeek Harness 正在运行或目录被占用',
-      friendlyMessage: '安装桌面端插件前需要先完全退出正在运行的 DeepSeek Harness 客户端（含系统托盘图标）。',
-      suggestion: '请先关闭 DeepSeek Harness 窗口并退出托盘程序，然后点击“重新安装”。',
+      title: '检测到 DeepSeek Harness 正在运行或目录被占用',
+      friendlyMessage: '安装或更新桌面端插件前，需要先完全退出正在运行的 DeepSeek Harness 客户端（含右下角系统托盘图标）。',
+      suggestion: '请先关闭 DeepSeek Harness 窗口并右键退出托盘程序，然后点击“重新扫描”或“立即一键安装”。',
       rawDetail: msg,
     };
   }
@@ -117,30 +176,590 @@ export function translateInstallErrorToPlainChinese(rawErrorOrMessage) {
   };
 }
 
-function commandExists(cmd, env = process.env) {
-  const pathSep = process.platform === 'win32' ? ';' : ':';
-  const exts = process.platform === 'win32' ? ['.cmd', '.exe', '.bat', ''] : [''];
-  for (const dir of String(env?.PATH ?? '').split(pathSep).filter(Boolean)) {
-    for (const ext of exts) {
-      const full = path.join(dir, `${cmd}${ext}`);
-      if (fs.existsSync(full)) return full;
-    }
+function normalizeWindowsDirCandidate(rawVal) {
+  let s = String(rawVal ?? '').trim();
+  if (!s) return null;
+  s = s.replace(/,\s*-?\d+\s*$/, '').trim();
+  if (s.startsWith('"')) {
+    const endQuote = s.indexOf('"', 1);
+    if (endQuote > 1) s = s.slice(1, endQuote).trim();
+    else s = s.replace(/^"+|"+$/g, '').trim();
+  } else {
+    const exeMatch = /^([A-Za-z]:\\.+?\.(?:exe|ico))(?:\s+.*)?$/i.exec(s);
+    if (exeMatch) s = exeMatch[1].trim();
   }
-  return null;
+  s = s.replace(/[\\/]+$/, '');
+  if (!/^[A-Za-z]:\\/.test(s) && !s.startsWith('\\\\')) return null;
+  if (/\\system32\\msiexec(?:\.exe)?$/i.test(s)) return null;
+  if (/\.(?:exe|ico|cmd|bat)$/i.test(s)) {
+    return path.win32.dirname(s);
+  }
+  return s;
 }
 
-function isOfficialDesktopProcessRunning(platform = process.platform) {
+export function parseWindowsUninstallRegistryOutput(rawText) {
+  const dirs = [];
+  const matchedSubkeys = [];
+  let currentSubkey = null;
+  let currentDisplayName = '';
+  let currentBlockDirs = [];
+
+  const flushBlock = () => {
+    if (!currentSubkey) return;
+    const isLegacyDataElem = /\bdsh\s+desktop\b/i.test(currentDisplayName) && !/deepseek[-\s]*harness/i.test(currentDisplayName);
+    if (!isLegacyDataElem) {
+      for (const d of currentBlockDirs) {
+        if (d && !dirs.includes(d)) dirs.push(d);
+      }
+      if (!matchedSubkeys.includes(currentSubkey)) matchedSubkeys.push(currentSubkey);
+    }
+    currentSubkey = null;
+    currentDisplayName = '';
+    currentBlockDirs = [];
+  };
+
+  for (const rawLine of String(rawText ?? '').split(/\r?\n/)) {
+    const trimmed = rawLine.trim();
+    if (!trimmed || /^End of search:/i.test(trimmed)) continue;
+    if (/^HKEY_(?:CURRENT_USER|LOCAL_MACHINE|USERS|CLASSES_ROOT)\\/i.test(trimmed)) {
+      flushBlock();
+      currentSubkey = trimmed;
+      continue;
+    }
+    const valMatch = /^([A-Za-z0-9_]+)\s+REG_(?:EXPAND_)?SZ\s+(.+)$/i.exec(trimmed);
+    if (!valMatch) continue;
+    const [, keyName, rawVal] = valMatch;
+    const lowerKey = keyName.toLowerCase();
+    if (lowerKey === 'displayname') {
+      currentDisplayName = rawVal.trim();
+      continue;
+    }
+    if (
+      lowerKey === 'installlocation' ||
+      lowerKey === 'displayicon' ||
+      lowerKey === 'uninstallstring' ||
+      lowerKey === 'quietuninstallstring' ||
+      lowerKey === 'apppath'
+    ) {
+      const cand = normalizeWindowsDirCandidate(rawVal);
+      if (cand) {
+        if (currentSubkey) currentBlockDirs.push(cand);
+        else if (!dirs.includes(cand)) dirs.push(cand);
+      }
+    }
+  }
+  flushBlock();
+  return { dirs, matchedSubkeys };
+}
+
+export function isOfficialDesktopProcessRunning(platform = process.platform, spawnSyncImpl = spawnSync) {
   try {
     if (platform === 'win32') {
-      const res = spawnSync('tasklist', ['/FI', 'IMAGENAME eq DeepSeek Harness.exe', '/NH'], {
+      const res = spawnSyncImpl('tasklist', ['/FI', 'IMAGENAME eq DeepSeek Harness.exe', '/NH'], {
         encoding: 'utf8',
         windowsHide: true,
         timeout: 4000,
       });
-      return String(res.stdout || '').toLowerCase().includes('deepseek harness.exe');
+      return String(res?.stdout || '').toLowerCase().includes('deepseek harness.exe');
     }
   } catch {}
   return false;
+}
+
+export function discoverWindowsDesktopCandidates({
+  env = process.env,
+  fsImpl = fs,
+  spawnSyncImpl = spawnSync,
+  driveLetters = null,
+} = {}) {
+  const candidates = [];
+  const addCandidate = raw => {
+    if (!raw || typeof raw !== 'string') return;
+    const trimmed = raw.trim().replace(/^"+|"+$/g, '');
+    if (!trimmed) return;
+    const dir = /\.(?:exe|cmd|bat)$/i.test(trimmed) ? path.dirname(trimmed) : trimmed;
+    const resolved = /^[A-Za-z]:[\\/]/.test(dir) ? path.win32.normalize(dir) : path.resolve(dir);
+    if (!candidates.includes(resolved)) candidates.push(resolved);
+  };
+
+  for (const envKey of ['DSH_DESKTOP_DIR', 'DSH_APP_DIR', 'LT_DSH_APP']) {
+    if (env?.[envKey]) addCandidate(env[envKey]);
+  }
+
+  if (env?.LOCALAPPDATA) {
+    addCandidate(path.join(env.LOCALAPPDATA, 'Programs', 'DeepSeek Harness'));
+    addCandidate(path.join(env.LOCALAPPDATA, 'Programs', 'DeepSeek-Harness'));
+  }
+  if (env?.PROGRAMFILES || env?.ProgramFiles) {
+    const pf = env.PROGRAMFILES || env.ProgramFiles;
+    addCandidate(path.join(pf, 'DeepSeek Harness'));
+    addCandidate(path.join(pf, 'DeepSeek-Harness'));
+  }
+  if (env?.['ProgramFiles(x86)']) {
+    addCandidate(path.join(env['ProgramFiles(x86)'], 'DeepSeek Harness'));
+    addCandidate(path.join(env['ProgramFiles(x86)'], 'DeepSeek-Harness'));
+  }
+
+  const letters = Array.isArray(driveLetters)
+    ? driveLetters.map(l => String(l).replace(/:.*$/, '').toUpperCase())
+    : Array.from({ length: 24 }, (_, idx) => String.fromCharCode(67 + idx)); // C..Z
+
+  for (const letter of letters) {
+    const driveRoot = `${letter}:\\`;
+    let rootExists = false;
+    try { rootExists = fsImpl.existsSync(driveRoot); } catch { rootExists = false; }
+    if (!rootExists) continue;
+    for (const segs of WINDOWS_DRIVE_SUBPATHS) {
+      addCandidate(path.win32.join(driveRoot, ...segs));
+    }
+  }
+
+  if (typeof spawnSyncImpl === 'function') {
+    const subkeysToExpand = new Set();
+    for (const regRoot of WINDOWS_UNINSTALL_REGISTRY_ROOTS) {
+      for (const term of ['DeepSeek Harness', 'DeepSeek-Harness']) {
+        try {
+          const res = spawnSyncImpl('reg.exe', ['query', regRoot, '/s', '/f', term], {
+            encoding: 'utf8',
+            windowsHide: true,
+            timeout: 3500,
+          });
+          if (res?.stdout) {
+            const parsed = parseWindowsUninstallRegistryOutput(res.stdout);
+            for (const d of parsed.dirs) addCandidate(d);
+            for (const sk of parsed.matchedSubkeys) subkeysToExpand.add(sk);
+          }
+        } catch {}
+      }
+    }
+    for (const subkey of subkeysToExpand) {
+      try {
+        const fullRes = spawnSyncImpl('reg.exe', ['query', subkey], {
+          encoding: 'utf8',
+          windowsHide: true,
+          timeout: 2500,
+        });
+        if (fullRes?.stdout) {
+          const parsed = parseWindowsUninstallRegistryOutput(fullRes.stdout);
+          for (const d of parsed.dirs) addCandidate(d);
+        }
+      } catch {}
+    }
+
+    if (isOfficialDesktopProcessRunning('win32', spawnSyncImpl)) {
+      try {
+        const psRes = spawnSyncImpl(
+          'powershell.exe',
+          [
+            '-NoProfile',
+            '-ExecutionPolicy',
+            'Bypass',
+            '-Command',
+            "(Get-Process -Name 'DeepSeek Harness' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Path -Unique)",
+          ],
+          { encoding: 'utf8', windowsHide: true, timeout: 4000 },
+        );
+        for (const line of String(psRes?.stdout || '').split(/\r?\n/)) {
+          if (line.trim()) addCandidate(line.trim());
+        }
+      } catch {}
+    }
+  }
+
+  return candidates;
+}
+
+function readFileFromAsarArchive(asarFile, relPosixPath, fsImpl = fs) {
+  let fd;
+  try {
+    fd = fsImpl.openSync(asarFile, 'r');
+    const prefix = Buffer.alloc(16);
+    if (fsImpl.readSync(fd, prefix, 0, 16, 0) < 16) return null;
+    const headerPickleSize = prefix.readUInt32LE(4);
+    const jsonByteLength = prefix.readUInt32LE(12);
+    if (headerPickleSize < 8 || jsonByteLength < 2 || jsonByteLength > 32 * 1024 * 1024) return null;
+    const jsonBuf = Buffer.alloc(jsonByteLength);
+    if (fsImpl.readSync(fd, jsonBuf, 0, jsonByteLength, 16) < jsonByteLength) return null;
+    const index = JSON.parse(jsonBuf.toString('utf8'));
+    let cursor = index;
+    for (const seg of relPosixPath.split('/').filter(Boolean)) {
+      cursor = cursor?.files?.[seg];
+      if (!cursor) return null;
+    }
+    if (cursor.unpacked) {
+      return fsImpl.readFileSync(path.join(`${asarFile}.unpacked`, ...relPosixPath.split('/').filter(Boolean)), 'utf8');
+    }
+    if (typeof cursor.size !== 'number' || cursor.offset === undefined) return null;
+    const dataOffset = 8 + headerPickleSize + Number(cursor.offset);
+    if (!Number.isFinite(dataOffset) || cursor.size < 0 || cursor.size > 16 * 1024 * 1024) return null;
+    const buf = Buffer.alloc(cursor.size);
+    if (fsImpl.readSync(fd, buf, 0, cursor.size, dataOffset) < cursor.size) return null;
+    return buf.toString('utf8');
+  } catch {
+    return null;
+  } finally {
+    if (fd !== undefined) {
+      try { fsImpl.closeSync(fd); } catch {}
+    }
+  }
+}
+
+function readCandidateText(basePath, relPosixPath, fsImpl = fs) {
+  try {
+    const st = fsImpl.statSync(basePath);
+    if (st.isDirectory()) {
+      return fsImpl.readFileSync(path.join(basePath, ...relPosixPath.split('/').filter(Boolean)), 'utf8');
+    }
+    if (st.isFile() && basePath.toLowerCase().endsWith('.asar')) {
+      return readFileFromAsarArchive(basePath, relPosixPath, fsImpl);
+    }
+  } catch {}
+  return null;
+}
+
+function probeDshHostCompatibilityAt(targetDir, fsImpl = fs) {
+  const resolved = path.resolve(targetDir);
+  let runtimeDesktopVersion = null;
+  const runtimeJsonFile = path.join(resolved, 'resources', 'runtime', 'primary-runtime', 'runtime.json');
+  if (fsImpl.existsSync(runtimeJsonFile)) {
+    try {
+      const rt = JSON.parse(fsImpl.readFileSync(runtimeJsonFile, 'utf8'));
+      if (typeof rt?.desktopVersion === 'string') runtimeDesktopVersion = rt.desktopVersion.trim();
+    } catch {}
+  }
+
+  const probes = [
+    { base: resolved, pkgRel: 'package.json', pipeRel: 'lib/pipeline.js', desktopPkgRel: null },
+    { base: resolved, pkgRel: 'node_modules/@deepseek-ai/dsh-tools/package.json', pipeRel: 'node_modules/@deepseek-ai/dsh-tools/lib/pipeline.js', desktopPkgRel: 'package.json' },
+    { base: path.join(resolved, 'lib'), pkgRel: 'node_modules/@deepseek-ai/dsh-tools/package.json', pipeRel: 'node_modules/@deepseek-ai/dsh-tools/lib/pipeline.js', desktopPkgRel: null },
+    { base: path.join(resolved, 'resources', 'app', 'dsh'), pkgRel: 'node_modules/@deepseek-ai/dsh-tools/package.json', pipeRel: 'node_modules/@deepseek-ai/dsh-tools/lib/pipeline.js', desktopPkgRel: null },
+    { base: path.join(resolved, 'resources', 'app.asar'), pkgRel: 'dsh/node_modules/@deepseek-ai/dsh-tools/package.json', pipeRel: 'dsh/node_modules/@deepseek-ai/dsh-tools/lib/pipeline.js', desktopPkgRel: 'package.json' },
+    { base: path.join(resolved, 'resources', 'app.asar'), pkgRel: 'node_modules/@deepseek-ai/dsh-tools/package.json', pipeRel: 'node_modules/@deepseek-ai/dsh-tools/lib/pipeline.js', desktopPkgRel: 'package.json' },
+  ];
+
+  for (const p of probes) {
+    const pkgTxt = readCandidateText(p.base, p.pkgRel, fsImpl);
+    if (!pkgTxt) continue;
+    let toolsPkg;
+    try { toolsPkg = JSON.parse(pkgTxt); } catch { continue; }
+    if (toolsPkg?.name && toolsPkg.name !== '@deepseek-ai/dsh-tools') continue;
+    if (!toolsPkg?.version) continue;
+
+    let desktopVersion = runtimeDesktopVersion;
+    if (!desktopVersion && p.desktopPkgRel) {
+      const dTxt = readCandidateText(p.base, p.desktopPkgRel, fsImpl);
+      if (dTxt) {
+        try {
+          const dPkg = JSON.parse(dTxt);
+          if (dPkg?.name === '@deepseek-ai/dsh-desktop' && typeof dPkg.version === 'string') {
+            desktopVersion = dPkg.version.trim();
+          }
+        } catch {}
+      }
+    }
+
+    const fullPipe = readCandidateText(p.base, p.pipeRel, fsImpl) ?? '';
+    const idx = fullPipe.indexOf('dispatchToolBody');
+    const slice = idx >= 0 && fullPipe.includes('resolveExecution') ? fullPipe.slice(idx, idx + 8192) : '';
+    return evaluateHostCompatibility({
+      toolsVersion: String(toolsPkg.version),
+      desktopVersion,
+      pipelineSource: slice,
+      supportedVersions: VERIFIED_CORE_VERSIONS,
+      supportedRange: SUPPORTED_DSH_ENGINE_RANGE,
+      policy: 'adaptive',
+    });
+  }
+
+  return {
+    status: 'fail',
+    classification: 'NOT_FOUND',
+    toolsVersion: runtimeDesktopVersion,
+    desktopVersion: runtimeDesktopVersion,
+    productionAllowed: false,
+    summary: `未在目录 "${resolved}" 下找到有效的 @deepseek-ai/dsh-tools 运行时组件。`,
+  };
+}
+
+function extractYamlItemIdAndName(lines) {
+  let id = null;
+  let name = null;
+  if (!Array.isArray(lines) || lines.length === 0) return { id, name };
+  const firstId = /^\s*-\s*id\s*:\s*['"]?([^'"#\r\n]+?)['"]?\s*(?:#.*)?$/.exec(lines[0]);
+  if (firstId) id = firstId[1].trim();
+  const baseIndentMatch = /^(\s*)-\s/.exec(lines[0]);
+  const propIndent = (baseIndentMatch ? baseIndentMatch[1].length : 0) + 2;
+  const idPropRe = new RegExp(`^\\s{${propIndent}}id\\s*:\\s*['"]?([^'"#\\r\\n]+?)['"]?\\s*(?:#.*)?$`);
+  const namePropRe = new RegExp(`^\\s{${propIndent}}name\\s*:\\s*['"]?([^'"#\\r\\n]+?)['"]?\\s*(?:#.*)?$`);
+  for (let i = 1; i < lines.length; i++) {
+    if (!id) {
+      const im = idPropRe.exec(lines[i]);
+      if (im) id = im[1].trim();
+    }
+    if (!name) {
+      const nm = namePropRe.exec(lines[i]);
+      if (nm) name = nm[1].trim();
+    }
+    if (id && name) break;
+  }
+  return { id, name };
+}
+
+function isStaleLegacyLeaderTeamInsertItem(lines) {
+  const { id, name } = extractYamlItemIdAndName(lines);
+  const blockText = lines.join('\n');
+  if (id && /^(?:leaderteam(?:-[A-Za-z0-9_-]+)?|dsh-leaderteam|preset-leaderteam|preset-lt-member-[A-Za-z0-9_-]+)$/i.test(id)) {
+    return true;
+  }
+  if (id === 'tool-executor-native' && /(?:leaderteam|entry-native-executor)/i.test(`${name || ''}\n${blockText}`)) {
+    return true;
+  }
+  if (name && /(?:leaderteam\/(?:entry-core|entry-native-executor|entry-lead|plugins\/)|^dsh-leaderteam(?:\/|$))/i.test(name)) {
+    return true;
+  }
+  return false;
+}
+
+function isToolWebAlreadyEnabled(lines) {
+  const text = lines.join('\n');
+  if (/^\s+disabled\s*:\s*true\b/m.test(text)) return false;
+  const hasFetchTrue = /\bfetch\s*:\s*true\b/.test(text);
+  const hasSearchTimeout = /\bsearchTimeoutMs\s*:\s*\d+\b/.test(text);
+  return hasFetchTrue && hasSearchTimeout;
+}
+
+export function sanitizeDesktopCordisPatchText(rawText) {
+  const normalizedOriginal = String(rawText ?? '').replace(/\r\n/g, '\n');
+  const lines = normalizedOriginal.split('\n');
+
+  let removedLegacyItems = 0;
+  let markersStripped = false;
+  const cleanedLines = [];
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (
+      trimmed === LEGACY_PATCH_BEGIN ||
+      trimmed.startsWith('# >>> leaderteam') ||
+      trimmed === LEGACY_PATCH_END ||
+      /^# leaderteam-original-empty-array:\s*[A-Za-z0-9+/=]+\s*$/.test(trimmed)
+    ) {
+      markersStripped = true;
+      continue;
+    }
+    if (/^\[\]\s*(?:#.*)?$/.test(trimmed) && !line.startsWith(' ')) {
+      continue;
+    }
+    cleanedLines.push(line);
+  }
+
+  const headerLines = [];
+  const topBlocks = [];
+  let pendingComments = [];
+  let currentItemLines = null;
+  let seenFirstItem = false;
+
+  const flushCurrent = () => {
+    if (currentItemLines) {
+      while (currentItemLines.length > 1 && currentItemLines[currentItemLines.length - 1].trim() === '') {
+        currentItemLines.pop();
+      }
+      topBlocks.push({ comments: pendingComments, lines: currentItemLines });
+      pendingComments = [];
+      currentItemLines = null;
+    }
+  };
+
+  for (const line of cleanedLines) {
+    if (/^-\s/.test(line)) {
+      flushCurrent();
+      seenFirstItem = true;
+      currentItemLines = [line];
+    } else if (!seenFirstItem) {
+      headerLines.push(line);
+    } else if (/^#/.test(line)) {
+      flushCurrent();
+      pendingComments.push(line);
+    } else if (currentItemLines) {
+      currentItemLines.push(line);
+    } else if (line.trim() !== '') {
+      pendingComments.push(line);
+    }
+  }
+  flushCurrent();
+
+  const keptBlocks = [];
+  let toolWebConfigured = false;
+
+  for (const block of topBlocks) {
+    const firstLine = block.lines[0] || '';
+
+    if (/^-\s+insert\s*:\s*(?:#.*)?$/.test(firstLine)) {
+      const childIndentMatch = block.lines.slice(1).map(l => /^([ \t]+)-\s/.exec(l)).find(Boolean);
+      if (!childIndentMatch) {
+        keptBlocks.push(block);
+        continue;
+      }
+      const childIndentLen = childIndentMatch[1].length;
+      const childStartRe = new RegExp(`^[ \\t]{${childIndentLen}}-\\s`);
+      const subItems = [];
+      let curSub = null;
+      const insertHeaderExtras = [];
+      for (let i = 1; i < block.lines.length; i++) {
+        const l = block.lines[i];
+        if (childStartRe.test(l)) {
+          if (curSub) subItems.push(curSub);
+          curSub = [l];
+        } else if (curSub) {
+          curSub.push(l);
+        } else {
+          insertHeaderExtras.push(l);
+        }
+      }
+      if (curSub) subItems.push(curSub);
+
+      const keptSubs = [];
+      for (const sub of subItems) {
+        if (isStaleLegacyLeaderTeamInsertItem(sub)) {
+          removedLegacyItems++;
+        } else {
+          keptSubs.push(sub);
+        }
+      }
+      if (keptSubs.length > 0) {
+        keptBlocks.push({
+          comments: block.comments,
+          lines: [firstLine, ...insertHeaderExtras, ...keptSubs.flat()],
+        });
+      }
+      continue;
+    }
+
+    const { id, name } = extractYamlItemIdAndName(block.lines);
+    const blockText = block.lines.join('\n');
+
+    if (id && /^(?:leaderteam(?:-[A-Za-z0-9_-]+)?|dsh-leaderteam|preset-leaderteam|preset-lt-member-[A-Za-z0-9_-]+)$/i.test(id)) {
+      removedLegacyItems++;
+      continue;
+    }
+    if (
+      id === 'tool-executor-native' &&
+      (/^\s+disabled\s*:\s*true\b/m.test(blockText) || /(?:leaderteam|entry-native-executor)/i.test(`${name || ''}\n${blockText}`))
+    ) {
+      removedLegacyItems++;
+      continue;
+    }
+
+    if (id === 'tool-web') {
+      toolWebConfigured = true;
+      if (isToolWebAlreadyEnabled(block.lines)) {
+        keptBlocks.push(block);
+      } else {
+        const nextToolWebLines = ['- id: tool-web'];
+        if (name) nextToolWebLines.push(`  name: ${JSON.stringify(name)}`);
+        nextToolWebLines.push('  config: {fetch: true, searchTimeoutMs: 60000}');
+        keptBlocks.push({ comments: block.comments, lines: nextToolWebLines });
+      }
+      continue;
+    }
+
+    keptBlocks.push(block);
+  }
+
+  let toolWebAdded = false;
+  if (!toolWebConfigured) {
+    keptBlocks.push({
+      comments: [],
+      lines: [
+        '- id: tool-web',
+        '  config: {fetch: true, searchTimeoutMs: 60000}',
+      ],
+    });
+    toolWebAdded = true;
+  }
+
+  const cleanHeader = headerLines
+    .filter(l => !/^#\s*(?:LeaderTeam rows for the DeepSeek Harness Desktop profile|Placeholders:\s*__LT_ROOT_URL__)/i.test(l.trim()));
+  while (cleanHeader.length > 0 && cleanHeader[cleanHeader.length - 1].trim() === '') {
+    cleanHeader.pop();
+  }
+
+  const outLines = [];
+  if (cleanHeader.length > 0) outLines.push(...cleanHeader);
+  for (const b of keptBlocks) {
+    const cleanComments = b.comments.filter(
+      c => !/^#\s*(?:LeaderTeam rows for the DeepSeek Harness Desktop profile|Placeholders:\s*__LT_ROOT_URL__)/i.test(c.trim()),
+    );
+    if (cleanComments.length > 0) outLines.push(...cleanComments);
+    outLines.push(...b.lines);
+  }
+
+  const nextText = `${outLines.join('\n').trimEnd()}\n`;
+  const changed = markersStripped || removedLegacyItems > 0 || nextText !== `${normalizedOriginal.trimEnd()}\n`;
+
+  return {
+    changed,
+    removedLegacyItems,
+    markersStripped,
+    toolWebEnsured: true,
+    toolWebAdded,
+    text: nextText,
+  };
+}
+
+export function sanitizeDesktopCordisPatch({
+  dshHome,
+  profile = 'desktop',
+  fsImpl = fs,
+} = {}) {
+  const profileDir = path.join(dshHome, 'profiles', profile);
+  if (!fsImpl.existsSync(profileDir)) {
+    return { updated: false, patchFile: path.join(profileDir, 'cordis.patch.yml'), removedLegacyItems: 0, backupFile: null };
+  }
+  const patchFile = path.join(profileDir, 'cordis.patch.yml');
+  const existed = fsImpl.existsSync(patchFile);
+  const prevRaw = existed ? fsImpl.readFileSync(patchFile, 'utf8') : '';
+  const res = sanitizeDesktopCordisPatchText(prevRaw);
+  if (!res.changed && existed) {
+    return {
+      updated: false,
+      patchFile,
+      removedLegacyItems: 0,
+      toolWebEnsured: true,
+      backupFile: null,
+    };
+  }
+
+  let backupFile = null;
+  if (existed && prevRaw.trim().length > 0) {
+    backupFile = `${patchFile}.bak-${Date.now()}`;
+    fsImpl.writeFileSync(backupFile, prevRaw, 'utf8');
+  }
+  const tmpFile = `${patchFile}.tmp-${process.pid}-${Date.now()}`;
+  fsImpl.writeFileSync(tmpFile, res.text, 'utf8');
+  fsImpl.renameSync(tmpFile, patchFile);
+
+  return {
+    updated: true,
+    patchFile,
+    removedLegacyItems: res.removedLegacyItems,
+    toolWebEnsured: true,
+    backupFile,
+  };
+}
+
+function commandExists(cmd, env = process.env, platform = process.platform, fsImpl = fs) {
+  const pathSep = platform === 'win32' ? ';' : ':';
+  const exts = platform === 'win32' ? ['.cmd', '.exe', '.bat', ''] : [''];
+  for (const dir of String(env?.PATH ?? '').split(pathSep).filter(Boolean)) {
+    for (const ext of exts) {
+      const full = path.join(dir, `${cmd}${ext}`);
+      try {
+        if (fsImpl.existsSync(full)) return full;
+      } catch {}
+    }
+  }
+  return null;
 }
 
 function findBundledLocalTarballs(searchDirs = [], fsImpl = fs) {
@@ -170,10 +789,6 @@ function findBundledLocalTarballs(searchDirs = [], fsImpl = fs) {
   return found;
 }
 
-/**
- * Scan the machine for all DeepSeek Harness installations (Official Desktop + CLI/Web),
- * Node/pnpm readiness, installed LeaderTeam status, and legacy V2.1 patch conflicts.
- */
 export function inspectInstallerEnvironment({
   repoRoot = DEFAULT_REPO_ROOT,
   dshHome = null,
@@ -182,36 +797,52 @@ export function inspectInstallerEnvironment({
   platform = process.platform,
   env = process.env,
   fsImpl = fs,
+  spawnSyncImpl = spawnSync,
+  driveLetters = null,
 } = {}) {
   const resolvedHome = dshHome ? path.resolve(dshHome) : resolveDefaultDshHomePath(platform, env);
   const targets = [];
+  const desktopRunningNow = isOfficialDesktopProcessRunning(platform, spawnSyncImpl);
 
-  // 1. Check Official Desktop candidates
   const desktopDirs = [];
-  if (customDshPath && fsImpl.existsSync(customDshPath)) {
-    desktopDirs.push(path.resolve(customDshPath));
+  const normalizedCustom = customDshPath
+    ? (/\.(?:exe|cmd|bat)$/i.test(customDshPath.trim()) ? path.dirname(path.resolve(customDshPath.trim())) : path.resolve(customDshPath.trim()))
+    : null;
+  if (normalizedCustom && fsImpl.existsSync(normalizedCustom)) {
+    desktopDirs.push(normalizedCustom);
   }
   if (platform === 'win32') {
-    if (env?.LOCALAPPDATA) desktopDirs.push(path.join(env.LOCALAPPDATA, 'Programs', 'DeepSeek Harness'));
-    if (env?.PROGRAMFILES) desktopDirs.push(path.join(env.PROGRAMFILES, 'DeepSeek Harness'));
+    desktopDirs.push(
+      ...discoverWindowsDesktopCandidates({ env, fsImpl, spawnSyncImpl, driveLetters }),
+    );
   } else {
+    if (env?.DSH_DESKTOP_DIR) desktopDirs.push(path.resolve(env.DSH_DESKTOP_DIR));
+    if (env?.DSH_APP_DIR) desktopDirs.push(path.resolve(env.DSH_APP_DIR));
+    if (env?.LT_DSH_APP) desktopDirs.push(path.resolve(env.LT_DSH_APP));
     desktopDirs.push('/opt/DeepSeek Harness', '/opt/deepseek-harness');
   }
 
-  for (const dir of [...new Set(desktopDirs)]) {
-    if (!fsImpl.existsSync(dir)) continue;
+  const seenDesktopRealPaths = new Set();
+  for (const dir of desktopDirs) {
+    if (!dir || !fsImpl.existsSync(dir)) continue;
     const winCli = path.join(dir, 'resources', 'runtime', 'cli', 'bin', 'dsh.cmd');
     const unixCli = path.join(dir, 'resources', 'runtime', 'cli', 'bin', 'dsh');
     const exeWin = path.join(dir, 'DeepSeek Harness.exe');
     const exeLinux = path.join(dir, 'deepseek-harness');
-    const hasAsar = fsImpl.existsSync(path.join(dir, 'resources', 'app.asar'));
-    const isDesktopLayout = fsImpl.existsSync(winCli) || fsImpl.existsSync(unixCli) || fsImpl.existsSync(exeWin) || fsImpl.existsSync(exeLinux) || hasAsar;
+    const hasAsarFile = fsImpl.existsSync(path.join(dir, 'resources', 'app.asar'));
+    const isDesktopLayout = fsImpl.existsSync(winCli) || fsImpl.existsSync(unixCli) || fsImpl.existsSync(exeWin) || fsImpl.existsSync(exeLinux) || hasAsarFile;
     const hasCliBinJs =
       fsImpl.existsSync(path.join(dir, 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js')) ||
       fsImpl.existsSync(path.join(dir, 'lib', 'bin.js'));
-    if (!isDesktopLayout && (dir !== customDshPath || hasCliBinJs)) continue;
+    if (!isDesktopLayout && (dir !== normalizedCustom || hasCliBinJs)) continue;
 
-    const compat = checkDshHostCompatibility({ checkHost: dir, platform, env, fsImpl });
+    const dedupKey = platform === 'win32' ? path.win32.normalize(dir).toLowerCase() : path.resolve(dir);
+    if (seenDesktopRealPaths.has(dedupKey)) continue;
+
+    const compat = probeDshHostCompatibilityAt(dir, fsImpl);
+    if (!isDesktopLayout && compat.classification === 'NOT_FOUND') continue;
+    seenDesktopRealPaths.add(dedupKey);
+
     const desktopProfileDir = path.join(resolvedHome, 'profiles', 'desktop');
     const profileInitialized = fsImpl.existsSync(desktopProfileDir);
     const installedLtPkg = path.join(desktopProfileDir, 'node_modules', 'dsh-leaderteam', 'package.json');
@@ -219,6 +850,8 @@ export function inspectInstallerEnvironment({
     if (fsImpl.existsSync(installedLtPkg)) {
       try { installedLtVersion = JSON.parse(fsImpl.readFileSync(installedLtPkg, 'utf8')).version; } catch {}
     }
+    const desktopHostCliJs = path.join(dir, 'resources', 'app.asar', 'dsh', 'node_modules', '@deepseek-ai', 'dsh-desktop-host', 'lib', 'cli.js');
+
     targets.push({
       id: `desktop:${dir}`,
       kind: 'official-desktop',
@@ -226,9 +859,12 @@ export function inspectInstallerEnvironment({
       profile: 'desktop',
       installDir: dir,
       cliCommand: fsImpl.existsSync(winCli) ? winCli : (fsImpl.existsSync(unixCli) ? unixCli : null),
+      desktopHostCliJs: hasAsarFile ? desktopHostCliJs : null,
       clientExecutable: fsImpl.existsSync(exeWin) ? exeWin : (fsImpl.existsSync(exeLinux) ? exeLinux : null),
       dshVersion: compat.desktopVersion || compat.toolsVersion,
       toolsVersion: compat.toolsVersion,
+      compatible: Boolean(compat.productionAllowed),
+      verified: compat.classification === 'VERIFIED',
       compatibility: {
         status: compat.status,
         classification: compat.classification,
@@ -236,23 +872,23 @@ export function inspectInstallerEnvironment({
         summary: compat.summary,
       },
       profileInitialized,
-      desktopRunning: isDesktopLayout ? isOfficialDesktopProcessRunning(platform) : false,
+      desktopRunning: isDesktopLayout ? desktopRunningNow : false,
       installedLtVersion,
-      recommended: platform === 'win32',
+      recommended: platform === 'win32' || dir === normalizedCustom,
     });
   }
 
   // 2. Check Web / CLI runtime candidates
   const cliDirs = [];
-  if (customDshPath && fsImpl.existsSync(customDshPath)) {
-    cliDirs.push(customDshPath);
+  if (normalizedCustom && fsImpl.existsSync(normalizedCustom)) {
+    cliDirs.push(normalizedCustom);
   }
-  const homeDir = os.homedir();
+  const homeDir = env?.USERPROFILE || env?.HOME || os.homedir();
   if (homeDir) {
     const dshRuntimeCur = path.join(homeDir, '.local', 'share', 'dsh-runtime', 'current');
     if (fsImpl.existsSync(dshRuntimeCur)) cliDirs.push(dshRuntimeCur);
   }
-  const pathDsh = commandExists('dsh', env);
+  const pathDsh = commandExists('dsh', env, platform, fsImpl);
   if (pathDsh) {
     try {
       const real = fsImpl.realpathSync(pathDsh);
@@ -262,12 +898,19 @@ export function inspectInstallerEnvironment({
     } catch {}
   }
 
-  for (const dir of [...new Set(cliDirs)]) {
-    if (!fsImpl.existsSync(dir)) continue;
+  const seenCliDirs = new Set();
+  for (const dir of cliDirs) {
+    if (!dir || !fsImpl.existsSync(dir)) continue;
+    const dedupKey = platform === 'win32' ? path.win32.normalize(dir).toLowerCase() : path.resolve(dir);
+    if (seenCliDirs.has(dedupKey) || seenDesktopRealPaths.has(dedupKey)) continue;
+    seenCliDirs.add(dedupKey);
+
     const binJs = path.join(dir, 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js');
     const directBinJs = path.join(dir, 'lib', 'bin.js');
     const resolvedBinJs = fsImpl.existsSync(binJs) ? binJs : (fsImpl.existsSync(directBinJs) ? directBinJs : null);
-    const compat = checkDshHostCompatibility({ checkHost: dir, platform, env, fsImpl });
+    if (!resolvedBinJs && !pathDsh) continue;
+
+    const compat = probeDshHostCompatibilityAt(dir, fsImpl);
     if (compat.classification === 'NOT_FOUND') continue;
 
     const webProfileDir = path.join(resolvedHome, 'profiles', 'web');
@@ -287,6 +930,8 @@ export function inspectInstallerEnvironment({
       cliUsesNode: Boolean(resolvedBinJs),
       dshVersion: compat.toolsVersion,
       toolsVersion: compat.toolsVersion,
+      compatible: Boolean(compat.productionAllowed),
+      verified: compat.classification === 'VERIFIED',
       compatibility: {
         status: compat.status,
         classification: compat.classification,
@@ -300,11 +945,10 @@ export function inspectInstallerEnvironment({
     });
   }
 
-  const pnpmPath = commandExists('pnpm', env);
-  const corepackPath = commandExists('corepack', env);
+  const pnpmPath = commandExists('pnpm', env, platform, fsImpl);
+  const corepackPath = commandExists('corepack', env, platform, fsImpl);
   const legacyConflicts = detectLegacyProfilePatchConflicts({ dshHome: resolvedHome, fsImpl });
 
-  // Local source repo or bundled .tgz packages
   const hasLocalSourceBundle =
     fsImpl.existsSync(path.join(repoRoot, 'package.json')) &&
     fsImpl.existsSync(path.join(repoRoot, 'cordis.patch.yml'));
@@ -346,26 +990,97 @@ function ensurePnpmInEnv({ dshHome, env = process.env }) {
   if (commandExists('pnpm', env)) return { ok: true, env };
   const corepack = commandExists('corepack', env);
   if (!corepack) {
-    return { ok: false, env, reason: '未检测到 pnpm 或 corepack' };
+    const nodeBinDir = path.dirname(process.execPath);
+    const siblingCorepack = path.join(nodeBinDir, process.platform === 'win32' ? 'corepack.cmd' : 'corepack');
+    if (!fs.existsSync(siblingCorepack)) {
+      return { ok: false, env, reason: '未在 PATH 中找到 pnpm 或 corepack' };
+    }
   }
-  const shimDir = path.join(dshHome, 'leaderteam', 'installer-bin');
+  const shimDir = path.join(dshHome, 'leaderteam', 'bin-shims');
   fs.mkdirSync(shimDir, { recursive: true });
-  const res = spawnSync(corepack, ['enable', '--install-directory', shimDir, 'pnpm'], {
+  const res = spawnSync('corepack', ['enable', '--install-directory', shimDir, 'pnpm'], {
     encoding: 'utf8',
     windowsHide: true,
-    timeout: 20000,
+    shell: process.platform === 'win32',
+    timeout: 30000,
     env,
   });
-  const sep = process.platform === 'win32' ? ';' : ':';
+  const pathSep = process.platform === 'win32' ? ';' : ':';
   const nextEnv = {
     ...env,
-    PATH: `${shimDir}${sep}${env?.PATH ?? ''}`,
+    PATH: `${shimDir}${pathSep}${env.PATH || ''}`,
   };
-  return {
-    ok: res.status === 0 && Boolean(commandExists('pnpm', nextEnv)),
-    env: nextEnv,
-    reason: res.status === 0 ? null : (res.stderr || res.stdout || '').trim(),
-  };
+  if (res.status === 0 || commandExists('pnpm', nextEnv)) {
+    return { ok: true, env: nextEnv };
+  }
+  return { ok: false, env: nextEnv, reason: (res.stderr || res.stdout || '').trim() };
+}
+
+function invokeDshPluginAddSync(selectedTarget, installSpec, execEnv) {
+  if (selectedTarget.kind === 'official-desktop' && selectedTarget.clientExecutable && selectedTarget.desktopHostCliJs) {
+    return spawnSync(
+      selectedTarget.clientExecutable,
+      ['--expose-internals', selectedTarget.desktopHostCliJs, 'plugin', '--profile', selectedTarget.profile, 'add', installSpec],
+      {
+        encoding: 'utf8',
+        windowsHide: true,
+        shell: false,
+        timeout: 180000,
+        env: { ...execEnv, ELECTRON_RUN_AS_NODE: '1' },
+      },
+    );
+  }
+  const cmd = selectedTarget.cliUsesNode ? process.execPath : selectedTarget.cliCommand;
+  const args = selectedTarget.cliUsesNode
+    ? [selectedTarget.cliCommand, 'plugin', '--profile', selectedTarget.profile, 'add', installSpec]
+    : ['plugin', '--profile', selectedTarget.profile, 'add', installSpec];
+  const isCmd = process.platform === 'win32' && /\.(?:cmd|bat)$/i.test(String(cmd));
+  if (isCmd) {
+    const quotedLine = [cmd, ...args].map(a => `"${String(a).replace(/"/g, '""')}"`).join(' ');
+    return spawnSync(process.env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', `"${quotedLine}"`], {
+      encoding: 'utf8',
+      windowsHide: true,
+      windowsVerbatimArguments: true,
+      shell: false,
+      timeout: 180000,
+      env: execEnv,
+    });
+  }
+  return spawnSync(cmd, args, {
+    encoding: 'utf8',
+    windowsHide: true,
+    shell: false,
+    timeout: 180000,
+    env: execEnv,
+  });
+}
+
+/**
+ * Idempotently initialize `<dshHome>/profiles/desktop/{package.json,cordis.patch.yml}` on a zero-state
+ * `$DSH_HOME` before `dsh plugin --profile desktop add` runs (preventing DSH 0.2.2-rc.1 exitCode 1
+ * `Open DeepSeek Harness Desktop once to initialize its profile...` when GUI has never been opened yet).
+ */
+export function ensureDesktopProfileInitialized(dshHome, fsImpl = fs) {
+  if (!dshHome) return { initialized: false, createdPkg: false, createdPatch: false, profileDir: null };
+  const profileDir = path.join(path.resolve(dshHome), 'profiles', 'desktop');
+  const pkgFile = path.join(profileDir, 'package.json');
+  const patchFile = path.join(profileDir, 'cordis.patch.yml');
+  let createdPkg = false;
+  let createdPatch = false;
+  fsImpl.mkdirSync(profileDir, { recursive: true });
+  if (!fsImpl.existsSync(pkgFile)) {
+    const pkgContent =
+      '{"name":"dsh-profile-desktop","private":true,"dsh":{"profile":{"bundles":["@deepseek-ai/dsh-base","@deepseek-ai/dsh-web-app"]}}}\n';
+    if (fsImpl === fs) writeFileAtomic(pkgFile, pkgContent);
+    else fsImpl.writeFileSync(pkgFile, pkgContent, 'utf8');
+    createdPkg = true;
+  }
+  if (!fsImpl.existsSync(patchFile)) {
+    if (fsImpl === fs) writeFileAtomic(patchFile, '[]\n');
+    else fsImpl.writeFileSync(patchFile, '[]\n', 'utf8');
+    createdPatch = true;
+  }
+  return { initialized: createdPkg || createdPatch, createdPkg, createdPatch, profileDir };
 }
 
 /**
@@ -374,20 +1089,22 @@ function ensurePnpmInEnv({ dshHome, env = process.env }) {
 export async function runOneClickInstallation({
   repoRoot = DEFAULT_REPO_ROOT,
   dshHome = null,
+  customDshPath = null,
   targetId = null,
   sourceKind = 'auto', // 'auto' | 'local-tgz' | 'local-source' | 'download-release'
   localTgzPath = null,
   track = 'open-source',
+  targetVersion = null,
+  platform = process.platform,
   cleanLegacyPatches = true,
   providerId = '',
   apiKey = '',
-  customDshPath = null,
-  targetVersion = null,
-  platform = process.platform,
   fetchImpl = globalThis.fetch,
   installerRunner = null,
+  spawnSyncImpl = spawnSync,
   onProgress = null,
 } = {}) {
+  assertTargetReleaseTagMatchesPlatform(targetVersion, platform);
   const reportStep = (step, message) => {
     if (typeof onProgress === 'function') {
       try { onProgress({ step, message, at: new Date().toISOString() }); } catch {}
@@ -401,6 +1118,7 @@ export async function runOneClickInstallation({
     dshHome,
     customDshPath: inferredCustomDshPath,
     platform,
+    spawnSyncImpl,
   });
   const resolvedHome = envSnap.dshHome;
   const storageRoot = path.join(resolvedHome, 'leaderteam');
@@ -413,7 +1131,7 @@ export async function runOneClickInstallation({
     null;
 
   if (!selectedTarget) {
-    const err = new Error('未在本机检测到已安装的 DeepSeek Harness 客户端或 CLI。请先安装官方 DeepSeek Harness（>= 0.2.2-rc.1），或手动指定安装目录。');
+    const err = new Error('未在本机检测到已安装的 DeepSeek Harness 客户端或 CLI。请先安装官方 DeepSeek Harness（>= 0.2.2-rc.1），或在页面输入框手动指定安装目录后点击“重新扫描”。');
     err.friendly = translateInstallErrorToPlainChinese(err);
     throw err;
   }
@@ -430,14 +1148,12 @@ export async function runOneClickInstallation({
     throw err;
   }
 
-  // 1. Clean legacy V2.1 profile patches if detected
   let cleanedPatches = [];
   if (cleanLegacyPatches && envSnap.legacyPatchConflicts.length > 0) {
     reportStep('clean-legacy', '正在自动备份并清理旧版 V2.1 配置文件补丁…');
     cleanedPatches = cleanLegacyProfilePatches({ dshHome: resolvedHome });
   }
 
-  // 2. Ensure pnpm available for CLI profile installation
   let execEnv = { ...process.env, DSH_HOME: resolvedHome };
   if (selectedTarget.kind === 'dsh-web-cli') {
     reportStep('check-deps', '正在检查包管理环境（Node.js / pnpm）…');
@@ -450,7 +1166,6 @@ export async function runOneClickInstallation({
     }
   }
 
-  // 3. Resolve package spec to install
   let installSpec = null;
   let installedVersion = null;
   let installedTrack = track;
@@ -473,10 +1188,9 @@ export async function runOneClickInstallation({
     installedVersion = info.version;
     installedTrack = info.track;
     sha256 = computeFileSha256(fullTgz);
-  } else if (sourceKind === 'auto' && envSnap.bundledTarballs.length > 0) {
-    const first = envSnap.bundledTarballs[0];
-    reportStep('verify-package', `发现随附离线安装包 ${first.fileName}，正在校验兼容性…`);
-    const info = inspectTgzPackage(first.path);
+  } else if (sourceKind === 'auto' && !targetVersion && envSnap.bundledTarballs.length > 0) {
+    const picked = envSnap.bundledTarballs[0];
+    const info = inspectTgzPackage(picked.path);
     const compat = checkCandidatePackageCompatibility({
       pkgInspection: info,
       currentHostVersion: selectedTarget.toolsVersion,
@@ -486,17 +1200,17 @@ export async function runOneClickInstallation({
       err.friendly = translateInstallErrorToPlainChinese(err);
       throw err;
     }
-    installSpec = first.path;
+    installSpec = picked.path;
     installedVersion = info.version;
     installedTrack = info.track;
-    sha256 = computeFileSha256(first.path);
-  } else if (sourceKind === 'local-source' || (sourceKind === 'auto' && envSnap.localSourceBundle.available)) {
+    sha256 = computeFileSha256(picked.path);
+  } else if ((sourceKind === 'local-source' || sourceKind === 'auto') && !targetVersion && envSnap.localSourceBundle.available) {
     installSpec = envSnap.localSourceBundle.path;
     installedVersion = envSnap.localSourceBundle.version;
     installedTrack = 'open-source';
   } else {
     reportStep('download', `正在从 GitHub 下载最新「${UPDATE_TRACKS[track]?.shortLabel || track}」安装包并校验 SHA-256…`);
-    const relCheck = await checkForUpdates({
+    const relCheck = await checkReleaseUpdates({
       pluginRoot: repoRoot,
       storageRoot,
       track,
@@ -506,7 +1220,7 @@ export async function runOneClickInstallation({
       fetchImpl,
     });
     if (!relCheck.latestRelease?.asset?.downloadUrl) {
-      const err = new Error('未在官方仓库找到可下载的 .tgz 发布包');
+      const err = new Error('未在官方仓库找到与当前平台匹配的 .tgz 发布包');
       err.friendly = translateInstallErrorToPlainChinese(err);
       throw err;
     }
@@ -533,7 +1247,11 @@ export async function runOneClickInstallation({
     sha256 = downloaded.sha256;
   }
 
-  // 4. Execute `dsh plugin --profile <desktop|web> add <installSpec>`
+  let desktopProfileInit = null;
+  if (selectedTarget.profile === 'desktop' || selectedTarget.kind === 'official-desktop') {
+    desktopProfileInit = ensureDesktopProfileInitialized(resolvedHome);
+  }
+
   reportStep('install', `正在向 DSH (${selectedTarget.profile} profile) 安装 LeaderTeam v${installedVersion || ''}…`);
   if (typeof installerRunner === 'function') {
     await installerRunner({
@@ -543,24 +1261,12 @@ export async function runOneClickInstallation({
       env: execEnv,
     });
   } else {
-    if (!selectedTarget.cliCommand) {
+    if (!selectedTarget.cliCommand && !(selectedTarget.clientExecutable && selectedTarget.desktopHostCliJs)) {
       const err = new Error('未找到目标 DSH 客户端内置的 dsh 命令行入口');
       err.friendly = translateInstallErrorToPlainChinese(err);
       throw err;
     }
-    const cmd = selectedTarget.cliUsesNode ? process.execPath : selectedTarget.cliCommand;
-    const args = selectedTarget.cliUsesNode
-      ? [selectedTarget.cliCommand, 'plugin', '--profile', selectedTarget.profile, 'add', installSpec]
-      : ['plugin', '--profile', selectedTarget.profile, 'add', installSpec];
-    const isCmd = process.platform === 'win32' && String(cmd).toLowerCase().endsWith('.cmd');
-
-    const proc = spawnSync(cmd, args, {
-      encoding: 'utf8',
-      windowsHide: true,
-      shell: isCmd,
-      timeout: 180000,
-      env: execEnv,
-    });
+    const proc = invokeDshPluginAddSync(selectedTarget, installSpec, execEnv);
     if (proc.status !== 0) {
       const detail = `${proc.stderr || ''}\n${proc.stdout || ''}`.trim() || `exit code ${proc.status}`;
       const err = new Error(detail);
@@ -569,15 +1275,27 @@ export async function runOneClickInstallation({
     }
   }
 
-  // 5. Optional: Pre-provision starter API key & Solo-Key config so user doesn't touch CLI at all
+  // 4b. Post-install Desktop `cordis.patch.yml` hygiene: remove stale manual `leaderteam-*` `- insert:` rows
+  // while preserving provider/model patches and ensuring `- id: tool-web` (`fetch: true, searchTimeoutMs: 60000`)!
+  let desktopPatchHygiene = null;
+  if (selectedTarget.profile === 'desktop' || selectedTarget.kind === 'official-desktop') {
+    reportStep('patch-hygiene', '正在检查并优化桌面端 cordis.patch.yml 配置（保留模型网关并启用联网工具 tool-web）…');
+    desktopPatchHygiene = sanitizeDesktopCordisPatch({
+      dshHome: resolvedHome,
+      profile: selectedTarget.profile || 'desktop',
+    });
+  }
+
+  // 5. Optional: Pre-provision starter API key, Solo-Key config & DSH profile model entries
   let starterModelConfigured = false;
   if (providerId && String(apiKey || '').trim()) {
-    reportStep('configure-key', '正在保存模型 API Key 并生成初始团队配置…');
+    reportStep('configure-key', '正在保存模型 API Key 并生成初始团队与宿主模型配置…');
     const preset = SOLO_PROVIDER_PRESETS.find(p => p.id === providerId || p.provider === providerId) ?? SOLO_PROVIDER_PRESETS[0];
+    const cleanKey = String(apiKey).trim();
     await persistProviderApiKey({
       dshHome: resolvedHome,
       envVarName: preset.envVars[0],
-      apiKey: String(apiKey).trim(),
+      apiKey: cleanKey,
       env: execEnv,
     });
     const baseCfgPath = path.join(repoRoot, 'config', 'leaderteam.config.json');
@@ -590,11 +1308,35 @@ export async function runOneClickInstallation({
       if (!fs.existsSync(userCfgFile)) {
         writeFileAtomic(userCfgFile, `${JSON.stringify(starterCfg, null, 2)}\n`);
       }
+      const providerTemplates = buildSoloProviderSettingsTemplates({ ...execEnv, [preset.envVars[0]]: cleanKey });
+      const modelsToSync = Object.entries(starterCfg.models ?? {}).map(([route, spec]) => ({
+        route,
+        provider: spec.provider ?? preset.provider,
+        upstreamModel: spec.upstreamModel ?? route,
+        efforts: spec.efforts,
+        ...(spec.reasoningEfforts ? { reasoningEfforts: spec.reasoningEfforts } : {}),
+        vision: spec.vision,
+        contextWindow: spec.contextWindow,
+        maxTokens: spec.maxTokens,
+      }));
+      const leaderSel = starterCfg.roles?.leader?.route
+        ? resolveModelTarget(starterCfg, starterCfg.roles.leader.route, starterCfg.roles.leader.effort)
+        : null;
+      syncModelsToDshDiskProfiles({
+        dshHome: resolvedHome,
+        modelsToEnsure: modelsToSync,
+        defaultProvider: preset.provider,
+        providerTemplates,
+        defaultSelection: leaderSel,
+        syncDefaultModel: true,
+        targetProfiles: selectedTarget.profile ? [selectedTarget.profile] : undefined,
+        createDefaultProfilesIfNone: true,
+      });
     }
     starterModelConfigured = true;
   }
 
-  reportStep('done', '安装与健康校验全部完成！');
+  reportStep('done', '安装与自检已完成！');
   return {
     ok: true,
     target: {
@@ -602,12 +1344,15 @@ export async function runOneClickInstallation({
       kind: selectedTarget.kind,
       label: selectedTarget.label,
       profile: selectedTarget.profile,
+      installDir: selectedTarget.installDir,
       dshVersion: selectedTarget.dshVersion,
     },
     installedVersion,
     installedTrack,
     sha256,
     cleanedLegacyPatches: cleanedPatches.length,
+    desktopProfileInit,
+    desktopPatchHygiene,
     starterModelConfigured,
     dshHome: resolvedHome,
     nextStepHint:
@@ -646,11 +1391,14 @@ export async function launchInstalledClient({
   }
 
   if (selectedTarget.kind === 'official-desktop' && selectedTarget.clientExecutable) {
+    const cleanLaunchEnv = { ...process.env, DSH_HOME: envSnap.dshHome };
+    delete cleanLaunchEnv.ELECTRON_RUN_AS_NODE;
     const child = spawner(selectedTarget.clientExecutable, [], {
+      cwd: selectedTarget.installDir,
       detached: true,
       stdio: 'ignore',
       windowsHide: false,
-      env: { ...process.env, DSH_HOME: envSnap.dshHome },
+      env: cleanLaunchEnv,
     });
     child.unref?.();
     return {
@@ -662,7 +1410,6 @@ export async function launchInstalledClient({
     };
   }
 
-  // Web / CLI mode: check if port is already serving, else spawn `dsh web --port <webPort> --no-open`
   const targetUrl = `http://127.0.0.1:${webPort}/lt/?onboarding=1`;
   let alreadyListening = false;
   try {
@@ -682,7 +1429,6 @@ export async function launchInstalledClient({
       env: { ...process.env, DSH_HOME: envSnap.dshHome },
     });
     child.unref?.();
-    // Wait briefly up to 4s for server readiness
     for (let i = 0; i < 16; i++) {
       await new Promise(r => setTimeout(r, 250));
       try {

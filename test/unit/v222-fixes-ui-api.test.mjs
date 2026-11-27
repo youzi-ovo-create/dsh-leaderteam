@@ -18,8 +18,7 @@ import {
   resolveLtWebDistDir,
   serveLtWebStaticRequest,
 } from '../../leaderteam/plugins/leaderteam-panel/public-api.mjs';
-import { scanNoSecretLeakage } from '../../../lt-shared-contracts/tests/contract-validator.mjs';
-import { startMockMagpieServer } from '../../../lt-shared-contracts/mocks/mock-magpie-server.mjs';
+import { scanNoSecretLeakage, startMockMagpieServer } from './companion-paths.mjs';
 import { createPanelHandlers } from '../../leaderteam/plugins/leaderteam-panel/panel-api.mjs';
 import { startStandaloneLtUiServer } from '../../bin/lt-ui.mjs';
 import { loadConfig } from '../../leaderteam/core/config.mjs';
@@ -234,7 +233,7 @@ test('UI-02: workbenchTranscript confines session paths + encodes segments, and 
   // Seed `<dshHome>/sessions/proj-a` + an escaping symlink + an encoded `session:1` directory (`session~003A1`) + uncompressed `.jsonl`
   const slugDir = path.join(dshHome, 'sessions', 'proj-a');
   fs.mkdirSync(slugDir, { recursive: true });
-  fs.symlinkSync(outsideDir, path.join(slugDir, 'symlink-escape'), 'dir');
+  fs.symlinkSync(outsideDir, path.join(slugDir, 'symlink-escape'), process.platform === 'win32' ? 'junction' : 'dir');
 
   assert.equal(encodeDshSegment('session:1'), 'session~003A1');
   assert.equal(encodeDshSegment('..'), '~002E~002E');
@@ -701,7 +700,14 @@ test('UI-06, UI-07 & UI-12: serveLtWebStaticRequest hardening, /lt/?token= cooki
 
   const outsideSecret = path.join(tmpDir, 'outside.txt');
   fs.writeFileSync(outsideSecret, 'TOP_SECRET_OUTSIDE_DIST', 'utf8');
-  fs.symlinkSync(outsideSecret, path.join(customDist, 'leak.txt'));
+  try {
+    fs.symlinkSync(outsideSecret, path.join(customDist, 'leak.txt'));
+  } catch (err) {
+    if (err?.code !== 'EPERM') throw err;
+    const outsideJunctionDir = path.join(tmpDir, 'outside-junction-dir');
+    fs.mkdirSync(outsideJunctionDir, { recursive: true });
+    fs.symlinkSync(outsideJunctionDir, path.join(customDist, 'leak.txt'), 'junction');
+  }
 
   // 1. UI-06: malformed URI returns 400 (never 500)
   const badUri = await serveLtWebStaticRequest(new Request('http://127.0.0.1:3080/lt/%E0%A4%A'), { distDir: customDist });
@@ -1159,7 +1165,8 @@ test('Stage 4 Re-Audit Fixes (S3-UIGW-01, S3-UIGW-02, S3-UIGW-04, S3-UIGW-06): l
   const combinedJs = jsFiles.map(f => fs.readFileSync(path.join(distDir, 'assets', f), 'utf8')).join('\n');
   assert.ok(combinedJs.includes('单凭据默认 (single)'), 'web-dist must include disabled single routing option');
 
-  const sharedDts = fs.readFileSync(path.resolve(repoRoot, '..', 'lt-shared-contracts', 'types', 'lt-public-v1.d.ts'), 'utf8');
+  const { SHARED_CONTRACTS_ROOT } = await import('./companion-paths.mjs');
+  const sharedDts = fs.readFileSync(path.join(SHARED_CONTRACTS_ROOT, 'types', 'lt-public-v1.d.ts'), 'utf8');
   const webTs = fs.readFileSync(path.join(repoRoot, 'packages', 'lt-web', 'src', 'types', 'lt-public-v1.ts'), 'utf8');
   assert.equal(webTs, sharedDts, 'lt-web lt-public-v1.ts must stay byte-for-byte synced with lt-shared-contracts');
 });

@@ -37,10 +37,15 @@
 
   let activeHostConnection = null;
 
+  function isDshAppSurface() {
+    if (typeof window === 'undefined' || !window || !window.location) return false;
+    return window.location.protocol === 'dsh-app:';
+  }
+
   function isHttpWebSurface() {
     if (typeof window === 'undefined' || !window || !window.location) return false;
     const proto = window.location.protocol;
-    return proto === 'http:' || proto === 'https:';
+    return proto === 'http:' || proto === 'https:' || proto === 'dsh-app:';
   }
 
   function isFileDesktopSurface() {
@@ -88,6 +93,8 @@
     let res;
     if (customConn) {
       res = await customConn.fetch(absPath, reqInit);
+    } else if (isDshAppSurface()) {
+      res = await fetch(absPath, Object.assign({}, reqInit, { credentials: 'include' }));
     } else if (isFileDesktopSurface()) {
       if (typeof fetch !== 'function') {
         throw new Error('当前处于 DSH Desktop (file://) 本地宿主模式；请在终端运行 npx lt-ui 或 dsh web 打开工作台。');
@@ -777,7 +784,19 @@
       const models = (data && Array.isArray(data.unifiedModels)) ? data.unifiedModels : [];
       const tok = resolvePanelTokens();
       const firstSid = sessionModes && sessionModes[0] && sessionModes[0].sessionId ? sessionModes[0].sessionId : '';
-      const ltNativeHref = firstSid ? ('./lt/#/workbench?session=' + encodeURIComponent(firstSid)) : './lt/';
+      const dshAppSurface = isDshAppSurface();
+      const ltBaseHref = dshAppSurface ? '/lt/' : './lt/';
+      const ltNativeHref = firstSid ? (ltBaseHref + '#/workbench?session=' + encodeURIComponent(firstSid)) : ltBaseHref;
+      const onOpenLtInCurrentWindow = dshAppSurface
+        ? function handleDshAppNavigate(e) {
+            if (e && typeof e.preventDefault === 'function') e.preventDefault();
+            if (typeof window !== 'undefined' && window.location && typeof window.location.assign === 'function') {
+              window.location.assign(ltNativeHref);
+            } else if (typeof window !== 'undefined' && window.location) {
+              window.location.href = ltNativeHref;
+            }
+          }
+        : undefined;
       const cardStyle = {
         border: '1px solid ' + tok.borderSubtle,
         borderRadius: '6px',
@@ -849,6 +868,7 @@
                 'a',
                 {
                   href: ltNativeHref,
+                  onClick: onOpenLtInCurrentWindow,
                   style: {
                     display: 'inline-block',
                     padding: compact ? '4px 10px' : '5px 12px',
@@ -863,7 +883,7 @@
                   },
                   title: '携带当前会话切换至 LT 原生工作台（共享运行时与活跃团队，切换零中断）',
                 },
-                '打开 /lt/ ↗'
+                dshAppSurface ? '打开 /lt/ →' : '打开 /lt/ ↗'
               )
               : null,
             h('button', { style: btnStyle(false), onClick: () => loadState({ forceDiscover: true }), disabled: loading }, loading ? '刷新中…' : '刷新状态'),
@@ -889,7 +909,7 @@
           },
           h('span', null, 'LT 原生工作台提供完整 Magpie 网关、多 Key 池、角色回退链、规划拓扑、衡账分析及四套河洛主题，与当前 DSH 前端共享同一会话与团队。'),
           isHttpWebSurface()
-            ? h('a', { href: ltNativeHref, style: { color: tok.accent, fontWeight: 600, whiteSpace: 'nowrap', textDecoration: 'none' } }, '进入 /lt/ →')
+            ? h('a', { href: ltNativeHref, onClick: onOpenLtInCurrentWindow, style: { color: tok.accent, fontWeight: 600, whiteSpace: 'nowrap', textDecoration: 'none' } }, '进入 /lt/ →')
             : h('span', { style: { color: tok.accent, fontWeight: 600, whiteSpace: 'nowrap' } }, '终端运行 npx lt-ui')
         ),
         error ? h('div', { style: { padding: '8px 10px', borderRadius: '6px', background: tok.dangerBg, color: tok.danger, marginBottom: '10px', fontSize: '12px' } }, '错误：' + error) : null,
@@ -1399,7 +1419,8 @@
                 h('option', { value: 'deepseek' }, 'DeepSeek'),
                 h('option', { value: 'dashscope' }, '阿里云百炼 (Qwen)'),
                 h('option', { value: 'zhipu' }, '智谱 (GLM)'),
-                h('option', { value: 'openai' }, 'OpenAI')
+                h('option', { value: 'openai' }, 'OpenAI'),
+                h('option', { value: 'openai-compatible' }, 'OpenAI 兼容接口')
               ),
               h('input', { type: 'password', style: { ...inputStyle, flex: 1, minWidth: '160px' }, placeholder: '粘贴 API Key (sk-...)', value: quickApiKey, onChange: e => setQuickApiKey(e.target.value) }),
               h('button', {

@@ -313,14 +313,17 @@ export function App() {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [navItems, navigateTo]);
 
+  const isDshAppProtocol =
+    typeof window !== 'undefined' && window.location?.protocol === 'dsh-app:';
+
   const dshFrontendUrl = useMemo(() => {
-    if (!bundle?.capabilities.frontendSwitch.available) return null;
-    const base = bundle.capabilities.frontendSwitch.dshFrontendUrl;
+    if (!bundle?.capabilities.frontendSwitch.available && !isDshAppProtocol) return null;
+    const base = isDshAppProtocol ? '/' : bundle?.capabilities.frontendSwitch.dshFrontendUrl;
     if (!base) return null;
     if (!activeSessionId) return base;
     const sep = base.includes('?') ? '&' : '?';
     return `${base}${sep}session=${encodeURIComponent(activeSessionId)}`;
-  }, [bundle, activeSessionId]);
+  }, [bundle, activeSessionId, isDshAppProtocol]);
 
   const paletteCommands: PaletteCommand[] = useMemo(() => {
     const navCmds: PaletteCommand[] = navItems
@@ -461,7 +464,11 @@ export function App() {
         label: '在 DSH 原生前端打开当前会话',
         icon: 'swap',
         run: () => {
-          window.location.href = dshFrontendUrl;
+          if (typeof window.location.assign === 'function') {
+            window.location.assign(dshFrontendUrl);
+          } else {
+            window.location.href = dshFrontendUrl;
+          }
         },
       });
     }

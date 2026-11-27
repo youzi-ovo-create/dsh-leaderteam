@@ -19,11 +19,15 @@
 
 ### Fixed
 - **修复「面板保存与 Doctor 全绿，但 DSH 客户端选不到模型」P0 体验缺陷**：
-  - 打通独立模式（`ctx === null`）与宿主内置模式双路径模型落盘：保存配置或完成新手引导时同步更新 `$DSH_HOME/.credentials.yaml`（`version: 1` `refs:` 实时监听凭据库）、`$DSH_HOME/.env` 以及 `$DSH_HOME/profiles/<desktop|web>/cordis.patch.yml` 中的 `llm-pi-ai` 与 `agent-default-model`；
-  - 修复 `openai` 等内置目录供应商填写自定义 `baseURL` 被忽略或触发 `PiAiCatalogError`（`modelOverrides` 冲突 / 自定义模型缺少 `api: "openai-completions"` / 非法 `reasoningEfforts` 键）的问题；
-  - 新手引导连通性预检支持解析真实 `/v1/models` 返回列表并在预设静态模型不存在时自动适配可用主力与轻量模型。
+  - 打通独立模式（`ctx === null`）与宿主内置模式双路径模型落盘：保存配置或完成新手引导时同步更新实时 `ctx.credentials`、`$DSH_HOME/.credentials.yaml`（`version: 1` `refs:` 实时监听凭据库）、`$DSH_HOME/.env` 以及 `$DSH_HOME/profiles/<desktop|web>/cordis.patch.yml` 中的 `llm-pi-ai` 与 `agent-default-model`（仅在宿主无可用默认模型或显式切换时更新 `agentDefaultModel`）；
+  - 新增 `openai-compatible` 自定义网关预设并避让保留内置适配器 ID（`deepseek-official`、`deepseek-account`），修复 `openai` 等内置目录供应商填写自定义 `baseURL` 被忽略或触发 `PiAiCatalogError`（`modelOverrides` 冲突 / 自定义模型缺少 `api: "openai-completions"` / 非推理模型误发 `{ off: "none" }`）的问题；
+  - 新手引导连通性预检与自定义网关接入支持自动探测真实 `/v1/models` 列表并替换占位模型路由。
+- **官方 DSH `0.2.2-rc.1` Windows 桌面端真机细节对齐**：
+  - 零状态首次安装自举：在从未打开过 GUI 的全新 `$DSH_HOME` 上执行 `--profile desktop` 安装前，自动幂等初始化 `profiles/desktop/package.json` 与 `cordis.patch.yml`，消除退出码 `1` 初始化报错；
+  - 完整支持官方 Windows Desktop `dsh-app://app/` 自定义协议：`leaderteam-panel/client.js` 与 `lt-web` 在 `dsh-app:` 下采用窗口内直跳 `/lt/` 与 `/`（不触发 `target="_blank"` 拦截，杜绝误导运行独立 `npx lt-ui` 脑裂）；
+  - Windows 系统级 Magpie 自动寻址优先匹配无头 `magpie-cli.exe`（避开同目录 Tauri GUI 壳 `magpie.exe`），并在跨进程同步切换模式时保留未核销的 `managed-pid.json` 交由异步健康探针安全回收，杜绝孤儿端口占用。
 - **合入 V2.2.1 治理与回退修复**：领队末位兜底严格按 `(provider, upstreamModel)` 成对匹配、策略拒绝（Policy Refusal）停止后台异步重发、区分安全门策略回执、修正中途重试 5h 窗口归因、双审回执绑定交付材料快照及回放恢复。
-- **Windows NTFS Junction / 符号链接参考文件追踪与 Magpie 进程树回收修复**：修复阶段 `references` 含 NTFS Junction 目录链接时的安全门放行与已读状态核销（`realpathBestEffort`），增强 Windows 本机 Magpie 二进制寻址与退出时子进程树清理兜底。
+- **Windows NTFS Junction / 符号链接参考文件追踪与 Magpie 进程树回收修复**：修复阶段 `references` 含 NTFS Junction 目录链接时的安全门放行与已读状态核销（`realpathBestEffort`），增强 Windows 退出时子进程树清理兜底。
 
 ## [2.2.0] - 2026-11-24
 

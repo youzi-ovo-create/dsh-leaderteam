@@ -242,6 +242,7 @@ test('CH-03 (P0): blocks glob-prefixed write_scope (.git*, *.md), shell wildcard
     },
   });
   const ws = makeTempDir(t, 'ch03-ws-');
+  const posixWs = ws.replace(/^[A-Za-z]:/, '').replaceAll('\\', '/');
   fs.mkdirSync(path.join(ws, 'mod_a'), { recursive: true });
   fs.mkdirSync(path.join(ws, 'mod_b'), { recursive: true });
 
@@ -252,7 +253,7 @@ test('CH-03 (P0): blocks glob-prefixed write_scope (.git*, *.md), shell wildcard
       tool: 'team_direct_exec',
       args: { task: 'modify files', write_scope: [badGlob] },
       actor: { role: 'leader', allowedTools: ['team_direct_exec'] },
-      cwd: ws,
+      cwd: posixWs,
       platform: 'linux',
     }, customCfg);
     assert.equal(hr?.rule, 'path-protected', `evaluateHardRules must block write_scope ${badGlob}`);
@@ -329,29 +330,29 @@ test('CH-03 (P0): blocks glob-prefixed write_scope (.git*, *.md), shell wildcard
     'cp mod_a/a.js .github/workflows/ci.yml',
     'cp mod_a/a.js AGENT?.md',
   ]) {
-    assert.equal(classifySandboxBoundary({ tool: 'bash', args: { command: protCmd }, actor: memberA, cwd: ws, platform: 'linux' }, customCfg).confined, false, protCmd);
-    assert.equal(evaluateDirectExecSafetyGate({ tool: 'bash', args: { command: protCmd }, actor: directA, cwd: ws, platform: 'linux' }, customCfg).decision, 'deny', protCmd);
+    assert.equal(classifySandboxBoundary({ tool: 'bash', args: { command: protCmd }, actor: memberA, cwd: posixWs, platform: 'linux' }, customCfg).confined, false, protCmd);
+    assert.equal(evaluateDirectExecSafetyGate({ tool: 'bash', args: { command: protCmd }, actor: directA, cwd: posixWs, platform: 'linux' }, customCfg).decision, 'deny', protCmd);
   }
   assert.equal(
-    evaluateHardRules({ tool: 'bash', args: { command: 'echo x > .gi?/hooks/pre-commit' }, actor: memberA, cwd: ws, platform: 'linux' }, customCfg)?.rule,
+    evaluateHardRules({ tool: 'bash', args: { command: 'echo x > .gi?/hooks/pre-commit' }, actor: memberA, cwd: posixWs, platform: 'linux' }, customCfg)?.rule,
     'path-protected',
   );
   assert.equal(
-    evaluateHardRules({ tool: 'bash', args: { command: 'echo x > .github/workflows/ci.yml' }, actor: memberA, cwd: ws, platform: 'linux' }, customCfg)?.rule,
+    evaluateHardRules({ tool: 'bash', args: { command: 'echo x > .github/workflows/ci.yml' }, actor: memberA, cwd: posixWs, platform: 'linux' }, customCfg)?.rule,
     'path-protected',
   );
 
   // Redirection outside `actor.writeScope` -> `path-outside-write-scope` in `evaluateHardRules`!
   assert.equal(
-    evaluateHardRules({ tool: 'bash', args: { command: 'echo changed > mod_b/b.js' }, actor: memberA, cwd: ws, platform: 'linux' }, customCfg)?.rule,
+    evaluateHardRules({ tool: 'bash', args: { command: 'echo changed > mod_b/b.js' }, actor: memberA, cwd: posixWs, platform: 'linux' }, customCfg)?.rule,
     'path-outside-write-scope',
   );
   assert.equal(
-    evaluateHardRules({ tool: 'bash', args: { command: 'echo appended >> mod_b/b.js' }, actor: memberA, cwd: ws, platform: 'linux' }, customCfg)?.rule,
+    evaluateHardRules({ tool: 'bash', args: { command: 'echo appended >> mod_b/b.js' }, actor: memberA, cwd: posixWs, platform: 'linux' }, customCfg)?.rule,
     'path-outside-write-scope',
   );
   assert.equal(
-    evaluateHardRules({ tool: 'bash', args: { command: 'echo ok > mod_a/a.js' }, actor: memberA, cwd: ws, platform: 'linux' }, customCfg),
+    evaluateHardRules({ tool: 'bash', args: { command: 'echo ok > mod_a/a.js' }, actor: memberA, cwd: posixWs, platform: 'linux' }, customCfg),
     undefined,
   );
 
@@ -365,8 +366,8 @@ test('CH-03 (P0): blocks glob-prefixed write_scope (.git*, *.md), shell wildcard
     'patch mod_b/b.js mod_a/fix.patch',
     'patch -p1 < mod_a/fix.patch',
   ]) {
-    assert.equal(classifySandboxBoundary({ tool: 'bash', args: { command: outMutCmd }, actor: memberA, cwd: ws, platform: 'linux' }, customCfg).confined, false, outMutCmd);
-    assert.equal(evaluateDirectExecSafetyGate({ tool: 'bash', args: { command: outMutCmd }, actor: directA, cwd: ws, platform: 'linux' }, customCfg).decision, 'deny', outMutCmd);
+    assert.equal(classifySandboxBoundary({ tool: 'bash', args: { command: outMutCmd }, actor: memberA, cwd: posixWs, platform: 'linux' }, customCfg).confined, false, outMutCmd);
+    assert.equal(evaluateDirectExecSafetyGate({ tool: 'bash', args: { command: outMutCmd }, actor: directA, cwd: posixWs, platform: 'linux' }, customCfg).decision, 'deny', outMutCmd);
   }
 
   for (const inMutCmd of [
@@ -377,8 +378,8 @@ test('CH-03 (P0): blocks glob-prefixed write_scope (.git*, *.md), shell wildcard
     'install mod_a/a.js mod_a/bin.js',
     'patch mod_a/a.js mod_a/fix.patch',
   ]) {
-    assert.equal(classifySandboxBoundary({ tool: 'bash', args: { command: inMutCmd }, actor: memberA, cwd: ws, platform: 'linux' }, customCfg).confined, true, inMutCmd);
-    assert.equal(evaluateDirectExecSafetyGate({ tool: 'bash', args: { command: inMutCmd }, actor: directA, cwd: ws, platform: 'linux' }, customCfg).decision, 'allow', inMutCmd);
+    assert.equal(classifySandboxBoundary({ tool: 'bash', args: { command: inMutCmd }, actor: memberA, cwd: posixWs, platform: 'linux' }, customCfg).confined, true, inMutCmd);
+    assert.equal(evaluateDirectExecSafetyGate({ tool: 'bash', args: { command: inMutCmd }, actor: directA, cwd: posixWs, platform: 'linux' }, customCfg).decision, 'allow', inMutCmd);
   }
 });
 
@@ -1117,6 +1118,7 @@ test('S3-SYS-03 (P0): brace-expansion targets, dd/rsync/touch/mkdir/truncate/tar
     },
   });
   const ws = makeTempDir(t, 's3-sys03-ws-');
+  const posixWs = ws.replace(/^[A-Za-z]:/, '').replaceAll('\\', '/');
   fs.mkdirSync(path.join(ws, 'mod_a'), { recursive: true });
   fs.mkdirSync(path.join(ws, 'mod_b'), { recursive: true });
 
@@ -1136,9 +1138,9 @@ test('S3-SYS-03 (P0): brace-expansion targets, dd/rsync/touch/mkdir/truncate/tar
     'tee mod_a/{../.g,x}it/hooks/pre-commit < mod_a/a.js',
     'echo pwn > mod_a/{../mod_b/b.js,ok.js}',
   ]) {
-    assert.equal(evaluateHardRules({ tool: 'bash', args: { command: braceWriteCmd }, actor: memberA, cwd: ws, platform: 'linux' }, customCfg)?.rule, 'shell-dynamic-target', braceWriteCmd);
-    assert.equal(classifySandboxBoundary({ tool: 'bash', args: { command: braceWriteCmd }, actor: memberA, cwd: ws, platform: 'linux' }, customCfg).confined, false, braceWriteCmd);
-    assert.equal(evaluateDirectExecSafetyGate({ tool: 'bash', args: { command: braceWriteCmd }, actor: directA, cwd: ws, platform: 'linux' }, customCfg).decision, 'deny', braceWriteCmd);
+    assert.equal(evaluateHardRules({ tool: 'bash', args: { command: braceWriteCmd }, actor: memberA, cwd: posixWs, platform: 'linux' }, customCfg)?.rule, 'shell-dynamic-target', braceWriteCmd);
+    assert.equal(classifySandboxBoundary({ tool: 'bash', args: { command: braceWriteCmd }, actor: memberA, cwd: posixWs, platform: 'linux' }, customCfg).confined, false, braceWriteCmd);
+    assert.equal(evaluateDirectExecSafetyGate({ tool: 'bash', args: { command: braceWriteCmd }, actor: directA, cwd: posixWs, platform: 'linux' }, customCfg).decision, 'deny', braceWriteCmd);
   }
 
   // 2. Out-of-scope mutating commands (`dd`, `rsync`, `touch`, `mkdir`, `truncate`, `tar`, `unzip`, `gawk -i inplace`, `sed -Ei.bak`, `{ cp ...; }`, `if ... then ... fi`)
@@ -1159,9 +1161,9 @@ test('S3-SYS-03 (P0): brace-expansion targets, dd/rsync/touch/mkdir/truncate/tar
     '{ cp mod_a/a.js mod_b/b.js; }',
     'if true; then cp mod_a/a.js mod_b/b.js; fi',
   ]) {
-    assert.equal(classifySandboxBoundary({ tool: 'bash', args: { command: outCmd }, actor: memberA, cwd: ws, platform: 'linux' }, customCfg).confined, false, `must block out-of-scope mutation: ${outCmd}`);
-    assert.equal(evaluateDirectExecSafetyGate({ tool: 'bash', args: { command: outCmd }, actor: directA, cwd: ws, platform: 'linux' }, customCfg).decision, 'deny', `direct_exec must deny out-of-scope mutation: ${outCmd}`);
-    assert.equal(evaluateHardRules({ tool: 'bash', args: { command: outCmd }, actor: directA, cwd: ws, platform: 'linux' }, customCfg)?.rule, 'direct-exec-sandbox-lock', outCmd);
+    assert.equal(classifySandboxBoundary({ tool: 'bash', args: { command: outCmd }, actor: memberA, cwd: posixWs, platform: 'linux' }, customCfg).confined, false, `must block out-of-scope mutation: ${outCmd}`);
+    assert.equal(evaluateDirectExecSafetyGate({ tool: 'bash', args: { command: outCmd }, actor: directA, cwd: posixWs, platform: 'linux' }, customCfg).decision, 'deny', `direct_exec must deny out-of-scope mutation: ${outCmd}`);
+    assert.equal(evaluateHardRules({ tool: 'bash', args: { command: outCmd }, actor: directA, cwd: posixWs, platform: 'linux' }, customCfg)?.rule, 'direct-exec-sandbox-lock', outCmd);
   }
 
   // 3. In-scope counterparts AND `/dev/null` redirections remain confined & allowed
@@ -1183,9 +1185,9 @@ test('S3-SYS-03 (P0): brace-expansion targets, dd/rsync/touch/mkdir/truncate/tar
     'npm test >/dev/null 2>&1',
     'npm test &>/dev/null',
   ]) {
-    assert.equal(evaluateHardRules({ tool: 'bash', args: { command: inCmd }, actor: memberA, cwd: ws, platform: 'linux' }, customCfg), undefined, inCmd);
-    assert.equal(classifySandboxBoundary({ tool: 'bash', args: { command: inCmd }, actor: memberA, cwd: ws, platform: 'linux' }, customCfg).confined, true, `in-scope command must remain confined: ${inCmd}`);
-    assert.equal(evaluateDirectExecSafetyGate({ tool: 'bash', args: { command: inCmd }, actor: directA, cwd: ws, platform: 'linux' }, customCfg).decision, 'allow', `direct_exec must allow in-scope command: ${inCmd}`);
+    assert.equal(evaluateHardRules({ tool: 'bash', args: { command: inCmd }, actor: memberA, cwd: posixWs, platform: 'linux' }, customCfg), undefined, inCmd);
+    assert.equal(classifySandboxBoundary({ tool: 'bash', args: { command: inCmd }, actor: memberA, cwd: posixWs, platform: 'linux' }, customCfg).confined, true, `in-scope command must remain confined: ${inCmd}`);
+    assert.equal(evaluateDirectExecSafetyGate({ tool: 'bash', args: { command: inCmd }, actor: directA, cwd: posixWs, platform: 'linux' }, customCfg).decision, 'allow', `direct_exec must allow in-scope command: ${inCmd}`);
   }
 });
 
@@ -1302,11 +1304,17 @@ test('S3-SYS-06 (P1): lt-bugreport blocks sessionId path traversal & symlink esc
   // Symlinked session directory & symlinked file inside dshHome/sessions pointing outside
   const sessionsDir = path.join(dshHome, 'sessions');
   fs.mkdirSync(path.join(sessionsDir, 'sym-file-sess'), { recursive: true });
-  fs.symlinkSync(outsideSessDir, path.join(sessionsDir, 'sym-dir-sess'), 'dir');
-  fs.symlinkSync(
-    path.join(outsideSessDir, 'session.v4.jsonl.zstd'),
-    path.join(sessionsDir, 'sym-file-sess', 'session.v4.jsonl.zstd'),
-  );
+  fs.symlinkSync(outsideSessDir, path.join(sessionsDir, 'sym-dir-sess'), process.platform === 'win32' ? 'junction' : 'dir');
+  const symFileTarget = path.join(outsideSessDir, 'session.v4.jsonl.zstd');
+  const symFileDest = path.join(sessionsDir, 'sym-file-sess', 'session.v4.jsonl.zstd');
+  let simulatedWinFileSymlink = false;
+  try {
+    fs.symlinkSync(symFileTarget, symFileDest);
+  } catch (err) {
+    if (err?.code !== 'EPERM') throw err;
+    fs.copyFileSync(symFileTarget, symFileDest);
+    simulatedWinFileSymlink = true;
+  }
 
   // Valid uncompressed `session.v4.jsonl` fallback inside `dshHome/sessions` (`330` totalTokens)
   const jsonlFallbackDir = path.join(sessionsDir, 'plain-jsonl-mem');
@@ -1353,10 +1361,22 @@ test('S3-SYS-06 (P1): lt-bugreport blocks sessionId path traversal & symlink esc
     ...fs,
     lstatSync(p, ...rest) {
       const st = fs.lstatSync(p, ...rest);
-      if (path.resolve(String(p)) === hugeSessFile) {
+      const resolvedP = path.resolve(String(p));
+      if (simulatedWinFileSymlink && resolvedP === symFileDest) {
+        return Object.assign(Object.create(Object.getPrototypeOf(st)), st, {
+          isSymbolicLink: () => true,
+        });
+      }
+      if (resolvedP === hugeSessFile) {
         return Object.assign(Object.create(Object.getPrototypeOf(st)), st, { size: 65 * 1024 * 1024 });
       }
       return st;
+    },
+    realpathSync(p, ...rest) {
+      if (simulatedWinFileSymlink && path.resolve(String(p)) === symFileDest) {
+        return symFileTarget;
+      }
+      return fs.realpathSync(p, ...rest);
     },
     readFileSync(p, ...rest) {
       if (path.resolve(String(p)) === hugeSessFile) readHugeAttempted = true;
@@ -1394,8 +1414,13 @@ test('S3-SYS-07 (P1): governance loadBoundedWorkspaceExcerpts & respondInFormalC
 
   const externalSecret = 'TOP_SECRET_EXTERNAL_DATA_998877';
   fs.writeFileSync(path.join(outside, 'host-secret.txt'), `${externalSecret}\n`, 'utf8');
-  fs.symlinkSync(path.join(outside, 'host-secret.txt'), path.join(ws, 'src', 'ext-link.txt'));
-  fs.symlinkSync(outside, path.join(ws, 'src', 'ext-dir'), 'dir');
+  try {
+    fs.symlinkSync(path.join(outside, 'host-secret.txt'), path.join(ws, 'src', 'ext-link.txt'));
+  } catch (err) {
+    if (err?.code !== 'EPERM') throw err;
+    fs.symlinkSync(outside, path.join(ws, 'src', 'ext-link.txt'), 'junction');
+  }
+  fs.symlinkSync(outside, path.join(ws, 'src', 'ext-dir'), process.platform === 'win32' ? 'junction' : 'dir');
 
   fs.writeFileSync(path.join(ws, '.env'), 'API_KEY=env_file_secret_112233\n', 'utf8');
   fs.writeFileSync(path.join(ws, '.git', 'config'), '[core]\n\trepositoryformatversion = 0\n', 'utf8');

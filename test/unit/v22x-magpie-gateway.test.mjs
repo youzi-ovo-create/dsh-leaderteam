@@ -20,7 +20,7 @@ import {
 import { applyModelConfigChanges } from '../../leaderteam/core/model-config-writer.mjs';
 import { loadConfig } from '../../leaderteam/core/config.mjs';
 import { buildSoloKeyStarterConfig, SOLO_PROVIDER_PRESETS } from '../../leaderteam/core/solo-key.mjs';
-import { startMockMagpieServer } from '../../../lt-shared-contracts/mocks/mock-magpie-server.mjs';
+import { startMockMagpieServer } from './companion-paths.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '..', '..');
@@ -242,9 +242,13 @@ test('Real Magpie binary lifecycle: isolated install, start, health, crash recov
     const rawCreds = JSON.parse(fs.readFileSync(mgr.credentialsFile, 'utf8'));
     assert.ok(!statusJson.includes(rawCreds.managedWebKey));
 
-    // Confirm live compatibility probe passes against real Magpie binary
+    // Confirm live compatibility probe passes against verified (>= 0.1.4731) binary, or accurately flags older local host binary
     const compat = await mgr.checkCompatibility();
-    assert.equal(compat.ok, true);
+    if (evaluateMagpieVersionCompatibility(inst.version).compatible) {
+      assert.equal(compat.ok, true);
+    } else {
+      assert.equal(compat.versionCompatibility.status, 'older-than-minimum');
+    }
 
     // 3. Simulate abnormal crash (SIGKILL) and verify automatic recovery
     process.kill(firstPid, 'SIGKILL');

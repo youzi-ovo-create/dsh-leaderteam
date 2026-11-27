@@ -148,6 +148,16 @@ export function Rail({
         <a
           className="rail-item"
           href={dshFrontendUrl}
+          onClick={e => {
+            if (typeof window !== 'undefined' && window.location?.protocol === 'dsh-app:') {
+              e.preventDefault();
+              if (typeof window.location.assign === 'function') {
+                window.location.assign(dshFrontendUrl);
+              } else {
+                window.location.href = dshFrontendUrl;
+              }
+            }
+          }}
           title="切换到 DSH 原生前端（共享运行时与活跃团队，零中断）"
         >
           <Icon name="swap" />

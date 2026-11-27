@@ -134,25 +134,69 @@ export function detectBinaryVersion(binaryPath) {
 }
 
 export function discoverSystemMagpieBinary() {
-  const candidates = IS_WIN
-    ? [
-      process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Programs', 'magpie', 'magpie.exe') : null,
-    ].filter(Boolean)
-    : [
+  const candidates = [];
+  if (IS_WIN) {
+    // 1. Prioritize headless `magpie-cli.exe` over `magpie.exe` (114MB Tauri GUI shell in %LOCALAPPDATA%\Programs\Magpie)
+    if (process.env.LOCALAPPDATA) {
+      candidates.push(
+        path.join(process.env.LOCALAPPDATA, 'Programs', 'Magpie', 'magpie-cli.exe'),
+        path.join(process.env.LOCALAPPDATA, 'Programs', 'magpie', 'magpie-cli.exe'),
+        path.join(process.env.LOCALAPPDATA, 'Magpie', 'magpie-cli.exe'),
+      );
+    }
+    if (process.env.ProgramFiles) {
+      candidates.push(path.join(process.env.ProgramFiles, 'Magpie', 'magpie-cli.exe'));
+    }
+    if (process.env.PATH) {
+      for (const dir of String(process.env.PATH).split(';').filter(Boolean)) {
+        candidates.push(path.join(dir, 'magpie-cli.exe'));
+        candidates.push(path.join(dir, 'magpie-cli-windows-amd64.exe'));
+      }
+    }
+    // 2. Fallback to standalone `magpie.exe` only when no `magpie-cli.exe` exists
+    if (process.env.LOCALAPPDATA) {
+      candidates.push(
+        path.join(process.env.LOCALAPPDATA, 'Magpie', 'magpie.exe'),
+        path.join(process.env.LOCALAPPDATA, 'Programs', 'magpie', 'magpie.exe'),
+        path.join(process.env.LOCALAPPDATA, 'Programs', 'Magpie', 'magpie.exe'),
+      );
+    }
+    if (process.env.ProgramFiles) {
+      candidates.push(path.join(process.env.ProgramFiles, 'Magpie', 'magpie.exe'));
+    }
+    if (process.env.PATH) {
+      for (const dir of String(process.env.PATH).split(';').filter(Boolean)) {
+        candidates.push(path.join(dir, 'magpie.exe'));
+      }
+    }
+  } else {
+    candidates.push(
       '/opt/magpie/current/magpie',
       `/opt/magpie/releases/${MAGPIE_MANIFEST.pinnedVersion}/magpie`,
-      os.homedir() ? path.join(os.homedir(), '.local', 'bin', 'magpie') : null,
+      ...(os.homedir() ? [path.join(os.homedir(), '.local', 'bin', 'magpie')] : []),
       '/usr/local/bin/magpie',
-    ].filter(Boolean);
+    );
+  }
 
   for (const cand of candidates) {
     try {
-      if (fs.existsSync(cand) && fs.statSync(cand).isFile()) {
+      if (cand && fs.existsSync(cand) && fs.statSync(cand).isFile()) {
         return cand;
       }
     } catch {}
   }
   return null;
+}
+
+function killWindowsProcessTreeBestEffort(pid) {
+  if (!IS_WIN || !Number.isInteger(pid) || pid <= 1 || pid === process.pid) return;
+  try {
+    execFileSync('taskkill', ['/PID', String(pid), '/T', '/F'], {
+      windowsHide: true,
+      timeout: 2500,
+      stdio: 'ignore',
+    });
+  } catch {}
 }
 
 export class MagpieGatewayManager {
@@ -341,6 +385,9 @@ export class MagpieGatewayManager {
     try {
       process.kill(pid, 'SIGKILL');
     } catch {}
+    if (IS_WIN && isPidAlive(pid)) {
+      killWindowsProcessTreeBestEffort(pid);
+    }
     const finalDeadline = Date.now() + 500;
     while (Date.now() < finalDeadline && isPidAlive(pid)) {
       await new Promise(r => setTimeout(r, 30));
@@ -699,6 +746,9 @@ export class MagpieGatewayManager {
       const fallback = setTimeout(() => {
         if (proc.exitCode === null) {
           try { proc.kill('SIGKILL'); } catch {}
+          if (IS_WIN && childPid && isPidAlive(childPid)) {
+            killWindowsProcessTreeBestEffort(childPid);
+          }
         }
         if (childPid && !isPidAlive(childPid)) {
           this._stoppingPids.delete(childPid);
@@ -711,6 +761,7 @@ export class MagpieGatewayManager {
       });
     }
     const saved = this._readManagedPidRecord();
+    let preserveCrossProcessPidRecord = false;
     if (saved && saved.pid !== proc?.pid) {
       const owned = this._verifyOwnedPidSync(saved);
       if (owned === true) {
@@ -723,15 +774,24 @@ export class MagpieGatewayManager {
         const fallback = setTimeout(() => {
           if (isPidAlive(saved.pid)) {
             try { process.kill(saved.pid, 'SIGKILL'); } catch {}
+            if (IS_WIN && isPidAlive(saved.pid)) {
+              killWindowsProcessTreeBestEffort(saved.pid);
+            }
           }
           if (!isPidAlive(saved.pid)) {
             this._stoppingPids.delete(saved.pid);
           }
         }, 2000);
         fallback.unref?.();
+      } else if (owned === null && isPidAlive(saved.pid)) {
+        // On Windows (`/proc` unavailable), synchronous ownership is indeterminate;
+        // preserve `managed-pid.json` so async `stop()` / `_startImpl()` can verify via HTTP health PID probe and terminate cleanly.
+        preserveCrossProcessPidRecord = true;
       }
     }
-    this._removeManagedPidRecord();
+    if (!preserveCrossProcessPidRecord) {
+      this._removeManagedPidRecord();
+    }
   }
 
   _prepareRuntimeSandbox(cfg) {

@@ -115,7 +115,7 @@ function openSystemBrowser(url) {
   } catch {}
 }
 
-function renderInstallerHtml() {
+export function renderInstallerHtml() {
   return `<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -275,13 +275,11 @@ function renderInstallerHtml() {
     </h2>
     <div id="targetsBox">正在扫描本机环境…</div>
     <div class="field">
-      <details>
-        <summary>未自动找到客户端？手动填写 DSH 安装目录重新识别</summary>
-        <div class="row" style="margin-top:8px">
-          <input id="customDshInput" type="text" placeholder="例如 D:\\Programs\\DeepSeek Harness" style="flex:1" />
-          <button class="secondary" id="btnProbeCustom" type="button">检测此目录</button>
-        </div>
-      </details>
+      <label for="customDshInput">手动指定 DeepSeek Harness 安装目录（可选）</label>
+      <div class="row" style="margin-top:6px">
+        <input id="customDshInput" type="text" placeholder="例如 D:\\Apps\\DeepSeek-Harness（留空则自动扫描全盘与注册表）" style="flex:1" />
+        <button class="secondary" id="btnProbeCustom" type="button">检测此目录</button>
+      </div>
     </div>
     <div id="legacyBox"></div>
     <div style="margin-top:12px">
@@ -301,6 +299,10 @@ function renderInstallerHtml() {
     <div class="field" id="uploadRow" style="display:none">
       <label for="tgzFileInput">选择本地已下载的 <code>dsh-leaderteam-*.tgz</code> 安装包</label>
       <input id="tgzFileInput" type="file" accept=".tgz,application/gzip" />
+    </div>
+    <div class="field" id="localPathRow" style="display:none">
+      <label for="localTgzPathInput">填写本地 <code>.tgz</code> 安装包完整路径</label>
+      <input id="localTgzPathInput" type="text" placeholder="例如 D:\\Downloads\\dsh-leaderteam-2.2.3.tgz" />
     </div>
     <div class="field">
       <label for="providerSelect">首次使用免命令行接入模型（可留空，安装后在控制台向导中配置）</label>
@@ -416,10 +418,13 @@ function renderInstallerHtml() {
     opts.push({ val: 'download:open-source', label: '在线下载最新「开源维护版 (Apache-2.0)」官方发布包' });
     opts.push({ val: 'download:closed-free', label: '在线下载最新「闭源免费公开发行版」官方发布包' });
     opts.push({ val: 'upload-tgz', label: '手动选择电脑上的 .tgz 安装包文件…' });
+    opts.push({ val: 'path-tgz', label: '手动输入本地 .tgz 安装包完整路径…' });
     srcSel.innerHTML = opts.map(o => '<option value="' + esc(o.val) + '">' + esc(o.label) + '</option>').join('');
     srcSel.onchange = () => {
       document.getElementById('uploadRow').style.display = srcSel.value === 'upload-tgz' ? 'block' : 'none';
+      document.getElementById('localPathRow').style.display = srcSel.value === 'path-tgz' ? 'block' : 'none';
     };
+    srcSel.onchange();
 
     // Providers
     const pSel = document.getElementById('providerSelect');
@@ -458,8 +463,10 @@ function renderInstallerHtml() {
 
     try {
       const srcVal = document.getElementById('sourceSelect').value;
+      const customPathVal = document.getElementById('customDshInput').value.trim();
       let payload = {
         targetId: selectedTargetId,
+        customDshPath: customPathVal || null,
         providerId: document.getElementById('providerSelect').value,
         apiKey: document.getElementById('apiKeyInput').value.trim(),
       };
@@ -471,6 +478,11 @@ function renderInstallerHtml() {
       } else if (srcVal.startsWith('download:')) {
         payload.sourceKind = 'download-release';
         payload.track = srcVal.slice('download:'.length);
+      } else if (srcVal === 'path-tgz') {
+        const localP = document.getElementById('localTgzPathInput').value.trim();
+        if (!localP) throw new Error('请先输入本地 .tgz 安装包的完整路径');
+        payload.sourceKind = 'local-tgz';
+        payload.localTgzPath = localP;
       } else if (srcVal === 'upload-tgz') {
         const fileInput = document.getElementById('tgzFileInput');
         const file = fileInput.files && fileInput.files[0];
