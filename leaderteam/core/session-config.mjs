@@ -6,7 +6,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { LtError, FAMILIES } from './constants.mjs';
-import { validateConfig } from './config.mjs';
+import { validateConfig, pruneExecutionFallbacksMap } from './config.mjs';
 import { writeFileAtomic } from './store.mjs';
 
 const ROLE_KEYS = Object.freeze([
@@ -448,7 +448,19 @@ export function buildNormalizedSessionPatch(baseConfig, currentActivePatch = {},
     }
   }
 
-  const validated = validateConfig(deepMergeConfig(baseClean, mergedPatch));
+  const mergedForValidation = deepMergeConfig(baseClean, mergedPatch);
+  if (isPlainObj(mergedForValidation.team?.executionFallbacks)) {
+    const { next } = pruneExecutionFallbacksMap(
+      mergedForValidation.team.executionFallbacks,
+      mergedForValidation.team.executionPool,
+      mergedForValidation.models,
+      mergedForValidation.team.disabledModels,
+      mergedForValidation.team.disabledFamilies,
+    );
+    if (next) mergedForValidation.team.executionFallbacks = next;
+    else delete mergedForValidation.team.executionFallbacks;
+  }
+  const validated = validateConfig(mergedForValidation);
   return {
     normalizedPatch: mergedPatch,
     validatedConfig: validated,
@@ -462,7 +474,19 @@ export function applySessionPatchToConfig(baseConfig, sessionRecord) {
   if (!hasActiveSessionOverride(sessionRecord)) return baseConfig;
   const baseClean = stripDerived(baseConfig);
   try {
-    return validateConfig(deepMergeConfig(baseClean, sessionRecord.activePatch));
+    const merged = deepMergeConfig(baseClean, sessionRecord.activePatch);
+    if (isPlainObj(merged.team?.executionFallbacks)) {
+      const { next } = pruneExecutionFallbacksMap(
+        merged.team.executionFallbacks,
+        merged.team.executionPool,
+        merged.models,
+        merged.team.disabledModels,
+        merged.team.disabledFamilies,
+      );
+      if (next) merged.team.executionFallbacks = next;
+      else delete merged.team.executionFallbacks;
+    }
+    return validateConfig(merged);
   } catch {
     return baseConfig;
   }

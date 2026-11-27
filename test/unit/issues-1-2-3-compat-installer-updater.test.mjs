@@ -743,7 +743,7 @@ test('DSH 0.2.2-rc.1..rc.5 Host Model Selection Closure: top-level Array describ
       configPath: cfgPath,
       bundledDefaultConfigPath: path.join(REPO_ROOT, 'config', 'leaderteam.config.json'),
       providerId: 'deepseek',
-      apiKey: 'sk-live-deepseek-key-8888',
+      apiKey: 'sk-test-deepseek-key-8888',
       customBaseURL: 'https://relay.example.com/v1/',
       verifyConnectivity: true,
       fetchImpl: async url => {
@@ -759,7 +759,7 @@ test('DSH 0.2.2-rc.1..rc.5 Host Model Selection Closure: top-level Array describ
     });
 
     assert.equal(applied.applied, true);
-    assert.equal(savedCreds.get('DEEPSEEK_API_KEY'), 'sk-live-deepseek-key-8888');
+    assert.equal(savedCreds.get('DEEPSEEK_API_KEY'), 'sk-test-deepseek-key-8888');
     assert.equal(applied.provider.reasoningRoute, 'deepseek/deepseek-reasoner');
     assert.equal(applied.provider.chatRoute, 'deepseek/deepseek-chat');
     assert.ok(savedLlmConfig?.providers?.deepseek);

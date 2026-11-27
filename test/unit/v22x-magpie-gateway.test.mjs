@@ -17,6 +17,7 @@ import {
   normalizeMagpieUsageRow,
   discoverSystemMagpieBinary,
 } from '../../leaderteam/gateway/index.mjs';
+import { findFreeLoopbackPort } from '../../leaderteam/gateway/magpie-process.mjs';
 import { applyModelConfigChanges } from '../../leaderteam/core/model-config-writer.mjs';
 import { loadConfig } from '../../leaderteam/core/config.mjs';
 import { buildSoloKeyStarterConfig, SOLO_PROVIDER_PRESETS } from '../../leaderteam/core/solo-key.mjs';
@@ -222,8 +223,13 @@ test('Real Magpie binary lifecycle: isolated install, start, health, crash recov
   const sentinelContent = '# user patch sentinel\nproviders:\n  magpie:\n    baseUrl: http://127.0.0.1:3425/v1\n';
   fs.writeFileSync(sentinelPatch, sentinelContent);
 
+  const gwPort = await findFreeLoopbackPort();
+  let webPort = await findFreeLoopbackPort();
+  while (webPort === gwPort) webPort = await findFreeLoopbackPort();
   const mgr = new MagpieGatewayManager({
     storageRoot: path.join(tmpDir, 'lt-storage'),
+    defaultGatewayPort: gwPort,
+    defaultWebPort: webPort,
   });
 
   try {
