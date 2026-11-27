@@ -29,6 +29,19 @@
 - **合入 V2.2.1 治理与回退修复**：领队末位兜底严格按 `(provider, upstreamModel)` 成对匹配、策略拒绝（Policy Refusal）停止后台异步重发、区分安全门策略回执、修正中途重试 5h 窗口归因、双审回执绑定交付材料快照及回放恢复。
 - **Windows NTFS Junction / 符号链接参考文件追踪与 Magpie 进程树回收修复**：修复阶段 `references` 含 NTFS Junction 目录链接时的安全门放行与已读状态核销（`realpathBestEffort`），增强 Windows 退出时子进程树清理兜底。
 
+## [2.2.1] - 2026-11-26
+
+跨平台稳定性、调度器抑制、治理回执一致性与推理档位同步维护版（纯 Node.js ESM，Apache-2.0）：
+
+### Fixed
+- **调度器零派发唤醒与终态轮询抑制**：修复自主滚动规划下触及槽位上限后 `awaitingSlots` 未复位、降容方向反向触发补派通知及跨轮未识别已宣告 `delivered` 终态的问题；补齐常规负载区间施密特滞回死区、多团队健康采样去重与系统采样器被动读数窗口配置接线。
+- **供应商策略拒绝（`CONTENT_REFUSED`）处理与双审材料版本绑定**：无工具审查与安全门收到明确策略拒绝时立即停止自动重试、备用切换及异步补审重发；安全门回执明确区分策略拒绝与临时服务故障；异步双审去重键绑定实际送审材料摘要（原样重提去重，修改提案或验收证据后重新获取双审意见），并在历史会话回放时恢复旧版延迟记录中的策略拒绝状态。
+- **多供应商兜底路由与 5 小时请求窗口精度**：修正“跟随领队模型兜底”仅按模型名匹配而忽略 `provider + upstreamModel` 成对核对的问题；将重试尝试纳入 5 小时滚动请求窗口计数，并修正中途模型切换时的尝试归属与正式会商恢复作用域。
+- **推理档位 `off → none` 映射与事务性配置写盘**：统一全新宿主配置与已有配置下的逻辑 `off` 线协议映射，模型同步更新时保留用户自定义的 `reasoningEfforts` 映射；多配置文件保存改为事务性原子更新，修复 Windows NTFS 只读回滚与并发波次测试计时稳定性。
+
+### Added
+- **工程实证报告与脱敏核验档案**：在 `docs/benchmarks/` 下新增《[LeaderTeam V2.2 工程实证报告：49 分钟完成 Linux 跨语言核心模块自举与宿主集成](docs/benchmarks/LeaderTeam_V2.2_Linux跨语言自举工程实证报告.md)》、《[LeaderTeam V1.1–V2.2：基于五项真实工程实测的架构演进与发展潜力分析](docs/benchmarks/LeaderTeam_V1.1至V2.2_架构演进与发展潜力分析.md)》及配套可复算回执目录 [`docs/benchmarks/evidence/v2.2-linux-selfhost/`](docs/benchmarks/evidence/v2.2-linux-selfhost/README.md)。
+
 ## [2.2.0] - 2026-11-24
 
 跨平台（Linux & Windows）一等公民支持、标准 `dsh.bundle` 分发、零网关 Solo-Key 起手与长工程韧性增强版（纯 Node.js ESM，Apache-2.0）：
