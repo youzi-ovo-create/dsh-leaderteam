@@ -1,0 +1,66 @@
+{
+  "promptSubmittedAt": "2026-11-25T05:00:41+00:00",
+  "settledAt": "2026-11-25T05:49:34.227000+00:00",
+  "wallClockSeconds": 2933.227,
+  "archivedLeaderHumanTriggers": [
+    {
+      "turn": 1,
+      "sequence": 9
+    }
+  ],
+  "sessions": 13,
+  "childrenByRole": {
+    "member": 7,
+    "direct_exec": 5
+  },
+  "sessionRequestsByRole": {
+    "leader": 140,
+    "member": 608,
+    "direct_exec": 78
+  },
+  "auxiliaryRequestsByRole": {
+    "discussB": 9,
+    "gate": 29,
+    "discussA": 9,
+    "arbiter": 2
+  },
+  "totals": {
+    "calls": 875,
+    "inputTokens": 4118887,
+    "cacheReadTokens": 108125056,
+    "cacheWriteTokens": 0,
+    "outputTokens": 350443,
+    "totalTokens": 112594386
+  },
+  "inputCacheReadFraction": 0.9633041490710995,
+  "recordedModelRoutes": {
+    "codex/gpt-6.1-sol": 210,
+    "codex/gpt-6.2-sol": 645,
+    "bailian-token-plan/qwen4-max-preview": 9,
+    "zcode/GLM-5.4": 9,
+    "google-vertex/gemini-4-carbon": 2
+  },
+  "schedulerTurns7Through13": {
+    "steps": 18,
+    "newDispatches": 0,
+    "toolCalls": {
+      "team_status": 5,
+      "glob": 2,
+      "read": 10,
+      "send_message": 1
+    },
+    "totalTokens": 3350461,
+    "cacheReadTokens": 3196416
+  },
+  "gateDecisions": {
+    "allow": 425,
+    "deny": 6
+  },
+  "gateDenialsBySource": {
+    "rule:path-outside-workspace": 4,
+    "model": 1,
+    "rule:refs-unread": 1
+  },
+  "supervisionsCompleted": 9,
+  "advisorySupervisions": 9
+}

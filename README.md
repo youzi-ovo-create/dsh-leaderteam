@@ -1,8 +1,8 @@
 # LeaderTeam for DeepSeek Harness (V2.2)
 
-![Version](https://img.shields.io/badge/version-2.2.0-blue)
+![Version](https://img.shields.io/badge/version-2.2.2-blue)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows-success)
-![DSH Host](https://img.shields.io/badge/DeepSeek%20Harness-0.2.2--rc.1%20%7C%200.2.2--rc.5-5b6ee1)
+![DSH Host](https://img.shields.io/badge/DeepSeek%20Harness-0.2.2--alpha.2%20..%200.2.3--alpha.2-5b6ee1)
 ![Node.js](https://img.shields.io/badge/node-%3E%3D22.15-339933)
 ![License](https://img.shields.io/badge/license-Apache--2.0-orange)
 
@@ -10,41 +10,41 @@
 
 LeaderTeam 是运行在 **DeepSeek Harness（Linux & Windows）** 上的长周期多 Agent 工程协作与安全治理插件（纯 Node.js ESM，零第三方运行时依赖，支持接入 DeepSeek、阿里云百炼 Qwen、智谱 GLM、OpenAI Codex 等主流模型）：
 
-- **不用手管子代理，也不怕“主管一言堂”跑偏**：领队模型自动拆解阶段并并行派发执行成员；双评审在后台**异步非阻塞监督**，仅当双方一致提出异议并经独立裁断认可时才暂停纠偏；遇到连续空转由独立调查员原位引导恢复，同案争议满三次自动整理卷宗交由人工拍板。
-- **零模型调用的确定性宿主安全门**：挂载于宿主工具执行管道最后一环，工作区内的合规文件读写与常规命令按确定性规则直接放行（0 次额外审查模型调用），越界读写与 Shell 逃逸硬阻断，跨界操作才调用独立安全门模型复核；宿主版本未验真时严格 **Fail-Closed**。
-- **四桶物理 Token 对账与无人值守护栏**：按 `Input / Cache Read / Cache Write / Output` 四桶逐笔落盘真实用量账本（以各上游接口实际返回的计量字段为准，严格区分未上报 `null` 与真实 `0`），内置 Linux `cgroup v2/v1` 容器内存感知、**不跳过审查的 5 小时请求窗口三级节流**，以及笔记本低电量检查点优雅收尾。
+- **不用手管子代理，也不怕“主管一言堂”跑偏**：领队模型按局部边界就绪即刻并行派发执行成员；双评审在后台**异步非阻塞监督**，仅当双方一致提出异议并经独立裁断认可时才暂停纠偏；遇到连续空转由独立调查员原位引导恢复，同案争议满三次自动整理卷宗交由人工拍板。
+- **零模型调用的确定性宿主安全门**：挂载于宿主工具执行管道最后一环，工作区内的合规文件读写与常规命令按确定性规则直接放行（0 次额外审查模型调用），越界读写、配置篡改与 Shell 逃逸硬阻断，跨界操作才调用独立安全门模型复核；宿主结构契约失配时严格 **Fail-Closed**。
+- **四桶物理 Token 对账与河洛原生工作台（`/lt/`）**：按 `Input / Cache Read / Cache Write / Output` 四桶逐笔落盘真实用量账本（严格区分未上报 `null` 与真实 `0`），内置河洛序可视化工作台（`lt.public.v1` `1.0.1`，纯团队治理模式）、三步新手向导、会话级独立模型跟随（默认 `leaderModelPolicy: "follow"`）、SHA-256 校验热升级与一键回滚，以及 Linux `cgroup v2/v1` 容器内存感知、5 小时请求窗口三级节流与笔记本低电量优雅收尾。
 
 ---
 
-## 第一屏：3 分钟安装与单 Key 即刻启动（Quick Start）
+## 第一屏：3 分钟零命令行安装与单 Key 即刻启动（Quick Start）
 
-### 1. 标准插件包安装（`dsh.bundle`）
+### 1. 图形化一键安装（推荐）与标准 `dsh.bundle` 安装
 
 - **运行环境要求**：
-  - **Node.js `>= 22.15`**（若需从源码构建 `extensions/dsh-context` 推荐 `22.19+` 或 `24.x`）；
-  - 已端到端实机验真的 **DeepSeek Harness `0.2.2-rc.1` 或 `0.2.2-rc.5`**（未实机放行的中间版本如 `rc.2–rc.4` 或未知新版本默认保持 Fail-Closed 拒绝加载，可通过 `lt-doctor --check-host` 离线预检）；
-  - 实机验证平台为 **Linux（x86_64 / WSL2）与 Windows**（底层 POSIX 路径兼容类 Unix 环境，macOS 暂未纳入官方真机验收矩阵）；Linux 下执行 `dsh plugin add` 需确保 `PATH` 中包含 `node` 与 `pnpm`（可通过 `corepack enable pnpm` 启用）。
-
-> **安装源说明**：当前稳定版通过 [GitHub Releases](https://github.com/youzi-ovo-create/dsh-leaderteam/releases/tag/v2.2.0) 分发离线 `.tgz` 插件包（公共 npm registry 尚未上架，请直接安装 `.tgz` 包或本地克隆目录）：
+  - **Node.js `>= 22.15`**；
+  - 官方 **DeepSeek Harness `>= 0.2.2-alpha.2 < 1.0.0`**（已实机认证 `0.2.2-rc.1`、`0.2.2-rc.5`、`0.2.3-alpha.2` 等版本，详见《[DSH 宿主兼容性列表](docs/10-DSH宿主兼容性列表.md)》）；
+  - **跨平台独立发行说明**：Linux 与 Windows 共享全部治理内核、设计原则（`DP-01`..`DP-06`）与 `lt.public.v1`（`1.0.1`）契约，各自保留平台专属适配边界并独立验收发版，分别使用 **`linux-v2.2.2`** 与 **`windows-v2.2.2`** Release 标签（详见《[跨平台独立发行与长期工程规范](docs/13-跨平台独立发行与长期工程规范.md)》）。
 
 ```bash
-# 1. 从 GitHub Release 下载 v2.2.0 标准插件包
-curl -fLO https://github.com/youzi-ovo-create/dsh-leaderteam/releases/download/v2.2.0/dsh-leaderteam-2.2.0.tgz
+# 方式 A：Linux / WSL2 图形化一键安装向导
+./install-leaderteam.sh
 
-# 2A. Linux / Web CLI Profile 安装
-dsh plugin --profile web add ./dsh-leaderteam-2.2.0.tgz
+# 方式 B：命令行直接安装对应平台的标准 .tgz 插件包
+# Linux Bash 下载 linux-v2.2.2：
+curl -fLO https://github.com/youzi-ovo-create/dsh-leaderteam/releases/download/linux-v2.2.2/dsh-leaderteam-2.2.2.tgz
+# Windows PowerShell 下载 windows-v2.2.2：
+curl.exe -fLO https://github.com/youzi-ovo-create/dsh-leaderteam/releases/download/windows-v2.2.2/dsh-leaderteam-2.2.2.tgz
 
-# 2B. 官方 Windows Desktop Profile 安装
-# （若此前用 V2.1 install-desktop.ps1 注入过旧补丁，先在克隆仓内运行一次清理，会自动备份原文件：
-#   node bin/lt-doctor.mjs --clean-legacy-patch ）
-dsh plugin --profile desktop add ./dsh-leaderteam-2.2.0.tgz
+# 安装到 Web/CLI 或官方 Desktop Profile
+dsh plugin --profile web add ./dsh-leaderteam-2.2.2.tgz
+dsh plugin --profile desktop add ./dsh-leaderteam-2.2.2.tgz
 ```
 
-> 若已 `git clone` 本仓库，也可在仓库根目录直接执行 `dsh plugin --profile web add .`；Windows 旧版脚本备份恢复流程见《[官方 Desktop 部署与恢复](docs/官方Desktop部署与恢复.md)》。
+> 若已 `git clone` 本仓库，也可在仓库根目录直接执行 `dsh plugin --profile web add .`；更多安装、三步新手向导与控制台一键升级回滚流程请见《[一键安装、新手引导与自动更新指南](docs/11-一键安装新手引导与自动更新指南.md)》。
 
 ### 2. 单 Key 免网关即刻启动 vs 多模型异构编队
 
-- **Solo-Key 极速模式（零网关、开箱即跑）**：只需导出任意一个上游模型 API Key（内置支持 `DEEPSEEK_API_KEY`、`DASHSCOPE_API_KEY` / `BAILIAN_API_KEY`、`ZHIPU_API_KEY`、`OPENAI_API_KEY`），首次启动 DSH 时会自动在 `<DSH_HOME>/leaderteam/config/leaderteam.config.json` 生成对应的在役主力模型与自动回退配置，新建会话选择 **LeaderTeam** 预设即可直接发送工程需求：
+- **三步新手引导 / Solo-Key 极速模式（零网关、开箱即跑）**：首次打开 `/lt/` 工作台会弹出图形化三步向导，点选厂商并粘贴任意一个 API Key（DeepSeek、阿里云百炼 Qwen、智谱 GLM、OpenAI 等），系统将自动写入本地 `0600` 凭据库（`.credentials.yaml` / `.env`）、同步至 DSH 模型选择器与团队 7 角色路由。也可直接通过环境变量启动：
   ```bash
   # Linux Bash
   export DEEPSEEK_API_KEY="sk-..."
@@ -53,7 +53,7 @@ dsh plugin --profile desktop add ./dsh-leaderteam-2.2.0.tgz
   # Windows PowerShell
   $env:DEEPSEEK_API_KEY = "sk-..."
   ```
-- **多模型异构编队模式（进阶生产）**：若你运行本地 OpenAI 兼容聚合网关（如 Magpie）或多厂商直连路由，可通过 DSH 右侧栏 **LeaderTeam 控制台**、`config/leaderteam.local.json` 或 `node scripts/configure-models.mjs --serve --open`，为领队（`leader`）、成员执行池（`executionPool`）、双评审（`discussA` / `discussB`）、独立裁断（`arbiter`）与安全门（`gate`）分别指派不同模型家族与推理档位。
+- **多模型异构编队模式（进阶生产）**：支持通过 `/lt/` 原生工作台连接本地 Magpie 网关或多厂商直连路由，为领队（`leader`）、成员执行池（`executionPool`）、双评审（`discussA` / `discussB`）、独立裁断（`arbiter`）与安全门（`gate`）分别指派不同模型家族与推理档位；在聊天框手动切换会话模型时默认仅对当前会话自动跟随（`leaderModelPolicy: "follow"`），空闲会话修改配置立即热生效。
 
 ---
 
@@ -77,10 +77,10 @@ dsh plugin --profile desktop add ./dsh-leaderteam-2.2.0.tgz
 
 ### 阶梯 1：`¥0` 纯离线单元测试验证（零模型调用、不依赖客户端）
 
-克隆仓库后直接验证安全门硬规则、四阶段自治状态机、Linux `cgroup v2/v1` 并发调度、5h 窗口节流与电量状态机（共 289 项跨平台单测）：
+克隆仓库后直接验证安全门硬规则、四阶段自治状态机、跨平台安装升级过滤、`lt.public.v1` 契约、Linux `cgroup v2/v1` 并发调度、5h 窗口节流与电量状态机：
 
 ```bash
-node --test "test/unit/*.test.mjs"
+node --test --test-concurrency=2 "test/unit/*.test.mjs"
 ```
 
 ### 阶梯 2：低成本微工程真机冒烟（[`examples/smoke-bugfix/`](examples/smoke-bugfix/README.md)）
@@ -91,31 +91,32 @@ node --test "test/unit/*.test.mjs"
 
 ### 阶梯 3：生产 Git 分支集成、预检诊断与隐私开关
 
-在生产项目建议绑定独立 Git 分支或 `git worktree` 运行，并配合内置双 CLI 工具进行环境预检与零泄露问题反馈（在克隆仓库根目录下通过 `node bin/...` 调用，或在已安装插件的 `<DSH_HOME>/profiles/<profile>/node_modules/.bin/` 下直接调用 `lt-doctor` / `lt-bugreport`）：
+在生产项目建议绑定独立 Git 分支或 `git worktree` 运行，并配合内置 CLI 工具进行环境预检、按平台检查更新与零泄露问题反馈：
 
 ```bash
-# 1. 环境与兼容性预检（Node 版本、已验证 DSH 0.2.2-rc.1 / rc.5 与 pipeline 契约、旧补丁冲突、Linux bash/cgroup/pnpm、Windows Win32 5 沙箱权限、Solo-Key 状态）
+# 1. 环境与宿主兼容性预检（Node 版本、DSH 结构契约与兼容矩阵、旧补丁冲突、Linux bash/cgroup/pnpm、Solo-Key 状态）
 node bin/lt-doctor.mjs
-# 针对待升级的候选客户端目录执行隔离探针（明确区分 VERIFIED / UNVERIFIED_COMPATIBLE_SHAPE / INCOMPATIBLE_PIPELINE）：
+node bin/lt-doctor.mjs --matrix
 node bin/lt-doctor.mjs --check-host <DSH安装目录或模块目录> --workspace <目标工作区>
 
-# 2. 生成严格脱敏的 GitHub Issue 诊断块（自动抹除全部 API Key、个人路径、主机名与任务原文，仅输出规则计数与四桶 Token 汇总）
+# 2. 按当前平台检查与升级正式版（Linux 自动匹配 linux-v*，Windows 自动匹配 windows-v*，绝不跨平台串台）
+node bin/lt-update.mjs --check
+
+# 3. 生成严格脱敏的 GitHub Issue 诊断块（自动抹除全部 API Key、个人路径、主机名与任务原文，仅输出规则计数与四桶 Token 汇总）
 node bin/lt-bugreport.mjs --out lt-bugreport.md
 ```
 
 - **Windows 新建目录 `Win32 5` 沙箱权限一键排查**：若非系统盘新建工作区缺少当前用户显式 `(F)` / `WRITE_DAC` 权限导致 `pwsh` 报 `SetNamedSecurityInfoW (Win32 5)`，`lt-doctor` 会直接打印即拷即用的 `icacls` 与 [`tools/dsh-sandbox-acl`](tools/dsh-sandbox-acl/SKILL.md) 带备份修复命令。
 - **低电量优雅停机（Battery-Aware Graceful Shutdown）隐私说明与开关**：
   - 默认开启（`powerMonitor.enabled: true`）：每 **12 分钟**（`720000ms`）以无弹窗静默方式采样一次，**仅读取 `(onBattery, batteryPct)` 两个布尔/数值字段**（绝不读取电池序列号、硬件型号或 OEM 标识；在 Linux VPS、WSL2 与台式机上自动静默跳过）。当电池供电且电量 `<= 20%` 时单次通知领队安全落盘检查点并暂停新派发；插电或恢复至 `>= 25%` 时仅重置检测器闩锁（`autoResumeAllowed: false`，绝不未经用户指令擅自恢复已暂停工程）。
-  - 如需关闭，在 DSH 侧栏 **LeaderTeam 控制台**关闭开关，或在 `leaderteam.local.json` 中写入：
-    ```json
-    {
-      "powerMonitor": { "enabled": false }
-    }
-    ```
+  - 如需关闭，在 DSH 侧栏 **LeaderTeam 控制台**关闭开关，或在 `leaderteam.local.json` 中写入 `"powerMonitor": { "enabled": false }`。
 
 ### 架构文档与实跑基准报告
 
-- **实跑基准与横向对照**：[V2.1 双项复杂工程实跑测评报告（自举编译器 & 存量生态账本插件，含耗时/成本客观劣势披露）](docs/benchmarks/LeaderTeam_V2.1_双项工程实跑测评报告.md)
-- **核心设计与接口契约**：[架构总览与设计决定](docs/00-总览.md) · [配置与接口参考](docs/01-配置与接口.md) · [按需工具与技能](docs/07-按需工具与技能.md) · [可视化与用量账本](docs/08-可视化与用量.md)
-- **日常操作与客户端维护**：[使用指南](docs/使用指南.md) · [官方 Desktop 部署与恢复](docs/官方Desktop部署与恢复.md) · [官方客户端更新复验](docs/官方Desktop更新复验.md) · [CHANGELOG.md](CHANGELOG.md)
-- **开源许可**：本项目采用 [Apache License 2.0](LICENSE) 许可发布，第三方组件声明见 [leaderteam/NOTICE](leaderteam/NOTICE)。
+- **实跑基准与演进分析**：
+  - [V2.2 工程实证报告：49 分钟完成 Linux 跨语言核心模块自举与宿主集成](docs/benchmarks/LeaderTeam_V2.2_Linux跨语言自举工程实证报告.md)（附 [脱敏验收回执与账本核算脚本](docs/benchmarks/evidence/v2.2-linux-selfhost/README.md)）
+  - [V1.1–V2.2：基于五项真实工程实测的架构演进与发展潜力分析](docs/benchmarks/LeaderTeam_V1.1至V2.2_架构演进与发展潜力分析.md)
+  - [V2.1 双项复杂工程实跑测评报告（自举编译器 & 存量生态账本插件，含耗时/成本客观劣势披露）](docs/benchmarks/LeaderTeam_V2.1_双项工程实跑测评报告.md)
+- **安装、兼容与跨平台治理**：[一键安装、新手引导与自动更新指南](docs/11-一键安装新手引导与自动更新指南.md) · [DSH 宿主兼容性列表](docs/10-DSH宿主兼容性列表.md) · [历代设计原则与反退化台账](docs/12-历代设计原则与反退化台账.md) · [跨平台独立发行与长期工程规范](docs/13-跨平台独立发行与长期工程规范.md)
+- **核心设计与日常维护**：[架构总览与设计决定](docs/00-总览.md) · [配置与接口参考](docs/01-配置与接口.md) · [按需工具与技能](docs/07-按需工具与技能.md) · [可视化与用量账本](docs/08-可视化与用量.md) · [使用指南](docs/使用指南.md) · [官方 Desktop 部署与恢复](docs/官方Desktop部署与恢复.md) · [CHANGELOG.md](CHANGELOG.md)
+- **开源许可**：本项目采用 [Apache License 2.0](LICENSE) 许可发布，第三方组件声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) 与 [leaderteam/NOTICE](leaderteam/NOTICE)。
