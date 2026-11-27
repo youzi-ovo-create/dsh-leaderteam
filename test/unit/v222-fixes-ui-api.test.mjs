@@ -389,14 +389,15 @@ test('UI-03 & UI-08: DSH 0.2.2-rc.5 SessionSummary projections/filtering, live c
   assert.equal(listAfterCreate.data.sessions.length, 2);
   assert.ok(listAfterCreate.data.sessions.some(s => s.sessionId === 'sess-blank'));
 
-  // Live attached session via `ctx.sessions.get` + synthetic filtering + compaction `replace`
+  // Live attached session via `ctx.sessions.get` + synthetic filtering + DSH 0.2.2-rc.5 model-only compaction `replace`
   const trLive = await (await h.workbenchTranscript(makeJsonPost({ sessionId: 'sess-live-attached' }))).json();
   assert.equal(trLive.ok, true);
   assert.equal(trLive.data.passiveState.running, true);
   assert.deepEqual(
     trLive.data.messages.map(m => ({ id: m.id, role: m.role, text: m.text })),
     [
-      { id: 'u-compact', role: 'assistant', text: 'Compacted summary of turns 0..1' },
+      { id: 'u0', role: 'user', text: 'Initial user prompt' },
+      { id: 'a0', role: 'assistant', text: 'Initial assistant reply' },
       { id: 'u2', role: 'user', text: 'Follow-up human prompt' },
     ],
   );

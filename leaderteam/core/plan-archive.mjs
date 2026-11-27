@@ -844,7 +844,23 @@ export class PlanArchiveStore {
       ? 'issues-identified'
       : (members.length > 0 ? 'clean-execution' : 'not-executed');
 
-    const retroId = `retro-${refreshed.planId}-${String(nowMs).slice(-6)}`;
+    fs.mkdirSync(this.retrospectivesDir, { recursive: true });
+    refreshed.execution ??= { members: [], deliveryAgreements: [], retrospectiveIds: [] };
+    const existingRetroIds = new Set(refreshed.execution.retrospectiveIds ?? []);
+    let retroId = '';
+    for (let attempt = 0; attempt < 16; attempt++) {
+      const nonce = crypto.randomBytes(4).toString('hex');
+      const candidate = `retro-${refreshed.planId}-${nowMs}-${nonce}`;
+      const jsonPath = path.join(this.retrospectivesDir, `${safeId(candidate)}.json`);
+      const mdPath = path.join(this.retrospectivesDir, `${safeId(candidate)}.md`);
+      if (!existingRetroIds.has(candidate) && !fs.existsSync(jsonPath) && !fs.existsSync(mdPath)) {
+        retroId = candidate;
+        break;
+      }
+    }
+    if (!retroId) {
+      retroId = `retro-${refreshed.planId}-${nowMs}-${crypto.randomUUID().slice(0, 12)}`;
+    }
     const nowIso = new Date(nowMs).toISOString();
     const retro = {
       v: 1,
