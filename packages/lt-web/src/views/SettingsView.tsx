@@ -1103,9 +1103,9 @@ export function SettingsView({
                   <HeluoxuMark size={44} />
                   <div className="col" style={{ gap: 2 }}>
                     <span className="t-display" style={{ fontSize: 24 }}>
-                      Leader Team
+                      Open Leader Team (OLT)
                     </span>
-                    <span className="t-meta">河洛 · 多代理工程协作 · 开源版</span>
+                    <span className="t-meta">河洛 · 开源多代理工程协作框架（独立品牌版）</span>
                   </div>
                 </div>
                 <div className="card card-pad">

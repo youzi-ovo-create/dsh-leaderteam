@@ -120,9 +120,10 @@ if (isMain(import.meta.url)) {
       });
       if (opts.json) console.log(JSON.stringify({ ok: true, ...res }, null, 2));
       else {
-        console.log(`当前版本：v${res.installedVersion} [${res.installedTrackInfo.label} · ${res.platform}]`);
+        console.log(`当前版本：${res.installedBrandDisplayName || 'Open Leader Team'} v${res.installedVersion} [${res.installedTrackInfo.label} · ${res.platform}]`);
         if (res.hasUpdate && res.latestRelease) {
-          console.log(`发现新版本：${res.latestRelease.tagName} (v${res.latestRelease.version} · ${res.latestRelease.publishedAt || ''})`);
+          const migNote = res.migrationFromLegacyLt ? '（旧版 LeaderTeam → Open Leader Team 独立品牌平滑迁移升级）' : '';
+          console.log(`发现新版本：${res.latestRelease.tagName} (v${res.latestRelease.version} · ${res.latestRelease.publishedAt || ''})${migNote}`);
           console.log(`更新说明：\n${res.latestRelease.body || '（无详细说明）'}`);
         } else {
           console.log('当前已是该平台发行分支最新版本。');

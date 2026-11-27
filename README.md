@@ -1,14 +1,16 @@
-# LeaderTeam for DeepSeek Harness (V2.2)
+# Open Leader Team (OLT) for DeepSeek Harness — V1.0.0
 
-![Version](https://img.shields.io/badge/version-2.2.4-blue)
+![Version](https://img.shields.io/badge/OLT-v1.0.0-blue)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows-success)
 ![DSH Host](https://img.shields.io/badge/DeepSeek%20Harness-%3E%3D0.2.2--alpha.2%20%3C1.0.0-5b6ee1)
 ![Node.js](https://img.shields.io/badge/node-%3E%3D22.15-339933)
 ![License](https://img.shields.io/badge/license-Apache--2.0-orange)
 
+> **品牌独立与版本演进说明**：原开源线 LeaderTeam（历史基线 `v2.1.0`–`v2.2.3` 保持不变）现正式以独立开源品牌 **Open Leader Team（OLT）** 从 **`V1.0.0`** 启程，进入以真实使用需求与社区反馈驱动的高质量维护阶段。为确保旧版用户**零成本无损原地迁移**，插件包名（`dsh-leaderteam`）、数据目录（`~/.dsh/leaderteam`）与公共契约（`lt.public.v1`）保持完全向后兼容，自动更新器已内置代际比较机制（`releaseEpoch`），不会将 OLT `v1.0.0` 误判为旧版 `v2.2.x` 的降级版本。
+
 **提交一句工程需求，自动拉起多模型团队完成规划、并行施工、独立审查、纠偏与验收交付——无需人工逐个指挥子代理。**
 
-LeaderTeam 是运行在 **DeepSeek Harness（Linux & Windows）** 上的长周期多 Agent 工程协作与安全治理插件（纯 Node.js ESM，零第三方运行时依赖，支持接入 DeepSeek、阿里云百炼 Qwen、智谱 GLM、OpenAI Codex 等主流模型）：
+Open Leader Team（OLT，原开源 LeaderTeam）是运行在 **DeepSeek Harness（Linux & Windows）** 上的长周期多 Agent 工程协作与安全治理插件（纯 Node.js ESM，零第三方运行时依赖，支持接入 DeepSeek、阿里云百炼 Qwen、智谱 GLM、OpenAI Codex 等主流模型）：
 
 - **不用手管子代理，也不怕“主管一言堂”跑偏**：领队模型自动拆解阶段并并行派发执行成员；双评审在后台**异步非阻塞监督**，仅当双方一致提出异议并经独立裁断认可时才暂停纠偏；遇到连续空转由独立调查员原位引导恢复，同案争议满三次自动整理卷宗交由人工拍板。
 - **零模型调用的确定性宿主安全门**：挂载于宿主工具执行管道最后一环，工作区内的合规文件读写与常规命令按确定性规则直接放行（0 次额外审查模型调用），越界读写与 Shell 逃逸硬阻断，跨界操作才调用独立安全门模型复核；宿主版本未验真时严格 **Fail-Closed**。
@@ -31,17 +33,17 @@ LeaderTeam 是运行在 **DeepSeek Harness（Linux & Windows）** 上的长周�
 
 - **方式 B：标准 `dsh plugin` 命令行安装**：
 
-> **安装源与跨平台独立 Release 标签说明**：当前稳定版通过 [GitHub Releases](https://github.com/youzi-ovo-create/dsh-leaderteam/releases) 按平台独立分发离线 `.tgz` 插件包——Linux 发行标签为 **`linux-vX.Y.Z`**（如 `linux-v2.2.3`），Windows 发行标签为 **`windows-vX.Y.Z`**（如 `windows-v2.2.3`）；内置安装器与自动更新器会自动按当前系统匹配对应平台 Release（详见《[跨平台独立发行与长期工程治理规范](docs/13-跨平台独立发行与长期工程规范.md)》）：
+> **安装源与跨平台独立 Release 标签说明**：当前稳定版通过 [GitHub Releases](https://github.com/youzi-ovo-create/dsh-leaderteam/releases) 按平台独立分发离线 `.tgz` 插件包——Linux 发行标签为 **`linux-vX.Y.Z`**（当前 **`linux-v1.0.0`**），Windows 发行标签为 **`windows-vX.Y.Z`**（各自独立验收、独立发行）；内置安装器与自动更新器会自动按当前系统与版本代际匹配对应平台 Release（旧版 `v2.2.x` 用户直接运行下方安装器或 `dsh plugin add` 即可原地无损迁移至 OLT `v1.0.0`，保留全部模型配置、凭据与历史会话）：
 
 ```bash
-# 1A. Linux / WSL2：从 linux-v2.2.3 Release 下载并安装到 web profile
-curl -fLO https://github.com/youzi-ovo-create/dsh-leaderteam/releases/download/linux-v2.2.3/dsh-leaderteam-2.2.3.tgz
-dsh plugin --profile web add ./dsh-leaderteam-2.2.3.tgz
+# 1A. Linux / WSL2：从 linux-v1.0.0 Release 下载并安装到 web profile（也支持同目录执行 ./install-leaderteam.sh）
+curl -fLO https://github.com/youzi-ovo-create/dsh-leaderteam/releases/download/linux-v1.0.0/dsh-leaderteam-1.0.0-linux-x64.tgz
+dsh plugin --profile web add ./dsh-leaderteam-1.0.0-linux-x64.tgz
 
-# 1B. 官方 Windows Desktop：从 windows-v2.2.3 Release 下载并安装到 desktop profile
+# 1B. 官方 Windows Desktop：从最新 windows-v* Release 下载并安装到 desktop profile
 # （推荐直接双击随附的 Install-LeaderTeam.cmd 图形向导自动识别默认/自定义安装目录；若用命令行安装：）
-curl.exe -fLO https://github.com/youzi-ovo-create/dsh-leaderteam/releases/download/windows-v2.2.3/dsh-leaderteam-2.2.3.tgz
-dsh plugin --profile desktop add ./dsh-leaderteam-2.2.3.tgz
+curl.exe -fLO https://github.com/youzi-ovo-create/dsh-leaderteam/releases/download/windows-v1.0.0/dsh-leaderteam-1.0.0.tgz
+dsh plugin --profile desktop add ./dsh-leaderteam-1.0.0.tgz
 ```
 
 > 若已 `git clone` 本仓库，也可在仓库根目录直接执行 `dsh plugin --profile web add .`；Windows 旧版脚本备份恢复流程见《[官方 Desktop 部署与恢复](docs/官方Desktop部署与恢复.md)》。

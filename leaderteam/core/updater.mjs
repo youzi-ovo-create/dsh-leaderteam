@@ -24,16 +24,22 @@ import {
 const THIS_DIR = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_PLUGIN_ROOT = path.resolve(THIS_DIR, '..', '..');
 
+export const OLT_BRAND_ID = 'open-leader-team';
+export const OLT_BRAND_DISPLAY_NAME = 'Open Leader Team';
+export const OLT_BRAND_SHORT_NAME = 'OLT';
+export const LEGACY_LT_EPOCH = 1;
+export const OLT_RELEASE_EPOCH = 2;
+
 export const UPDATE_TRACKS = Object.freeze({
   'open-source': Object.freeze({
     id: 'open-source',
-    label: '开源维护版 (Apache-2.0)',
-    shortLabel: '开源版',
+    label: 'Open Leader Team (OLT · Apache-2.0)',
+    shortLabel: 'OLT 开源版',
     license: 'Apache-2.0',
     repo: 'youzi-ovo-create/dsh-leaderteam',
     releasesApiUrl: 'https://api.github.com/repos/youzi-ovo-create/dsh-leaderteam/releases',
     releasesHtmlUrl: 'https://github.com/youzi-ovo-create/dsh-leaderteam/releases',
-    description: '纯 Node.js ESM 开源源码与标准安装包发行分支（Apache-2.0 协议）。',
+    description: 'Open Leader Team (OLT) 纯 Node.js ESM 开源源码与标准安装包发行分支（Apache-2.0 协议）。',
   }),
   'closed-free': Object.freeze({
     id: 'closed-free',
@@ -46,6 +52,83 @@ export const UPDATE_TRACKS = Object.freeze({
     description: '包含预编译 Rust 原生模型映射核心与增强特性的免费公开发行分支。',
   }),
 });
+
+export function inferPackageReleaseEpoch({
+  version = null,
+  track = 'open-source',
+  rootPkg = null,
+  internalPkg = null,
+  explicitEpoch = null,
+} = {}) {
+  if (track && track !== 'open-source') return LEGACY_LT_EPOCH;
+  if (Number.isInteger(explicitEpoch) && explicitEpoch >= LEGACY_LT_EPOCH) return explicitEpoch;
+  const declaredInternal = internalPkg?.leaderteam?.releaseEpoch;
+  if (Number.isInteger(declaredInternal) && declaredInternal >= LEGACY_LT_EPOCH) return declaredInternal;
+  const declaredRoot = rootPkg?.leaderteam?.releaseEpoch;
+  if (Number.isInteger(declaredRoot) && declaredRoot >= LEGACY_LT_EPOCH) return declaredRoot;
+  const brand = String(internalPkg?.leaderteam?.brand ?? rootPkg?.leaderteam?.brand ?? '').trim().toLowerCase();
+  if (brand === OLT_BRAND_ID || brand === 'olt') return OLT_RELEASE_EPOCH;
+  const parsed = parseDshSemver(version);
+  // Historical open-source LeaderTeam releases started at v2.1.0 (frozen at v2.2.3).
+  // Open Leader Team (OLT) reset semver at v1.0.0 under releaseEpoch 2.
+  if (parsed && parsed.major === 1) return OLT_RELEASE_EPOCH;
+  return LEGACY_LT_EPOCH;
+}
+
+export function inferGitHubReleaseEpoch(rel, { track = 'open-source', parsedTag = null } = {}) {
+  if (track && track !== 'open-source') return LEGACY_LT_EPOCH;
+  const tag = String(rel?.tag_name ?? parsedTag?.tagName ?? '').trim();
+  const title = String(rel?.name ?? '').trim();
+  const body = String(rel?.body ?? '');
+  const assets = Array.isArray(rel?.assets) ? rel.assets : [];
+
+  const epochBodyMatch = /LT-RELEASE-EPOCH\s*:\s*(\d+)/i.exec(body);
+  if (epochBodyMatch) {
+    const parsedEpoch = Number(epochBodyMatch[1]);
+    if (Number.isInteger(parsedEpoch) && parsedEpoch >= LEGACY_LT_EPOCH) return parsedEpoch;
+  }
+  if (/^olt-/i.test(tag)) return OLT_RELEASE_EPOCH;
+  if (/\b(?:Open\s+Leader\s+Team|OLT)\b/i.test(title)) return OLT_RELEASE_EPOCH;
+  if (/\bOpen\s+Leader\s+Team\b/i.test(body)) return OLT_RELEASE_EPOCH;
+  if (assets.some(a => typeof a?.name === 'string' && /^(?:olt|open-leader-team|dsh-leaderteam-olt)/i.test(a.name))) {
+    return OLT_RELEASE_EPOCH;
+  }
+  const parsedVer = parseDshSemver(parsedTag?.version ?? rel?.version ?? null);
+  if (parsedVer && parsedVer.major === 1) return OLT_RELEASE_EPOCH;
+  return LEGACY_LT_EPOCH;
+}
+
+/**
+ * Epoch-aware release version comparator:
+ * Compares `releaseEpoch` first (OLT epoch 2 > Legacy LT 2.x epoch 1), then standard semver.
+ * Ensures OLT v1.0.0 is strictly recognized as an UPGRADE over legacy LT v2.1.x / v2.2.x,
+ * and historical v2.2.3 releases never appear as upgrades over OLT v1.0.0.
+ */
+export function compareReleaseVersions(a, b) {
+  const norm = x => {
+    if (typeof x === 'string') {
+      return {
+        version: x,
+        epoch: inferPackageReleaseEpoch({ version: x, track: 'open-source' }),
+      };
+    }
+    const ver = String(x?.version ?? '').trim();
+    const track = x?.track ?? x?.installedTrack ?? 'open-source';
+    const explicitEpoch = Number.isInteger(x?.releaseEpoch)
+      ? x.releaseEpoch
+      : (Number.isInteger(x?.epoch) ? x.epoch : null);
+    return {
+      version: ver,
+      epoch: explicitEpoch ?? inferPackageReleaseEpoch({ version: ver, track }),
+    };
+  };
+  const na = norm(a);
+  const nb = norm(b);
+  if (na.epoch !== nb.epoch) {
+    return na.epoch > nb.epoch ? 1 : -1;
+  }
+  return compareDshSemver(na.version, nb.version);
+}
 
 export const DEFAULT_CHECK_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
 export const MAX_TARBALL_BYTES = 80 * 1024 * 1024; // 80 MiB safety ceiling
@@ -85,16 +168,37 @@ export function readInstalledVersionInfo(pluginRoot = DEFAULT_PLUGIN_ROOT, fsImp
   let version = '0.0.0';
   let name = 'dsh-leaderteam';
   let enginesDsh = SUPPORTED_DSH_ENGINE_RANGE;
+  let rootPkg = null;
+  let internalPkg = null;
   try {
-    const rootPkg = JSON.parse(fsImpl.readFileSync(path.join(pluginRoot, 'package.json'), 'utf8'));
+    rootPkg = JSON.parse(fsImpl.readFileSync(path.join(pluginRoot, 'package.json'), 'utf8'));
     if (typeof rootPkg.version === 'string') version = rootPkg.version.trim();
     if (typeof rootPkg.name === 'string') name = rootPkg.name.trim();
     if (typeof rootPkg.engines?.dsh === 'string') enginesDsh = rootPkg.engines.dsh.trim();
   } catch {}
+  try {
+    const internalPath = path.join(pluginRoot, 'leaderteam', 'package.json');
+    if (fsImpl.existsSync(internalPath)) {
+      internalPkg = JSON.parse(fsImpl.readFileSync(internalPath, 'utf8'));
+    }
+  } catch {}
   const track = detectInstalledTrack(pluginRoot, fsImpl);
+  const releaseEpoch = inferPackageReleaseEpoch({ version, track, rootPkg, internalPkg });
+  const isOlt = track === 'open-source' && releaseEpoch >= OLT_RELEASE_EPOCH;
+  const brand = isOlt ? OLT_BRAND_ID : 'leaderteam';
+  const brandDisplayName = isOlt
+    ? String(internalPkg?.leaderteam?.brandDisplayName ?? rootPkg?.leaderteam?.brandDisplayName ?? OLT_BRAND_DISPLAY_NAME)
+    : 'LeaderTeam';
+  const brandShortName = isOlt
+    ? String(internalPkg?.leaderteam?.brandShortName ?? rootPkg?.leaderteam?.brandShortName ?? OLT_BRAND_SHORT_NAME)
+    : 'LT';
   return {
     name,
     version,
+    brand,
+    brandDisplayName,
+    brandShortName,
+    releaseEpoch,
     track,
     trackInfo: UPDATE_TRACKS[track] ?? UPDATE_TRACKS['open-source'],
     enginesDsh,
@@ -277,9 +381,21 @@ export function inspectTgzPackage(tgzFileOrBuffer, fsImpl = fs) {
         ? 'closed-free'
         : 'open-source';
 
+  const inferredVersion = String(rootPkg.version || '').trim();
+  const releaseEpoch = inferPackageReleaseEpoch({
+    version: inferredVersion,
+    track: inferredTrack,
+    rootPkg,
+    internalPkg,
+  });
+  const isOlt = inferredTrack === 'open-source' && releaseEpoch >= OLT_RELEASE_EPOCH;
+
   return {
     name: rootPkg.name,
-    version: String(rootPkg.version || '').trim(),
+    version: inferredVersion,
+    brand: isOlt ? OLT_BRAND_ID : 'leaderteam',
+    brandDisplayName: isOlt ? OLT_BRAND_DISPLAY_NAME : 'LeaderTeam',
+    releaseEpoch,
     license: rootPkg.license || null,
     track: inferredTrack,
     enginesDsh: rootPkg.engines?.dsh ?? null,
@@ -448,7 +564,7 @@ export function normalizeUpdaterPlatform(rawPlatform = process.platform) {
 export function parseReleaseTagForPlatform(rawTag) {
   const tag = String(rawTag ?? '').trim();
   if (!tag) return null;
-  const prefMatch = /^(windows|linux|darwin)-v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$/i.exec(tag);
+  const prefMatch = /^(?:olt-)?(windows|linux|darwin)-v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$/i.exec(tag);
   if (prefMatch) {
     const prefix = prefMatch[1].toLowerCase();
     const version = prefMatch[2];
@@ -460,7 +576,7 @@ export function parseReleaseTagForPlatform(rawTag) {
       platformScope: prefix === 'windows' ? 'win32' : prefix,
     };
   }
-  const legacyMatch = /^v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$/i.exec(tag);
+  const legacyMatch = /^(?:olt-)?v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$/i.exec(tag);
   if (legacyMatch && !tag.includes('/')) {
     const version = legacyMatch[1];
     if (!parseDshSemver(version)) return null;
@@ -575,10 +691,15 @@ function normalizeReleaseEntry(rel, track, { platform = process.platform, arch =
     if (/^[0-9a-f]{64}$/.test(hex)) assetDigestSha256 = hex;
   }
 
+  const releaseEpoch = inferGitHubReleaseEpoch(rel, { track, parsedTag });
+  const brand = track === 'open-source' && releaseEpoch >= OLT_RELEASE_EPOCH ? OLT_BRAND_ID : 'leaderteam';
+
   return {
     track,
     tagName: rawTag,
     version: cleanVersion,
+    releaseEpoch,
+    brand,
     platformScope: parsedTag.platformScope,
     platformPrefix: parsedTag.prefix,
     name: String(rel.name || rawTag),
@@ -604,6 +725,7 @@ function normalizeReleaseEntry(rel, track, { platform = process.platform, arch =
  * - Prefers same-platform prefixed releases (`windows-v*` on `win32`, `linux-v*` on `linux`),
  *   falling back to historical unprefixed `vX.Y.Z` ONLY when zero same-platform prefixed releases exist.
  * - Throws `PLATFORM_RELEASE_TAG_MISMATCH` if `targetVersion` explicitly names another platform's prefix.
+ * - Sorts newest-first using epoch-aware `compareReleaseVersions` (OLT epoch 2 > legacy LT 2.x epoch 1).
  */
 export function selectReleasesForPlatform(rawList, {
   track = 'open-source',
@@ -637,7 +759,7 @@ export function selectReleasesForPlatform(rawList, {
         const aPref = a.platformScope === normPlat ? 1 : 0;
         const bPref = b.platformScope === normPlat ? 1 : 0;
         if (aPref !== bPref) return bPref - aPref;
-        return compareDshSemver(b.version, a.version) ?? 0;
+        return compareReleaseVersions(b, a) ?? 0;
       });
     return exactMatches;
   }
@@ -647,7 +769,7 @@ export function selectReleasesForPlatform(rawList, {
     ? samePlatPrefixed
     : allowedForPlat.filter(r => r.platformScope === 'universal');
 
-  return candidatePool.sort((a, b) => compareDshSemver(b.version, a.version) ?? 0);
+  return candidatePool.sort((a, b) => compareReleaseVersions(b, a) ?? 0);
 }
 
 /**
@@ -691,6 +813,7 @@ export async function checkForUpdates({
         age >= 0 &&
         age < cacheTtlMs &&
         cached.installedVersion === installed.version &&
+        (cached.installedEpoch ?? inferPackageReleaseEpoch({ version: cached.installedVersion, track: cached.installedTrack ?? queryTrack })) === installed.releaseEpoch &&
         cached.platform === normPlat &&
         (!cached.targetPlatform || cached.targetPlatform === `${normPlat}-${normArch}`) &&
         Boolean(cached.includePrerelease) === wantPre
@@ -735,13 +858,21 @@ export async function checkForUpdates({
   const selectableReleases = releases.filter(r => r.asset?.downloadUrl);
   const allRawReleasesLackAssets = rawList.every(r => !Array.isArray(r?.assets) || r.assets.length === 0);
   const latest = selectableReleases[0] ?? (releases.length > 0 && allRawReleasesLackAssets ? releases[0] : null);
+  const latestCmp = latest ? (compareReleaseVersions(latest, installed) ?? 0) : 0;
+  const migrationFromLegacyLt = Boolean(
+    latest &&
+      !isCrossTrackPreview &&
+      queryTrack === 'open-source' &&
+      installed.releaseEpoch < OLT_RELEASE_EPOCH &&
+      latest.releaseEpoch >= OLT_RELEASE_EPOCH,
+  );
   const hasUpdate = latest && (latest.asset?.downloadUrl || allRawReleasesLackAssets)
     ? (
         targetVersion
-          ? latest.version !== installed.version || queryTrack !== installed.track
+          ? latest.version !== installed.version || latest.releaseEpoch !== installed.releaseEpoch || queryTrack !== installed.track
           : (isCrossTrackPreview
               ? latest.version !== installed.version || queryTrack !== installed.track
-              : compareDshSemver(latest.version, installed.version) > 0)
+              : latestCmp > 0)
       )
     : false;
 
@@ -753,11 +884,16 @@ export async function checkForUpdates({
     targetPlatform: `${normPlat}-${normArch}`,
     includePrerelease: wantPre,
     installedVersion: installed.version,
+    installedBrand: installed.brand,
+    installedBrandDisplayName: installed.brandDisplayName,
+    installedEpoch: installed.releaseEpoch,
     installedTrack: installed.track,
     installedTrackInfo: installed.trackInfo,
     queriedTrack: queryTrack,
     queriedTrackInfo: trackMeta,
     isCrossTrack: isCrossTrackPreview,
+    migrationFromLegacyLt,
+    isDowngrade: Boolean(latest && !isCrossTrackPreview && latestCmp < 0),
     crossTrackConfirmationToken: isCrossTrackPreview ? requiredTrackSwitchToken(queryTrack) : null,
     currentHostVersion,
     hasUpdate,
@@ -937,6 +1073,7 @@ export function verifyBackupSnapshotIntegrity(backupRecord, fsImpl = fs) {
   const requiredBase = ['package.json', 'cordis.patch.yml', 'leaderteam/package.json'];
 
   let rootPkg = null;
+  let internalPkg = null;
   const rootPkgPath = path.join(snapDir, 'package.json');
   if (fsImpl.existsSync(rootPkgPath)) {
     try {
@@ -945,11 +1082,27 @@ export function verifyBackupSnapshotIntegrity(backupRecord, fsImpl = fs) {
       rootPkg = null;
     }
   }
+  const internalPkgPath = path.join(snapDir, 'leaderteam', 'package.json');
+  if (fsImpl.existsSync(internalPkgPath)) {
+    try {
+      internalPkg = JSON.parse(fsImpl.readFileSync(internalPkgPath, 'utf8'));
+    } catch {
+      internalPkg = null;
+    }
+  }
 
   const backupVersion =
     (typeof rootPkg?.version === 'string' && rootPkg.version.trim()) ||
     (typeof backupRecord?.fromVersion === 'string' && backupRecord.fromVersion.trim()) ||
     null;
+  const backupTrack = backupRecord?.fromTrack ?? internalPkg?.leaderteam?.distributionTrack ?? 'open-source';
+  const backupEpoch = inferPackageReleaseEpoch({
+    version: backupVersion,
+    track: backupTrack,
+    rootPkg,
+    internalPkg,
+    explicitEpoch: backupRecord?.fromEpoch,
+  });
   const panelDir = path.join(snapDir, 'leaderteam', 'plugins', 'leaderteam-panel');
   const webDistDir = path.join(panelDir, 'web-dist');
   const hasFileHashManifest = Boolean(
@@ -959,7 +1112,8 @@ export function verifyBackupSnapshotIntegrity(backupRecord, fsImpl = fs) {
       Object.keys(backupRecord.fileHashes).length > 0,
   );
   const expectsWebWorkbench = Boolean(
-    (backupVersion && (compareDshSemver(backupVersion, '2.2.2') ?? 0) >= 0) ||
+    backupEpoch >= OLT_RELEASE_EPOCH ||
+      (backupVersion && (compareDshSemver(backupVersion, '2.2.2') ?? 0) >= 0) ||
       rootPkg?.bin?.['lt-ui'] ||
       (hasFileHashManifest && (
         'leaderteam/plugins/leaderteam-panel/public-api.mjs' in backupRecord.fileHashes ||
@@ -1186,6 +1340,8 @@ export function createPreUpgradeBackup({
   profileDir = null,
   targetVersion,
   targetTrack,
+  targetEpoch = null,
+  targetBrand = null,
 }) {
   const installed = readInstalledVersionInfo(pluginRoot);
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -1221,12 +1377,17 @@ export function createPreUpgradeBackup({
     }
   }
 
+  const resolvedToEpoch = targetEpoch ?? inferPackageReleaseEpoch({ version: targetVersion, track: targetTrack ?? installed.track });
   const manifest = {
     backupId,
     createdAt: new Date().toISOString(),
     fromVersion: installed.version,
+    fromBrand: installed.brand,
+    fromEpoch: installed.releaseEpoch,
     fromTrack: installed.track,
     toVersion: targetVersion,
+    toBrand: targetBrand ?? (resolvedToEpoch >= OLT_RELEASE_EPOCH ? OLT_BRAND_ID : 'leaderteam'),
+    toEpoch: resolvedToEpoch,
     toTrack: targetTrack,
     profileDir: profileDir || null,
     pluginSnapshotDir: pkgSnapshotDir,
@@ -1502,6 +1663,31 @@ export async function performOneClickUpgrade({
       profileCtx?.dir ??
       (dshHome ? path.join(dshHome, 'profiles', effectiveProfile) : null);
 
+    const targetEpoch = staged.inspection.releaseEpoch ?? inferPackageReleaseEpoch({
+      version: staged.inspection.version,
+      track: staged.inspection.track,
+    });
+    const targetBrand = staged.inspection.brand ?? (targetEpoch >= OLT_RELEASE_EPOCH ? OLT_BRAND_ID : 'leaderteam');
+    const targetVersionCmp = compareReleaseVersions(
+      { version: staged.inspection.version, releaseEpoch: targetEpoch, track: staged.inspection.track },
+      installed,
+    ) ?? 0;
+    const migrationFromLegacyLt = Boolean(
+      installed.track === 'open-source' &&
+        staged.inspection.track === 'open-source' &&
+        installed.releaseEpoch < OLT_RELEASE_EPOCH &&
+        targetEpoch >= OLT_RELEASE_EPOCH,
+    );
+    const isDowngrade = installed.track === staged.inspection.track && targetVersionCmp < 0;
+    const upgradeMeta = {
+      fromEpoch: installed.releaseEpoch,
+      fromBrand: installed.brand,
+      toEpoch: targetEpoch,
+      toBrand: targetBrand,
+      migrationFromLegacyLt,
+      isDowngrade,
+    };
+
     writeUpdaterState(storageRoot, { phase: 'backing_up' });
     const backup = createPreUpgradeBackup({
       storageRoot,
@@ -1509,6 +1695,8 @@ export async function performOneClickUpgrade({
       profileDir,
       targetVersion: staged.inspection.version,
       targetTrack: staged.inspection.track,
+      targetEpoch,
+      targetBrand,
     });
 
     writeUpdaterState(storageRoot, {
@@ -1516,6 +1704,7 @@ export async function performOneClickUpgrade({
       activeUpgrade: {
         fromVersion: installed.version,
         toVersion: staged.inspection.version,
+        ...upgradeMeta,
         track: staged.inspection.track,
         backupId: backup.backupId,
         startedAt: new Date().toISOString(),
@@ -1611,6 +1800,7 @@ export async function performOneClickUpgrade({
           requiresRestart: Boolean(hookRes?.requiresRestart),
           fromVersion: installed.version,
           toVersion: staged.inspection.version,
+          ...upgradeMeta,
           track: staged.inspection.track,
           sha256: staged.sha256,
           backupId: backup.backupId,
@@ -1688,10 +1878,13 @@ export async function performOneClickUpgrade({
         requiresRestart: false,
         fromVersion: installed.version,
         toVersion: staged.inspection.version,
+        ...upgradeMeta,
         track: staged.inspection.track,
         sha256: staged.sha256,
         backupId: backup.backupId,
-        message: `正在后台热替换升级至 v${staged.inspection.version}（约 3~8 秒自动生效，无需命令行或重启）…`,
+        message: migrationFromLegacyLt
+          ? `正在从旧版 LeaderTeam v${installed.version} 无损迁移升级至 Open Leader Team (OLT) v${staged.inspection.version}（约 3~8 秒自动生效）…`
+          : `正在后台热替换升级至 v${staged.inspection.version}（约 3~8 秒自动生效，无需命令行或重启）…`,
       };
     }
 
@@ -1710,11 +1903,14 @@ export async function performOneClickUpgrade({
           requiresRestart: true,
           fromVersion: installed.version,
           toVersion: staged.inspection.version,
+          ...upgradeMeta,
           track: staged.inspection.track,
           sha256: staged.sha256,
           backupId: backup.backupId,
           finishedAt: new Date().toISOString(),
-          message: `已完成 v${staged.inspection.version} 安装，重启 DeepSeek Harness 客户端后生效（全部配置与历史会话已保留）。`,
+          message: migrationFromLegacyLt
+            ? `已完成从旧版 LeaderTeam v${installed.version} 到 Open Leader Team (OLT) v${staged.inspection.version} 的平滑迁移升级，重启 DeepSeek Harness 客户端后生效（全部配置与历史会话已保留）。`
+            : `已完成 v${staged.inspection.version} 安装，重启 DeepSeek Harness 客户端后生效（全部配置与历史会话已保留）。`,
         };
         writeUpdaterState(storageRoot, {
           phase: 'succeeded',
@@ -1776,11 +1972,14 @@ export async function performOneClickUpgrade({
       requiresRestart: true,
       fromVersion: installed.version,
       toVersion: staged.inspection.version,
+      ...upgradeMeta,
       track: staged.inspection.track,
       sha256: staged.sha256,
       backupId: backup.backupId,
       finishedAt: new Date().toISOString(),
-      message: `已成功安装 v${staged.inspection.version}（模型配置、历史会话与团队账本已完整保留）。`,
+      message: migrationFromLegacyLt
+        ? `已成功从旧版 LeaderTeam v${installed.version} 迁移升级至 Open Leader Team (OLT) v${staged.inspection.version}（模型配置、历史会话与团队账本已完整保留）。`
+        : `已成功安装 v${staged.inspection.version}（模型配置、历史会话与团队账本已完整保留）。`,
     };
     writeUpdaterState(storageRoot, {
       phase: 'succeeded',
@@ -1915,9 +2114,16 @@ export async function rollbackToSavedBackup({
     activeUpgrade: null,
     lastError: null,
   });
+  const restoredEpoch = chosen.fromEpoch ?? inferPackageReleaseEpoch({
+    version: chosen.fromVersion,
+    track: chosen.fromTrack ?? 'open-source',
+  });
+  const restoredBrand = chosen.fromBrand ?? (restoredEpoch >= OLT_RELEASE_EPOCH ? OLT_BRAND_ID : 'leaderteam');
   return {
     ok: true,
     restoredVersion: chosen.fromVersion,
+    restoredEpoch,
+    restoredBrand,
     restoredTrack: chosen.fromTrack,
     backupId: chosen.backupId,
     requiresRestart: !hasHmr,

@@ -19,6 +19,7 @@ import {
   inspectTgzPackage,
   checkCandidatePackageCompatibility,
   computeFileSha256,
+  compareReleaseVersions,
   reconcileConfigForTargetCapabilities,
   doesDirectorySupportFollowPolicy,
 } from './updater.mjs';
@@ -163,12 +164,15 @@ function findBundledLocalTarballs(searchDirs = [], fsImpl = fs) {
             fileName: name,
             sizeBytes: fsImpl.statSync(full).size,
             version: info.version,
+            brand: info.brand,
+            releaseEpoch: info.releaseEpoch,
             track: info.track,
           });
         } catch {}
       }
     } catch {}
   }
+  found.sort((a, b) => compareReleaseVersions(b, a) ?? 0);
   return found;
 }
 
@@ -541,7 +545,7 @@ export async function runOneClickInstallation({
   }
 
   // 4. Execute `dsh plugin --profile <desktop|web> add <installSpec>`
-  reportStep('install', `正在向 DSH (${selectedTarget.profile} profile) 安装 LeaderTeam v${installedVersion || ''}…`);
+  reportStep('install', `正在向 DSH (${selectedTarget.profile} profile) 安装 Open Leader Team (OLT) v${installedVersion || ''}…`);
   if (typeof installerRunner === 'function') {
     await installerRunner({
       target: selectedTarget,
@@ -624,8 +628,8 @@ export async function runOneClickInstallation({
     dshHome: resolvedHome,
     nextStepHint:
       selectedTarget.kind === 'official-desktop'
-        ? '点击“立即启动客户端”即可直接打开 DeepSeek Harness 桌面端并进入新手引导。'
-        : '点击“立即启动 Web 控制台”即可直接在浏览器进入 LeaderTeam 工作台与新手引导。',
+        ? '点击“立即启动客户端”即可直接打开 DeepSeek Harness 桌面端并进入 Open Leader Team (OLT) 新手引导。'
+        : '点击“立即启动 Web 控制台”即可直接在浏览器进入 Open Leader Team (OLT) 工作台与新手引导。',
   };
 }
 

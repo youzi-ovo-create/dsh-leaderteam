@@ -604,10 +604,10 @@ test('R2-V223-06: writeSessionModeRecord appends audit history BEFORE updating s
 });
 
 test('R2-V223-07b & Forward-Merged R2-SH-01..04: zero duplicate single->single audit entries on persistInitial, v2.2.3 manifest versions, and standalone Single session discovery with usage disabled', async t => {
-  // 1. Package versions align at 2.2.4 (and lt-shared-contracts schema supports 1.1.0)
+  // 1. Package versions align at 1.0.0 (Open Leader Team V1.0.0; lt-shared-contracts schema supports 1.1.0)
   for (const rel of ['package.json', 'leaderteam/package.json', 'packages/lt-web/package.json']) {
     const pkgJson = JSON.parse(fs.readFileSync(path.join(repoRoot, rel), 'utf8'));
-    assert.equal(pkgJson.version, '2.2.4', `${rel} must align at 2.2.4`);
+    assert.equal(pkgJson.version, '1.0.0', `${rel} must align at 1.0.0`);
   }
   const { SHARED_CONTRACTS_ROOT } = await import('./companion-paths.mjs');
   const schemaText = fs.readFileSync(path.join(SHARED_CONTRACTS_ROOT, 'schemas/lt-public-v1.schema.json'), 'utf8');

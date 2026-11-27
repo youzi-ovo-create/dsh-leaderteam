@@ -155,7 +155,7 @@ test('V2.2.3 Contracts (1.1.0): bundle capabilities.features.inSessionDualMode, 
   const bundleEnvelope = await (await h.bundle(makeJsonPost({}, 'http://127.0.0.1/api/lt/v1/bundle'))).json();
   assert.equal(bundleEnvelope.ok, true);
   assert.equal(bundleEnvelope.contractVersion, '1.1.0');
-  assert.equal(bundleEnvelope.data.capabilities.backendVersion, '2.2.4');
+  assert.equal(bundleEnvelope.data.capabilities.backendVersion, '1.0.0');
   assert.equal(bundleEnvelope.data.capabilities.features.inSessionDualMode, true);
   const liveCheck = validateContractBundle(bundleEnvelope);
   assert.equal(liveCheck.ok, true, liveCheck.errors.join('; '));
@@ -2066,6 +2066,6 @@ test('Stage 9 Product Regressions (S8-E2E-01a/b/c, S8-E2E-02, S8-E2E-03, S8-E2E-
   assert.match(noticesText, /MIT/);
   assert.match(noticesText, /packages\/lt-usage\/NOTICE\.md/);
   const rootPkg = JSON.parse(fs.readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
-  assert.equal(rootPkg.version, '2.2.4');
+  assert.equal(rootPkg.version, '1.0.0');
   assert.ok(rootPkg.files.includes('THIRD_PARTY_NOTICES.md'));
 });
