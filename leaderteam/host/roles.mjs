@@ -648,7 +648,11 @@ async function maybeAutoContinueLeader(ctx, rt, actor, agent) {
           const streak = prev && prev.fingerprint === fingerprint ? prev.streak + 1 : 1;
           rt.autoContinueState.set(stateKey, { fingerprint, streak });
           if (streak <= 2) {
-            agent.followup(buildContinuationMessage(rt, `[LeaderTeam Dual Supervision Incomplete] ${gov.pendingSupervisions.length} autonomous supervision item(s) do not yet have two valid reviewer opinions (${missingSummary}). Delivery cannot be marked completed without completed dual supervision. Call team_discuss(kind="delivery", ...) once reviewer routes recover, or declare team_status(stop_state="blocked", reason=...) if upstream reviewer routes remain unavailable.`));
+            const anyPolicyRefused = gov.pendingSupervisions.some(p => p.policyRefused);
+            const guidance = anyPolicyRefused
+              ? 'One or more supervision items were refused by provider policy (non-retryable); adjust the refused content/route or declare team_status(stop_state="blocked", reason=...) instead of retrying unchanged.'
+              : 'Call team_discuss(kind="delivery", ...) once reviewer routes recover, or declare team_status(stop_state="blocked", reason=...) if upstream reviewer routes remain unavailable.';
+            agent.followup(buildContinuationMessage(rt, `[LeaderTeam Dual Supervision Incomplete] ${gov.pendingSupervisions.length} autonomous supervision item(s) do not yet have two valid reviewer opinions (${missingSummary}). Delivery cannot be marked completed without completed dual supervision. ${guidance}`));
           }
           return;
         }
@@ -817,20 +821,63 @@ export function onAgentError(_ctx, { agent, error } = {}) {
   rt.memberErrors ??= new Map();
   rt.memberErrors.set(agent.id, { seq: agent.session?.seq ?? 0, message: truncate(rawMsg, 600) });
 }
+function resolveSessionAttemptSource(session, event, fallbackSel) {
+  if (event.type === 'compaction/summary') {
+    const compModel = event.data?.model ?? event.data?.message?.source?.model ?? null;
+    const compProv = event.data?.provider ?? event.data?.message?.source?.provider ?? null;
+    if (typeof compModel === 'string' && compModel.trim().length > 0) {
+      return { provider: typeof compProv === 'string' ? compProv : null, model: compModel };
+    }
+  }
+  const explicit = event.data?.message?.source
+    ?? event.data?.source
+    ?? (typeof event.data?.model === 'string' && event.data.model.trim().length > 0 ? event.data : null);
+  if (typeof explicit?.model === 'string' && explicit.model.trim().length > 0) {
+    return {
+      provider: typeof explicit.provider === 'string' ? explicit.provider : null,
+      model: explicit.model,
+    };
+  }
+  const history = session?.snapshotEvents?.();
+  const maxSeq = Number.isSafeInteger(event.seq) ? event.seq : Number.POSITIVE_INFINITY;
+  if (Array.isArray(history)) {
+    for (let i = history.length - 1; i >= 0; i--) {
+      const row = history[i];
+      if (!row || (Number.isSafeInteger(row.seq) && row.seq > maxSeq)) continue;
+      if (row.type === 'request/context' && typeof row.data?.provider === 'string' && typeof row.data?.model === 'string') {
+        return row.data;
+      }
+      if (row.type === 'request/header' && typeof row.data?.header?.config?.provider === 'string' && typeof row.data?.header?.config?.model === 'string') {
+        return row.data.header.config;
+      }
+    }
+  }
+  const reqCtx = session?.requestContext?.() ?? session?.requestHeader?.()?.config ?? null;
+  if (typeof reqCtx?.provider === 'string' && typeof reqCtx?.model === 'string') return reqCtx;
+  if (Array.isArray(history)) {
+    for (let i = history.length - 1; i >= 0; i--) {
+      const row = history[i];
+      if (!row || (Number.isSafeInteger(row.seq) && row.seq > maxSeq)) continue;
+      if (row.type === 'model/selection' && typeof row.data?.provider === 'string' && typeof row.data?.model === 'string') {
+        return row.data;
+      }
+    }
+  }
+  return fallbackSel ?? null;
+}
 export function onSessionEvent(ctx, session, event) {
   const rt = runtime();
   if (!rt.config || !rt.storageRoot || !session || !event) return;
-  if ((event.type === 'assistant/message' || event.type === 'compaction/summary') && event.surfaceOp !== 'seed') {
-    const src = event.type === 'compaction/summary'
-      ? {
-          provider: event.data?.provider ?? event.data?.message?.source?.provider ?? null,
-          model: event.data?.model ?? event.data?.message?.source?.model ?? null,
-        }
-      : (event.data?.message?.source ?? event.data?.source ?? null);
-    const hasExplicitModel = typeof src?.model === 'string' && src.model.trim().length > 0;
+  if (
+    (event.type === 'assistant/message' || event.type === 'assistant/attempt' || event.type === 'compaction/summary')
+    && event.surfaceOp !== 'seed'
+    && event.surfaceOp?.op !== 'seed'
+  ) {
     const leader = [...rt.actors.values()].find(a => a.role === 'leader' && (a.agent?.session === session || a.teamId === session.id));
     if (leader) {
       const sel = leader.agent?.model?.current?.() ?? null;
+      const src = resolveSessionAttemptSource(session, event, sel);
+      const hasExplicitModel = typeof src?.model === 'string' && src.model.trim().length > 0 && src !== sel;
       const hostProvider = hasExplicitModel ? (src?.provider ?? null) : (src?.provider ?? sel?.provider ?? null);
       const hostModel = hasExplicitModel ? src.model : (sel?.model ?? null);
       const teamCfg = runtimeForTeam(leader.teamId).config ?? rt.config;
@@ -856,19 +903,24 @@ export function onSessionEvent(ctx, session, event) {
         : null);
     if (subActor) {
       const rec = teamStore(subActor.teamId).getMember(subActor.agentId);
+      const sel = subActor.agent?.model?.current?.() ?? null;
+      const src = resolveSessionAttemptSource(session, event, sel);
+      const hasExplicitModel = typeof src?.model === 'string' && src.model.trim().length > 0 && src !== sel;
+      const hostProvider = hasExplicitModel ? (src?.provider ?? null) : (src?.provider ?? sel?.provider ?? null);
+      const hostModel = hasExplicitModel ? src.model : (sel?.model ?? null);
       const teamCfg = runtimeForTeam(subActor.teamId).config ?? rt.config;
       const route = resolveCanonicalRouteFromHostSelection(
         teamCfg,
-        src?.provider ?? null,
-        src?.model ?? null,
+        hostProvider,
+        hostModel,
         rec?.model ?? null,
       );
       recordSessionModelRequest(rt, {
         teamId: subActor.teamId,
         role: subActor.role,
         route,
-        hostProvider: src?.provider ?? null,
-        hostModel: src?.model ?? null,
+        hostProvider,
+        hostModel,
         atMs: typeof event.time === 'number' && Number.isFinite(event.time) ? event.time : Date.now(),
       });
     }
