@@ -26,7 +26,8 @@ import {
 import { frontierState } from '../core/frontier.mjs';
 import { boundJson, sanitizeArguments } from '../core/redact.mjs';
 import { GATE_DENIED_CODE, GATE_DENIED_NAME } from '../core/constants.mjs';
-import { pathKey } from '../core/paths.mjs';
+import { pathKey, resolvePath } from '../core/paths.mjs';
+import { isProtectedLeaderTeamConfigPath } from '../core/session-config.mjs';
 import { readQuotaStateFile } from '../core/quota.mjs';
 import { quotaGate } from '../core/models.mjs';
 import { replay, nextAction } from '../core/agreement.mjs';
@@ -35,8 +36,15 @@ import { roleRouteChain } from '../core/role-routes.mjs';
 import { runtime, teamStore, recordUsage, syncRuntimeConfig, runtimeForTeam, isPluginActive, refreshUpstreamCatalog, effectiveRuntimeConfig } from './runtime.mjs';
 import { resolveActor, leaderAllowedTools, userTaskText, userMessageTexts, currentTaskSeq, reconcileStaleMembers } from './roles.mjs';
 import { resumeAdmission, withMemberActivation, activationConfig, resolveSendMessageTargetId } from './activation.mjs';
+import {
+  VERIFIED_CORE_VERSIONS,
+  SUPPORTED_DSH_ENGINE_RANGE,
+  CANONICAL_PIPELINE_SNIPPETS,
+  evaluateHostCompatibility,
+} from '../core/host-compat.mjs';
 
 const INSTALLED = Symbol.for('leaderteam.finalGate.installed.v1');
+const ORIGINAL_DISPATCH = Symbol.for('leaderteam.finalGate.originalDispatch.v1');
 const RECOVERABLE_PROTOCOL_NUDGES = new Set([
   'rule:tool-not-loaded',
   'rule:refs-unread',
@@ -61,24 +69,65 @@ function countSubstantiveMemberDenials(memberReceipts) {
   return count;
 }
 
-const REQUIRED_SOURCE = [
-  'this.resolveExecution(exec.name, exec.agent, exec.parent !== void 0, exec.toolSet)',
-  'await tool.execute(exec.arguments, exec)',
-];
+const REQUIRED_SOURCE = CANONICAL_PIPELINE_SNIPPETS;
 
-/** Throws when the host pipeline is not the exact shape this patch was verified against. */
-export function assertCompatiblePipeline(proto, version, supported) {
-  if (!supported.includes(version)) throw new Error(`leaderteam: @deepseek-ai/dsh-tools ${version} is not a verified core version (${supported.join(', ')}); refusing to start without the safety gate`);
-  if (typeof proto.dispatchToolBody !== 'function' || typeof proto.resolveExecution !== 'function') throw new Error('leaderteam: ToolExecutionPipeline lacks dispatchToolBody/resolveExecution; refusing to start');
-  const src = Function.prototype.toString.call(proto.dispatchToolBody);
-  for (const s of REQUIRED_SOURCE) if (!src.includes(s)) throw new Error(`leaderteam: dispatchToolBody no longer contains "${s}"; refusing to start`);
+/**
+ * Throws when the host pipeline breaks safety-gate contract invariants or is disallowed by policy.
+ * When `options` is omitted and `supported` is a plain array of versions, defaults to `'strict-verified'`
+ * so explicit allowlist callers retain deterministic pin semantics; runtime startup passes `{ policy: 'adaptive' }`.
+ */
+export function assertCompatiblePipeline(proto, version, supported, options = null) {
+  const isConfigObj = supported !== null && typeof supported === 'object' && !Array.isArray(supported);
+  const cfg = isConfigObj ? supported : (options ?? {});
+  const supportedVersions = isConfigObj
+    ? (cfg.supportedVersions ?? VERIFIED_CORE_VERSIONS)
+    : (Array.isArray(supported) ? supported : VERIFIED_CORE_VERSIONS);
+  const policy = cfg.policy ?? (isConfigObj || options ? 'adaptive' : 'strict-verified');
+  const supportedRange = cfg.supportedRange ?? SUPPORTED_DSH_ENGINE_RANGE;
+
+  if (!proto || typeof proto.dispatchToolBody !== 'function' || typeof proto.resolveExecution !== 'function') {
+    throw new Error('leaderteam: ToolExecutionPipeline lacks dispatchToolBody/resolveExecution; refusing to start');
+  }
+  const unpatchedFn = typeof proto[ORIGINAL_DISPATCH] === 'function' ? proto[ORIGINAL_DISPATCH] : proto.dispatchToolBody;
+  const src = Function.prototype.toString.call(unpatchedFn);
+  const evaluation = evaluateHostCompatibility({
+    toolsVersion: version,
+    pipelineSource: src,
+    supportedVersions,
+    supportedRange,
+    policy,
+  });
+
+  if (evaluation.classification === 'INCOMPATIBLE_PIPELINE') {
+    for (const s of REQUIRED_SOURCE) {
+      if (!src.includes(s)) {
+        throw new Error(`leaderteam: dispatchToolBody no longer contains "${s}"; refusing to start`);
+      }
+    }
+    throw new Error(`leaderteam: ${evaluation.summary}`);
+  }
+  if (!evaluation.productionAllowed) {
+    throw new Error(
+      `leaderteam: @deepseek-ai/dsh-tools ${version} is not a verified core version (${supportedVersions.join(', ')}); refusing to start without the safety gate`,
+    );
+  }
+  return evaluation;
 }
 
-export function installFinalGate(supportedVersions) {
+export function installFinalGate(supportedVersionsOrOptions) {
   const proto = ToolExecutionPipeline.prototype;
-  if (proto[INSTALLED]) return;
-  assertCompatiblePipeline(proto, toolsPackage.version, supportedVersions);
-  const original = proto.dispatchToolBody;
+  const opts = Array.isArray(supportedVersionsOrOptions)
+    ? { supportedVersions: supportedVersionsOrOptions, supportedRange: SUPPORTED_DSH_ENGINE_RANGE, policy: 'adaptive' }
+    : (supportedVersionsOrOptions ?? { supportedVersions: VERIFIED_CORE_VERSIONS, supportedRange: SUPPORTED_DSH_ENGINE_RANGE, policy: 'adaptive' });
+  const evaluation = assertCompatiblePipeline(proto, toolsPackage.version, opts);
+  const original = typeof proto[ORIGINAL_DISPATCH] === 'function' ? proto[ORIGINAL_DISPATCH] : proto.dispatchToolBody;
+  if (!proto[ORIGINAL_DISPATCH]) {
+    Object.defineProperty(proto, ORIGINAL_DISPATCH, { value: original });
+  }
+  runtime().hostCompatibility = Object.freeze({
+    ...evaluation,
+    checkedAt: new Date().toISOString(),
+  });
   proto.dispatchToolBody = async function leaderteamFinalGate(exec) {
     const gate = runtime().gate;
     const agent = exec.agent;
@@ -126,14 +175,43 @@ export function installFinalGate(supportedVersions) {
       }
     }
     const isShell = Boolean(runtimeForTeam(actor.teamId).config?.gate?.shellTools?.includes(name));
+    const sessionKey = actor.teamId ?? agent?.id ?? null;
+    const baseRtForFlight = runtime();
+    if (sessionKey) {
+      baseRtForFlight.inFlightToolDispatchesByTeam ??= new Map();
+      baseRtForFlight.inFlightToolDispatchesByTeam.set(
+        sessionKey,
+        (baseRtForFlight.inFlightToolDispatchesByTeam.get(sessionKey) ?? 0) + 1,
+      );
+      if (isShell) {
+        baseRtForFlight.inFlightShellCallsBySession ??= new Map();
+        baseRtForFlight.inFlightShellCallsBySession.set(
+          sessionKey,
+          (baseRtForFlight.inFlightShellCallsBySession.get(sessionKey) ?? 0) + 1,
+        );
+      }
+    }
     if (isShell) runtime().scheduler?.beginShellCall?.();
     try {
       return await original.call(this, exec);
     } finally {
+      if (sessionKey && baseRtForFlight.inFlightToolDispatchesByTeam) {
+        const nextToolCnt = (baseRtForFlight.inFlightToolDispatchesByTeam.get(sessionKey) ?? 1) - 1;
+        if (nextToolCnt <= 0) baseRtForFlight.inFlightToolDispatchesByTeam.delete(sessionKey);
+        else baseRtForFlight.inFlightToolDispatchesByTeam.set(sessionKey, nextToolCnt);
+      }
+      if (sessionKey && isShell && baseRtForFlight.inFlightShellCallsBySession) {
+        const nextShellCnt = (baseRtForFlight.inFlightShellCallsBySession.get(sessionKey) ?? 1) - 1;
+        if (nextShellCnt <= 0) baseRtForFlight.inFlightShellCallsBySession.delete(sessionKey);
+        else baseRtForFlight.inFlightShellCallsBySession.set(sessionKey, nextShellCnt);
+      }
       if (isShell) runtime().scheduler?.endShellCall?.();
     }
   };
-  Object.defineProperty(proto, INSTALLED, { value: true });
+  if (!proto[INSTALLED]) {
+    Object.defineProperty(proto, INSTALLED, { value: true });
+  }
+  return evaluation;
 }
 
 function denied(name, verdict) {
@@ -153,6 +231,41 @@ export class Gate {
     const cfg = rt.config;
     const unreadRefs = actor.role === 'member' ? (actor.refs ?? []).filter(r => !(rt.reads.get(agent.id)?.has(pathKey(r)))) : [];
     const cwd = typeof agent?.session?.header?.cwd === 'string' ? agent.session.header.cwd : actor.cwd;
+    const baseRt = runtime();
+    // Enforce Agent-vs-User separation at filesystem boundary: agents may NEVER mutate LeaderTeam global or session config files.
+    if (cfg.gate?.mutatingTools?.includes(name)) {
+      const argKeys = [...new Set([...(cfg.gate?.pathArgs?.[name] ?? []), 'file_path', 'path'])];
+      for (const k of argKeys) {
+        const rawTarget = args?.[k];
+        if (typeof rawTarget === 'string' && rawTarget.trim()) {
+          const resolved = resolvePath(rawTarget, cwd) ?? rawTarget;
+          if (isProtectedLeaderTeamConfigPath(resolved, { storageRoot: baseRt.storageRoot, configPath: baseRt.configPath })) {
+            return {
+              rule: 'protected-lt-config',
+              reason: 'Agent processes are forbidden from modifying LeaderTeam global or session configuration files; only user-initiated actions are permitted.',
+            };
+          }
+        }
+      }
+    }
+    if (cfg.gate?.shellTools?.includes(name) && typeof args?.command === 'string') {
+      const cmdLower = args.command.toLowerCase();
+      if (
+        cmdLower.includes('leaderteam.config.json') ||
+        cmdLower.includes('leaderteam.local.json') ||
+        cmdLower.includes('session-config.json') ||
+        cmdLower.includes('session-configs') ||
+        cmdLower.includes('governance-changes.jsonl') ||
+        (cmdLower.includes('governance.json') && cmdLower.includes('teams'))
+      ) {
+        if (/(?:>|tee\b|sed\s+-i|mv\b|cp\b|rm\b|python|node\s+-e|writefile|set-content|add-content|out-file|clear-content|new-item|copy-item|move-item|remove-item|\bsc\b|\bac\b|writealltext|writeallbytes|writealllines|streamwriter)/i.test(args.command)) {
+          return {
+            rule: 'protected-lt-config',
+            reason: 'Shell commands initiated by an agent may not modify LeaderTeam configuration or governance files.',
+          };
+        }
+      }
+    }
     const userTexts = (actor.role === 'leader' || name === 'web_search' || name === 'web_fetch') ? () => userMessageTexts(this.ctx, actor.teamId) : undefined;
     const rawSessionId = typeof agent?.session?.id === 'string' ? agent.session.id : (typeof agent?.session?.header?.id === 'string' ? agent.session.header.id : '');
     const ownSpillSessionSegment = rawSessionId ? `session-${createHash('sha256').update(rawSessionId).digest('hex').slice(0, 12)}` : undefined;

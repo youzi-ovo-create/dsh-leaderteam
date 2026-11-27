@@ -202,6 +202,8 @@ test('[DP-04, DP-05 & DP-06] Blank-session rebinding, enforce diagnostic stop re
   t.after(() => fs.rmSync(tmp, { recursive: true, force: true }));
   const cfgFile = path.join(tmp, 'leaderteam.config.json');
   const rawCfg = JSON.parse(fs.readFileSync(DEFAULT_CONFIG_FILE, 'utf8'));
+  assert.equal(rawCfg.team.leaderModelPolicy, 'follow');
+  rawCfg.team.leaderModelPolicy = 'enforce';
   rawCfg.team.executionFallbacks = {
     'codex/gpt-6.1-sol': ['zcode/GLM-5.3', 'codex/gpt-6.1-terra'],
     'zcode/GLM-5.3': ['zcode/GLM-5.3-Flash'],
@@ -327,7 +329,8 @@ test('[DP-04, DP-05 & DP-06] Blank-session rebinding, enforce diagnostic stop re
   });
 
   const handlers = createPanelHandlers(ctx, rt);
-  const stRes = await (await handlers.state(new Request('http://local/state', { method: 'POST', body: '{}' }))).json();
+  const jsonHeaders = { 'content-type': 'application/json' };
+  const stRes = await (await handlers.state(new Request('http://local/state', { method: 'POST', headers: jsonHeaders, body: '{}' }))).json();
   assert.equal(stRes.ok, true);
   const mismatchRow = stRes.value.leaderSessionChecks.find(r => r.sessionId === freshId);
   assert.equal(mismatchRow?.status, 'mismatch');
@@ -335,6 +338,7 @@ test('[DP-04, DP-05 & DP-06] Blank-session rebinding, enforce diagnostic stop re
 
   const alignCfgRes = await (await handlers.apply(new Request('http://local/apply', {
     method: 'POST',
+    headers: jsonHeaders,
     body: JSON.stringify({ target: 'base', changes: { alignLeaderSession: { sessionId: freshId, mode: 'config-to-session' } } }),
   }))).json();
   assert.equal(alignCfgRes.ok, true);
@@ -345,6 +349,7 @@ test('[DP-04, DP-05 & DP-06] Blank-session rebinding, enforce diagnostic stop re
   freshSel = { provider: 'magpie', model: 'codex/gpt-6.1-sol', reasoningEffort: 'low' };
   const alignSessRes = await (await handlers.apply(new Request('http://local/apply', {
     method: 'POST',
+    headers: jsonHeaders,
     body: JSON.stringify({ target: 'base', changes: { alignLeaderSession: { sessionId: freshId, mode: 'session-to-config' } } }),
   }))).json();
   assert.equal(alignSessRes.ok, true);

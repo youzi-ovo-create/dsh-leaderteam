@@ -2,7 +2,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import zlib from 'node:zlib';
-import { TeamStore, readJsonl } from '../core/store.mjs';
+import { TeamStore, readJsonl, resolveTeamStoreLogicalId, decodeEncodedStoreSegment as decodeSessionModeSegment } from '../core/store.mjs';
+import { isInside } from '../core/paths.mjs';
 import { resolveCanonicalRouteFromHostSelection } from './runtime.mjs';
 
 export const MAX_CACHED_SESSIONS = 32;
@@ -47,12 +48,14 @@ function extractNativeRowRoute(row, fallbackRoute = null, cfg = null) {
 
 function decodeZstdSessionLog(buf) {
   if (!buf || buf.length === 0) return Buffer.alloc(0);
-  try {
-    return zlib.zstdDecompressSync(buf);
-  } catch {}
+  // Note: Node 24+ `zlib.zstdDecompressSync(buf)` silently stops at the end of Frame 0 on concatenated
+  // multi-frame `.jsonl.zstd` logs without throwing! Always split by Zstandard frame magic first.
   const starts = [];
   for (let i = 0; i + 3 < buf.length; i++) {
     if (buf[i] === 0x28 && buf[i + 1] === 0xb5 && buf[i + 2] === 0x2f && buf[i + 3] === 0xfd) starts.push(i);
+  }
+  if (starts.length === 0) {
+    return zlib.zstdDecompressSync(buf);
   }
   const parts = [];
   let n = 0;
@@ -126,10 +129,16 @@ export function _observabilityCacheSizeForTest() {
   return cache.size;
 }
 
-function durableRows(home,id) {
+function durableRows(home,id,fallbackSeg=null) {
   if (!home || !id) return null;
   const root=path.join(home,'sessions');
-  const segs=[...new Set([id, encodeDshSegment(id)])];
+  const isSafeRaw=/^[A-Za-z0-9._-]+$/.test(id)&&id!=='.'&&id!=='..'&&!id.includes('..');
+  const isSafeFallback=typeof fallbackSeg==='string'&&/^[A-Za-z0-9._~-]+$/.test(fallbackSeg)&&fallbackSeg!=='.'&&fallbackSeg!=='..'&&!fallbackSeg.includes('..');
+  const segs=[...new Set([
+    ...(isSafeRaw?[id]:[]),
+    encodeDshSegment(id),
+    ...(isSafeFallback?[fallbackSeg]:[]),
+  ])];
   const candidates=[];
   for (const seg of segs) candidates.push(path.join(root,seg,'session.v4.jsonl.zstd'));
   try {
@@ -140,7 +149,9 @@ function durableRows(home,id) {
   } catch {
     if (candidates.length === 0) return null;
   }
+  const absRoot=path.resolve(root);
   for (const file of candidates) {
+    if (!isInside(path.resolve(file),absRoot)) continue;
     let stat;
     try { stat=fs.statSync(file); } catch { continue; }
     const signature=`${stat.mtimeMs}:${stat.size}`;
@@ -180,20 +191,33 @@ function dedupedNativeRows(rows) {
 
 export function teamObservability(ctx,rt,teamId) {
   const store=new TeamStore(rt.storageRoot,teamId);
+  let teamMeta;
+  try { teamMeta=JSON.parse(fs.readFileSync(path.join(store.dir,'team.json'),'utf8')); } catch {}
+  const metaSessionId=typeof teamMeta?.sessionId==='string'&&teamMeta.sessionId.trim()?teamMeta.sessionId.trim():null;
+  const decodedMetaTeamId=(!metaSessionId&&typeof teamMeta?.teamId==='string'&&teamMeta.teamId.trim()&&!/~h[0-9a-f]{32}$/.test(teamMeta.teamId.trim()))
+    ?decodeSessionModeSegment(teamMeta.teamId.trim())
+    :null;
+  const gateTeamId=metaSessionId
+    ?null
+    :(readJsonl(store.gateFile).records.find(r=>typeof r?.teamId==='string'&&r.teamId.trim())?.teamId?.trim()??null);
+  const resolvedTeamId=rt.actors.has(teamId)
+    ?teamId
+    :(metaSessionId??gateTeamId??decodedMetaTeamId??(teamId!==store.teamId?teamId:decodeSessionModeSegment(store.teamId)));
   const governance=readJsonl(path.join(store.dir,'usage.jsonl')).records;
   let snapshot;
   try { snapshot=JSON.parse(fs.readFileSync(path.join(store.dir,'governance.json'),'utf8')); } catch {}
   const cfg=snapshot?.config??rt.config;
-  let home=process.env.DSH_HOME;
-  try { home??=ctx?.get?.('profileContext')?.home; } catch {}
-  home??=path.dirname(rt.storageRoot);
+  let home;
+  try { home = ctx?.get?.('profileContext')?.home; } catch {}
+  home ??= process.env.DSH_HOME;
+  home ??= path.dirname(rt.storageRoot);
   const members=[...store.members().values()];
   const sessions=[
-    {id:teamId,name:'leader',group:'leader',actorRole:'leader',configuredModel:null},
-    ...members.map(m=>({id:m.childId,name:m.name,group:'execution',actorRole:m.actorRole??'member',configuredModel:m.model??null})),
+    {id:resolvedTeamId,name:'leader',group:'leader',actorRole:'leader',configuredModel:null,fallbackSeg:store.teamId},
+    ...members.map(m=>({id:m.childId,name:m.name,group:'execution',actorRole:m.actorRole??'member',configuredModel:m.model??null,fallbackSeg:null})),
   ].map(s=>{
     let rows=rt.actors.get(s.id)?.agent?.session?.snapshotEvents?.();
-    if (!rows?.some(nativeResponse)) rows=durableRows(home,s.id);
+    if (!rows?.some(nativeResponse)) rows=durableRows(home,s.id,s.fallbackSeg);
     return {...s,rows:rows??[],available:rows!==null&&rows!==undefined};
   });
   const extractSessionFallbackRoute = sess => {
@@ -210,8 +234,8 @@ export function teamObservability(ctx,rt,teamId) {
     const fb=extractSessionFallbackRoute(ds);
     return dedupedNativeRows(ds.rows).map(r=>({row:r,route:extractNativeRowRoute(r,fb,cfg)}));
   });
-  return { teamId,governanceSha256:snapshot?.sourceSha256??null,
-    roles:Object.entries(cfg.roles).map(([role,value])=>{
+  return { teamId:resolvedTeamId,governanceSha256:snapshot?.sourceSha256??null,
+    roles:Object.entries(cfg?.roles??{}).map(([role,value])=>{
       const actual=governance.filter(r=>r.role===role);
       if (role==='leader') {
         const requestRoutes=[...new Set(sessions[0].rows.filter(r=>r.type==='request/header').map(r=>r.data?.header?.config?.model).filter(Boolean))];
@@ -252,6 +276,18 @@ export function teamObservability(ctx,rt,teamId) {
 
 export function recentTeamObservability(ctx,rt,limit=8) {
   const root=path.join(rt.storageRoot,'teams');let dirs;
-  try { dirs=fs.readdirSync(root,{withFileTypes:true}).filter(d=>d.isDirectory()).map(d=>({id:d.name,time:fs.statSync(path.join(root,d.name)).mtimeMs})).sort((a,b)=>b.time-a.time); } catch { return []; }
+  try {
+    dirs=fs.readdirSync(root,{withFileTypes:true})
+      .filter(d=>{
+        if (!d.isDirectory()) return false;
+        const dirPath=path.join(root,d.name);
+        return fs.existsSync(path.join(dirPath,'members.jsonl')) || fs.existsSync(path.join(dirPath,'team.json'));
+      })
+      .map(d=>({
+        id:resolveTeamStoreLogicalId(rt.storageRoot,d.name),
+        time:fs.statSync(path.join(root,d.name)).mtimeMs,
+      }))
+      .sort((a,b)=>b.time-a.time);
+  } catch { return []; }
   return dirs.slice(0,limit).map(d=>{try{return teamObservability(ctx,rt,d.id);}catch(e){return{teamId:d.id,error:e.message};}});
 }

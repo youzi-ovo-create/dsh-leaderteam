@@ -14,6 +14,9 @@
     ARCHIVE: 'api/leaderteam-panel/archive',
     RETROSPECT: 'api/leaderteam-panel/retrospect',
     CLEAN: 'api/leaderteam-panel/clean',
+    SESSION_CONFIG: 'api/leaderteam-panel/session-config',
+    UPDATE: 'api/leaderteam-panel/update',
+    ONBOARDING: 'api/leaderteam-panel/onboarding',
   };
   const ROLE_META = [
     { key: 'leader', label: '领队 (leader)' },
@@ -36,7 +39,12 @@
   function isHttpWebSurface() {
     if (typeof window === 'undefined' || !window || !window.location) return false;
     const proto = window.location.protocol;
-    return proto === 'http:' || proto === 'https:';
+    return proto === 'http:' || proto === 'https:' || proto === 'dsh-app:';
+  }
+
+  function isDshAppSurface() {
+    if (typeof window === 'undefined' || !window || !window.location) return false;
+    return window.location.protocol === 'dsh-app:';
   }
 
   function isFileDesktopSurface() {
@@ -96,11 +104,21 @@
     } else {
       res = await fetch(route, reqInit);
     }
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-    const json = await res.json();
-    if (!json || json.ok !== true) {
-      const msg = (json && json.error && json.error.message) ? json.error.message : 'Request failed';
-      throw new Error(msg);
+    let json = null;
+    try {
+      json = await res.json();
+    } catch {}
+    if (!res.ok || !json || json.ok !== true) {
+      const msg = (json && json.error && json.error.message)
+        ? json.error.message
+        : ('HTTP ' + res.status);
+      const err = new Error(msg);
+      if (json && json.error) {
+        err.code = json.error.code || null;
+        err.details = json.error.details || null;
+      }
+      err.status = res.status;
+      throw err;
     }
     return json.value;
   }
@@ -163,6 +181,9 @@
       const [retroNotes, setRetroNotes] = useState('');
       const [cleanPreview, setCleanPreview] = useState(null);
       const [cleanDays, setCleanDays] = useState('');
+      const [updateCheckInfo, setUpdateCheckInfo] = useState(null);
+      const [quickProvider, setQuickProvider] = useState('deepseek');
+      const [quickApiKey, setQuickApiKey] = useState('');
 
       const hydrateFromState = useCallback((snap, opts) => {
         setData(snap);
@@ -441,7 +462,53 @@
         }
       };
 
+      const onSetSessionLeaderOverride = async (sid, nextRoute) => {
+        if (!sid) return;
+        setLoading(true);
+        setError(null);
+        setNotice(null);
+        try {
+          if (!nextRoute) {
+            const res = await postApi(ROUTES.SESSION_CONFIG, { action: 'reset', sessionId: sid });
+            if (res && res.state) hydrateFromState(res.state, { preserveDirty: isDirty });
+            setNotice(res.appliedImmediately ? ('会话 ' + sid + ' 已恢复跟随全局配置。') : ('会话 ' + sid + ' 正在执行，已暂存重置并在当前回合结束后生效。'));
+          } else {
+            const res = await postApi(ROUTES.SESSION_CONFIG, {
+              action: 'set',
+              sessionId: sid,
+              syncAllRolesToLeader: true,
+              patch: { roles: { leader: { route: nextRoute } } },
+            });
+            if (res && res.state) hydrateFromState(res.state, { preserveDirty: isDirty });
+            setNotice(res.appliedImmediately ? ('会话 ' + sid + ' 已切换为专属模型 ' + nextRoute + '（不影响全局及其他会话）。') : ('会话 ' + sid + ' 正在执行，已暂存模型切换并在安全边界自动生效。'));
+          }
+        } catch (e) {
+          setError(e && e.message ? e.message : String(e));
+        } finally {
+          setLoading(false);
+        }
+      };
+
+      const onAutoWireHostModels = async () => {
+        setLoading(true);
+        setError(null);
+        setNotice(null);
+        try {
+          const res = await postApi(ROUTES.SESSION_CONFIG, { action: 'auto-adopt-host' });
+          if (res && res.state) hydrateFromState(res.state, { preserveDirty: false });
+          setNotice('已根据当前 DSH 已连接模型一键自动配齐全部角色与成员执行池，所有空闲会话已立即生效！');
+        } catch (e) {
+          setError(e && e.message ? e.message : String(e));
+        } finally {
+          setLoading(false);
+        }
+      };
+
       const models = (data && Array.isArray(data.unifiedModels)) ? data.unifiedModels : [];
+      const sessionConfigs = (data && Array.isArray(data.sessionConfigs)) ? data.sessionConfigs : [];
+      const firstSid = sessionConfigs && sessionConfigs[0] && sessionConfigs[0].sessionId ? sessionConfigs[0].sessionId : '';
+      const baseNativeUrl = isDshAppSurface() ? '/lt/' : './lt/';
+      const ltNativeHref = firstSid ? (baseNativeUrl + '#/workbench?session=' + encodeURIComponent(firstSid)) : baseNativeUrl;
       const cardStyle = {
         border: '1px solid rgba(128,128,128,0.25)',
         borderRadius: '8px',
@@ -493,7 +560,7 @@
               ? h(
                 'a',
                 {
-                  href: './lt/',
+                  href: ltNativeHref,
                   style: {
                     display: 'inline-block',
                     padding: '5px 12px',
@@ -532,7 +599,7 @@
           },
           h('span', null, 'LT V2.2.x 原生工作台已就绪：提供完整网关与多 Key 管理、角色回退链配置、实时治理轴线、衡账分析及四套河洛序主题，与当前 DSH 前端共享同一会话与团队。'),
           isHttpWebSurface()
-            ? h('a', { href: './lt/', style: { color: '#9C5B2E', fontWeight: 600, whiteSpace: 'nowrap', textDecoration: 'none' } }, '立即进入 /lt/ →')
+            ? h('a', { href: ltNativeHref, style: { color: '#9C5B2E', fontWeight: 600, whiteSpace: 'nowrap', textDecoration: 'none' } }, '立即进入 /lt/ →')
             : h('span', { style: { color: '#9C5B2E', fontWeight: 600, whiteSpace: 'nowrap' } }, '终端运行 npx lt-ui 打开独立工作台')
         ),
         error ? h('div', { style: { padding: '8px 10px', borderRadius: '6px', background: 'rgba(220,38,38,0.15)', color: '#ef4444', marginBottom: '10px', fontSize: '12px' } }, '错误：' + error) : null,
@@ -601,6 +668,7 @@
             ['plugins', '可拆卸插件'],
             ['timers', '工程计时器'],
             ['archive', '历史计划归档 (' + archivePlans.length + ')'],
+            ['updates', '版本更新与新手引导'],
           ].map(([id, label]) =>
             h('button', { key: id, style: btnStyle(tab === id), onClick: () => setTab(id) }, label)
           )
@@ -610,14 +678,36 @@
         tab === 'models' ? h(
           'div',
           null,
+          sessionConfigs.length > 0
+            ? h('div', { style: cardStyle },
+                h('strong', { style: { display: 'block', marginBottom: '6px' } }, '会话级专属模型隔离配置（不影响全局与其他会话）'),
+                sessionConfigs.map(s => h('div', {
+                  key: s.sessionId,
+                  style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '8px', padding: '6px 0', borderTop: '1px solid rgba(128,128,128,0.15)', fontSize: '12px' },
+                },
+                h('span', { style: { fontFamily: 'monospace' } }, s.sessionId),
+                h('select', {
+                  value: s.hasSessionConfigOverride ? (s.effectiveLeaderRoute || '') : '',
+                  onChange: e => onSetSessionLeaderOverride(s.sessionId, e.target.value),
+                  disabled: loading,
+                  style: { ...inputStyle, maxWidth: '220px' },
+                },
+                h('option', { value: '' }, s.hasPendingSessionConfig ? '⏳ 待安全边界切换' : ('跟随全局 (' + (s.effectiveLeaderRoute || '默认') + ')')),
+                models.map(m => h('option', { key: m.route, value: m.route }, '本会话专属: ' + m.route))
+                )))
+              )
+            : null,
           h('div', { style: cardStyle },
             h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px', flexWrap: 'wrap', gap: '6px' } },
-              h('strong', null, '治理角色与领队模型（支持任意 DSH 上游 Provider 与非推理模型）'),
-              h('label', { style: { fontSize: '12px' } },
-                '写入目标：',
-                h('select', { value: saveTarget, onChange: e => setSaveTarget(e.target.value), style: { ...inputStyle, marginLeft: '4px' } },
-                  h('option', { value: 'local' }, '本机覆盖 (leaderteam.local.json)'),
-                  h('option', { value: 'base' }, '基础配置 (leaderteam.config.json)')
+              h('strong', null, '治理角色与领队模型（空闲会话立即热生效 · 支持任意 DSH 上游模型）'),
+              h('div', { style: { display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' } },
+                h('button', { style: btnStyle(false), onClick: onAutoWireHostModels, disabled: loading }, '✨ 一键用已连接模型配齐全部角色'),
+                h('label', { style: { fontSize: '12px' } },
+                  '写入目标：',
+                  h('select', { value: saveTarget, onChange: e => setSaveTarget(e.target.value), style: { ...inputStyle, marginLeft: '4px' } },
+                    h('option', { value: 'local' }, '本机覆盖 (leaderteam.local.json)'),
+                    h('option', { value: 'base' }, '基础配置 (leaderteam.config.json)')
+                  )
                 )
               )
             ),
@@ -868,6 +958,101 @@
               ))
               : null
           ) : null
+        ) : null,
+
+        // TAB 6: Auto-Update, Rollback, Host Compatibility & Quick Onboarding
+        tab === 'updates' ? h(
+          'div',
+          null,
+          h('div', { style: cardStyle },
+            h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px', flexWrap: 'wrap', gap: '6px' } },
+              h('strong', null, '版本更新、一键升级与宿主兼容性'),
+              h('button', {
+                style: btnStyle(true),
+                disabled: loading,
+                onClick: async () => {
+                  setLoading(true); setError(null); setNotice(null);
+                  try {
+                    const res = await postApi(ROUTES.UPDATE, { action: 'check', force: true });
+                    setUpdateCheckInfo(res.check);
+                    setNotice(res.check && res.check.hasUpdate ? ('发现新版本 v' + res.check.latestRelease.version + ' (' + res.check.latestRelease.tagName + ')！') : '当前已是当前平台发行分支最新版本。');
+                  } catch (e) { setError(e && e.message ? e.message : String(e)); }
+                  finally { setLoading(false); }
+                },
+              }, loading ? '检查中…' : '立即检查更新')
+            ),
+            h('div', { style: { fontSize: '12px', marginBottom: '8px' } },
+              '当前版本：v' + ((data && data.updater && data.updater.installed && data.updater.installed.version) || '2.2.2') +
+              ' · 分支：' + ((data && data.updater && data.updater.installed && data.updater.installed.trackInfo && data.updater.installed.trackInfo.label) || '开源版') +
+              (data && data.hostCompatibility ? (' · DSH 宿主：' + (data.hostCompatibility.toolsVersion || '') + ' (' + data.hostCompatibility.classification + ')') : '')
+            ),
+            (updateCheckInfo && updateCheckInfo.hasUpdate && updateCheckInfo.latestRelease)
+              ? h('div', { style: { padding: '10px', borderRadius: '6px', background: 'rgba(37,99,235,0.08)', marginBottom: '8px', fontSize: '12px' } },
+                  h('div', { style: { fontWeight: 700, marginBottom: '4px' } }, '可用更新：v' + updateCheckInfo.latestRelease.version + ' (' + updateCheckInfo.latestRelease.tagName + ')'),
+                  h('pre', { style: { whiteSpace: 'pre-wrap', maxHeight: '140px', overflowY: 'auto', fontSize: '11px', margin: '6px 0' } }, updateCheckInfo.latestRelease.body || '无详细说明'),
+                  h('button', {
+                    style: btnStyle(true),
+                    disabled: loading,
+                    onClick: async () => {
+                      setLoading(true); setError(null); setNotice('正在下载、校验 SHA-256、备份并升级…');
+                      try {
+                        const res = await postApi(ROUTES.UPDATE, { action: 'apply' });
+                        setNotice((res.result && res.result.message) || '已完成一键升级！');
+                        setTimeout(() => loadState({}), 2500);
+                      } catch (e) { setError(e && e.message ? e.message : String(e)); }
+                      finally { setLoading(false); }
+                    },
+                  }, '一键下载、校验并安装升级')
+                )
+              : null,
+            (data && data.updater && Array.isArray(data.updater.backups) && data.updater.backups.length > 0)
+              ? h('div', { style: { marginTop: '8px', fontSize: '12px' } },
+                  h('strong', null, '本地回滚快照：'),
+                  data.updater.backups.map(b => h('div', { key: b.backupId, style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '4px' } },
+                    h('span', null, 'v' + b.fromVersion + ' → v' + b.toVersion),
+                    h('button', {
+                      style: btnStyle(false),
+                      disabled: loading,
+                      onClick: async () => {
+                        setLoading(true); setError(null);
+                        try {
+                          const res = await postApi(ROUTES.UPDATE, { action: 'rollback', backupId: b.backupId });
+                          setNotice((res.result && res.result.message) || '已执行回滚');
+                        } catch (e) { setError(e && e.message ? e.message : String(e)); }
+                        finally { setLoading(false); }
+                      },
+                    }, '一键回滚至 v' + b.fromVersion)
+                  ))
+                )
+              : null
+          ),
+          h('div', { style: cardStyle },
+            h('strong', { style: { display: 'block', marginBottom: '6px' } }, '新手零命令行快速模型接入'),
+            h('div', { style: { fontSize: '11.5px', opacity: 0.8, marginBottom: '8px' } }, '直接选择厂商并粘贴 API Key，自动写入本地凭据库并生成全套团队角色路由，无需配置环境变量。'),
+            h('div', { style: { display: 'flex', gap: '6px', flexWrap: 'wrap', alignItems: 'center' } },
+              h('select', { style: inputStyle, value: quickProvider, onChange: e => setQuickProvider(e.target.value) },
+                h('option', { value: 'deepseek' }, 'DeepSeek'),
+                h('option', { value: 'dashscope' }, '阿里云百炼 (Qwen)'),
+                h('option', { value: 'zhipu' }, '智谱 (GLM)'),
+                h('option', { value: 'openai' }, 'OpenAI')
+              ),
+              h('input', { type: 'password', style: { ...inputStyle, flex: 1, minWidth: '160px' }, placeholder: '粘贴 API Key (sk-...)', value: quickApiKey, onChange: e => setQuickApiKey(e.target.value) }),
+              h('button', {
+                style: btnStyle(true),
+                disabled: loading || !quickApiKey.trim(),
+                onClick: async () => {
+                  setLoading(true); setError(null);
+                  try {
+                    await postApi(ROUTES.ONBOARDING, { action: 'apply-quick-setup', providerId: quickProvider, apiKey: quickApiKey.trim() });
+                    setQuickApiKey('');
+                    setNotice('已完成快速模型接入与团队角色配置！新建会话选择 LeaderTeam 预设即可开始。');
+                    await loadState({});
+                  } catch (e) { setError(e && e.message ? e.message : String(e)); }
+                  finally { setLoading(false); }
+                },
+              }, '一键保存并配置团队')
+            )
+          )
         ) : null
       );
     }

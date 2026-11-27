@@ -743,14 +743,24 @@ export function applyModelConfigChanges(changes = {}, options = {}) {
     const route = String(rawRoute ?? '').trim();
     if (!route) throw new LtError('BAD_CONFIG', 'removeModels entry must be a non-empty string');
     if (target === 'local') {
-      if (Object.hasOwn(nextBase.models ?? {}, route)) {
-        throw new LtError('BAD_CONFIG', `cannot remove base catalog model "${route}" via --local (local overrides merge onto base); omit --local to delete from catalog or use --pool-disable to disable it for members`);
-      }
-      if (!isPlainObj(nextLocal.models) || !Object.hasOwn(nextLocal.models, route)) {
+      const inBase = Object.hasOwn(nextBase.models ?? {}, route);
+      const inLocal = isPlainObj(nextLocal.models) && Object.hasOwn(nextLocal.models, route);
+      if (!inBase && !inLocal) {
         throw new LtError('BAD_CONFIG', `model "${route}" does not exist in leaderteam.local.json`);
       }
-      delete nextLocal.models[route];
-      if (changes.prunePool && Array.isArray(nextLocal.team?.executionPool)) {
+      if (inLocal) {
+        delete nextLocal.models[route];
+      }
+      if (inBase) {
+        nextLocal.team ??= {};
+        const prevDisabled = Array.isArray(nextLocal.team.disabledModels)
+          ? [...nextLocal.team.disabledModels]
+          : [...(nextBase.team?.disabledModels ?? [])];
+        if (!prevDisabled.includes(route)) prevDisabled.push(route);
+        nextLocal.team.disabledModels = prevDisabled;
+        poolAutoDisable.push(route);
+        warnings.push(`base catalog model "${route}" has been disabled and removed from the local execution pool in leaderteam.local.json`);
+      } else if (changes.prunePool && Array.isArray(nextLocal.team?.executionPool)) {
         nextLocal.team.executionPool = nextLocal.team.executionPool.filter(r => r !== route);
         touched.pool = true;
       }
@@ -843,6 +853,18 @@ export function applyModelConfigChanges(changes = {}, options = {}) {
     } else {
       effort = prior.effort;
     }
+    const targetModelSpec = mergedModelsNow[route];
+    if (
+      !item.requireExplicitEffort &&
+      (options.autoAlignRoleEfforts || (item.route && item.route !== prior.route)) &&
+      Array.isArray(targetModelSpec?.efforts) &&
+      targetModelSpec.efforts.length > 0 &&
+      !targetModelSpec.efforts.includes(effort)
+    ) {
+      effort = targetModelSpec.defaultEffort && targetModelSpec.efforts.includes(targetModelSpec.defaultEffort)
+        ? targetModelSpec.defaultEffort
+        : targetModelSpec.efforts[0];
+    }
 
     const leaderMaxTokens = (item.clearMaxTokens || item.maxTokens === null)
       ? undefined
@@ -864,7 +886,21 @@ export function applyModelConfigChanges(changes = {}, options = {}) {
         ...(nonLeaderMaxTokens !== undefined ? { maxTokens: nonLeaderMaxTokens } : {}),
         timeoutMs: item.timeoutMs ?? prior.timeoutMs ?? DEFAULT_ROLE_LIMITS[role].timeoutMs,
         retries: item.retries ?? prior.retries ?? DEFAULT_ROLE_LIMITS[role].retries,
-        ...(Array.isArray(item.fallback) ? { fallback: item.fallback.map(f => ({ ...f })) } : {}),
+        ...(Array.isArray(item.fallback) ? { fallback: item.fallback.map(f => {
+          const fbCopy = { ...f };
+          const fbSpec = mergedModelsNow[fbCopy.route];
+          if (
+            options.autoAlignRoleEfforts &&
+            Array.isArray(fbSpec?.efforts) &&
+            fbSpec.efforts.length > 0 &&
+            !fbSpec.efforts.includes(fbCopy.effort)
+          ) {
+            fbCopy.effort = fbSpec.defaultEffort && fbSpec.efforts.includes(fbSpec.defaultEffort)
+              ? fbSpec.defaultEffort
+              : fbSpec.efforts[0];
+          }
+          return fbCopy;
+        }) } : {}),
       };
     if (role !== 'leader' && nonLeaderMaxTokens === undefined) delete nextRole.maxTokens;
     if (role !== 'leader' && Array.isArray(nextRole.fallback)) nextRole.fallback = nextRole.fallback.filter(f => f.route !== route);
@@ -912,7 +948,28 @@ export function applyModelConfigChanges(changes = {}, options = {}) {
     dest.requestWindow = { ...(dest.requestWindow ?? {}), ...changes.setRequestWindow };
   }
 
-  // 5c. Auto-prune stale `team.executionFallbacks` routes when `executionPool`, families, or models change
+  // 5c. Auto-unblock disabledFamilies when a user explicitly enables or assigns a model of that family
+  if ((changes.poolDisableFamilies?.length ?? 0) === 0) {
+    const previewMerged = mergeConfigLayers(nextBase, nextLocal);
+    const activeRoutes = new Set([
+      ...(previewMerged.team?.executionPool ?? []),
+      ...Object.values(previewMerged.roles ?? {}).flatMap(r => [r?.route, ...(r?.fallback ?? []).map(f => f?.route)]).filter(Boolean),
+    ]);
+    const activeFams = new Set([...activeRoutes].map(r => previewMerged.models?.[r]?.family).filter(Boolean));
+    const curDisabledFams = previewMerged.team?.disabledFamilies ?? [];
+    if (Array.isArray(curDisabledFams) && curDisabledFams.some(f => activeFams.has(f))) {
+      const filteredFams = curDisabledFams.filter(f => !activeFams.has(f));
+      if (target === 'base') {
+        nextBase.team ??= {};
+        nextBase.team.disabledFamilies = filteredFams;
+      } else {
+        nextLocal.team ??= {};
+        nextLocal.team.disabledFamilies = filteredFams;
+      }
+    }
+  }
+
+  // 5d. Auto-prune stale `team.executionFallbacks` routes when `executionPool`, families, or models change
   if (touched.pool || touched.removedModels.size > 0 || (changes.poolDisableFamilies?.length ?? 0) > 0) {
     if (target === 'base' && isPlainObj(nextBase.team?.executionFallbacks)) {
       const { next, pruned } = pruneExecutionFallbacksMap(

@@ -30,9 +30,11 @@ export function quotaGate(config, quotaState, route, now) {
   if (quota.status === 'exhausted') return { allowed: false, quota, error: `model ${route} quota is exhausted (${quota.reason}${quota.nextResetAt ? `, resets ${quota.nextResetAt}` : ''}); choose another model` };
   if (quota.status === 'unknown') {
     const isGpt = modelCfg?.family === 'gpt';
-    const allow = isGpt ? (config.quota.allowUnknownGpt && config.quota.allowUnknown) : config.quota.allowUnknown;
+    // Only guard Magpie's shared Codex reserve by default; user-configured direct GPT providers pass freely when stateFile is null.
+    const isMagpieSharedGpt = isGpt && (!modelCfg?.provider || modelCfg.provider === config.magpie?.provider);
+    const allow = isMagpieSharedGpt ? (config.quota.allowUnknownGpt && config.quota.allowUnknown) : config.quota.allowUnknown;
     if (!allow) {
-      const flag = isGpt && !config.quota.allowUnknownGpt ? 'quota.allowUnknownGpt' : 'quota.allowUnknown';
+      const flag = isMagpieSharedGpt && !config.quota.allowUnknownGpt ? 'quota.allowUnknownGpt' : 'quota.allowUnknown';
       return { allowed: false, quota, error: `quota for ${route} is unknown (${quota.reason}) and ${flag} is false` };
     }
   }
@@ -41,10 +43,13 @@ export function quotaGate(config, quotaState, route, now) {
 /**
  * Compare the leader session's live model selection with roles.leader.
  * selection: {provider, model, reasoningEffort?} | undefined (unknown). Policy team.leaderModelPolicy:
- * "enforce" (default) blocks team tools on mismatch or unknown; "warn" reports only; "off" skips the check.
+ * - "follow" (default): automatically syncs user session model/effort changes without throwing mismatch errors;
+ * - "enforce" (opt-in): strictly blocks team tools on mismatch or unknown;
+ * - "warn": reports mismatch without blocking;
+ * - "off": skips the check.
  */
 export function checkLeaderModel(config, selection) {
-  const policy = config.team.leaderModelPolicy ?? 'enforce';
+  const policy = config.team.leaderModelPolicy ?? 'follow';
   const target = resolveModelTarget(config, config.roles.leader.route, config.roles.leader.effort);
   const configured = { provider: target.provider, model: target.model, route: config.roles.leader.route, effort: config.roles.leader.effort };
   const actual = selection && typeof selection.provider === 'string' && typeof selection.model === 'string'
@@ -52,6 +57,21 @@ export function checkLeaderModel(config, selection) {
     : null;
   const base = { policy, configured, actual };
   if (policy === 'off') return { ...base, status: 'unchecked', blocked: false };
+  if (policy === 'follow') {
+    if (actual === null) return { ...base, status: 'follow-default', blocked: false };
+    const effortMatches = configured.effort === 'none'
+      ? (actual.effort === null || actual.effort === 'none')
+      : (actual.effort === null || actual.effort === configured.effort);
+    if (actual.provider === configured.provider && actual.model === configured.model && effortMatches) {
+      return { ...base, status: 'match', blocked: false };
+    }
+    return {
+      ...base,
+      status: 'synced',
+      blocked: false,
+      note: `session leader synced to ${actual.provider}/${actual.model}${actual.effort ? ` (${actual.effort})` : ''}`,
+    };
+  }
   if (actual === null) {
     const message = `cannot determine this leader session's model; the configured leader is ${configured.provider}/${configured.model} (roles.leader)`;
     return { ...base, status: 'unknown', blocked: policy === 'enforce', message };

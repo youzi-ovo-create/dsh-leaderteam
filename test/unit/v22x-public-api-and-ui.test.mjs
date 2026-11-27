@@ -12,8 +12,9 @@ import {
 import { startStandaloneLtUiServer } from '../../bin/lt-ui.mjs';
 import { loadConfig } from '../../leaderteam/core/config.mjs';
 import { bindRuntimeConfigFile } from '../../leaderteam/host/runtime.mjs';
-import { startMockMagpieServer } from '../../../lt-shared-contracts/mocks/mock-magpie-server.mjs';
-import { validateContractBundle } from '../../../lt-shared-contracts/tests/contract-validator.mjs';
+import { loadSharedContractsModules } from '../helpers/shared-contracts-loader.mjs';
+
+const { startMockMagpieServer, validateContractBundle } = await loadSharedContractsModules();
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '..', '..');

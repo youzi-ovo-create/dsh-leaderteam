@@ -113,21 +113,35 @@ export function buildSoloProviderSettingsTemplates(env = process.env) {
   const templates = {};
   for (const preset of SOLO_PROVIDER_PRESETS) {
     const activeEnvVar = preset.envVars.find(k => typeof env?.[k] === 'string' && env[k].trim().length > 0) ?? preset.envVars[0];
+    const reasoningModelId = preset.reasoningRoute.slice(preset.provider.length + 1);
+    const chatModelId = preset.chatRoute.slice(preset.provider.length + 1);
     templates[preset.provider] = {
       displayName: preset.displayName ?? preset.provider,
       apiKeyEnv: activeEnvVar,
       ...(preset.catalogRoute ? {} : { api: preset.api ?? 'openai-completions', baseURL: preset.defaultBaseURL }),
       modelMetadata: {
-        [preset.reasoningRoute.slice(preset.provider.length + 1)]: {
+        [reasoningModelId]: {
           ...(preset.reasoningContextWindow ? { contextWindow: preset.reasoningContextWindow } : {}),
           ...(preset.reasoningMaxTokens ? { maxTokens: preset.reasoningMaxTokens } : {}),
           ...(preset.reasoningCompat ? { compat: preset.reasoningCompat } : {}),
         },
-        [preset.chatRoute.slice(preset.provider.length + 1)]: {
+        [chatModelId]: {
           ...(preset.chatContextWindow ? { contextWindow: preset.chatContextWindow } : {}),
           ...(preset.chatMaxTokens ? { maxTokens: preset.chatMaxTokens } : {}),
           ...(preset.chatCompat ? { compat: preset.chatCompat } : {}),
         },
+        ...(preset.id === 'deepseek' ? {
+          'deepseek-reasoner': {
+            contextWindow: 128000,
+            maxTokens: 65536,
+            compat: preset.reasoningCompat,
+          },
+          'deepseek-chat': {
+            contextWindow: 128000,
+            maxTokens: 8192,
+            compat: preset.chatCompat,
+          },
+        } : {}),
       },
     };
   }
@@ -210,7 +224,7 @@ export function buildSoloKeyStarterConfig(baseRawConfig, { preset = SOLO_PROVIDE
 
   cfg.team = {
     ...cfg.team,
-    leaderModelPolicy: 'warn',
+    leaderModelPolicy: 'follow',
     executionPool: cRoute !== rRoute ? [cRoute, rRoute] : [rRoute],
     autoIncludeUpstreamModels: true,
     disabledModels: [],
@@ -221,7 +235,7 @@ export function buildSoloKeyStarterConfig(baseRawConfig, { preset = SOLO_PROVIDE
     ...cfg.quota,
     stateFile: null,
     allowUnknown: true,
-    allowUnknownGpt: preset.family === 'gpt',
+    allowUnknownGpt: true,
   };
 
   return cfg;

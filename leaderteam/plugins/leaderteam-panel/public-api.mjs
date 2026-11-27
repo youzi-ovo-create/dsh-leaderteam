@@ -12,7 +12,7 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { TeamStore, readJsonl, writeFileAtomic } from '../../core/store.mjs';
+import { TeamStore, readJsonl, writeFileAtomic, resolveTeamStoreLogicalId } from '../../core/store.mjs';
 import { frontierView } from '../../core/frontier.mjs';
 import { isAutonomousGovernance, replayGovernanceState } from '../../core/governance-protocol.mjs';
 import { computeTimerSnapshot, resolveNowMs } from '../../core/timer.mjs';
@@ -25,11 +25,23 @@ import { loadConfig } from '../../core/config.mjs';
 import {
   runtime,
   baseRuntime,
+  runtimeForTeam,
   bindRuntimeConfigFile,
   syncRuntimeConfig,
   activePluginsMap,
   refreshUpstreamCatalog,
+  inspectSessionBusyForConfig,
+  effectiveSessionConfig,
+  rebindTeamGovernanceSnapshot,
+  rebindAllIdleSessionsOnGlobalUserSave,
 } from '../../host/runtime.mjs';
+import {
+  readSessionConfigRecord,
+  hasActiveSessionOverride,
+  hasPendingSessionOverride,
+  mutateSessionConfig,
+  buildAutoAdoptedLocalOverrideFromDshModels,
+} from '../../core/session-config.mjs';
 import { recentTeamObservability } from '../../host/observability.mjs';
 import {
   getOrCreateGatewayManager,
@@ -47,10 +59,27 @@ import {
   resolveStorageRoot,
 } from '../../../packages/lt-usage/index.mjs';
 import { listKnownHomes } from '../../../packages/lt-usage/reader/homes.js';
+import { getHostCompatibilityMatrix } from '../../core/host-compat.mjs';
+import {
+  UPDATE_TRACKS,
+  readInstalledVersionInfo,
+  readUpdaterState,
+  writeUpdaterState,
+  listSavedBackups,
+  checkForUpdates,
+  performOneClickUpgrade,
+  rollbackToSavedBackup,
+} from '../../core/updater.mjs';
+import {
+  buildOnboardingSnapshot,
+  writePersistedOnboardingRecord,
+  probeProviderKeyConnectivity,
+  applyQuickOnboardingSetup,
+} from '../../core/onboarding.mjs';
 import pkg from '../../../package.json' with { type: 'json' };
 
 export const CONTRACT_ID = 'lt.public.v1';
-export const CONTRACT_VERSION = '1.0.0';
+export const CONTRACT_VERSION = '1.0.1';
 
 export const PUBLIC_API_ROUTES = Object.freeze({
   CAPABILITIES: '/api/lt/v1/capabilities',
@@ -68,6 +97,7 @@ export const PUBLIC_API_ROUTES = Object.freeze({
   WORKBENCH_CREATE: '/api/lt/v1/workbench/create',
   WORKBENCH_PROMPT: '/api/lt/v1/workbench/prompt',
   WORKBENCH_CANCEL: '/api/lt/v1/workbench/cancel',
+  WORKBENCH_SESSION_CONFIG: '/api/lt/v1/workbench/session-config',
   ARCHIVE_QUERY: '/api/lt/v1/archive/query',
   ARCHIVE_ACTION: '/api/lt/v1/archive/action',
   USAGE_STATUS: '/api/lt/v1/usage/status',
@@ -77,6 +107,9 @@ export const PUBLIC_API_ROUTES = Object.freeze({
   USAGE_PRICING: '/api/lt/v1/usage/pricing',
   USAGE_TOGGLE: '/api/lt/v1/usage/toggle',
   UI_PREFERENCES: '/api/lt/v1/ui-preferences',
+  SYSTEM_COMPATIBILITY: '/api/lt/v1/system/compatibility',
+  SYSTEM_UPDATE: '/api/lt/v1/system/update',
+  ONBOARDING: '/api/lt/v1/onboarding',
 });
 
 export const PUBLIC_READONLY_API_ROUTES = new Set([
@@ -90,6 +123,7 @@ export const PUBLIC_READONLY_API_ROUTES = new Set([
   PUBLIC_API_ROUTES.USAGE_STATUS,
   PUBLIC_API_ROUTES.USAGE_OVERVIEW,
   PUBLIC_API_ROUTES.USAGE_SESSIONS,
+  PUBLIC_API_ROUTES.SYSTEM_COMPATIBILITY,
 ]);
 
 export const SUPPORTED_V22_ROLES = Object.freeze([
@@ -135,14 +169,21 @@ function okEnvelope(data) {
   );
 }
 
-function errEnvelope(code, message, status = 200, retriable = false, extraHeaders = {}) {
+function errEnvelope(code, message, status = 200, detailsOrRetriable = undefined, extraHeaders = {}) {
+  const retriable = typeof detailsOrRetriable === 'boolean' ? detailsOrRetriable : status === 409;
+  const hasDetails = detailsOrRetriable !== undefined && typeof detailsOrRetriable !== 'boolean';
   return Response.json(
     {
       ok: false,
       contract: CONTRACT_ID,
       contractVersion: CONTRACT_VERSION,
       generatedAt: new Date().toISOString(),
-      error: { code, message, retriable },
+      error: {
+        code,
+        message,
+        retriable,
+        ...(hasDetails ? { details: detailsOrRetriable } : {}),
+      },
     },
     { status, headers: { 'cache-control': 'no-store', ...extraHeaders } },
   );
@@ -158,11 +199,18 @@ function httpContractError(code, message, status = 400, headers = null) {
   return err;
 }
 
-function errFromException(fallbackCode, e) {
-  const status = Number.isInteger(e?.status) && e.status >= 400 ? e.status : 200;
+function errFromException(fallbackCode, e, defaultStatus = 200) {
+  const rawStatus = Number.isInteger(e?.status) ? e.status : (Number.isInteger(e?.statusCode) ? e.statusCode : defaultStatus);
+  const status = rawStatus >= 400 ? rawStatus : 200;
   const code = typeof e?.code === 'string' && e.code ? e.code : fallbackCode;
   const extraHeaders = e?.headers && typeof e.headers === 'object' ? e.headers : {};
-  return errEnvelope(code, e instanceof Error ? e.message : String(e), status, false, extraHeaders);
+  return errEnvelope(
+    code,
+    e instanceof Error ? e.message : String(e),
+    status,
+    e?.details !== undefined ? e.details : false,
+    extraHeaders,
+  );
 }
 
 async function parseJsonRequest(request, { allowGet = false } = {}) {
@@ -272,9 +320,10 @@ function sanitizeOAuthSignInResult(raw) {
 }
 
 function resolveDshHomeFromCtx(ctx, rt) {
-  let home = process.env.DSH_HOME || null;
-  if (!home) {
-    try { home = ctx?.get?.('profileContext')?.home ?? null; } catch {}
+  let home = null;
+  try { home = ctx?.get?.('profileContext')?.home ?? null; } catch {}
+  if (!home && process.env.DSH_HOME) {
+    home = process.env.DSH_HOME;
   }
   if (!home && rt?.storageRoot) {
     home = path.dirname(rt.storageRoot);
@@ -344,11 +393,14 @@ function writeUiPreferences(storageRoot, patch) {
 
 function getHostService(ctx, key) {
   if (!ctx) return null;
+  if (typeof ctx.get === 'function') {
+    try {
+      const val = ctx.get(key);
+      if (val !== undefined && val !== null) return val;
+    } catch {}
+  }
   try {
-    if (ctx[key]) return ctx[key];
-  } catch {}
-  try {
-    return ctx.get?.(key) ?? null;
+    return ctx[key] ?? null;
   } catch {
     return null;
   }
@@ -390,7 +442,13 @@ export function buildCapabilitiesPayload(ctx, rt, { hostKindOverride = null } = 
       usageAnalytics: true,
       usageOfflineImport: true,
       themePersistence: Boolean(rt?.storageRoot),
+      inSessionDualMode: false,
+      autoUpdate: true,
+      onboardingWizard: true,
+      hostCompatibilityMatrix: true,
     },
+    distributionTrack: 'open-source',
+    hostCompatibility: rt?.hostCompatibility ?? null,
     supportedRoles: SUPPORTED_V22_ROLES,
   };
 }
@@ -953,8 +1011,9 @@ export function enrichChangesWithDiscoveredProviders(changes, rtConfig, discover
   };
 }
 
-export async function syncActiveModelsToDshHost(ctx, rt, effective, discoveredModels = [], gwStatus = null, extraUpserts = []) {
-  if (!ctx) return { synced: false, reason: 'no-host-context', updatedProviders: [] };
+export async function syncActiveModelsToDshHost(ctx, rt, effective, discoveredModels = [], gwStatus = null, extraUpserts = [], syncOpts = {}) {
+  const standaloneDshHome = !ctx && syncOpts?.dshHome ? syncOpts.dshHome : null;
+  if (!ctx && !standaloneDshHome) return { synced: false, reason: 'no-host-context', updatedProviders: [] };
   const magpieProv = resolveMagpieGatewayHostProvider(effective ?? rt?.config);
   const configuredDefaultProv = effective?.magpie?.provider ?? rt?.config?.magpie?.provider ?? magpieProv;
   const templates = buildSoloProviderSettingsTemplates(process.env);
@@ -1002,11 +1061,22 @@ export async function syncActiveModelsToDshHost(ctx, rt, effective, discoveredMo
       maxTokens: spec.maxTokens ?? dm?.upstreamMaxTokens ?? dm?.maxTokens ?? dm?.defaultMaxTokens,
     });
   }
+  let leaderTarget = null;
+  if (effective?.roles?.leader?.route && effective?.models) {
+    try {
+      leaderTarget = resolveModelTarget(effective, effective.roles.leader.route, effective.roles.leader.effort);
+    } catch {}
+  }
   return syncUpstreamModelsToDshSettings(
     ctx,
     [...byRouteToSync.values()],
     magpieProv,
-    { providerTemplates: templates },
+    {
+      providerTemplates: templates,
+      leaderTarget,
+      autoSelectIfDefaultUnconfigured: true,
+      ...(standaloneDshHome ? { dshHome: standaloneDshHome } : {}),
+    },
   ).catch(err => ({
     synced: false,
     reason: err instanceof Error ? err.message : String(err),
@@ -1045,10 +1115,11 @@ function discoverStandaloneWorkbenchSessions(dshHome, storageRoot, archivedSet) 
     try {
       for (const entry of fs.readdirSync(teamsRoot, { withFileTypes: true })) {
         if (!entry.isDirectory()) continue;
-        if (!TeamStore.exists(storageRoot, entry.name)) continue;
+        const entryDir = path.join(teamsRoot, entry.name);
+        if (!fs.existsSync(path.join(entryDir, 'members.jsonl')) && !fs.existsSync(path.join(entryDir, 'team.json'))) continue;
         teamDirs.push(entry.name);
         try {
-          const members = foldMembers(readJsonl(path.join(teamsRoot, entry.name, 'members.jsonl')).records);
+          const members = foldMembers(readJsonl(path.join(entryDir, 'members.jsonl')).records);
           for (const m of members.values()) {
             if (m?.childId) childIds.add(String(m.childId));
           }
@@ -1086,7 +1157,7 @@ function discoverStandaloneWorkbenchSessions(dshHome, storageRoot, archivedSet) 
       const tf = path.join(dirPath, 'team.json');
       if (fs.existsSync(tf)) teamJson = JSON.parse(fs.readFileSync(tf, 'utf8'));
     } catch {}
-    const sid = String(teamJson?.sessionId ?? teamJson?.teamId ?? dirName).trim();
+    const sid = String(resolveTeamStoreLogicalId(storageRoot, dirName) || '').trim();
     if (!sid || childIds.has(sid) || archivedSet.has(sid)) continue;
     if (teamJson?.parentSessionId || teamJson?.origin === 'subagent') continue;
     const existing = bySessionId.get(sid);
@@ -1248,6 +1319,18 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
         const runtimeSnap = await buildRuntimeSnapshotPayload(ctx, rt);
         const uiPreferences = readUiPreferences(storageRoot);
         const usageStatus = await getUsageBridge().getStatus();
+        const pluginRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
+        const installedInfo = readInstalledVersionInfo(pluginRoot);
+        const updaterState = readUpdaterState(storageRoot);
+        const backups = listSavedBackups(storageRoot);
+        const onboardingSnap = buildOnboardingSnapshot({
+          storageRoot,
+          dshHome: getDshHome(),
+          hasLocalOverrides: Boolean(runtimeSnap?.localOverrides?.exists),
+          hasGatewayRunning: gateway?.state === 'running',
+          hasExternalProviders: Array.isArray(providers) && providers.some(p => p.enabled),
+          sessionCount: Array.isArray(runtimeSnap?.teams) ? runtimeSnap.teams.length : 0,
+        });
 
         return okEnvelope({
           capabilities: buildCapabilitiesPayload(ctx, rt, { hostKindOverride: options.hostKindOverride }),
@@ -1258,6 +1341,17 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
           runtime: runtimeSnap,
           uiPreferences,
           usageStatus,
+          onboarding: onboardingSnap,
+          updater: {
+            installed: installedInfo,
+            tracks: Object.values(UPDATE_TRACKS),
+            state: updaterState,
+            backups: backups.slice(0, 10),
+          },
+          compatibilityMatrix: getHostCompatibilityMatrix({
+            track: installedInfo.track,
+            currentHostVersion: rt?.hostCompatibility?.toolsVersion ?? null,
+          }),
         });
       } catch (e) {
         return errFromException('BUNDLE_FAILED', e);
@@ -1572,18 +1666,25 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
           target,
           dryRun: Boolean(body.dryRun),
           discoveredModels,
+          autoAlignRoleEfforts: true,
         });
         let dshSettingsSync = { synced: false, reason: body.dryRun ? 'dry-run' : 'no-host-context', updatedProviders: [] };
         const warnings = [...(applyResult.warnings ?? [])];
+        let idleRebind = { reboundIds: [], skippedBusyIds: [] };
         if (!body.dryRun) {
           syncRuntimeConfig(rt);
-          if (ctx) {
+          idleRebind = rebindAllIdleSessionsOnGlobalUserSave(rt, {
+            principal: { kind: 'user', source: 'lt-public-v1' },
+          });
+          if (ctx || options.dshHome) {
             dshSettingsSync = await syncActiveModelsToDshHost(
               ctx,
               rt,
               applyResult.effective,
               discoveredModels,
               gwStatus,
+              [],
+              { dshHome: options.dshHome || null },
             );
             if (
               !dshSettingsSync.synced &&
@@ -1601,6 +1702,7 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
           },
           dshSettingsSync,
           shadowedByLocal: applyResult.shadowedByLocal ?? [],
+          idleRebind,
           warnings,
           runtime: await buildRuntimeSnapshotPayload(ctx, rt),
         });
@@ -1728,17 +1830,18 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
 
     async workbenchCreate(request) {
       try {
+        ensureConfigLoaded();
         const body = await parseJsonRequest(request);
         const sessionController = getHostService(ctx, 'sessionController');
         if (!sessionController || typeof sessionController.create !== 'function') {
           return errEnvelope('HOST_UNAVAILABLE', 'Live DSH session controller is only available inside DSH web/desktop runtime');
         }
+        const requestedPreset = body.agentPreset || body.preset || 'leaderteam';
         const created = await sessionController.create({
           ...(body.workspaceId ? { workspaceId: body.workspaceId } : { cwd: body.cwd || process.cwd() }),
-          agentPreset: body.agentPreset || 'leaderteam',
+          agentPreset: requestedPreset,
         });
         const createdSid = String(created?.sessionId ?? created?.id ?? '').trim();
-        const requestedPreset = body.agentPreset || 'leaderteam';
         const effectivePreset = created?.agentPreset ?? requestedPreset;
         if (createdSid && effectivePreset === 'leaderteam' && !body.model && rt?.config?.roles?.leader?.route) {
           const leaderTarget = resolveModelTarget(
@@ -1766,10 +1869,16 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
               const agentsSvc = getHostService(ctx, 'agents');
               const liveAgent =
                 agentsSvc?.get?.(createdSid)
+                ?? baseRuntime(rt)?.hostAgents?.get?.(createdSid)
                 ?? baseRuntime(rt)?.actors?.get?.(createdSid)?.agent
+                ?? created?.agent
                 ?? null;
               if (typeof liveAgent?.model?.select === 'function') {
+                const llmSvc = getHostService(ctx, 'llm') ?? getHostService(liveAgent?.ctx, 'llm');
                 try {
+                  if (typeof llmSvc?.resolveCallConfig === 'function') {
+                    await llmSvc.resolveCallConfig(selection);
+                  }
                   liveAgent.model.select(selection);
                 } catch {}
               }
@@ -1786,9 +1895,231 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
           }
           rt.workbenchCreatedSessionIds.add(createdSid);
         }
-        return okEnvelope(created);
+        return okEnvelope({
+          ...created,
+          ...(createdSid ? { sessionId: createdSid } : {}),
+          agentPreset: effectivePreset,
+        });
       } catch (e) {
         return errFromException('WORKBENCH_CREATE_FAILED', e);
+      }
+    },
+
+    async workbenchSessionConfig(request) {
+      try {
+        ensureConfigLoaded();
+        const body = await parseJsonRequest(request);
+        const action = String(body.action || 'get').trim().toLowerCase();
+        const storageRoot = getStorageRoot();
+        const principal = { kind: 'user', source: 'lt-public-v1' };
+        const mgr = getGatewayMgr();
+        const { gwStatus, discoveredModels } = await collectCombinedDiscoveredModels(ctx, rt, mgr);
+
+        const buildSnap = sid => {
+          const rec = readSessionConfigRecord(storageRoot, sid);
+          const busy = inspectSessionBusyForConfig(rt, sid);
+          const eff = effectiveSessionConfig(rt, sid) ?? rt.config;
+          return {
+            sessionId: sid,
+            hasOverride: hasActiveSessionOverride(rec),
+            hasPending: hasPendingSessionOverride(rec),
+            isBusy: busy.busy,
+            busyReasons: busy.reasons,
+            record: rec,
+            effective: {
+              roles: eff?.roles ?? {},
+              executionPool: eff?.team?.executionPool ?? [],
+              maxActiveMembers: eff?.team?.maxActiveMembers ?? 6,
+              leaderModelPolicy: eff?.team?.leaderModelPolicy ?? 'follow',
+            },
+          };
+        };
+
+        if (action === 'auto-adopt-host') {
+          const scope = body.scope === 'session' ? 'session' : 'global';
+          const candidatePool = discoveredModels?.length > 0
+            ? discoveredModels
+            : Object.entries(rt.config?.models ?? {}).map(([route, s]) => ({
+                route,
+                provider: s.provider ?? rt.config?.magpie?.provider,
+                upstreamModel: s.upstreamModel ?? route,
+                family: s.family,
+                label: s.label,
+                efforts: s.efforts,
+                defaultEffort: s.defaultEffort,
+                vision: s.vision,
+                contextWindow: s.contextWindow,
+                maxTokens: s.maxTokens,
+                registeredInDsh: true,
+              }));
+          const adopted = buildAutoAdoptedLocalOverrideFromDshModels(candidatePool);
+          if (!adopted) {
+            return errEnvelope('NO_USABLE_MODELS', '未发现可用的已注册模型，请先连接至少一个模型供应商。', 400);
+          }
+          if (scope === 'session') {
+            const sessionId = String(body.sessionId || '').trim();
+            if (!sessionId) return errEnvelope('BAD_REQUEST', 'sessionId is required for scope="session"', 400);
+            const busy = inspectSessionBusyForConfig(rt, sessionId);
+            const mut = mutateSessionConfig({
+              storageRoot,
+              sessionId,
+              baseConfig: rt.config,
+              patch: adopted,
+              action: 'set',
+              principal,
+              isBusy: busy.busy,
+              busyReasons: busy.reasons,
+              discoveredModels,
+            });
+            if (mut.appliedImmediately) {
+              rebindTeamGovernanceSnapshot(rt, sessionId, { principal, forceAtSafeBoundary: true });
+            }
+            return okEnvelope({
+              scope: 'session',
+              appliedImmediately: mut.appliedImmediately,
+              stagedForSafeBoundary: mut.stagedForSafeBoundary,
+              sessionConfig: buildSnap(sessionId),
+            });
+          }
+
+          const setRoles = Object.entries(adopted.roles).map(([role, spec]) => ({ role, ...spec }));
+          const upsertModels = Object.entries(adopted.models).map(([route, spec]) => ({ route, ...spec }));
+          applyModelConfigChanges(
+            {
+              upsertModels,
+              poolSet: adopted.team.executionPool,
+              setRoles,
+              leaderModelPolicy: 'follow',
+            },
+            {
+              configFile: rt.configPath,
+              target: 'local',
+              discoveredModels,
+              autoAlignRoleEfforts: true,
+            },
+          );
+          syncRuntimeConfig(rt);
+          const idleRebind = rebindAllIdleSessionsOnGlobalUserSave(rt, { principal });
+          if (ctx || options.dshHome) {
+            await syncActiveModelsToDshHost(ctx, rt, rt.config, discoveredModels, gwStatus, [], { dshHome: options.dshHome || null }).catch(() => null);
+          }
+          return okEnvelope({
+            scope: 'global',
+            idleRebind,
+            runtime: await buildRuntimeSnapshotPayload(ctx, rt),
+          });
+        }
+
+        const sessionId = String(body.sessionId || '').trim();
+        if (!sessionId) return errEnvelope('BAD_REQUEST', 'sessionId is required', 400);
+
+        if (action === 'get') {
+          return okEnvelope(buildSnap(sessionId));
+        }
+
+        if (action === 'set') {
+          const busy = inspectSessionBusyForConfig(rt, sessionId);
+          const rawPatch = isPlainObj(body.patch) ? body.patch : {};
+          const patch = {
+            ...rawPatch,
+            ...(body.syncAllRolesToLeader ? { syncAllRolesToLeader: true } : {}),
+          };
+          const mut = mutateSessionConfig({
+            storageRoot,
+            sessionId,
+            baseConfig: rt.config,
+            patch,
+            action: body.replaceAll ? 'set' : 'merge',
+            principal,
+            isBusy: busy.busy,
+            busyReasons: busy.reasons,
+            discoveredModels,
+          });
+          if (mut.appliedImmediately) {
+            rebindTeamGovernanceSnapshot(rt, sessionId, { principal, forceAtSafeBoundary: true });
+            if (ctx || options.dshHome) {
+              await syncActiveModelsToDshHost(ctx, rt, mut.effectiveConfig, discoveredModels, gwStatus, [], { dshHome: options.dshHome || null }).catch(() => null);
+            }
+            const baseRt = baseRuntime(rt);
+            const liveAgent = baseRt?.actors?.get?.(sessionId)?.agent ?? baseRt?.hostAgents?.get?.(sessionId) ?? null;
+            if (liveAgent && typeof liveAgent.model?.select === 'function' && patch.roles?.leader) {
+              try {
+                const effCfg = effectiveSessionConfig(rt, sessionId) ?? rt.config;
+                const tgt = resolveModelTarget(effCfg, effCfg.roles.leader.route, effCfg.roles.leader.effort);
+                liveAgent.model.select(tgt);
+              } catch {}
+            }
+          }
+          return okEnvelope({
+            appliedImmediately: mut.appliedImmediately,
+            stagedForSafeBoundary: mut.stagedForSafeBoundary,
+            busyReasons: mut.busyReasons,
+            sessionConfig: buildSnap(sessionId),
+          });
+        }
+
+        if (action === 'reset') {
+          const busy = inspectSessionBusyForConfig(rt, sessionId);
+          const mut = mutateSessionConfig({
+            storageRoot,
+            sessionId,
+            baseConfig: rt.config,
+            action: 'reset',
+            principal,
+            isBusy: busy.busy,
+            busyReasons: busy.reasons,
+          });
+          if (mut.appliedImmediately) {
+            rebindTeamGovernanceSnapshot(rt, sessionId, { principal, forceAtSafeBoundary: true });
+          }
+          return okEnvelope({
+            appliedImmediately: mut.appliedImmediately,
+            stagedForSafeBoundary: mut.stagedForSafeBoundary,
+            busyReasons: mut.busyReasons,
+            sessionConfig: buildSnap(sessionId),
+          });
+        }
+
+        if (action === 'promote-to-global') {
+          const snap = buildSnap(sessionId);
+          const setRoles = Object.entries(snap.effective.roles).map(([role, spec]) => ({ role, ...spec }));
+          applyModelConfigChanges(
+            {
+              poolSet: snap.effective.executionPool,
+              setRoles,
+              leaderModelPolicy: snap.effective.leaderModelPolicy,
+            },
+            {
+              configFile: rt.configPath,
+              target: 'local',
+              discoveredModels,
+              autoAlignRoleEfforts: true,
+            },
+          );
+          syncRuntimeConfig(rt);
+          const idleRebind = rebindAllIdleSessionsOnGlobalUserSave(rt, { principal });
+          if (!snap.isBusy) {
+            mutateSessionConfig({
+              storageRoot,
+              sessionId,
+              baseConfig: rt.config,
+              action: 'reset',
+              principal,
+              isBusy: false,
+            });
+            rebindTeamGovernanceSnapshot(rt, sessionId, { principal, forceAtSafeBoundary: true });
+          }
+          return okEnvelope({
+            promoted: true,
+            idleRebind,
+            sessionConfig: buildSnap(sessionId),
+            runtime: await buildRuntimeSnapshotPayload(ctx, rt),
+          });
+        }
+
+        return errEnvelope('BAD_ACTION', `Unsupported workbench/session-config action: ${action}`, 400);
+      } catch (e) {
+        return errFromException(e?.code || 'SESSION_CONFIG_FAILED', e, e?.statusCode || 200);
       }
     },
 
@@ -2010,6 +2341,212 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
         return errFromException('UI_PREFS_FAILED', e);
       }
     },
+
+    /* ==================== Host Compatibility, Auto-Update & Onboarding ==================== */
+
+    async systemCompatibility(request) {
+      try {
+        if (request) await parseJsonRequest(request, { allowGet: true });
+        const pluginRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
+        const installed = readInstalledVersionInfo(pluginRoot);
+        const hostVersion = rt?.hostCompatibility?.toolsVersion ?? null;
+        return okEnvelope({
+          installed,
+          hostCompatibility: rt?.hostCompatibility ?? null,
+          matrix: getHostCompatibilityMatrix({
+            track: installed.track,
+            currentHostVersion: hostVersion,
+          }),
+        });
+      } catch (e) {
+        return errFromException('SYSTEM_COMPATIBILITY_FAILED', e);
+      }
+    },
+
+    async systemUpdate(request) {
+      try {
+        ensureConfigLoaded();
+        const storageRoot = getStorageRoot();
+        const dshHome = getDshHome();
+        const pluginRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
+        const body = await parseJsonRequest(request);
+        const action = String(body.action || 'status').trim().toLowerCase();
+        const hostVersion = rt?.hostCompatibility?.toolsVersion ?? null;
+
+        if (action === 'status') {
+          return okEnvelope({
+            installed: readInstalledVersionInfo(pluginRoot),
+            tracks: Object.values(UPDATE_TRACKS),
+            state: readUpdaterState(storageRoot),
+            backups: listSavedBackups(storageRoot).slice(0, 10),
+            hostCompatibility: rt?.hostCompatibility ?? null,
+          });
+        }
+
+        if (action === 'toggle-auto-check') {
+          const nextState = writeUpdaterState(storageRoot, {
+            autoCheckEnabled: Boolean(body.enabled),
+          });
+          return okEnvelope({ state: nextState });
+        }
+
+        if (action === 'check') {
+          const checkRes = await checkForUpdates({
+            pluginRoot,
+            storageRoot,
+            track: body.track || null,
+            releaseTag: body.releaseTag || null,
+            includePrerelease: Boolean(body.includePrerelease),
+            force: body.force !== false,
+            currentHostVersion: hostVersion,
+            apiUrlOverride: options.allowUpdateMirrorOverride ? (body.apiUrlOverride || null) : null,
+            fetchImpl: options.fetchImpl ?? globalThis.fetch,
+          });
+          return okEnvelope({
+            check: checkRes,
+            state: readUpdaterState(storageRoot),
+            backups: listSavedBackups(storageRoot).slice(0, 10),
+          });
+        }
+
+        if (action === 'apply') {
+          const upgRes = await performOneClickUpgrade({
+            ctx,
+            rt,
+            pluginRoot,
+            storageRoot,
+            dshHome,
+            profile: body.profile || null,
+            localTgzPath: body.localTgzPath || null,
+            downloadUrl: body.downloadUrl || null,
+            sha256SumsUrl: body.sha256SumsUrl || null,
+            expectedSha256: body.expectedSha256 || null,
+            targetTrack: body.targetTrack || null,
+            releaseTag: body.releaseTag || null,
+            confirmTrackSwitch: body.confirmTrackSwitch || null,
+            currentHostVersion: hostVersion,
+            fetchImpl: options.fetchImpl ?? globalThis.fetch,
+            installerHook: options.installerHook ?? null,
+          });
+          return okEnvelope({
+            result: upgRes,
+            state: readUpdaterState(storageRoot),
+            backups: listSavedBackups(storageRoot).slice(0, 10),
+          });
+        }
+
+        if (action === 'rollback') {
+          const rbRes = await rollbackToSavedBackup({
+            ctx,
+            rt,
+            storageRoot,
+            dshHome,
+            backupId: body.backupId || null,
+            profile: body.profile || null,
+            installerHook: options.installerHook ?? null,
+          });
+          return okEnvelope({
+            result: rbRes,
+            state: readUpdaterState(storageRoot),
+            backups: listSavedBackups(storageRoot).slice(0, 10),
+          });
+        }
+
+        return errEnvelope('BAD_UPDATE_ACTION', `Unknown system/update action: ${action}`, 400);
+      } catch (e) {
+        return errFromException(e?.code || 'SYSTEM_UPDATE_FAILED', e, e?.statusCode || 200);
+      }
+    },
+
+    async onboarding(request) {
+      try {
+        ensureConfigLoaded();
+        const storageRoot = getStorageRoot();
+        const dshHome = getDshHome();
+        const pluginRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
+        const body = await parseJsonRequest(request);
+        const action = String(body.action || 'status').trim().toLowerCase();
+
+        if (action === 'status') {
+          const runtimeSnap = await buildRuntimeSnapshotPayload(ctx, rt);
+          return okEnvelope(
+            buildOnboardingSnapshot({
+              storageRoot,
+              dshHome,
+              hasLocalOverrides: Boolean(runtimeSnap?.localOverrides?.exists),
+              sessionCount: Array.isArray(runtimeSnap?.teams) ? runtimeSnap.teams.length : 0,
+            }),
+          );
+        }
+
+        if (action === 'probe-key') {
+          const res = await probeProviderKeyConnectivity({
+            baseURL: body.baseURL,
+            apiKey: body.apiKey,
+            fetchImpl: options.fetchImpl ?? globalThis.fetch,
+          });
+          return okEnvelope(res);
+        }
+
+        if (action === 'apply-quick-setup') {
+          const applied = await applyQuickOnboardingSetup({
+            ctx,
+            rt,
+            storageRoot,
+            dshHome,
+            configPath: rt.configPath,
+            bundledDefaultConfigPath: path.join(pluginRoot, 'config', 'leaderteam.config.json'),
+            providerId: body.providerId || 'deepseek',
+            apiKey: body.apiKey || '',
+            customBaseURL: body.customBaseURL || '',
+            modelId: body.modelId || '',
+            reasoningModel: body.reasoningModel || '',
+            chatModel: body.chatModel || '',
+            discoveredModels: Array.isArray(body.models) ? body.models : null,
+            collabPresetId: body.collabPresetId || 'balanced-team',
+            verifyConnectivity: Boolean(body.verifyConnectivity),
+            fetchImpl: options.fetchImpl ?? globalThis.fetch,
+          });
+          if (rt?.configPath && rt?.config) {
+            bindRuntimeConfigFile(rt, rt.configPath, rt.config);
+            rebindAllIdleSessionsOnGlobalUserSave(rt, { principal: { kind: 'user', source: 'onboarding' } });
+          }
+          return okEnvelope(applied);
+        }
+
+        if (action === 'complete') {
+          const rec = writePersistedOnboardingRecord(storageRoot, {
+            completed: true,
+            dismissed: false,
+            completedAt: new Date().toISOString(),
+            ...(body.firstSessionId ? { firstSessionId: String(body.firstSessionId) } : {}),
+          });
+          return okEnvelope(rec);
+        }
+
+        if (action === 'dismiss') {
+          const rec = writePersistedOnboardingRecord(storageRoot, {
+            dismissed: true,
+            dismissedAt: new Date().toISOString(),
+          });
+          return okEnvelope(rec);
+        }
+
+        if (action === 'reset') {
+          const rec = writePersistedOnboardingRecord(storageRoot, {
+            completed: false,
+            dismissed: false,
+            completedAt: null,
+            dismissedAt: null,
+          });
+          return okEnvelope(rec);
+        }
+
+        return errEnvelope('BAD_ONBOARDING_ACTION', `Unknown onboarding action: ${action}`, 400);
+      } catch (e) {
+        return errFromException(e?.code || 'ONBOARDING_FAILED', e, e?.statusCode || 200);
+      }
+    },
   };
 }
 
@@ -2171,6 +2708,7 @@ export function registerPublicContractRoutes(scopeCtx, connection, rootCtx, rt =
     [PUBLIC_API_ROUTES.WORKBENCH_CREATE, h.workbenchCreate],
     [PUBLIC_API_ROUTES.WORKBENCH_PROMPT, h.workbenchPrompt],
     [PUBLIC_API_ROUTES.WORKBENCH_CANCEL, h.workbenchCancel],
+    [PUBLIC_API_ROUTES.WORKBENCH_SESSION_CONFIG, h.workbenchSessionConfig],
     [PUBLIC_API_ROUTES.ARCHIVE_QUERY, h.archiveQuery],
     [PUBLIC_API_ROUTES.ARCHIVE_ACTION, h.archiveAction],
     [PUBLIC_API_ROUTES.USAGE_STATUS, h.usageStatus],
@@ -2180,13 +2718,16 @@ export function registerPublicContractRoutes(scopeCtx, connection, rootCtx, rt =
     [PUBLIC_API_ROUTES.USAGE_PRICING, h.usagePricing],
     [PUBLIC_API_ROUTES.USAGE_TOGGLE, h.usageToggle],
     [PUBLIC_API_ROUTES.UI_PREFERENCES, h.uiPreferences],
+    [PUBLIC_API_ROUTES.SYSTEM_COMPATIBILITY, h.systemCompatibility],
+    [PUBLIC_API_ROUTES.SYSTEM_UPDATE, h.systemUpdate],
+    [PUBLIC_API_ROUTES.ONBOARDING, h.onboarding],
   ];
 
   scopeCtx.effect(() => {
     const disposers = entries.map(([routePath, fetch]) =>
       connection.fetch.register({
         path: routePath,
-        methods: ['POST'],
+        methods: ['GET', 'POST'],
         requestBody: 'buffered',
         fetch,
       }),

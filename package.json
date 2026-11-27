@@ -7,11 +7,13 @@
   "icon": "icon.svg",
   "engines": {
     "node": ">=22.15",
-    "dsh": "0.2.2-rc.1 || 0.2.2-rc.5"
+    "dsh": ">=0.2.2-alpha.2 <1.0.0"
   },
   "bin": {
     "lt-doctor": "./bin/lt-doctor.mjs",
     "lt-bugreport": "./bin/lt-bugreport.mjs",
+    "lt-installer": "./bin/lt-installer.mjs",
+    "lt-update": "./bin/lt-update.mjs",
     "lt-magpie": "./bin/lt-magpie.mjs",
     "lt-ui": "./bin/lt-ui.mjs",
     "lt-setup-desktop": "./bin/lt-setup-desktop.mjs"
@@ -50,6 +52,7 @@
     "scripts/dev/set-max-members.mjs",
     "tools/dsh-sandbox-acl/**",
     "examples/smoke-bugfix/**",
+    "install-leaderteam.sh",
     "README.md",
     "CHANGELOG.md",
     "LICENSE",

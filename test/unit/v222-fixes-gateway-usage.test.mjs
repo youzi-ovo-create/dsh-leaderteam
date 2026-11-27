@@ -23,8 +23,9 @@ import {
   toPublicLogicalUsageRecords,
 } from '../../leaderteam/usage/index.mjs';
 import { defaultPricing, buildReport } from '../../packages/lt-usage/index.mjs';
-import { startMockMagpieServer } from '../../../lt-shared-contracts/mocks/mock-magpie-server.mjs';
-import { validateContractBundle, scanNoSecretLeakage } from '../../../lt-shared-contracts/tests/contract-validator.mjs';
+import { loadSharedContractsModules } from '../helpers/shared-contracts-loader.mjs';
+
+const { sharedContractsDir, startMockMagpieServer, validateContractBundle, scanNoSecretLeakage } = await loadSharedContractsModules();
 import { createPublicContractHandlers } from '../../leaderteam/plugins/leaderteam-panel/public-api.mjs';
 import { loadConfig } from '../../leaderteam/core/config.mjs';
 import { bindRuntimeConfigFile } from '../../leaderteam/host/runtime.mjs';
@@ -185,7 +186,7 @@ test('CT-01 & CT-02 & GW-07 & GW-08: sanitizeMaskedPreview, external key clearin
       dshDiscoveredModels,
     });
     const baseSnap = JSON.parse(
-      fs.readFileSync(path.resolve(repoRoot, '..', 'lt-shared-contracts', 'mocks', 'mock-v2.2-oss-snapshot.json'), 'utf8'),
+      fs.readFileSync(path.join(sharedContractsDir, 'mocks', 'mock-v2.2-oss-snapshot.json'), 'utf8'),
     );
     const liveEnvelope = {
       ok: true,
@@ -688,7 +689,7 @@ test('Live Magpie 0.1.4731 binary verification: GW-01..06 & HZ-01 (providerJSON 
     assert.match(scrubbedStatus.lastError.message, /&k=\[REDACTED\]/);
 
     const schemaJson = JSON.parse(
-      fs.readFileSync(path.resolve(repoRoot, '..', 'lt-shared-contracts', 'schemas', 'lt-public-v1.schema.json'), 'utf8'),
+      fs.readFileSync(path.join(sharedContractsDir, 'schemas', 'lt-public-v1.schema.json'), 'utf8'),
     );
     assert.ok(Array.isArray(schemaJson.oneOf) && schemaJson.oneOf.length === 2);
     for (const defName of ['Capabilities', 'Gateway', 'ProviderDescriptor', 'ModelCatalogEntry', 'RuntimeSnapshot', 'LogicalUsageRecord', 'FlatBundleSnapshot', 'LiveBundleEnvelope']) {

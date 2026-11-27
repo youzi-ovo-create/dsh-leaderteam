@@ -1,212 +1,197 @@
-import React, { useEffect, useMemo, useRef, useState, useCallback } from 'react';
-import * as echarts from 'echarts';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { decompress as fzstdDecompress } from 'fzstd';
 // @ts-expect-error Pure JS ESM shared core
 import { decodeSessionBytes, parseJsonl, buildReport, defaultPricing } from '@lt-usage-core';
-import { callLtApi, formatCny, formatNumber, formatDurationMs, type HydratedBundle } from '../lib/api';
-import type { CustomThemeSeeds, ThemePresetId } from '../types/lt-public-v1';
+import {
+  callLtApi,
+  computeTodayUsageSummary,
+  extractCnyAmount,
+  formatClockTime,
+  formatCny,
+  formatDurationMs,
+  formatNumber,
+  formatTokensCompact,
+  type HydratedBundle,
+} from '../lib/api';
+import { Icon, type IconName } from '../components/Icon';
+import { StageHead } from '../components/AppShell';
+import { StackedBars, type StackedBarRow } from '../components/Charts';
+import { Drawer } from '../components/Overlays';
+import { HeluoxuHorizonMark } from '../components/HeluoxuMark';
+import { UnknownValue } from '../components/UnknownValue';
 
-function parseHexRgb(hex: string, fallback: [number, number, number] = [20, 22, 25]): [number, number, number] {
-  const m = String(hex || '').trim().replace(/^#/, '');
-  if (/^[0-9A-Fa-f]{3}$/.test(m)) {
-    return [parseInt(m[0] + m[0], 16), parseInt(m[1] + m[1], 16), parseInt(m[2] + m[2], 16)];
-  }
-  if (/^[0-9A-Fa-f]{6,8}$/.test(m)) {
-    return [parseInt(m.slice(0, 2), 16), parseInt(m.slice(2, 4), 16), parseInt(m.slice(4, 6), 16)];
-  }
-  return fallback;
+const GROUP_COLORS: Record<string, string> = {
+  leader: 'var(--lt-chart-1)',
+  execution: 'var(--lt-chart-2)',
+  governance: 'var(--lt-chart-3)',
+  main: 'var(--lt-chart-1)',
+  subagents: 'var(--lt-chart-2)',
+  unknown: 'var(--lt-chart-6)',
+};
+
+const GROUP_LABELS: Record<string, string> = {
+  leader: '主导',
+  execution: '执行',
+  governance: '治理',
+  main: '主会话',
+  subagents: '子会话',
+  unknown: '未知',
+};
+
+function renderTokCompact(n: number | null | undefined) {
+  const fmt = formatTokensCompact(n);
+  if (!fmt) return <UnknownValue reason="未计量：上游缺失 usage 字段" />;
+  return (
+    <>
+      {fmt.value}
+      {fmt.unit && <span className="unit">{fmt.unit}</span>}
+    </>
+  );
 }
 
-function rgbToHex([r, g, b]: [number, number, number]): string {
-  const to2 = (v: number) => Math.max(0, Math.min(255, Math.round(v))).toString(16).padStart(2, '0');
-  return `#${to2(r)}${to2(g)}${to2(b)}`.toUpperCase();
+function renderStatusBadge(ok: boolean | undefined, status?: string) {
+  if (status === 'aborted') return <span className="badge sm warning">中止</span>;
+  if (status === 'unknown') return <span className="badge sm outline">未知</span>;
+  if (ok === false || status === 'error') return <span className="badge sm danger">失败</span>;
+  return <span className="badge sm success">成功</span>;
 }
 
-function mixHex(hexA: string, hexB: string, weightA = 0.5): string {
-  const a = parseHexRgb(hexA);
-  const b = parseHexRgb(hexB);
-  const w = Math.max(0, Math.min(1, weightA));
-  return rgbToHex([
-    a[0] * w + b[0] * (1 - w),
-    a[1] * w + b[1] * (1 - w),
-    a[2] * w + b[2] * (1 - w),
-  ]);
-}
+function buildDailyTokenBuckets(calls: any[], rangeDays: number): StackedBarRow[] {
+  if (!Array.isArray(calls) || calls.length === 0) return [];
+  const now = Date.now();
+  const cutoff = now - rangeDays * 86_400_000;
+  const byDay = new Map<string, { u: number; r: number; w: number; o: number; unk: number }>();
 
-function rgbaFromHex(hex: string, alpha: number): string {
-  const [r, g, b] = parseHexRgb(hex);
-  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
-}
-
-function luminanceOfHex(hex: string): number {
-  const rgb = parseHexRgb(hex);
-  const norm = rgb.map(v => {
-    const c = v / 255;
-    return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
-  });
-  return 0.2126 * norm[0] + 0.7152 * norm[1] + 0.0722 * norm[2];
-}
-
-interface ChartPalette {
-  fg: string;
-  muted: string;
-  accent: string;
-  info: string;
-  success: string;
-  tooltipBg: string;
-  tooltipBorder: string;
-  splitLine: string;
-  pieColors: string[];
-}
-
-export function resolveHengzhangChartPalette(theme: ThemePresetId, customTheme?: CustomThemeSeeds): ChartPalette {
-  if (theme === 'dark') {
-    return {
-      fg: '#ECEFF4',
-      muted: '#A5AEBC',
-      accent: '#D29A68',
-      info: '#6CB2CE',
-      success: '#63B692',
-      tooltipBg: '#222731',
-      tooltipBorder: '#3B4352',
-      splitLine: 'rgba(236, 239, 244, 0.12)',
-      pieColors: ['#6CB2CE', '#D29A68', '#63B692', '#E0AD56', '#D98A82', '#9EA8F0'],
-    };
-  }
-  if (theme === 'heluoxu') {
-    return {
-      fg: '#1A1916',
-      muted: '#6F6B63',
-      accent: '#9C5B2E',
-      info: '#2A657C',
-      success: '#39755E',
-      tooltipBg: '#FAF8F4',
-      tooltipBorder: '#8A867D',
-      splitLine: 'rgba(26, 25, 22, 0.12)',
-      pieColors: ['#9C5B2E', '#2A657C', '#39755E', '#9A6C19', '#92544E', '#55524B'],
-    };
-  }
-  if (theme === 'custom' && customTheme) {
-    const surface = rgbToHex(parseHexRgb(customTheme.surfaceColor, [255, 255, 255]));
-    const fg = rgbToHex(parseHexRgb(customTheme.inkColor, [20, 22, 25]));
-    const accent = rgbToHex(parseHexRgb(customTheme.accentColor, [156, 91, 46]));
-    const danger = rgbToHex(parseHexRgb(customTheme.dangerColor, [163, 38, 63]));
-    const isDark = luminanceOfHex(surface) < 0.25;
-    const info = isDark ? '#6CB2CE' : '#2A657C';
-    const success = isDark ? '#63B692' : '#2F6F55';
-    return {
-      fg,
-      muted: mixHex(fg, surface, 0.56),
-      accent,
-      info,
-      success,
-      tooltipBg: surface,
-      tooltipBorder: mixHex(fg, surface, 0.34),
-      splitLine: rgbaFromHex(fg, 0.12),
-      pieColors: [accent, info, success, isDark ? '#E0AD56' : '#9A6715', danger, mixHex(fg, accent, 0.5)],
-    };
-  }
-  return {
-    fg: '#141619',
-    muted: '#6E7681',
-    accent: '#9C5B2E',
-    info: '#2A657C',
-    success: '#2F6F55',
-    tooltipBg: '#FFFFFF',
-    tooltipBorder: '#C8CFD8',
-    splitLine: 'rgba(20, 22, 25, 0.09)',
-    pieColors: ['#2A657C', '#9C5B2E', '#2F6F55', '#9A6715', '#92544E', '#4A5058'],
-  };
-}
-
-function EChartBox({ option, height = 240 }: { option: echarts.EChartsCoreOption; height?: number }) {
-  const ref = useRef<HTMLDivElement | null>(null);
-  const chartRef = useRef<echarts.ECharts | null>(null);
-
-  useEffect(() => {
-    const el = ref.current;
-    if (!el) return;
-    const chart = echarts.init(el);
-    chartRef.current = chart;
-    const ro = new ResizeObserver(() => chart.resize());
-    ro.observe(el);
-    return () => {
-      ro.disconnect();
-      chart.dispose();
-      chartRef.current = null;
-    };
-  }, []);
-
-  useEffect(() => {
-    if (chartRef.current) {
-      chartRef.current.setOption(option, { notMerge: true });
+  for (const c of calls) {
+    const t = typeof c.timeMs === 'number' && Number.isFinite(c.timeMs) ? c.timeMs : null;
+    if (t !== null && rangeDays > 0 && t < cutoff) continue;
+    const d = t ? new Date(t) : null;
+    const key = d
+      ? `${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+      : '未知日期';
+    const cur = byDay.get(key) || { u: 0, r: 0, w: 0, o: 0, unk: 0 };
+    if (c.unmetered) {
+      cur.unk += 1;
+    } else {
+      cur.u += Number(c.inputTokens || 0);
+      cur.r += Number(c.cacheReadTokens || 0);
+      cur.w += Number(c.cacheWriteTokens || 0);
+      cur.o += Number(c.outputTokens || 0);
     }
-  }, [option]);
+    byDay.set(key, cur);
+  }
 
-  return <div ref={ref} style={{ width: '100%', height }} />;
+  return Array.from(byDay.entries()).map(([label, v]) => ({
+    label,
+    values: { u: v.u, r: v.r, w: v.w, o: v.o },
+    unknownCount: v.unk,
+  }));
 }
 
 export function HengzhangView({
   bundle,
-  theme: propTheme,
-  customTheme: propCustomTheme,
   onRefreshBundle,
+  onNotify,
+  onUsageSummary,
 }: {
   bundle: HydratedBundle;
-  theme?: ThemePresetId;
-  customTheme?: CustomThemeSeeds;
   onRefreshBundle: () => Promise<void>;
+  onNotify?: (message: string, icon?: IconName) => void;
+  onUsageSummary?: (summary: { costCny: number | null; unknownCount: number }) => void;
 }) {
-  const activeTheme = propTheme || bundle.uiPreferences?.theme || 'white';
-  const activeCustomTheme = propCustomTheme || bundle.uiPreferences?.customTheme;
   const [overviewData, setOverviewData] = useState<any>(null);
   const [selectedSessionId, setSelectedSessionId] = useState<string>('');
   const [report, setReport] = useState<any>(null);
   const [offlineMode, setOfflineMode] = useState(false);
+  const [range, setRange] = useState<'1d' | '7d' | '30d'>('7d');
   const [callFilterGroup, setCallFilterGroup] = useState('all');
   const [callSearch, setCallSearch] = useState('');
   const [page, setPage] = useState(1);
-  const [showPricingModal, setShowPricingModal] = useState(false);
+  const [showPricingDrawer, setShowPricingDrawer] = useState(false);
   const [usdToCnyInput, setUsdToCnyInput] = useState('6.71');
   const [newPriceRoute, setNewPriceRoute] = useState('');
   const [newPriceIn, setNewPriceIn] = useState('2');
   const [newPriceCache, setNewPriceCache] = useState('0.2');
   const [newPriceOut, setNewPriceOut] = useState('8');
   const [newPriceCurrency, setNewPriceCurrency] = useState<'CNY' | 'USD'>('CNY');
+  const [dragOver, setDragOver] = useState(false);
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const enabled = bundle.usageStatus.enabled;
+  const offlineModeRef = useRef(offlineMode);
+  offlineModeRef.current = offlineMode;
+  const overviewReqSeqRef = useRef(0);
+  const reportReqSeqRef = useRef(0);
+  const overviewDataRef = useRef<any>(overviewData);
+  overviewDataRef.current = overviewData;
+  const selectedSessionIdRef = useRef<string>(selectedSessionId);
+  selectedSessionIdRef.current = selectedSessionId;
+
+  const notify = useCallback(
+    (msg: string, icon: IconName = 'check') => {
+      setNotice(msg);
+      if (onNotify) onNotify(msg, icon);
+    },
+    [onNotify],
+  );
 
   const loadLiveOverview = useCallback(async () => {
-    if (!enabled || offlineMode) return;
+    if (!enabled || offlineModeRef.current) return;
+    const reqSeq = ++overviewReqSeqRef.current;
     try {
       const res = await callLtApi<any>('usage/overview', { syncGateway: true });
+      if (offlineModeRef.current || reqSeq !== overviewReqSeqRef.current) return;
+      overviewDataRef.current = res;
       setOverviewData(res);
       if (res?.pricing?.usdToCny) setUsdToCnyInput(String(res.pricing.usdToCny));
-      if (!selectedSessionId && res?.overview?.sessions?.length > 0) {
-        setSelectedSessionId(res.overview.sessions[0].sessionId);
+      if (!selectedSessionIdRef.current && res?.overview?.sessions?.length > 0) {
+        const firstSid = res.overview.sessions[0].sessionId;
+        selectedSessionIdRef.current = firstSid;
+        setSelectedSessionId(firstSid);
+      }
+      if (onUsageSummary && res?.overview) {
+        onUsageSummary(computeTodayUsageSummary(res.overview));
       }
     } catch (e: any) {
+      if (offlineModeRef.current || reqSeq !== overviewReqSeqRef.current) return;
       setError(e.message);
     }
-  }, [enabled, offlineMode, selectedSessionId]);
+  }, [enabled, onUsageSummary]);
 
-  const loadLiveReport = useCallback(async (sid: string) => {
-    if (!sid || !enabled || offlineMode) return;
-    try {
-      const res = await callLtApi<any>('usage/report', { sessionId: sid, syncGateway: true });
-      setReport(res?.report || null);
-      setPage(1);
-    } catch (e: any) {
-      setError(e.message);
-    }
-  }, [enabled, offlineMode]);
+  const loadLiveReport = useCallback(
+    async (sid: string) => {
+      if (!sid || !enabled || offlineModeRef.current) return;
+      const reqSeq = ++reportReqSeqRef.current;
+      try {
+        const res = await callLtApi<any>('usage/report', { sessionId: sid, syncGateway: true });
+        if (
+          offlineModeRef.current ||
+          reqSeq !== reportReqSeqRef.current ||
+          selectedSessionIdRef.current !== sid
+        ) {
+          return;
+        }
+        const nextReport = res?.report || null;
+        setReport(nextReport);
+        setPage(1);
+        if (onUsageSummary && overviewDataRef.current?.overview) {
+          onUsageSummary(computeTodayUsageSummary(overviewDataRef.current.overview, nextReport));
+        }
+      } catch (e: any) {
+        if (offlineModeRef.current || reqSeq !== reportReqSeqRef.current) return;
+        setError(e.message);
+      }
+    },
+    [enabled, onUsageSummary],
+  );
 
   useEffect(() => {
-    void loadLiveOverview();
-  }, [loadLiveOverview]);
+    if (!offlineMode) {
+      void loadLiveOverview();
+    }
+  }, [offlineMode, loadLiveOverview]);
 
   useEffect(() => {
     if (selectedSessionId && !offlineMode) {
@@ -220,11 +205,16 @@ export function HengzhangView({
     try {
       await callLtApi('usage/toggle', { enabled: next });
       if (!next) {
+        overviewReqSeqRef.current += 1;
+        reportReqSeqRef.current += 1;
         setReport(null);
         setOverviewData(null);
       }
       await onRefreshBundle();
-      setNotice(next ? '已开启衡账非阻塞实时采集' : '已关闭衡账实时采集（LT 模型调用与网关运行完全不受影响）');
+      notify(
+        next ? '已开启衡账非阻塞实时统计' : '已关闭衡账实时统计（工作台与网关不受影响）',
+        next ? 'check' : 'info',
+      );
     } catch (e: any) {
       setError(e.message);
     } finally {
@@ -232,31 +222,30 @@ export function HengzhangView({
     }
   }
 
-  async function handleOfflineFileUpload(e: React.ChangeEvent<HTMLInputElement>) {
-    const file = e.target.files?.[0];
-    if (!file) return;
+  async function decodeLocalFile(file: File) {
     setError(null);
     setNotice(null);
     try {
       const buf = new Uint8Array(await file.arrayBuffer());
-      let text: string;
-      if (file.name.endsWith('.zstd') || file.name.endsWith('.zst')) {
-        text = decodeSessionBytes(buf, (frame: Uint8Array) => fzstdDecompress(frame));
-      } else {
-        text = new TextDecoder('utf-8').decode(buf);
-      }
+      const text =
+        file.name.endsWith('.zstd') || file.name.endsWith('.zst')
+          ? decodeSessionBytes(buf, (frame: Uint8Array) => fzstdDecompress(frame))
+          : new TextDecoder('utf-8').decode(buf);
       const rows = parseJsonl(text);
       const header = rows.find((r: any) => r?.type === 'session') || { id: file.name, cwd: '(离线导入)' };
       const built = buildReport({
         sessionId: header.id || file.name,
         kind: 'session',
         sessions: [{ id: header.id || file.name, header, rows }],
-        pricing: overviewData?.pricing || defaultPricing,
+        pricing: overviewDataRef.current?.pricing || defaultPricing,
       });
+      offlineModeRef.current = true;
+      overviewReqSeqRef.current += 1;
+      reportReqSeqRef.current += 1;
       setOfflineMode(true);
       setReport(built);
       setPage(1);
-      setNotice(`已在浏览器本地纯离线解析 ${file.name}（共 ${built.calls.length} 笔逻辑请求，零文件上传）`);
+      notify(`已在本地纯离线解析 ${file.name}（共 ${built.calls.length} 笔逻辑请求，零文件上传）`, 'check');
     } catch (err: any) {
       setError(`离线解码失败：${err.message}`);
     }
@@ -285,10 +274,10 @@ export function HengzhangView({
       }
       await callLtApi('usage/pricing', { pricing: curPricing });
       setNewPriceRoute('');
-      setShowPricingModal(false);
+      setShowPricingDrawer(false);
       await loadLiveOverview();
       if (selectedSessionId) await loadLiveReport(selectedSessionId);
-      setNotice('自定义单价表已保存并重算账本');
+      notify('路由单价已保存并重算账本', 'check');
     } catch (err: any) {
       setError(err.message);
     } finally {
@@ -313,35 +302,53 @@ export function HengzhangView({
   function exportCsv() {
     if (!report) return;
     const header = [
-      'n', 'timeMs', 'group', 'actor', 'role', 'taskSeq', 'step', 'requestedRoute',
-      'actualProvider', 'actualModel', 'physicalAttempts', 'latencyMs', 'ok',
-      'inputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'outputTokens', 'totalTokens',
-      'costPeakCny', 'costActualCny',
+      'n',
+      'timeMs',
+      'group',
+      'actor',
+      'role',
+      'taskSeq',
+      'step',
+      'requestedRoute',
+      'actualProvider',
+      'actualModel',
+      'physicalAttempts',
+      'latencyMs',
+      'ok',
+      'inputTokens',
+      'cacheReadTokens',
+      'cacheWriteTokens',
+      'outputTokens',
+      'totalTokens',
+      'costPeakCny',
+      'costActualCny',
     ];
     const lines = [header.join(',')];
     for (const c of report.calls || []) {
-      lines.push([
-        c.n,
-        c.timeMs ?? '',
-        c.group,
-        JSON.stringify(c.actor ?? ''),
-        JSON.stringify(c.role ?? ''),
-        c.taskSeq ?? '',
-        c.step,
-        JSON.stringify(c.route ?? ''),
-        JSON.stringify(c.actualProvider ?? 'unknown'),
-        JSON.stringify(c.actualModel ?? 'unknown'),
-        c.physicalAttempts ?? '',
-        c.latencyMs ?? '',
-        c.ok,
-        c.unmetered ? '' : c.inputTokens,
-        c.unmetered ? '' : c.cacheReadTokens,
-        c.unmetered ? '' : c.cacheWriteTokens,
-        c.unmetered ? '' : c.outputTokens,
-        c.unmetered ? '' : c.totalTokens,
-        c.costPeakCny != null ? c.costPeakCny.toFixed(6) : '',
-        c.costActualCny != null ? c.costActualCny.toFixed(6) : '',
-      ].join(','));
+      lines.push(
+        [
+          c.n,
+          c.timeMs ?? '',
+          c.group,
+          JSON.stringify(c.actor ?? ''),
+          JSON.stringify(c.role ?? ''),
+          c.taskSeq ?? '',
+          c.step,
+          JSON.stringify(c.route ?? ''),
+          JSON.stringify(c.actualProvider ?? 'unknown'),
+          JSON.stringify(c.actualModel ?? 'unknown'),
+          c.physicalAttempts ?? '',
+          c.latencyMs ?? '',
+          c.ok,
+          c.unmetered ? '' : c.inputTokens,
+          c.unmetered ? '' : c.cacheReadTokens,
+          c.unmetered ? '' : c.cacheWriteTokens,
+          c.unmetered ? '' : c.outputTokens,
+          c.unmetered ? '' : c.totalTokens,
+          c.costPeakCny != null ? c.costPeakCny.toFixed(6) : '',
+          c.costActualCny != null ? c.costActualCny.toFixed(6) : '',
+        ].join(','),
+      );
     }
     const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8' });
     const objUrl = URL.createObjectURL(blob);
@@ -355,83 +362,28 @@ export function HengzhangView({
     }
   }
 
-  const palette = useMemo(
-    () => resolveHengzhangChartPalette(activeTheme, activeCustomTheme),
-    [activeTheme, activeCustomTheme],
-  );
+  const rangeDays = range === '1d' ? 1 : range === '30d' ? 30 : 7;
+  const totals = report?.totals || null;
+  const bucketUncached = totals?.inputTokens ?? 0;
+  const bucketCacheRead = totals?.cacheReadTokens ?? 0;
+  const bucketCacheWrite = totals?.cacheWriteTokens ?? 0;
+  const bucketOutput = totals?.outputTokens ?? 0;
+  const bucketTotal = Math.max(1, bucketUncached + bucketCacheRead + bucketCacheWrite + bucketOutput);
+  const tokenBuckets = [
+    { key: 'u', label: '新增输入', value: bucketUncached, color: 'var(--lt-chart-1)' },
+    { key: 'r', label: '缓存读', value: bucketCacheRead, color: 'var(--lt-chart-3)' },
+    { key: 'w', label: '缓存写', value: bucketCacheWrite, color: 'var(--lt-chart-6)' },
+    { key: 'o', label: '输出', value: bucketOutput, color: 'var(--lt-chart-2)' },
+  ];
 
-  const groupBarOption = useMemo<echarts.EChartsCoreOption>(
-    () => ({
-      tooltip: {
-        trigger: 'axis',
-        backgroundColor: palette.tooltipBg,
-        borderColor: palette.tooltipBorder,
-        borderWidth: 1,
-        textStyle: { color: palette.fg, fontSize: 12 },
-      },
-      grid: { left: 90, right: 24, top: 20, bottom: 28 },
-      xAxis: {
-        type: 'value',
-        axisLabel: { color: palette.muted },
-        splitLine: { lineStyle: { color: palette.splitLine } },
-      },
-      yAxis: {
-        type: 'category',
-        data: (report?.groups || []).map((g: any) => g.label),
-        axisLabel: { color: palette.fg },
-        axisLine: { lineStyle: { color: palette.splitLine } },
-      },
-      series: [
-        {
-          name: '未缓存输入',
-          type: 'bar',
-          stack: 'tok',
-          itemStyle: { color: palette.info },
-          data: (report?.groups || []).map((g: any) => g.inputTokens),
-        },
-        {
-          name: '缓存读取',
-          type: 'bar',
-          stack: 'tok',
-          itemStyle: { color: palette.accent },
-          data: (report?.groups || []).map((g: any) => g.cacheReadTokens),
-        },
-        {
-          name: '输出 (含推理)',
-          type: 'bar',
-          stack: 'tok',
-          itemStyle: { color: palette.success },
-          data: (report?.groups || []).map((g: any) => g.outputTokens),
-        },
-      ],
-    }),
-    [report, palette],
+  const dailyRows = buildDailyTokenBuckets(report?.calls || [], rangeDays);
+  const byModel: any[] = report?.byModel || [];
+  const maxModelCost = Math.max(
+    0.0001,
+    ...byModel.map(m => extractCnyAmount(m.costActualCny) ?? 0),
   );
-
-  const modelDonutOption = useMemo<echarts.EChartsCoreOption>(
-    () => ({
-      color: palette.pieColors,
-      tooltip: {
-        trigger: 'item',
-        backgroundColor: palette.tooltipBg,
-        borderColor: palette.tooltipBorder,
-        borderWidth: 1,
-        textStyle: { color: palette.fg, fontSize: 12 },
-      },
-      series: [
-        {
-          type: 'pie',
-          radius: ['45%', '72%'],
-          label: { color: palette.fg, fontSize: 11 },
-          data: (report?.byModel || []).map((m: any) => ({
-            name: m.route,
-            value: m.totalTokens,
-          })),
-        },
-      ],
-    }),
-    [report, palette],
-  );
+  const byGroup: any[] = report?.groups || [];
+  const totalGroupTokens = Math.max(1, byGroup.reduce((s, g) => s + (g.totalTokens || 0), 0));
 
   const filteredCalls = (report?.calls || []).filter((c: any) => {
     if (callFilterGroup !== 'all' && c.group !== callFilterGroup) return false;
@@ -448,322 +400,731 @@ export function HengzhangView({
   const totalPages = Math.max(1, Math.ceil(filteredCalls.length / pageSize));
   const pagedCalls = filteredCalls.slice((page - 1) * pageSize, page * pageSize);
 
+  const watermarkTime = bundle.usageStatus.lastSyncAt
+    ? bundle.usageStatus.lastSyncAt.slice(11, 16)
+    : '未同步';
+  const allCalls = report?.calls || [];
+  const successCalls = allCalls.filter((c: any) => c.ok !== false).length;
+  const successRatePct =
+    allCalls.length > 0 ? ((successCalls / allCalls.length) * 100).toFixed(1) : null;
+  const unknownTotal = (totals?.unmeteredCalls || 0) + (totals?.unpricedCalls || 0);
+
   return (
-    <div>
-      <div className="lt-section-header">
-        <div>
-          <div className="lt-section-kicker">Hengzhang Modular Token & Cost Ledger</div>
-          <h1 className="lt-section-title">衡账 — 真实用量对账、峰谷成本与网关归因分析</h1>
-          <p className="lt-section-desc">
-            模块化只读整合 <code>lt-usage-plugin</code>：合并 DSH 多帧 <code>.jsonl.zstd</code>、LT 治理旁路与 Magpie 游标流水；严守「未知 ≠ 0」与非阻塞原则。
-          </p>
-        </div>
-        <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
-          <label className="lt-btn" style={{ cursor: 'pointer' }}>
-            离线导入 .zstd / .jsonl
-            <input type="file" accept=".zstd,.zst,.jsonl" style={{ display: 'none' }} onChange={handleOfflineFileUpload} />
-          </label>
-          {offlineMode && (
-            <button className="lt-btn" onClick={() => { setOfflineMode(false); void loadLiveOverview(); }}>
-              返回实时连接
-            </button>
-          )}
-          <button className="lt-btn" onClick={() => setShowPricingModal(v => !v)}>单价表配置</button>
-          <button
-            className={`lt-btn ${enabled ? '' : 'lt-btn-primary'}`}
-            disabled={busy}
-            onClick={() => void handleToggleEnabled(!enabled)}
-          >
-            {enabled ? '暂停衡账采集' : '启用衡账采集'}
-          </button>
-        </div>
-      </div>
+    <div className="body" style={{ flex: 1 }}>
+      <main className="stage">
+        <StageHead
+          overline="用量与成本"
+          title="衡账"
+          right={
+            <div className="row" style={{ gap: 8, flexWrap: 'wrap' }}>
+              <label className="switch">
+                <input
+                  type="checkbox"
+                  checked={enabled}
+                  disabled={busy}
+                  onChange={e => void handleToggleEnabled(e.target.checked)}
+                />
+                <span className="track" />
+                统计
+              </label>
 
-      {error && <div className="lt-banner lt-banner-danger"><span>{error}</span><button className="lt-btn lt-btn-sm" onClick={() => setError(null)}>关闭</button></div>}
-      {notice && <div className="lt-banner"><span>{notice}</span><button className="lt-btn lt-btn-sm" onClick={() => setNotice(null)}>关闭</button></div>}
+              {bundle.capabilities.features.usageOfflineImport && (
+                <label className="btn btn-sm" style={{ cursor: 'pointer' }}>
+                  <Icon name="upload" className="icon-14" />
+                  离线导入 .zstd
+                  <input
+                    type="file"
+                    accept=".zstd,.zst,.jsonl"
+                    style={{ display: 'none' }}
+                    onChange={e => {
+                      const f = e.target.files?.[0];
+                      e.target.value = '';
+                      if (f) void decodeLocalFile(f);
+                    }}
+                  />
+                </label>
+              )}
 
-      {showPricingModal && (
-        <form className="lt-card" style={{ marginBottom: 16 }} onSubmit={handleSaveCustomPrice}>
-          <div className="lt-card-title">
-            <span>自定义等效 API 单价表（仅保存在 &lt;storageRoot&gt;/usage/custom-pricing.json，不篡改原始会话）</span>
-            <button type="button" className="lt-btn lt-btn-sm" onClick={() => setShowPricingModal(false)}>收起</button>
-          </div>
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 8 }}>
-            <input className="lt-input lt-num" placeholder="USD 汇率 (默认 6.71)" value={usdToCnyInput} onChange={e => setUsdToCnyInput(e.target.value)} />
-            <input className="lt-input lt-mono" placeholder="路由 (如 deepseek/deepseek-chat)" value={newPriceRoute} onChange={e => setNewPriceRoute(e.target.value)} />
-            <select className="lt-select" value={newPriceCurrency} onChange={e => setNewPriceCurrency(e.target.value as 'CNY' | 'USD')}>
-              <option value="CNY">CNY (元 / 百万 Token)</option>
-              <option value="USD">USD ($ / 百万 Token)</option>
-            </select>
-            <input className="lt-input lt-num" placeholder="输入单价 / 1M" value={newPriceIn} onChange={e => setNewPriceIn(e.target.value)} />
-            <input className="lt-input lt-num" placeholder="缓存读单价 / 1M" value={newPriceCache} onChange={e => setNewPriceCache(e.target.value)} />
-            <input className="lt-input lt-num" placeholder="输出单价 / 1M" value={newPriceOut} onChange={e => setNewPriceOut(e.target.value)} />
-          </div>
-          <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
-            <button type="submit" className="lt-btn lt-btn-primary" disabled={busy}>保存单价并重算</button>
-            <button
-              type="button"
-              className="lt-btn"
-              onClick={() => void callLtApi('usage/pricing', { action: 'reset' }).then(() => loadLiveOverview())}
-            >
-              恢复默认校准价格
-            </button>
-          </div>
-        </form>
-      )}
-
-      {!enabled && !offlineMode ? (
-        <div className="lt-card">
-          <strong>衡账实时采集当前已关闭</strong>
-          <p style={{ color: 'var(--lt-fg-secondary)', margin: '6px 0 0' }}>
-            Leader Team 与 Magpie 的模型推理请求完全独立于衡账运行。您可随时重新启用实时采集，或直接点击右上角「离线导入 .zstd」在纯浏览器端解码分析。
-          </p>
-        </div>
-      ) : (
-        <>
-          {/* Session Selector Bar */}
-          {!offlineMode && overviewData?.overview && (
-            <div className="lt-card" style={{ marginBottom: 16, display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 10 }}>
-              <div className="lt-num" style={{ fontSize: 12.5 }}>
-                <strong>全局汇总 ({overviewData.overview.sessions.length} 个根会话，子会话已自动去重归并)：</strong>{' '}
-                总计 <strong>{formatNumber(overviewData.overview.totals.totalTokens)}</strong> Token ·{' '}
-                实际分时估算 <strong>{formatCny(overviewData.overview.totals.costActualCny?.total)}</strong> ·{' '}
-                缓存节省 <strong>{formatCny(overviewData.overview.totals.cacheSavingsCny)}</strong>
-              </div>
-              <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-                <select
-                  className="lt-select"
-                  style={{ width: 300 }}
-                  value={selectedSessionId}
-                  onChange={e => setSelectedSessionId(e.target.value)}
+              {offlineMode && (
+                <button
+                  type="button"
+                  className="btn btn-sm"
+                  onClick={() => {
+                    offlineModeRef.current = false;
+                    setOfflineMode(false);
+                    void loadLiveOverview();
+                    if (selectedSessionIdRef.current) {
+                      void loadLiveReport(selectedSessionIdRef.current);
+                    }
+                  }}
                 >
-                  {overviewData.overview.sessions.length === 0 ? (
-                    <option value="">暂无会话账本</option>
-                  ) : (
-                    overviewData.overview.sessions.map((s: any) => (
-                      <option key={s.sessionId} value={s.sessionId}>
-                        {s.title || s.sessionId.slice(0, 16)} ({formatNumber(s.totalTokens)} tok)
-                      </option>
-                    ))
-                  )}
-                </select>
-                <button className="lt-btn lt-btn-sm" onClick={() => void loadLiveOverview()}>刷新对账</button>
-              </div>
+                  返回实时统计
+                </button>
+              )}
+
+              {(enabled || offlineMode) && (
+                <>
+                  <span style={{ width: 1, height: 20, background: 'var(--lt-border-subtle)' }} />
+                  <div className="seg seg-sm" role="radiogroup" aria-label="统计时间窗口">
+                    {(
+                      [
+                        ['1d', '今天'],
+                        ['7d', '7 天'],
+                        ['30d', '30 天'],
+                      ] as const
+                    ).map(([id, lbl]) => (
+                      <button
+                        key={id}
+                        type="button"
+                        aria-pressed={range === id}
+                        onClick={() => setRange(id)}
+                      >
+                        {lbl}
+                      </button>
+                    ))}
+                  </div>
+                  <button
+                    type="button"
+                    className="btn btn-sm"
+                    disabled={busy || offlineMode}
+                    title="手动同步用量水位"
+                    onClick={() => {
+                      void loadLiveOverview();
+                      if (selectedSessionId) void loadLiveReport(selectedSessionId);
+                      notify('已触发水位同步', 'refresh');
+                    }}
+                  >
+                    <Icon name="refresh" className="icon-14" />
+                    水位 <span className="num">{watermarkTime}</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-sm"
+                    onClick={() => setShowPricingDrawer(true)}
+                  >
+                    <Icon name="sliders" className="icon-14" />
+                    单价
+                  </button>
+                </>
+              )}
             </div>
-          )}
+          }
+        />
 
-          {report ? (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 18 }}>
-              {/* Explicit Unknown Warnings */}
-              {report.totals.unpricedCalls > 0 && (
-                <div className="lt-banner lt-banner-warn">
-                  <span>
-                    显式未知告警：共 <strong>{report.totals.unpricedCalls}</strong> 次成功调用缺少匹配单价，已严格标记为「未定价 (null)」，绝不伪造为 ¥0。可在「单价表配置」中补充路由单价。
-                  </span>
-                </div>
-              )}
-              {report.totals.unmeteredCalls > 0 && (
-                <div className="lt-banner lt-banner-warn">
-                  <span>
-                    显式未知告警：共 <strong>{report.totals.unmeteredCalls}</strong> 次调用缺失上游 usage 字段，已标记为「未计量」，不计为 0。
-                  </span>
-                </div>
-              )}
-
-              {/* Symmetrical Dual-Box Cost & 4-Bucket KPI Strip */}
-              <div className="lt-grid-kpi">
-                <div className="lt-card lt-card-authority">
-                  <div className="lt-kpi-label">实际分时等效成本 (Actual Time-of-Use)</div>
-                  <div className="lt-kpi-value">{formatCny(report.totals.costActualCny?.total)}</div>
-                  <div className="lt-kpi-sub">
-                    折合 ${report.totals.costActualUsd?.toFixed(4)} · 已定价请求汇总
-                  </div>
-                </div>
-                <div className="lt-card">
-                  <div className="lt-kpi-label">全高峰假设 / 全低谷假设对照</div>
-                  <div className="lt-kpi-value" style={{ fontSize: 18 }}>
-                    {formatCny(report.totals.costPeakCny?.total)} / {formatCny(report.totals.costOffPeakCny?.total)}
-                  </div>
-                  <div className="lt-kpi-sub">北京时间峰谷时段对称核验</div>
-                </div>
-                <div className="lt-card">
-                  <div className="lt-kpi-label">四桶物理总 Token (推理不二次累加)</div>
-                  <div className="lt-kpi-value">{formatNumber(report.totals.totalTokens)}</div>
-                  <div className="lt-kpi-sub">
-                    新增入 {formatNumber(report.totals.inputTokens)} · 缓存读 {formatNumber(report.totals.cacheReadTokens)} · 输出 {formatNumber(report.totals.outputTokens)}
-                  </div>
-                </div>
-                <div className="lt-card">
-                  <div className="lt-kpi-label">KV 缓存命中率与节省金额</div>
-                  <div className="lt-kpi-value">{report.totals.cacheHitRatePct}%</div>
-                  <div className="lt-kpi-sub">
-                    节省 {formatCny(report.totals.cacheSavingsCny)} · 逻辑请求 {report.totals.callsTotal} 次
-                  </div>
-                </div>
-              </div>
-
-              {/* Charts Row */}
-              <div className="lt-grid-2">
-                <div className="lt-card">
-                  <h2 className="lt-card-title">层级 Token 构成（主导 / 执行 / 治理）</h2>
-                  <EChartBox option={groupBarOption} height={220} />
-                </div>
-                <div className="lt-card">
-                  <h2 className="lt-card-title">模型路由 Token 占比</h2>
-                  <EChartBox option={modelDonutOption} height={220} />
-                </div>
-              </div>
-
-              {/* Provider & Task Attribution Breakdown */}
-              <div className="lt-grid-2">
-                <div className="lt-card">
-                  <h2 className="lt-card-title">真实供应商归因汇总 (byProvider)</h2>
-                  <div className="lt-table-wrap">
-                    <table className="lt-table">
-                      <thead>
-                        <tr>
-                          <th>实际供应商 (actualProvider)</th>
-                          <th className="lt-right">逻辑请求</th>
-                          <th className="lt-right">总 Token</th>
-                          <th className="lt-right">占比</th>
-                          <th className="lt-right">实际成本</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {(report.byProvider || []).map((p: any) => (
-                          <tr key={p.provider}>
-                            <td className="lt-mono">
-                              <strong>{p.provider}</strong>
-                              {p.provider === 'unknown' && <span className="lt-tag" style={{ marginLeft: 6 }}>未知归因</span>}
-                            </td>
-                            <td className="lt-right">{p.callsTotal}</td>
-                            <td className="lt-right">{formatNumber(p.totalTokens)}</td>
-                            <td className="lt-right">{p.shareOfTotalTokensPct}%</td>
-                            <td className="lt-right">{p.costActualCny !== null ? formatCny(p.costActualCny) : '未定价'}</td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                </div>
-
-                <div className="lt-card">
-                  <h2 className="lt-card-title">任务轮次归属 (byTask · taskSeq)</h2>
-                  <div className="lt-table-wrap">
-                    <table className="lt-table">
-                      <thead>
-                        <tr>
-                          <th>任务序号</th>
-                          <th className="lt-right">请求数</th>
-                          <th className="lt-right">总 Token</th>
-                          <th className="lt-right">实际成本</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {(report.byTask || []).map((t: any, idx: number) => (
-                          <tr key={idx}>
-                            <td>{t.taskSeq !== null ? `任务 #${t.taskSeq}` : '未知 / 跨轮治理'}</td>
-                            <td className="lt-right">{t.callsTotal}</td>
-                            <td className="lt-right">{formatNumber(t.totalTokens)}</td>
-                            <td className="lt-right">{t.costActualCny !== null ? formatCny(t.costActualCny) : '含未知项'}</td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                </div>
-              </div>
-
-              {/* Detailed Paginated Call Ledger */}
-              <div className="lt-card">
-                <div className="lt-card-title" style={{ flexWrap: 'wrap' }}>
-                  <span>逐笔逻辑请求与网关物理尝试流水 ({filteredCalls.length} 笔)</span>
-                  <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-                    <input
-                      className="lt-input"
-                      style={{ width: 200, height: 28 }}
-                      placeholder="筛选路由 / 供应商 / 成员…"
-                      value={callSearch}
-                      onChange={e => { setCallSearch(e.target.value); setPage(1); }}
-                    />
-                    <select
-                      className="lt-select"
-                      style={{ width: 130, height: 28 }}
-                      value={callFilterGroup}
-                      onChange={e => { setCallFilterGroup(e.target.value); setPage(1); }}
-                    >
-                      <option value="all">全部组别</option>
-                      <option value="leader">主导 (leader)</option>
-                      <option value="execution">执行 (execution)</option>
-                      <option value="governance">治理 (governance)</option>
-                      <option value="main">主会话 (main)</option>
-                      <option value="subagents">子会话 (subagents)</option>
-                    </select>
-                    <button className="lt-btn lt-btn-sm" onClick={exportCsv}>导出 CSV</button>
-                    <button className="lt-btn lt-btn-sm" onClick={exportJson}>导出 JSON</button>
-                  </div>
-                </div>
-
-                <div className="lt-table-wrap">
-                  <table className="lt-table">
-                    <thead>
-                      <tr>
-                        <th>#</th>
-                        <th>组别 / 角色</th>
-                        <th>任务</th>
-                        <th>请求路由</th>
-                        <th>真实供应商 / 模型</th>
-                        <th className="lt-right">尝试</th>
-                        <th className="lt-right">耗时</th>
-                        <th className="lt-right">未缓存入</th>
-                        <th className="lt-right">缓存读</th>
-                        <th className="lt-right">输出</th>
-                        <th className="lt-right">实际成本</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {pagedCalls.map((c: any) => (
-                        <tr key={c.n}>
-                          <td className="lt-mono">{c.n}</td>
-                          <td>
-                            <strong>{c.actor}</strong>
-                            <div style={{ fontSize: 10.5, color: 'var(--lt-fg-muted)' }}>{c.group} · {c.role}</div>
-                          </td>
-                          <td className="lt-mono">{c.taskSeq !== null ? `#${c.taskSeq}` : '未知'}</td>
-                          <td className="lt-mono" style={{ fontSize: 11.5 }}>{c.route}</td>
-                          <td className="lt-mono" style={{ fontSize: 11.5 }}>
-                            {c.actualProvider} / {c.actualModel}
-                          </td>
-                          <td className="lt-right lt-mono">{c.physicalAttempts ?? '未知'}</td>
-                          <td className="lt-right lt-mono">{c.latencyMs != null ? formatDurationMs(c.latencyMs) : '未知'}</td>
-                          <td className="lt-right lt-mono">{c.unmetered ? '未计量' : formatNumber(c.inputTokens)}</td>
-                          <td className="lt-right lt-mono">{c.unmetered ? '未计量' : formatNumber(c.cacheReadTokens)}</td>
-                          <td className="lt-right lt-mono">{c.unmetered ? '未计量' : formatNumber(c.outputTokens)}</td>
-                          <td className="lt-right lt-mono">
-                            {!c.ok ? '¥0 (失败)' : c.unmetered ? '未计量' : c.costActualCny != null ? formatCny(c.costActualCny) : '未定价'}
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-
-                {totalPages > 1 && (
-                  <div style={{ display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: 8, marginTop: 10, fontSize: 12 }}>
-                    <button className="lt-btn lt-btn-sm" disabled={page <= 1} onClick={() => setPage(p => p - 1)}>上一页</button>
-                    <span className="lt-num">第 {page} / {totalPages} 页</span>
-                    <button className="lt-btn lt-btn-sm" disabled={page >= totalPages} onClick={() => setPage(p => p + 1)}>下一页</button>
-                  </div>
-                )}
-              </div>
+        <div
+          className="stage-body"
+          onDragOver={e => {
+            if (!bundle.capabilities.features.usageOfflineImport) return;
+            e.preventDefault();
+            setDragOver(true);
+          }}
+          onDragLeave={() => setDragOver(false)}
+          onDrop={e => {
+            if (!bundle.capabilities.features.usageOfflineImport) return;
+            e.preventDefault();
+            setDragOver(false);
+            const f = e.dataTransfer.files?.[0];
+            if (f) void decodeLocalFile(f);
+          }}
+        >
+          {!enabled && !offlineMode ? (
+            <div className="empty" style={{ height: '72%' }}>
+              <HeluoxuHorizonMark />
+              <h3>衡账已关闭</h3>
+              <p className="t-small" style={{ maxWidth: 440, margin: 0 }}>
+                关闭时不进行任何后台拉取，工作台与网关推理不受影响。重新开启后将从上次水位补齐统计，或直接拖入本地 <code>.jsonl.zstd</code> 进行纯浏览器离线解析。
+              </p>
+              <button
+                type="button"
+                className="btn btn-primary"
+                disabled={busy}
+                onClick={() => void handleToggleEnabled(true)}
+              >
+                开启统计
+              </button>
             </div>
           ) : (
-            <div className="lt-card" style={{ color: 'var(--lt-fg-muted)' }}>
-              当前暂无可展示的会话账本。运行一次对话或通过右上角「离线导入 .zstd」即可查看完整峰谷对账与图表。
+            <div className="stage-pad" style={{ maxWidth: 1320 }}>
+              {dragOver && (
+                <div className="dropzone is-dragover" style={{ marginBottom: 14, textAlign: 'center' }}>
+                  松开以在浏览器本地解码 <code>.jsonl.zstd</code> / <code>.jsonl</code> 会话账本（零上传）
+                </div>
+              )}
+              {error && (
+                <div className="callout danger" style={{ marginBottom: 14 }}>
+                  <Icon name="alert" />
+                  <span className="grow">{error}</span>
+                  <button type="button" className="btn btn-ghost btn-sm" onClick={() => setError(null)}>
+                    关闭
+                  </button>
+                </div>
+              )}
+              {notice && (
+                <div className="callout info" style={{ marginBottom: 14 }}>
+                  <Icon name="info" />
+                  <span className="grow">{notice}</span>
+                  <button type="button" className="btn btn-ghost btn-sm" onClick={() => setNotice(null)}>
+                    关闭
+                  </button>
+                </div>
+              )}
+
+              {!report ? (
+                <div className="empty" style={{ padding: '64px 24px' }}>
+                  <HeluoxuHorizonMark />
+                  <h3>暂无可展示的会话账本</h3>
+                  <p className="t-small" style={{ maxWidth: 440, margin: 0 }}>
+                    在工作台运行一次对话，或点击右上角「离线导入 .zstd」即可查看四桶 Token 分布、峰谷成本与逐笔归因账本。
+                  </p>
+                </div>
+              ) : (
+                <>
+                  {/* Unified KPI Strip */}
+                  <div className="kpi-strip" style={{ marginBottom: 16 }}>
+                    <div className="kpi">
+                      <div className="kpi-label">逻辑调用</div>
+                      <div className="kpi-value num">{formatNumber(totals.callsTotal)}</div>
+                      <div className="kpi-sub">
+                        成功率 <span className="num">{successRatePct !== null ? `${successRatePct}%` : '—'}</span>
+                      </div>
+                    </div>
+
+                    <div className="kpi" style={{ gridColumn: 'span 2' }}>
+                      <div className="kpi-label">
+                        总 Token{' '}
+                        <span className="t-meta mono" style={{ fontSize: 10 }}>
+                          = 新增输入 + 缓存读 + 缓存写 + 输出
+                        </span>
+                      </div>
+                      <div className="kpi-value num">{renderTokCompact(totals.totalTokens)}</div>
+                      <div className="meter" style={{ height: 8, marginTop: 8 }}>
+                        {tokenBuckets.map(b => (
+                          <span
+                            key={b.key}
+                            style={{
+                              width: `${((b.value / bucketTotal) * 100).toFixed(2)}%`,
+                              background: b.color,
+                            }}
+                          />
+                        ))}
+                      </div>
+                      <div className="legend" style={{ marginTop: 6 }}>
+                        {tokenBuckets.map(b => (
+                          <span key={b.key}>
+                            <i style={{ background: b.color }} />
+                            {b.label} <b className="num">{renderTokCompact(b.value)}</b>
+                          </span>
+                        ))}
+                        {totals.reasoningTokens != null && (
+                          <span className="muted">
+                            推理 {renderTokCompact(totals.reasoningTokens)}（含于输出）
+                          </span>
+                        )}
+                      </div>
+                    </div>
+
+                    <div className="kpi">
+                      <div className="kpi-label">缓存命中率</div>
+                      <div className="kpi-value num" style={{ color: 'var(--lt-success)' }}>
+                        {totals.cacheHitRatePct != null ? `${totals.cacheHitRatePct}%` : <UnknownValue />}
+                      </div>
+                      <div className="kpi-sub">缓存读 / 全部输入</div>
+                    </div>
+
+                    <div className="kpi">
+                      <div className="kpi-label">实际费用</div>
+                      <div className="kpi-value num">
+                        {totals.costActualCny?.total != null ? (
+                          formatCny(totals.costActualCny.total)
+                        ) : (
+                          <UnknownValue reason="未定价：缺少匹配单价，不以 ¥0 计" />
+                        )}
+                      </div>
+                      <div className="kpi-sub">
+                        刊例峰值{' '}
+                        <span className="num">
+                          {totals.costPeakCny?.total != null ? formatCny(totals.costPeakCny.total) : '—'}
+                        </span>
+                        {typeof totals.cacheSavingsCny === 'number' && totals.cacheSavingsCny > 0 && (
+                          <>
+                            {' · '}
+                            <span className="up num">省 {formatCny(totals.cacheSavingsCny)}</span>
+                          </>
+                        )}
+                      </div>
+                    </div>
+
+                    <div className="kpi">
+                      <div className="kpi-label" style={{ color: unknownTotal > 0 ? 'var(--lt-warning)' : undefined }}>
+                        <Icon name="alert" className="icon-14" />
+                        未知
+                      </div>
+                      <div
+                        className="kpi-value num"
+                        style={{ color: unknownTotal > 0 ? 'var(--lt-warning)' : undefined }}
+                      >
+                        {unknownTotal}
+                      </div>
+                      <div className="kpi-sub">
+                        未计量 <span className="num">{totals.unmeteredCalls || 0}</span> · 未定价{' '}
+                        <span className="num">{totals.unpricedCalls || 0}</span> · 不计为 0
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* 1.6 : 1 Charts Row */}
+                  <div className="grid" style={{ gridTemplateColumns: 'minmax(0, 1.6fr) minmax(0, 1fr)', marginBottom: 16 }}>
+                    <div className="card">
+                      <div className="card-head">
+                        <h3>每日 Token</h3>
+                        <div className="legend">
+                          {tokenBuckets.map(b => (
+                            <span key={b.key}>
+                              <i style={{ background: b.color }} />
+                              {b.label}
+                            </span>
+                          ))}
+                          <span>
+                            <i
+                              style={{
+                                background:
+                                  'repeating-linear-gradient(135deg, var(--lt-chart-unknown) 0 2px, transparent 2px 4px)',
+                              }}
+                            />
+                            未计量
+                          </span>
+                        </div>
+                      </div>
+                      <div className="card-pad">
+                        <StackedBars
+                          rows={dailyRows}
+                          series={tokenBuckets.map(b => ({ key: b.key, label: b.label, color: b.color }))}
+                          ariaLabel="每日 Token 四桶堆叠"
+                        />
+                      </div>
+                    </div>
+
+                    <div className="card">
+                      <div className="card-head">
+                        <h3>模型费用</h3>
+                        <span className="t-meta">CNY</span>
+                      </div>
+                      <div className="card-pad">
+                        {byModel.length === 0 ? (
+                          <div className="t-meta">暂无模型维度汇总</div>
+                        ) : (
+                          byModel.slice(0, 6).map((m: any) => {
+                            const modelCost = extractCnyAmount(m.costActualCny);
+                            const knownCost = modelCost !== null;
+                            return (
+                              <div key={m.route} className="hbar">
+                                <span className="mono ellipsis" title={m.route}>
+                                  {m.route}
+                                </span>
+                                <div className="hbar-track">
+                                  {!knownCost ? (
+                                    <span className="meter-unknown" style={{ width: '100%' }} title="未定价" />
+                                  ) : (
+                                    <span
+                                      style={{
+                                        width: `${Math.max(2, (modelCost / maxModelCost) * 100)}%`,
+                                        background: 'var(--lt-chart-1)',
+                                      }}
+                                    />
+                                  )}
+                                </div>
+                                <span className="num" style={{ textAlign: 'right' }}>
+                                  {!knownCost ? (
+                                    <span className="badge sm warning">未定价</span>
+                                  ) : (
+                                    formatCny(modelCost)
+                                  )}
+                                </span>
+                              </div>
+                            );
+                          })
+                        )}
+
+                        {byGroup.length > 0 && (
+                          <>
+                            <div className="t-overline" style={{ margin: '18px 0 8px' }}>
+                              角色组开销占比
+                            </div>
+                            <div className="meter" style={{ height: 12 }}>
+                              {byGroup.map((g: any) => {
+                                const pct = ((g.totalTokens || 0) / totalGroupTokens) * 100;
+                                return (
+                                  <span
+                                    key={g.group || g.label}
+                                    style={{
+                                      width: `${pct.toFixed(2)}%`,
+                                      background: GROUP_COLORS[g.group] || 'var(--lt-chart-4)',
+                                    }}
+                                  />
+                                );
+                              })}
+                            </div>
+                            <div className="legend" style={{ marginTop: 8 }}>
+                              {byGroup.map((g: any) => {
+                                const pct = Math.round(((g.totalTokens || 0) / totalGroupTokens) * 100);
+                                return (
+                                  <span key={g.group || g.label}>
+                                    <i style={{ background: GROUP_COLORS[g.group] || 'var(--lt-chart-4)' }} />
+                                    {GROUP_LABELS[g.group] || g.label || g.group}{' '}
+                                    <b className="num">{pct}%</b>
+                                  </span>
+                                );
+                              })}
+                            </div>
+                          </>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Clickable Sessions Overview Table */}
+                  {!offlineMode && overviewData?.overview?.sessions?.length > 0 && (
+                    <div className="card" style={{ marginBottom: 16 }}>
+                      <div className="card-head">
+                        <h3>会话 ({overviewData.overview.sessions.length})</h3>
+                        <span className="t-meta">点击会话切换下方逐笔账本（子会话已自动去重归并）</span>
+                      </div>
+                      <div style={{ overflow: 'auto', maxHeight: 240 }}>
+                        <table className="tbl">
+                          <thead>
+                            <tr>
+                              <th>会话</th>
+                              <th className="r">调用</th>
+                              <th className="r">Token</th>
+                              <th className="r">费用</th>
+                              <th className="r">未知</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {overviewData.overview.sessions.map((s: any) => {
+                              const unk = (s.unmeteredCalls || 0) + (s.unpricedCalls || 0);
+                              return (
+                                <tr
+                                  key={s.sessionId}
+                                  className="is-clickable"
+                                  aria-selected={s.sessionId === selectedSessionId ? 'true' : undefined}
+                                  onClick={() => setSelectedSessionId(s.sessionId)}
+                                >
+                                  <td>
+                                    <span className="row" style={{ gap: 8 }}>
+                                      <span className="ellipsis" style={{ maxWidth: 420 }}>
+                                        {s.title || s.sessionId.slice(0, 18)}
+                                      </span>
+                                      <span className="mono t-meta">{s.sessionId.slice(0, 14)}</span>
+                                    </span>
+                                  </td>
+                                  <td className="r num">{formatNumber(s.callsTotal ?? s.calls)}</td>
+                                  <td className="r num">{renderTokCompact(s.totalTokens)}</td>
+                                  <td className="r num">
+                                    {s.costActualCny != null ? (
+                                      formatCny(typeof s.costActualCny === 'object' ? s.costActualCny.total : s.costActualCny)
+                                    ) : (
+                                      <UnknownValue reason="含未定价调用" />
+                                    )}
+                                  </td>
+                                  <td className="r num">
+                                    {unk > 0 ? (
+                                      <span style={{ color: 'var(--lt-warning)' }}>{unk}</span>
+                                    ) : (
+                                      <span className="muted">0</span>
+                                    )}
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Full 14-Column Call Ledger */}
+                  <div className="card">
+                    <div className="card-head" style={{ flexWrap: 'wrap' }}>
+                      <h3>
+                        逐笔账本 ·{' '}
+                        <span className="mono" style={{ fontWeight: 500 }}>
+                          {report.meta?.sessionId || selectedSessionId || '离线报告'}
+                        </span>
+                        <span className="t-meta num" style={{ marginLeft: 8, fontWeight: 400 }}>
+                          ({filteredCalls.length} 笔)
+                        </span>
+                      </h3>
+                      <div className="row" style={{ gap: 8, flexWrap: 'wrap' }}>
+                        <label className="search" style={{ width: 200 }}>
+                          <Icon name="search" />
+                          <input
+                            className="input input-sm"
+                            placeholder="筛选路由 / 供应商 / 成员…"
+                            value={callSearch}
+                            onChange={e => {
+                              setCallSearch(e.target.value);
+                              setPage(1);
+                            }}
+                          />
+                        </label>
+                        <select
+                          className="select select-sm"
+                          style={{ width: 132 }}
+                          value={callFilterGroup}
+                          onChange={e => {
+                            setCallFilterGroup(e.target.value);
+                            setPage(1);
+                          }}
+                        >
+                          <option value="all">全部组别</option>
+                          <option value="leader">主导 (leader)</option>
+                          <option value="execution">执行 (execution)</option>
+                          <option value="governance">治理 (governance)</option>
+                          <option value="main">主会话 (main)</option>
+                          <option value="subagents">子会话 (subagents)</option>
+                        </select>
+                        <button type="button" className="btn btn-sm btn-ghost" onClick={exportCsv}>
+                          <Icon name="download" className="icon-14" />
+                          导出 CSV
+                        </button>
+                        <button type="button" className="btn btn-sm btn-ghost" onClick={exportJson}>
+                          <Icon name="download" className="icon-14" />
+                          导出 JSON
+                        </button>
+                      </div>
+                    </div>
+
+                    <div style={{ overflow: 'auto' }}>
+                      <table className="tbl">
+                        <thead>
+                          <tr>
+                            <th className="r">#</th>
+                            <th>时间</th>
+                            <th>角色 / 成员</th>
+                            <th className="r">任务</th>
+                            <th>请求路由</th>
+                            <th>实际上游</th>
+                            <th className="r">尝试</th>
+                            <th className="r">耗时</th>
+                            <th className="r">新增输入</th>
+                            <th className="r">缓存读</th>
+                            <th className="r">缓存写</th>
+                            <th className="r">输出</th>
+                            <th className="r">费用</th>
+                            <th>状态</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {pagedCalls.map((c: any) => {
+                            const isUnknownProv = !c.actualProvider || c.actualProvider === 'unknown';
+                            return (
+                              <tr key={c.n}>
+                                <td className="r num muted">{c.n}</td>
+                                <td className="num">{formatClockTime(c.timeMs) || '—'}</td>
+                                <td>
+                                  <span className="row" style={{ gap: 6 }}>
+                                    <span>{c.actor || c.role || '—'}</span>
+                                    <span className="badge sm outline">{GROUP_LABELS[c.group] || c.group}</span>
+                                  </span>
+                                </td>
+                                <td className="r num">
+                                  {c.taskSeq !== null && c.taskSeq !== undefined ? (
+                                    `#${c.taskSeq}`
+                                  ) : (
+                                    <UnknownValue reason="非团队轮次或未关联任务序号" />
+                                  )}
+                                </td>
+                                <td className="mono">{c.route || '—'}</td>
+                                <td className="mono">
+                                  {isUnknownProv ? (
+                                    <span className="badge sm outline" title="上游未揭示，不猜测归属">
+                                      unknown
+                                    </span>
+                                  ) : (
+                                    `${c.actualProvider} / ${c.actualModel || 'unknown'}`
+                                  )}
+                                </td>
+                                <td className="r num">
+                                  {c.physicalAttempts == null ? (
+                                    <UnknownValue reason="无物理尝试次数记录" />
+                                  ) : c.physicalAttempts > 1 ? (
+                                    <span style={{ color: 'var(--lt-warning)' }}>{c.physicalAttempts}</span>
+                                  ) : (
+                                    c.physicalAttempts
+                                  )}
+                                </td>
+                                <td className="r num">
+                                  {c.latencyMs != null ? (
+                                    formatDurationMs(c.latencyMs)
+                                  ) : (
+                                    <UnknownValue reason="无耗时记录" />
+                                  )}
+                                </td>
+                                <td className="r num">
+                                  {c.unmetered ? (
+                                    <UnknownValue reason="未计量：上游未返回 usage" />
+                                  ) : (
+                                    formatNumber(c.inputTokens)
+                                  )}
+                                </td>
+                                <td className="r num">
+                                  {c.unmetered ? (
+                                    <UnknownValue reason="未计量：上游未返回 usage" />
+                                  ) : (
+                                    formatNumber(c.cacheReadTokens)
+                                  )}
+                                </td>
+                                <td className="r num">
+                                  {c.unmetered ? (
+                                    <UnknownValue reason="未计量：上游未返回 usage" />
+                                  ) : (
+                                    formatNumber(c.cacheWriteTokens)
+                                  )}
+                                </td>
+                                <td className="r num">
+                                  {c.unmetered ? (
+                                    <UnknownValue reason="未计量：上游未返回 usage" />
+                                  ) : (
+                                    formatNumber(c.outputTokens)
+                                  )}
+                                </td>
+                                <td className="r num">
+                                  {c.unmetered ? (
+                                    <UnknownValue reason="未计量，无法计算费用" />
+                                  ) : c.costActualCny != null ? (
+                                    formatCny(c.costActualCny)
+                                  ) : (
+                                    <UnknownValue reason="未定价：缺少单价，不以 ¥0 计" />
+                                  )}
+                                </td>
+                                <td>{renderStatusBadge(c.ok, c.status)}</td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+
+                    {totalPages > 1 && (
+                      <div className="card-pad hairline-top row" style={{ justifyContent: 'flex-end', gap: 8 }}>
+                        <button
+                          type="button"
+                          className="btn btn-sm"
+                          disabled={page <= 1}
+                          onClick={() => setPage(p => p - 1)}
+                        >
+                          上一页
+                        </button>
+                        <span className="t-meta num">
+                          第 {page} / {totalPages} 页
+                        </span>
+                        <button
+                          type="button"
+                          className="btn btn-sm"
+                          disabled={page >= totalPages}
+                          onClick={() => setPage(p => p + 1)}
+                        >
+                          下一页
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                </>
+              )}
             </div>
           )}
-        </>
-      )}
+        </div>
+      </main>
+
+      {/* Pricing Override Slide-Over Drawer */}
+      <Drawer
+        open={showPricingDrawer}
+        onClose={() => setShowPricingDrawer(false)}
+        title="路由单价覆盖"
+        subtitle="仅保存在 storageRoot/usage/custom-pricing.json，不篡改原始会话"
+        leading={<Icon name="sliders" />}
+        footer={
+          <>
+            <button
+              type="button"
+              className="btn"
+              disabled={busy}
+              onClick={() =>
+                void callLtApi('usage/pricing', { action: 'reset' }).then(() => {
+                  setShowPricingDrawer(false);
+                  void loadLiveOverview();
+                  notify('已恢复默认校准价格', 'rollback');
+                })
+              }
+            >
+              恢复默认单价
+            </button>
+            <button type="button" className="btn" onClick={() => setShowPricingDrawer(false)}>
+              取消
+            </button>
+            <button type="submit" form="hz-pricing-form" className="btn btn-primary" disabled={busy}>
+              保存并重算
+            </button>
+          </>
+        }
+      >
+        <div className="callout" style={{ marginBottom: 16 }}>
+          <Icon name="info" />
+          <span>
+            价格来源优先级：自定义 &gt; 网关 &gt; 目录。未定价路由在报表中严格显示为「— / 未定价」，绝不伪造为 ¥0。
+          </span>
+        </div>
+        <form id="hz-pricing-form" className="col" style={{ gap: 14 }} onSubmit={handleSaveCustomPrice}>
+          <div className="grid grid-2">
+            <div className="field">
+              <label className="label">USD → CNY 汇率</label>
+              <input
+                className="input num"
+                value={usdToCnyInput}
+                onChange={e => setUsdToCnyInput(e.target.value)}
+              />
+            </div>
+            <div className="field">
+              <label className="label">币种</label>
+              <select
+                className="select"
+                value={newPriceCurrency}
+                onChange={e => setNewPriceCurrency(e.target.value as 'CNY' | 'USD')}
+              >
+                <option value="CNY">CNY (元 / 百万 Token)</option>
+                <option value="USD">USD ($ / 百万 Token)</option>
+              </select>
+            </div>
+          </div>
+
+          <div className="field">
+            <label className="label">新增或覆盖路由单价</label>
+            <input
+              className="input mono"
+              placeholder="如 deepseek/deepseek-reasoner"
+              value={newPriceRoute}
+              onChange={e => setNewPriceRoute(e.target.value)}
+            />
+          </div>
+
+          <div className="grid grid-3">
+            <div className="field">
+              <label className="label">输入 / 1M</label>
+              <input className="input num" value={newPriceIn} onChange={e => setNewPriceIn(e.target.value)} />
+            </div>
+            <div className="field">
+              <label className="label">缓存读 / 1M</label>
+              <input className="input num" value={newPriceCache} onChange={e => setNewPriceCache(e.target.value)} />
+            </div>
+            <div className="field">
+              <label className="label">输出 / 1M</label>
+              <input className="input num" value={newPriceOut} onChange={e => setNewPriceOut(e.target.value)} />
+            </div>
+          </div>
+          <span className="hint">单位：所选币种 / 百万 Token。</span>
+        </form>
+      </Drawer>
     </div>
   );
 }

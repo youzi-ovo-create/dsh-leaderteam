@@ -36,7 +36,7 @@ export function frontierState(store, taskSeq) {
   return { revision: increments.length, overview, stages, events, increments, startedAt: increments[0]?.at ?? null };
 }
 function safeStageFile(store, taskSeq, id, revision, hash) {
-  const root = currentPlanRoot(path.dirname(path.dirname(store.dir)), store.teamId);
+  const root = currentPlanRoot(path.dirname(path.dirname(store.dir)), store.rawTeamId ?? store.teamId);
   const file = path.join(root, `task-${taskSeq}`, 'stages', id, `${revision}-${hash}.md`);
   for (let p = file; ; p = path.dirname(p)) {
     try { if (fs.lstatSync(p).isSymbolicLink()) throw new Error('stage snapshot path contains a symlink or junction'); }
@@ -109,7 +109,7 @@ export function recordStage(store, taskSeq, args) {
 }
 function syncCurrentPlan(store, taskSeq) {
   const root = path.dirname(path.dirname(store.dir));
-  writeCurrentPlan(root, store.teamId, taskSeq, renderPlan(frontierState(store, taskSeq)));
+  writeCurrentPlan(root, store.rawTeamId ?? store.teamId, taskSeq, renderPlan(frontierState(store, taskSeq)));
 }
 export function requireReadyStage(store, taskSeq, id) {
   const stage = frontierState(store, taskSeq).stages.get(stageId(id));
