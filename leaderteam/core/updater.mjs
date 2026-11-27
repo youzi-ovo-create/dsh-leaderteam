@@ -858,15 +858,55 @@ export async function downloadAndVerifyReleaseTarball({
   };
 }
 
+const WIN_UPDATER_DRIVE_SUBPATHS = Object.freeze([
+  ['Apps', 'DeepSeek-Harness'],
+  ['Apps', 'DeepSeek Harness'],
+  ['Program Files', 'DeepSeek Harness'],
+  ['Program Files', 'DeepSeek-Harness'],
+  ['DeepSeek-Harness'],
+  ['DeepSeek Harness'],
+  ['Programs', 'DeepSeek-Harness'],
+  ['Programs', 'DeepSeek Harness'],
+]);
+
 export function resolveDshCliCommand({ dshHome = null, profile = 'web', env = process.env, fsImpl = fs } = {}) {
-  // 1. Official Windows Desktop bundled CLI for `--profile desktop`
-  if (process.platform === 'win32' && profile === 'desktop') {
-    const candidates = [
-      env?.LOCALAPPDATA ? path.join(env.LOCALAPPDATA, 'Programs', 'DeepSeek Harness', 'resources', 'runtime', 'cli', 'bin', 'dsh.cmd') : null,
-      env?.PROGRAMFILES ? path.join(env.PROGRAMFILES, 'DeepSeek Harness', 'resources', 'runtime', 'cli', 'bin', 'dsh.cmd') : null,
+  // 1. Official Windows Desktop bundled CLI (supports BOTH `desktop` and `web` profiles, custom install dirs like D:\Apps\DeepSeek-Harness, and LT_DSH_APP)
+  if (process.platform === 'win32') {
+    const appDirCandidates = [
+      env?.LT_DSH_APP ? String(env.LT_DSH_APP).trim() : null,
+      env?.DSH_APP_DIR ? String(env.DSH_APP_DIR).trim() : null,
+      env?.LOCALAPPDATA ? path.join(env.LOCALAPPDATA, 'Programs', 'DeepSeek Harness') : null,
+      env?.LOCALAPPDATA ? path.join(env.LOCALAPPDATA, 'Programs', 'DeepSeek-Harness') : null,
+      env?.PROGRAMFILES ? path.join(env.PROGRAMFILES, 'DeepSeek Harness') : null,
+      env?.PROGRAMFILES ? path.join(env.PROGRAMFILES, 'DeepSeek-Harness') : null,
     ].filter(Boolean);
-    for (const c of candidates) {
-      if (fsImpl.existsSync(c)) return { cmd: c, prefixArgs: [], shell: true };
+
+    for (let code = 67; code <= 90; code++) {
+      const driveRoot = `${String.fromCharCode(code)}:\\`;
+      let driveExists = false;
+      try { driveExists = fsImpl.existsSync(driveRoot); } catch {}
+      if (!driveExists) continue;
+      for (const sub of WIN_UPDATER_DRIVE_SUBPATHS) {
+        const candDir = path.join(driveRoot, ...sub);
+        if (!appDirCandidates.includes(candDir)) appDirCandidates.push(candDir);
+      }
+    }
+
+    for (const appDir of appDirCandidates) {
+      const exePath = path.join(appDir, 'DeepSeek Harness.exe');
+      const cliJsPath = path.join(appDir, 'resources', 'app.asar', 'dsh', 'node_modules', '@deepseek-ai', 'dsh-desktop-host', 'lib', 'cli.js');
+      if (fsImpl.existsSync(exePath) && fsImpl.existsSync(cliJsPath)) {
+        return {
+          cmd: exePath,
+          prefixArgs: ['--expose-internals', cliJsPath],
+          shell: false,
+          extraEnv: { ELECTRON_RUN_AS_NODE: '1' },
+        };
+      }
+      const dshCmd = path.join(appDir, 'resources', 'runtime', 'cli', 'bin', 'dsh.cmd');
+      if (fsImpl.existsSync(dshCmd)) {
+        return { cmd: dshCmd, prefixArgs: [], shell: true, extraEnv: {} };
+      }
     }
   }
   // 2. Linux `~/.local/share/dsh-runtime/current/node_modules/@deepseek-ai/dsh/lib/bin.js`
@@ -874,7 +914,7 @@ export function resolveDshCliCommand({ dshHome = null, profile = 'web', env = pr
   if (homeDir) {
     const localRuntimeBin = path.join(homeDir, '.local', 'share', 'dsh-runtime', 'current', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js');
     if (fsImpl.existsSync(localRuntimeBin)) {
-      return { cmd: process.execPath, prefixArgs: [localRuntimeBin], shell: false };
+      return { cmd: process.execPath, prefixArgs: [localRuntimeBin], shell: false, extraEnv: {} };
     }
   }
   // 3. `dsh` in PATH
@@ -884,7 +924,7 @@ export function resolveDshCliCommand({ dshHome = null, profile = 'web', env = pr
     for (const ext of exts) {
       const cand = path.join(dir, `dsh${ext}`);
       if (fsImpl.existsSync(cand)) {
-        return { cmd: cand, prefixArgs: [], shell: process.platform === 'win32' && ext === '.cmd' };
+        return { cmd: cand, prefixArgs: [], shell: process.platform === 'win32' && ext === '.cmd', extraEnv: {} };
       }
     }
   }
@@ -1285,6 +1325,21 @@ export async function performOneClickUpgrade({
       throw err;
     }
 
+    if (effectiveProfile === 'desktop' && dshHome) {
+      const dpDir = path.join(dshHome, 'profiles', 'desktop');
+      const dpPkg = path.join(dpDir, 'package.json');
+      if (!fs.existsSync(dpPkg)) {
+        fs.mkdirSync(dpDir, { recursive: true });
+        writeFileAtomic(dpPkg, JSON.stringify({
+          name: 'dsh-profile-desktop',
+          private: true,
+          dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app'] } },
+        }, null, 2) + '\n');
+        const dpPatch = path.join(dpDir, 'cordis.patch.yml');
+        if (!fs.existsSync(dpPatch)) writeFileAtomic(dpPatch, '[]\n');
+      }
+    }
+
     const proc = spawnSync(
       dshCli.cmd,
       [...dshCli.prefixArgs, 'plugin', '--profile', effectiveProfile, 'add', staged.tgzPath],
@@ -1293,7 +1348,7 @@ export async function performOneClickUpgrade({
         windowsHide: true,
         shell: dshCli.shell,
         timeout: 180000,
-        env: { ...process.env, ...(dshHome ? { DSH_HOME: dshHome } : {}) },
+        env: { ...process.env, ...(dshCli.extraEnv ?? {}), ...(dshHome ? { DSH_HOME: dshHome } : {}) },
       },
     );
     if (proc.status !== 0) {
@@ -1428,7 +1483,7 @@ export async function rollbackToSavedBackup({
         windowsHide: true,
         shell: dshCli.shell,
         timeout: 180000,
-        env: { ...process.env, ...(dshHome ? { DSH_HOME: dshHome } : {}) },
+        env: { ...process.env, ...(dshCli.extraEnv ?? {}), ...(dshHome ? { DSH_HOME: dshHome } : {}) },
       },
     );
     if (proc.status !== 0) {

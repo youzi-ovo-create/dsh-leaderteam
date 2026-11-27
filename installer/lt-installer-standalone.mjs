@@ -1027,6 +1027,8 @@ function invokeStandalonePluginAdd(target, tgzToInstall, dshHome) {
 export async function downloadAndInstallStandalone({
   targetId = null,
   customPath = null,
+  profile = null,
+  ignoreRunningLock = false,
   track = 'open-source',
   targetVersion = null,
   platform = process.platform,
@@ -1043,14 +1045,22 @@ export async function downloadAndInstallStandalone({
   }
   const inferredCustom = customPath || (/^(?:desktop|web):(.+)$/.exec(String(targetId ?? ''))?.[1] ?? null);
   const snap = scanDshTargets({ customPath: inferredCustom, dshHome, platform, spawnSyncImpl });
-  const target = (targetId ? snap.targets.find(t => t.id === targetId) : null) || snap.targets[0];
-  if (!target) {
+  const rawTarget = (targetId ? snap.targets.find(t => t.id === targetId) : null) || snap.targets[0];
+  if (!rawTarget) {
     throw new Error('未检测到本机已安装的 DeepSeek Harness，请先安装官方客户端（>= 0.2.2-rc.1），或在页面手动指定安装目录后点击“重新扫描”。');
   }
+  const requestedProfile = profile === 'web' || profile === 'desktop' ? profile : null;
+  const target = requestedProfile && requestedProfile !== rawTarget.profile
+    ? {
+        ...rawTarget,
+        profile: requestedProfile,
+        ...(requestedProfile === 'web' ? { desktopRunning: false } : {}),
+      }
+    : rawTarget;
   if (!target.compatible) {
     throw new Error(`当前 DSH 版本 (${target.dshVersion || '未知'}) 低于最低要求 0.2.2-alpha.2，请先更新 DSH 客户端。`);
   }
-  if (target.kind === 'official-desktop' && target.desktopRunning) {
+  if (target.kind === 'official-desktop' && target.profile === 'desktop' && target.desktopRunning && !ignoreRunningLock) {
     throw new Error('EBUSY: 检测到 DeepSeek Harness 正在运行，请先完全退出客户端（含右下角托盘图标）后再点击安装。');
   }
 
@@ -1108,7 +1118,7 @@ export async function downloadAndInstallStandalone({
   }
 
   let desktopProfileInit = null;
-  if (target.profile === 'desktop' || target.kind === 'official-desktop') {
+  if (target.profile === 'desktop') {
     desktopProfileInit = ensureDesktopProfileInitialized(snap.dshHome);
   }
 
@@ -1122,7 +1132,7 @@ export async function downloadAndInstallStandalone({
   }
 
   let desktopPatchHygiene = null;
-  if (target.profile === 'desktop' || target.kind === 'official-desktop') {
+  if (target.profile === 'desktop' || target.profile === 'web') {
     desktopPatchHygiene = sanitizeDesktopCordisPatch({
       dshHome: snap.dshHome,
       profile: target.profile || 'desktop',
@@ -1603,6 +1613,8 @@ function parseStandaloneArgs(argv) {
     json: false,
     port: 0,
     customPath: null,
+    profile: null,
+    ignoreRunningLock: false,
     dshHome: null,
     tgz: null,
     version: null,
@@ -1616,8 +1628,10 @@ function parseStandaloneArgs(argv) {
     else if (a === '--inspect') { opts.inspect = true; opts.gui = false; }
     else if (a === '--no-open') opts.noOpen = true;
     else if (a === '--json') opts.json = true;
+    else if (a === '--ignore-running-lock') opts.ignoreRunningLock = true;
     else if (a === '--port' && argv[i + 1]) opts.port = Number(argv[++i]) || 0;
-    else if (a === '--custom-path' && argv[i + 1]) opts.customPath = argv[++i];
+    else if ((a === '--custom-path' || a === '--dsh-dir' || a === '--dsh-app') && argv[i + 1]) opts.customPath = argv[++i];
+    else if (a === '--profile' && argv[i + 1]) opts.profile = argv[++i];
     else if (a === '--dsh-home' && argv[i + 1]) opts.dshHome = argv[++i];
     else if (a === '--tgz' && argv[i + 1]) opts.tgz = argv[++i];
     else if ((a === '--version' || a === '--tag') && argv[i + 1]) opts.version = argv[++i];
@@ -1649,6 +1663,8 @@ if (isMain(import.meta.url)) {
     if (!opts.gui) {
       const out = await downloadAndInstallStandalone({
         customPath: opts.customPath,
+        profile: opts.profile,
+        ignoreRunningLock: opts.ignoreRunningLock,
         dshHome: opts.dshHome,
         localTgzPath: opts.tgz,
         targetVersion: opts.version,
