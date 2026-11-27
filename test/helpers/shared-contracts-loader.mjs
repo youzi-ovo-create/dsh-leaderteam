@@ -11,6 +11,7 @@ export function resolveSharedContractsDir() {
     path.resolve(REPO_ROOT, '..', 'lt-shared-contracts'),
     path.resolve(REPO_ROOT, '..', '..', 'deliverables', 'v2.2.2', 'companion', 'lt-shared-contracts'),
     path.resolve(REPO_ROOT, '..', '..', 'v2.2.2-r3', 'leaderteam-v2.2.2-r3', 'lt-shared-contracts'),
+    path.resolve(REPO_ROOT, 'test', 'fixtures', 'lt-shared-contracts'),
   ].filter(Boolean);
   for (const dir of candidates) {
     if (fs.existsSync(path.join(dir, 'tests', 'contract-validator.mjs'))) {
