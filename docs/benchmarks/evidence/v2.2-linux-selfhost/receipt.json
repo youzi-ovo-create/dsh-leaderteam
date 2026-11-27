@@ -1,0 +1,260 @@
+{
+  "结论": "通过。当前私有 V2.3 和公开 V2.2.1 在所测 Linux 范围内未发现影响较大的遗留缺陷。",
+  "复核日期": "2026-11-26（北京时间）",
+  "运行环境": {
+    "platform": "linux-x86_64",
+    "node": "v24.22.3",
+    "dsh": "0.2.2-rc.5",
+    "模型端点": "DSH 发行版连接本机受控 HTTP/SSE 网关。开发期间的用量另从历史会话账本核算。"
+  },
+  "原始版本": {
+    "developmentBaseline": "3de5ea87868c088f2d743f402cc5ff4b5b943afc",
+    "privateStart": "47bea1a2029aa1097361454c3e6448d67203087a",
+    "deliveryCommit": "71975af5d6829d9de76d0c92f7e500c6ad65dbd9",
+    "frozenArchiveSha256": "c11442096c812ee696276db3fcf738a2512e0564c9be77d62eb2b5fe465c7fdc",
+    "tarballSha256": "2243466d3b3fc59570f7ff663dda874a202775d1e5dca872431e1f96d18b2f95",
+    "nativeSha256": "0d49fab65e487c423024f38c67261f034471646444c2a70abf2518b45390764f",
+    "rustMapperTree": "751e5a77f577da88a9113964b6f66f9e9763c841",
+    "frozenFullSuitePreviouslyVerified": {
+      "evidence": "04-独立复测证据.zip / logs/summary.json",
+      "counts": {
+        "commit": "71975af",
+        "js": {
+          "tests": 302,
+          "pass": 302,
+          "fail": 0,
+          "skipped": 0,
+          "cancelled": 0
+        },
+        "integration": {
+          "passed": 48,
+          "ran": 48,
+          "skipped": 0
+        },
+        "rust": {
+          "passed": 17,
+          "failed": 0,
+          "clippyWarnings": 0
+        }
+      }
+    },
+    "frozenScenariosRerunThisReview": 3,
+    "strictCapWire": {
+      "wire": [
+        {
+          "model": "codex/gpt-6.1-terra",
+          "limit": 8192,
+          "http": 404
+        },
+        {
+          "model": "zcode/GLM-5.3",
+          "limit": 8192,
+          "http": 200
+        }
+      ],
+      "memberStatus": "done"
+    },
+    "configurationEdit": [
+      {
+        "step": "before",
+        "exit": 0,
+        "saved": null,
+        "error": null
+      },
+      {
+        "step": "save",
+        "exit": 1,
+        "saved": null,
+        "error": "invalid leaderteam config:\n- roles.gate.effort must match roles.leader.effort when using the default route"
+      },
+      {
+        "step": "reopen",
+        "exit": 0,
+        "saved": null,
+        "error": null
+      }
+    ],
+    "baselineConfigurationEditControls": {
+      "v2.2.0": [
+        {
+          "step": "before",
+          "exit": 1,
+          "saved": null,
+          "error": "invalid leaderteam config:\n- roles.gate.route \"default\" is not in models"
+        },
+        {
+          "step": "save",
+          "exit": 1,
+          "saved": null,
+          "error": "invalid leaderteam config:\n- roles.gate.route \"default\" is not in models"
+        },
+        {
+          "step": "reopen",
+          "exit": 1,
+          "saved": null,
+          "error": "invalid leaderteam config:\n- roles.gate.route \"default\" is not in models"
+        }
+      ],
+      "47bea1a": [
+        {
+          "step": "before",
+          "exit": 1,
+          "saved": null,
+          "error": "invalid leaderteam config:\n- roles.gate.route \"default\" is not in models"
+        },
+        {
+          "step": "save",
+          "exit": 1,
+          "saved": null,
+          "error": "invalid leaderteam config:\n- roles.gate.route \"default\" is not in models"
+        },
+        {
+          "step": "reopen",
+          "exit": 1,
+          "saved": null,
+          "error": "invalid leaderteam config:\n- roles.gate.route \"default\" is not in models"
+        }
+      ]
+    }
+  },
+  "最新修复版本": {
+    "private": {
+      "commit": "b0b2fc2b1b5d036224fd945df5385ce5cc60cfa9",
+      "js": {
+        "tests": 313,
+        "pass": 313,
+        "fail": 0,
+        "skipped": 0,
+        "cancelled": 0
+      },
+      "dshIntegrationPassed": 49,
+      "gitStatusPorcelain": "",
+      "rustTestsPassed": 17,
+      "clippyExit": 0,
+      "rustMapperTree": "751e5a77f577da88a9113964b6f66f9e9763c841",
+      "binaryUsedForFullSuite": "5a2fdde1187994ebcdbaccfd70b276eae391fb263ad1370638ac046f94dd3d2b",
+      "freshBuildMapperScenariosPassed": 4
+    },
+    "public": {
+      "commit": "1fda9f0fc67fe3449d156659cd710f96dc754a54",
+      "js": {
+        "tests": 295,
+        "pass": 295,
+        "fail": 0,
+        "skipped": 0,
+        "cancelled": 0
+      },
+      "dshIntegrationPassed": 45,
+      "gitStatusPorcelain": ""
+    },
+    "round1Passed": [
+      "F01",
+      "F02",
+      "F03",
+      "F04",
+      "F05",
+      "F06",
+      "F07",
+      "F08",
+      "F09"
+    ],
+    "round2Passed": [
+      "R01",
+      "R02",
+      "R03",
+      "R04",
+      "R05",
+      "R06",
+      "R07"
+    ],
+    "strictCapWire": {
+      "wire": [
+        {
+          "model": "codex/gpt-6.1-terra",
+          "limit": 65536,
+          "http": 404
+        },
+        {
+          "model": "zcode/GLM-5.3",
+          "limit": 8192,
+          "http": 200
+        }
+      ],
+      "memberStatus": "done"
+    },
+    "missingPrimaryAdapter": {
+      "testPassed": 1,
+      "wire": [
+        {
+          "model": "zcode/GLM-5.3",
+          "limit": 8192
+        }
+      ],
+      "terminal": "done",
+      "attempts": [
+        {
+          "type": "execution-attempt",
+          "route": "codex/gpt-6.1-terra"
+        },
+        {
+          "type": "execution-settled",
+          "route": "codex/gpt-6.1-terra",
+          "code": "NO_ADAPTER",
+          "kind": "unavailable",
+          "tools": 0
+        },
+        {
+          "type": "execution-attempt",
+          "route": "zcode/GLM-5.3"
+        },
+        {
+          "type": "execution-settled",
+          "route": "zcode/GLM-5.3",
+          "kind": null,
+          "tools": 0
+        }
+      ]
+    }
+  },
+  "离线产物": {
+    "frozen": {
+      "entries": 115,
+      "sha256": "2243466d3b3fc59570f7ff663dda874a202775d1e5dca872431e1f96d18b2f95",
+      "bytes": 788237,
+      "nativeSha256": "0d49fab65e487c423024f38c67261f034471646444c2a70abf2518b45390764f",
+      "nativeArchiveMode": "0o700",
+      "installExit": 0,
+      "doctorOverall": "warn",
+      "doctorOk": true,
+      "installedMapper": {
+        "n": 1,
+        "round": 2
+      }
+    },
+    "v22": {
+      "entries": 112,
+      "sha256": "4bebf8fc26333ecdbf73b3fbd9e8192dda2d8441dfca9078a9a14698910fe452",
+      "bytes": 427697,
+      "nativeSha256": null,
+      "nativeArchiveMode": null,
+      "installExit": 0,
+      "doctorOverall": "warn",
+      "doctorOk": true
+    },
+    "v23": {
+      "entries": 115,
+      "sha256": "2332a97f7015da9dc0aaba94691d5c7ee2dd9a9c9486c2ee241ab122e4fcdbae",
+      "bytes": 795132,
+      "nativeSha256": "2aee943981e59a184f252922d1d539e596db84d06f8da06a6c97069db56f7e71",
+      "nativeArchiveMode": "0o755",
+      "installExit": 0,
+      "doctorOverall": "warn",
+      "doctorOk": true,
+      "installedMapper": {
+        "n": 1,
+        "round": 2
+      }
+    }
+  },
+  "诊断摘要": "三个隔离安装的 lt-doctor 均退出 0，唯一警告是使用有效的仓库示例配置。"
+}

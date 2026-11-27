@@ -2,28 +2,40 @@
 
 本项目的所有重要版本变更均记录于此文件，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
-## [2.2.3] - 2026-11-27
+## [2.2.3] - 2026-11-27 (`linux-v2.2.3` / `v2.2.3`)
 
-会话内 `Single / Team` 双模协同、河洛（Heluo）原生控制台 v2、Magpie 网关与衡账（`lt-usage`）融合、历代设计原则（`DP-01`..`DP-06`）防退化护栏、DSH 模型选择器全链路同步修复，以及 Windows / Linux 跨平台独立发行版（`Apache-2.0`）：
+会话内 `Single / Team` 双模协同、河洛（Heluo）原生控制台 v2、Magpie 网关与衡账（`lt-usage`）融合、历代设计原则（`DP-01`..`DP-06`）防退化护栏、DSH 模型选择器全链路同步修复，以及跨平台独立发行版（`Apache-2.0`）：
 
 ### Added
 - **会话内 `Single / Team` 双模无缝切换与河洛原生工作台（`lt.public.v1` `1.1.0`）**：支持在同一 `leaderteam` 会话内于安全边界一键切换轻量单兵直连模式（`single`）与多角色分权自治团队模式（`team`），内置完整 React 源码（`packages/lt-web`）与构建产物、Magpie 托管/外置网关生命周期管理及衡账（`packages/lt-usage`）多维成本归因。
 - **零命令行图形安装器、三步新手引导、双轨隔离自动升级与会话级模型隔离（Issues #1–#4）**：
   - 自适应宿主结构契约兼容矩阵（覆盖官方 DeepSeek Harness `0.2.2-alpha.2` ~ `0.2.3-alpha.2`）；
-  - 图形化一键安装器（`Install-LeaderTeam.cmd` / `install-leaderteam.sh` / `lt-installer-standalone.mjs`），支持 Windows 注册表 `Uninstall`、环境变量、运行中进程及 `C:..Z:` 全盘自定义安装目录（如 `D:\Apps\DeepSeek-Harness`）自动识别与旧补丁无损清理；
+  - 图形化一键安装器（`bin/lt-installer.mjs`、`install-leaderteam.sh`、`Install-LeaderTeam.cmd`）与旧补丁无损清理；
   - 控制台内置 SHA-256 校验热升级与一键快照回滚；
   - 会话级独立模型覆盖（`session-config.mjs`）、默认 `leaderModelPolicy: "follow"` 自动跟随 DSH 模型/推理档位切换、空闲会话保存即生效及 User/Agent 严格权限隔离（`403 AGENT_CONFIG_MUTATION_FORBIDDEN`）。
-- **跨平台独立发行标签治理（`windows-vX.Y.Z` / `linux-vX.Y.Z`）**：新增《[跨平台独立发行与长期工程治理规范](docs/13-跨平台独立发行与长期工程规范.md)》，升级 `updater.mjs` 与全系安装器按当前运行平台严格筛选 GitHub Releases（同平台前缀优先、无同平台前缀时向后兼容 `vX.Y.Z`、硬性拦截跨平台标签 `PLATFORM_RELEASE_TAG_MISMATCH`），支持 Linux 技术先行与 Windows 独立适配发版而不互相串台。
+- **跨平台独立发行标签治理（`linux-vX.Y.Z` / `windows-vX.Y.Z`）**：新增《[跨平台独立发行与长期工程治理规范](docs/13-跨平台独立发行与长期工程规范.md)》，升级 `updater.mjs` 与安装器按当前运行平台严格筛选 GitHub Releases（同平台前缀优先、无同平台前缀时向后兼容 `vX.Y.Z`、硬性拦截跨平台标签 `PLATFORM_RELEASE_TAG_MISMATCH`），Linux 与 Windows 各自保留平台专属适配边界并独立验收发版。
 - **历代设计原则反退化台账与回归测试（`DP-01`..`DP-06`）**：新增《[历代设计原则与反退化台账](docs/12-历代设计原则与反退化台账.md)》与专项回归套件，固化渐进式规划、免审批自主直派、两级障碍判定、静默前缀 KV 缓存保护、`team_conference` 按需参数注入、隐私脱敏宿主运行事实及 `@deepseek-ai/dsh-tool-web` 原生联网安全边界。
-- **Windows 宿主终端 `0xC0000142` 确定性熔断器（`shell-circuit-breaker.mjs`）**：针对 Windows 非交互窗口站/桌面堆耗尽导致的 `pwsh`/`bash` 进程初始化失败（`0xC0000142` / `3221225794` / `-1073741502` / `STATUS_DLL_INIT_FAILED`），单会话累计 2 次即触发 `0ms` 确定性阻断并引导保留静态工作或单次汇报阻塞，杜绝无效重试空转。
 
 ### Fixed
 - **修复「面板保存与 Doctor 全绿，但 DSH 客户端选不到模型」P0 体验缺陷**：
-  - 打通独立模式（`ctx === null`）与宿主内置模式双路径模型落盘：保存配置或完成新手引导时同步更新 `$DSH_HOME/.credentials.yaml`（`version: 1` `refs:` 实时监听凭据库）、`$DSH_HOME/.env` 以及 `$DSH_HOME/profiles/<desktop|web>/cordis.patch.yml` 中的 `llm-pi-ai` 与 `agent-default-model`；
-  - 修复 `openai` 等内置目录供应商填写自定义 `baseURL` 被忽略或触发 `PiAiCatalogError`（`modelOverrides` 冲突 / 自定义模型缺少 `api: "openai-completions"` / 非法 `reasoningEfforts` 键）的问题；
+  - 打通独立模式（`ctx === null`）与宿主内置模式双路径模型落盘：保存配置或完成新手引导时同步更新实时 `ctx.credentials`、`$DSH_HOME/.credentials.yaml`（`version: 1` `refs:` 实时监听凭据库）、`$DSH_HOME/.env` 以及 `$DSH_HOME/profiles/<web|desktop>/cordis.patch.yml` 中的 `llm-pi-ai` 与 `agent-default-model`（仅在宿主无可用默认模型或显式切换时更新 `agentDefaultModel`）；
+  - 新增 `openai-compatible` 自定义网关预设（内置面板与新手引导均支持）并避让保留内置适配器 ID（`deepseek-official`、`deepseek-account`），修复 `openai` 等内置目录供应商填写自定义 `baseURL` 被忽略或触发 `PiAiCatalogError`（`modelOverrides` 冲突 / 自定义模型缺少 `api: "openai-completions"` / 非推理模型误发 `{ off: "none" }`）的问题；
   - 新手引导连通性预检支持解析真实 `/v1/models` 返回列表并在预设静态模型不存在时自动适配可用主力与轻量模型。
-- **合入 V2.2.1 治理与回退修复**：领队末位兜底严格按 `(provider, upstreamModel)` 成对匹配、策略拒绝（Policy Refusal）停止后台异步重发、区分安全门策略回执、修正中途重试 5h 窗口归因、双审回执绑定交付材料快照及回放恢复。
-- **Windows NTFS Junction / 符号链接参考文件追踪与 Magpie 进程树回收修复**：修复阶段 `references` 含 NTFS Junction 目录链接时的安全门放行与已读状态核销（`realpathBestEffort`），增强 Windows 本机 Magpie 二进制寻址与退出时子进程树清理兜底。
+- **Node 24+ 多帧 zstd 会话日志解码修复**：修复 `bin/lt-bugreport.mjs`、`leaderteam/host/observability.mjs` 与 `scripts/dev/lib/session-rows.mjs` 在 Node 24+ 上读取多帧拼接 `session.v4.jsonl.zstd` 时仅解压首帧的问题。
+- **合入 V2.2.1 治理与回退修复及公开工程实证报告**：领队末位兜底严格按 `(provider, upstreamModel)` 成对匹配、策略拒绝（Policy Refusal）停止后台异步重发、区分安全门策略回执、修正中途重试 5h 窗口归因、双审回执绑定交付材料快照及回放恢复；同步补齐 `docs/benchmarks/` 公开工程实证报告及脱敏核验附件。
+
+## [2.2.1] - 2026-11-26
+
+跨平台稳定性、调度器抑制、治理回执一致性与推理档位同步维护版（纯 Node.js ESM，Apache-2.0）：
+
+### Fixed
+- **调度器零派发唤醒与终态轮询抑制**：修复自主滚动规划下触及槽位上限后 `awaitingSlots` 未复位、降容方向反向触发补派通知及跨轮未识别已宣告 `delivered` 终态的问题；补齐常规负载区间施密特滞回死区、多团队健康采样去重与系统采样器被动读数窗口配置接线。
+- **供应商策略拒绝（`CONTENT_REFUSED`）处理与双审材料版本绑定**：无工具审查与安全门收到明确策略拒绝时立即停止自动重试、备用切换及异步补审重发；安全门回执明确区分策略拒绝与临时服务故障；异步双审去重键绑定实际送审材料摘要（原样重提去重，修改提案或验收证据后重新获取双审意见），并在历史会话回放时恢复旧版延迟记录中的策略拒绝状态。
+- **多供应商兜底路由与 5 小时请求窗口精度**：修正“跟随领队模型兜底”仅按模型名匹配而忽略 `provider + upstreamModel` 成对核对的问题；将重试尝试纳入 5 小时滚动请求窗口计数，并修正中途模型切换时的尝试归属与正式会商恢复作用域。
+- **推理档位 `off → none` 映射与事务性配置写盘**：统一全新宿主配置与已有配置下的逻辑 `off` 线协议映射，模型同步更新时保留用户自定义的 `reasoningEfforts` 映射；多配置文件保存改为事务性原子更新。
+
+### Added
+- **工程实证报告与脱敏核验档案**：在 `docs/benchmarks/` 下新增《[LeaderTeam V2.2 工程实证报告：49 分钟完成 Linux 跨语言核心模块自举与宿主集成](docs/benchmarks/LeaderTeam_V2.2_Linux跨语言自举工程实证报告.md)》、《[LeaderTeam V1.1–V2.2：基于五项真实工程实测的架构演进与发展潜力分析](docs/benchmarks/LeaderTeam_V1.1至V2.2_架构演进与发展潜力分析.md)》及配套可复算回执目录 [`docs/benchmarks/evidence/v2.2-linux-selfhost/`](docs/benchmarks/evidence/v2.2-linux-selfhost/README.md)。
 
 ## [2.2.0] - 2026-11-24
 
