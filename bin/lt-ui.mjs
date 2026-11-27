@@ -105,7 +105,7 @@ function readBoundedBody(req, maxBytes = MAX_BODY_BYTES) {
 function sendPayloadTooLargeAndDestroy(req, res, maxBytes = MAX_BODY_BYTES) {
   const timer = setTimeout(() => {
     try { req.destroy(); } catch {}
-  }, 50);
+  }, 500);
   timer.unref?.();
   res.writeHead(413, {
     'Content-Type': 'application/json; charset=utf-8',
@@ -119,7 +119,10 @@ function sendPayloadTooLargeAndDestroy(req, res, maxBytes = MAX_BODY_BYTES) {
     }),
     () => {
       clearTimeout(timer);
-      try { req.destroy(); } catch {}
+      const grace = setTimeout(() => {
+        try { req.destroy(); } catch {}
+      }, 150);
+      grace.unref?.();
     },
   );
 }
@@ -156,6 +159,7 @@ export async function startStandaloneLtUiServer({
     [PUBLIC_API_ROUTES.WORKBENCH_CREATE, handlers.workbenchCreate],
     [PUBLIC_API_ROUTES.WORKBENCH_PROMPT, handlers.workbenchPrompt],
     [PUBLIC_API_ROUTES.WORKBENCH_CANCEL, handlers.workbenchCancel],
+    [PUBLIC_API_ROUTES.WORKBENCH_SESSION_CONFIG, handlers.workbenchSessionConfig],
     [PUBLIC_API_ROUTES.ARCHIVE_QUERY, handlers.archiveQuery],
     [PUBLIC_API_ROUTES.ARCHIVE_ACTION, handlers.archiveAction],
     [PUBLIC_API_ROUTES.USAGE_STATUS, handlers.usageStatus],
@@ -165,6 +169,9 @@ export async function startStandaloneLtUiServer({
     [PUBLIC_API_ROUTES.USAGE_PRICING, handlers.usagePricing],
     [PUBLIC_API_ROUTES.USAGE_TOGGLE, handlers.usageToggle],
     [PUBLIC_API_ROUTES.UI_PREFERENCES, handlers.uiPreferences],
+    [PUBLIC_API_ROUTES.SYSTEM_COMPATIBILITY, handlers.systemCompatibility],
+    [PUBLIC_API_ROUTES.SYSTEM_UPDATE, handlers.systemUpdate],
+    [PUBLIC_API_ROUTES.ONBOARDING, handlers.onboarding],
   ]);
 
   let boundPort = port;

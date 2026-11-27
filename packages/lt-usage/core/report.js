@@ -676,10 +676,14 @@ function appendGovernanceRows({
   pricing,
   issues,
   matchGateway,
-  notes
+  notes,
+  filterLeaderRole = false
 }) {
   const governanceAgents = new Map();
-  for (const record of governance ?? []) {
+  const records = filterLeaderRole
+    ? (governance ?? []).filter((record) => record && record.role !== 'leader')
+    : (governance ?? []);
+  for (const record of records) {
     const timeMs = Date.parse(record?.at);
     if (!Number.isFinite(timeMs)) {
       notes.push(`governance record without valid at: ${String(record?.at)}`);
@@ -709,6 +713,8 @@ function appendGovernanceRows({
           sessionId: ownerSessionId,
           agentKey: `governance|${ownerSessionId}|${actor}`,
           route: record.route ?? 'unknown',
+          hostProvider: record.hostProvider ?? null,
+          responseId: record.responseId ?? null,
           attempts: Number.isInteger(record.attempts) ? record.attempts : null,
           latencyMs: Number.isFinite(record.latencyMs) ? record.latencyMs : null,
           usage: record.usage ?? null,
@@ -943,7 +949,8 @@ function buildSessionReport(input, notes, issues, matchGateway) {
     pricing,
     issues,
     matchGateway,
-    notes
+    notes,
+    filterLeaderRole: true
   });
 
   const hasGovernance = ledger.some((row) => row.group === 'governance');

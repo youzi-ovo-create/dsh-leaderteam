@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { defineTool } from '@deepseek-ai/dsh-tools';
-import { requireReady, teamStore, runtime, baseRuntime, recordUsage, runtimeForTeam, isPluginActive, activePluginsMap, refreshUpstreamCatalog, effectiveRuntimeConfig } from './runtime.mjs';
+import { requireReady, teamStore, runtime, baseRuntime, recordUsage, runtimeForTeam, isPluginActive, activePluginsMap, refreshUpstreamCatalog, effectiveRuntimeConfig, syncSessionLeaderSelectionFromHost } from './runtime.mjs';
 import { resolveActor, userTaskText, currentTaskSeq, reconcileStaleMembers } from './roles.mjs';
 import { callRoleJson } from './llm.mjs';
 import { roleRouteChain, degradedNote } from '../core/role-routes.mjs';
@@ -171,6 +171,10 @@ async function leaderOf(ctx, exec, { allowBlockedStopReport = false } = {}) {
   if (!actor || actor.role !== 'leader') throw new Error('team tools are only available in a LeaderTeam leader session');
   if (!actor.cwd) throw new Error('the leader session has no working directory');
   rt = runtimeForTeam(actor.teamId);
+  if ((rt.config?.team?.leaderModelPolicy ?? 'follow') === 'follow') {
+    syncSessionLeaderSelectionFromHost(ctx, base, agent, { allowHostPrologue: true });
+    rt = runtimeForTeam(actor.teamId);
+  }
   const leaderModel = checkLeaderModel(rt.config, currentSelection(agent));
   const cfg = rt.config;
   if (leaderModel.blocked && !allowBlockedStopReport) throw new Error(`LeaderTeam leader model check failed: ${leaderModel.message}`);

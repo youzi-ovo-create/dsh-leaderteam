@@ -4,10 +4,19 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadConfig, validateConfig, routeProvider } from '../core/config.mjs';
 import { hashJson, deepFreeze } from '../core/canonical.mjs';
-import { TeamStore, writeFileAtomic } from '../core/store.mjs';
+import { TeamStore, encodeTeamStoreId, resolveTeamStoreLogicalId, writeFileAtomic } from '../core/store.mjs';
 import { discoverRuntimeModels, enrichConfigModelsFromCatalog, mergeUpstreamModelsIntoConfig, resolveModelTarget } from '../core/upstream-models.mjs';
 import { DETACHABLE_PLUGINS } from '../core/constants.mjs';
 import { currentPlanRoot } from '../core/current-plan.mjs';
+import {
+  assertUserConfigPrincipal,
+  readSessionConfigRecord,
+  hasActiveSessionOverride,
+  hasPendingSessionOverride,
+  applySessionPatchToConfig,
+  mutateSessionConfig,
+  flushPendingSessionConfig,
+} from '../core/session-config.mjs';
 
 const KEY = Symbol.for('leaderteam.runtime.v1');
 const BASE_RUNTIME = Symbol.for('leaderteam.runtime.base');
@@ -38,7 +47,7 @@ export function runtime() {
 
 export function baseRuntime(rt = runtime()) { return rt[BASE_RUNTIME] ?? rt; }
 
-/** True once a team has recorded any workflow, member, agreement, or governance activity (after which governance is immutable). */
+/** True once a team has recorded any workflow, member, agreement, or governance activity (after which unstarted rebind stops). */
 export function isTeamExecutionStarted(store) {
   if (!store) return false;
   try {
@@ -56,6 +65,8 @@ export function isTeamExecutionStarted(store) {
 export function rebindUnstartedTeamGovernance(rt = runtime(), teamId) {
   rt = baseRuntime(rt);
   if (!teamId || !rt.config || !rt.storageRoot) return { rebound: false, reason: 'not-ready' };
+  let storeId;
+  try { storeId = encodeTeamStoreId(teamId, rt.storageRoot); } catch { return { rebound: false, reason: 'bad-id' }; }
   const store = teamStore(teamId);
   if (!fs.existsSync(store.dir)) return { rebound: false, reason: 'no-store' };
   if (isTeamExecutionStarted(store)) return { rebound: false, reason: 'already-started' };
@@ -71,7 +82,9 @@ export function rebindUnstartedTeamGovernance(rt = runtime(), teamId) {
       prevLeaderTarget = resolveModelTarget(prevValidated, prevValidated.roles.leader.route, prevValidated.roles.leader.effort);
     } catch {}
   }
-  const config = structuredClone(rt.config);
+  const sessionRec = readSessionConfigRecord(rt.storageRoot, teamId);
+  const mergedCfg = applySessionPatchToConfig(rt.config, sessionRec);
+  const config = structuredClone(mergedCfg);
   delete config.derived;
   const sourceSha256 = hashJson(config);
   const changed = !prevRecord || prevRecord.sourceSha256 !== sourceSha256;
@@ -85,8 +98,9 @@ export function rebindUnstartedTeamGovernance(rt = runtime(), teamId) {
     };
     writeFileAtomic(file, JSON.stringify(record, null, 1));
   }
+  rt.teamConfigViews?.delete(`${rt.storageRoot}:${storeId}`);
   rt.teamConfigViews?.delete(`${rt.storageRoot}:${teamId}`);
-  const nextLeaderTarget = resolveModelTarget(rt.config, rt.config.roles.leader.route, rt.config.roles.leader.effort);
+  const nextLeaderTarget = resolveModelTarget(mergedCfg, mergedCfg.roles.leader.route, mergedCfg.roles.leader.effort);
   return { rebound: true, changed, prevLeaderTarget, nextLeaderTarget };
 }
 
@@ -98,15 +112,13 @@ export function rebindAllUnstartedTeams(_ctx, rt = runtime(), { alignBlankSessio
   for (const actor of rt.actors?.values() ?? []) {
     if (actor?.role === 'leader' && actor.teamId) candidateIds.add(actor.teamId);
   }
-  const prefix = `${rt.storageRoot}:`;
-  for (const key of rt.teamConfigViews?.keys() ?? []) {
-    if (key.startsWith(prefix)) candidateIds.add(key.slice(prefix.length));
-  }
   const teamsDir = path.join(rt.storageRoot, 'teams');
   try {
     if (fs.existsSync(teamsDir)) {
       for (const d of fs.readdirSync(teamsDir, { withFileTypes: true }).slice(0, 60)) {
-        if (d.isDirectory()) candidateIds.add(d.name);
+        if (d.isDirectory()) {
+          try { candidateIds.add(resolveTeamStoreLogicalId(rt.storageRoot, d.name)); } catch {}
+        }
       }
     }
   } catch {}
@@ -134,41 +146,54 @@ export function rebindAllUnstartedTeams(_ctx, rt = runtime(), { alignBlankSessio
   return { reboundTeamIds, alignedSessionIds };
 }
 
-/** Immutable team governance; execution choices and capacity remain live. */
+/** Immutable during active execution; user-rebindable when idle and layerable with per-session overrides. */
 export function runtimeForTeam(teamId) {
   const rt = runtime();
   if (!teamId || !rt.config || !rt.storageRoot) return rt;
+  let storeId;
+  try { storeId = encodeTeamStoreId(teamId, rt.storageRoot); } catch { return rt; }
+  const sessionRec = readSessionConfigRecord(rt.storageRoot, teamId);
+  const file = path.join(rt.storageRoot, 'teams', storeId, 'governance.json');
   rt.teamConfigViews ??= new Map();
-  const key = `${rt.storageRoot}:${teamId}`;
+  const key = `${rt.storageRoot}:${storeId}`;
   let view = rt.teamConfigViews.get(key);
   if (!view) {
     const store = teamStore(teamId);
     fs.mkdirSync(store.dir, { recursive: true });
-    const file = path.join(store.dir, 'governance.json');
     let record;
     try { record = JSON.parse(fs.readFileSync(file, 'utf8')); }
     catch (error) {
       if (error.code !== 'ENOENT') throw new Error(`cannot load frozen team governance: ${error.message}`);
-      const config = structuredClone(rt.config); delete config.derived;
+      const baseWithSess = applySessionPatchToConfig(rt.config, sessionRec);
+      const config = structuredClone(baseWithSess); delete config.derived;
       record = { v: 1, createdAt: new Date().toISOString(), sourceSha256: hashJson(config), config };
       try { fs.writeFileSync(file, JSON.stringify(record, null, 1), { flag: 'wx' }); }
       catch (writeError) { if (writeError.code !== 'EEXIST') throw writeError; record = JSON.parse(fs.readFileSync(file, 'utf8')); }
     }
     if (record.v !== 1 || hashJson(record.config) !== record.sourceSha256) throw new Error('frozen team governance snapshot is corrupt; refusing to replace it with live defaults');
-    view = { snapshot: validateConfig(record.config), sourceSha256: record.sourceSha256, live: null, mixed: null, proxy: null };
+    view = { snapshot: validateConfig(record.config), sourceSha256: record.sourceSha256, live: null, sessionSig: null, mixed: null, proxy: null };
     view.proxy = new Proxy(rt, {
       get(target, property, receiver) {
         if (property === BASE_RUNTIME) return target;
         if (property !== 'config') return Reflect.get(target, property, receiver);
-        if (view.live !== target.config || view.catalog !== target.upstreamCatalog) {
+        const curSessionRec = readSessionConfigRecord(target.storageRoot, teamId);
+        const curSessionSig = curSessionRec.updatedAt ?? '';
+        if (view.live !== target.config || view.catalog !== target.upstreamCatalog || view.sessionSig !== curSessionSig) {
           const fixed = view.snapshot;
-          const live = target.upstreamCatalog
+          const liveBase = target.upstreamCatalog
             ? (target.config.team.autoIncludeUpstreamModels === true
               ? mergeUpstreamModelsIntoConfig(target.config, target.upstreamCatalog)
               : enrichConfigModelsFromCatalog(target.config, target.upstreamCatalog))
             : target.config;
-          const roleModels = Object.fromEntries(Object.values(fixed.roles).flatMap(role => [role.route, ...(role.fallback ?? []).map(f => f.route)]).filter(route => fixed.models[route]).map(route => {
-            const frozenSpec = fixed.models[route];
+          const live = hasActiveSessionOverride(curSessionRec)
+            ? applySessionPatchToConfig(liveBase, curSessionRec)
+            : liveBase;
+          const effectiveRoles = curSessionRec?.activePatch?.roles
+            ? { ...fixed.roles, ...live.roles }
+            : fixed.roles;
+          const roleSourceModels = { ...fixed.models, ...live.models };
+          const roleModels = Object.fromEntries(Object.values(effectiveRoles).flatMap(role => [role.route, ...(role.fallback ?? []).map(f => f.route)]).filter(route => roleSourceModels[route]).map(route => {
+            const frozenSpec = fixed.models[route] ?? roleSourceModels[route];
             const liveSpec = live.models[route];
             const enrichedRoleSpec = liveSpec ? {
               ...frozenSpec,
@@ -178,15 +203,23 @@ export function runtimeForTeam(teamId) {
             return [route, enrichedRoleSpec];
           }));
           view.mixed = deepFreeze({ ...fixed,
-            models: { ...live.models, ...roleModels },
-            team: { ...fixed.team, executionPool: live.team.executionPool, maxActiveMembers: live.team.maxActiveMembers },
+            roles: effectiveRoles,
+            models: { ...live.models, ...roleModels, ...(curSessionRec?.activePatch?.models ?? {}) },
+            team: {
+              ...fixed.team,
+              executionPool: curSessionRec?.activePatch?.team?.executionPool ?? live.team.executionPool,
+              maxActiveMembers: curSessionRec?.activePatch?.team?.maxActiveMembers ?? live.team.maxActiveMembers,
+              leaderModelPolicy: curSessionRec?.activePatch?.team?.leaderModelPolicy ?? fixed.team.leaderModelPolicy,
+              disabledFamilies: curSessionRec?.activePatch?.team?.disabledFamilies ?? fixed.team.disabledFamilies,
+            },
             scheduler: live.scheduler,
             timer: live.timer,
-            paths: { ...fixed.paths, globalRefRoots: [...new Set([...fixed.paths.globalRefRoots, currentPlanRoot(rt.storageRoot, teamId), ...((fixed.team.rollingPlanning || fixed.governance?.mode === 'autonomous') ? [fileURLToPath(new URL('../../docs/HeLuoDoc/V2.1', import.meta.url))] : [])])] },
+            paths: { ...fixed.paths, globalRefRoots: [...new Set([...fixed.paths.globalRefRoots, currentPlanRoot(rt.storageRoot, store.rawTeamId ?? store.teamId), ...((fixed.team.rollingPlanning || fixed.governance?.mode === 'autonomous') ? [fileURLToPath(new URL('../../docs/HeLuoDoc/V2.1', import.meta.url))] : [])])] },
             derived: { ...fixed.derived, executionModels: live.models, governanceSha256: view.sourceSha256 },
           });
           view.live = target.config;
           view.catalog = target.upstreamCatalog;
+          view.sessionSig = curSessionSig;
         }
         return view.mixed;
       },
@@ -268,7 +301,10 @@ export function syncRuntimeConfig(rt = runtime()) {
 export function teamStore(teamId) {
   const rt = runtime();
   let s = rt.stores.get(teamId);
-  if (!s) { s = new TeamStore(rt.storageRoot, teamId); rt.stores.set(teamId, s); }
+  if (!s) {
+    s = new TeamStore(rt.storageRoot, teamId);
+    rt.stores.set(teamId, s);
+  }
   return s;
 }
 /** Append one LeaderTeam model-usage record (team usage.jsonl); never fails the operation. */
@@ -486,4 +522,264 @@ export function effectiveRuntimeConfig(rt = runtime()) {
   return rt.config.team.autoIncludeUpstreamModels === true
     ? mergeUpstreamModelsIntoConfig(rt.config, rt.upstreamCatalog)
     : enrichConfigModelsFromCatalog(rt.config, rt.upstreamCatalog);
+}
+
+const ACTIVE_MEMBER_SET = new Set(['starting', 'started', 'running']);
+
+/**
+ * Determine whether a session is currently mid-execution (leader turn running, tool call in-flight,
+ * active subagent members, or pending governance review).
+ */
+export function inspectSessionBusyForConfig(rt = runtime(), teamId, { ignoreLeaderRunning = false } = {}) {
+  const baseRt = baseRuntime(rt);
+  if (!teamId || !baseRt) return { busy: false, reasons: [] };
+  const reasons = [];
+  const actor = baseRt.actors?.get?.(teamId);
+  const agent = (actor?.role === 'leader' ? actor.agent : null) ?? baseRt.hostAgents?.get?.(teamId) ?? null;
+  if (!ignoreLeaderRunning && agent && ['running', 'streaming', 'thinking'].includes(String(agent.status || '').toLowerCase())) {
+    reasons.push('leader_turn_running');
+  }
+  if ((baseRt.inFlightToolDispatchesByTeam?.get?.(teamId) ?? 0) > 0) {
+    reasons.push('tool_dispatch_in_flight');
+  }
+  if ((baseRt.inFlightShellCallsBySession?.get?.(teamId) ?? 0) > 0) {
+    reasons.push('shell_call_in_flight');
+  }
+  if ((baseRt.simpleDispatchInFlight?.get?.(teamId)?.size ?? 0) > 0) {
+    reasons.push('direct_exec_in_flight');
+  }
+  if (baseRt.storageRoot && TeamStore.exists(baseRt.storageRoot, teamId)) {
+    try {
+      const store = teamStore(teamId);
+      const hasActive = [...store.members().values()].some(m => ACTIVE_MEMBER_SET.has(m.status));
+      if (hasActive) reasons.push('active_team_members');
+    } catch {}
+  }
+  const hasReviewJob =
+    [...(baseRt.executionReviewJobs?.values?.() ?? [])].some(j => j?.teamId === teamId) ||
+    [...(baseRt.governanceJobs?.values?.() ?? [])].some(j => j?.teamId === teamId) ||
+    Boolean(baseRt.stopReviewPending?.has?.(teamId)) ||
+    Boolean(baseRt.directiveVerifyPending?.has?.(teamId));
+  if (hasReviewJob) reasons.push('governance_review_in_flight');
+  return { busy: reasons.length > 0, reasons };
+}
+
+/**
+ * Atomically refresh `teams/<storeId>/governance.json` and invalidate cached `teamConfigViews`
+ * for an IDLE session on user-initiated configuration changes. Refuses agent calls and refuses
+ * to disturb mid-execution sessions unless `forceAtSafeBoundary` is true.
+ */
+export function rebindTeamGovernanceSnapshot(rt = runtime(), teamId, {
+  principal,
+  forceAtSafeBoundary = false,
+} = {}) {
+  const baseRt = baseRuntime(rt);
+  if (!baseRt?.config || !baseRt?.storageRoot || !teamId) return { rebound: false, reason: 'uninitialized' };
+  const inTool = (baseRt.inFlightToolDispatchesByTeam?.get?.(teamId) ?? 0) > 0;
+  const verified = assertUserConfigPrincipal(principal, { inAgentToolDispatch: inTool });
+  const busyCheck = inspectSessionBusyForConfig(baseRt, teamId);
+  if (busyCheck.busy && !forceAtSafeBoundary) {
+    return { rebound: false, busy: true, reasons: busyCheck.reasons };
+  }
+  let storeId;
+  try { storeId = encodeTeamStoreId(teamId, baseRt.storageRoot); } catch { return { rebound: false, reason: 'bad-id' }; }
+  const key = `${baseRt.storageRoot}:${storeId}`;
+  const govFile = path.join(baseRt.storageRoot, 'teams', storeId, 'governance.json');
+  if (fs.existsSync(govFile)) {
+    const sessionRec = readSessionConfigRecord(baseRt.storageRoot, teamId);
+    const mergedCfg = applySessionPatchToConfig(baseRt.config, sessionRec);
+    const cleanCfg = structuredClone(mergedCfg);
+    delete cleanCfg.derived;
+    let prevCreatedAt = new Date().toISOString();
+    try {
+      const prev = JSON.parse(fs.readFileSync(govFile, 'utf8'));
+      if (prev?.createdAt) prevCreatedAt = prev.createdAt;
+    } catch {}
+    const nextRecord = {
+      v: 1,
+      createdAt: prevCreatedAt,
+      updatedAt: new Date().toISOString(),
+      updatedBy: verified.source,
+      sourceSha256: hashJson(cleanCfg),
+      config: cleanCfg,
+    };
+    writeFileAtomic(govFile, JSON.stringify(nextRecord, null, 1));
+  }
+  baseRt.teamConfigViews?.delete?.(key);
+  baseRt.teamConfigViews?.delete?.(`${baseRt.storageRoot}:${teamId}`);
+  return { rebound: true, busy: false };
+}
+
+/**
+ * Refresh governance snapshots for all currently IDLE sessions after a User saves global settings,
+ * so idle sessions immediately reflect updated roles/models while executing sessions remain protected.
+ */
+export function rebindAllIdleSessionsOnGlobalUserSave(rt = runtime(), { principal } = {}) {
+  const baseRt = baseRuntime(rt);
+  if (!baseRt?.config || !baseRt?.storageRoot) return { reboundIds: [], skippedBusyIds: [] };
+  assertUserConfigPrincipal(principal);
+  const candidateIds = new Set([
+    ...(baseRt.stores?.keys?.() ?? []),
+    ...(baseRt.actors?.keys?.() ?? []),
+  ]);
+  const teamsDir = path.join(baseRt.storageRoot, 'teams');
+  if (fs.existsSync(teamsDir)) {
+    try {
+      for (const d of fs.readdirSync(teamsDir, { withFileTypes: true })) {
+        if (d.isDirectory()) {
+          try { candidateIds.add(resolveTeamStoreLogicalId(baseRt.storageRoot, d.name)); } catch {}
+        }
+      }
+    } catch {}
+  }
+  const reboundIds = [];
+  const skippedBusyIds = [];
+  for (const tid of candidateIds) {
+    if (!tid) continue;
+    const res = rebindTeamGovernanceSnapshot(baseRt, tid, { principal });
+    if (res.rebound) reboundIds.push(tid);
+    else if (res.busy) skippedBusyIds.push(tid);
+  }
+  return { reboundIds, skippedBusyIds };
+}
+
+export function effectiveSessionConfig(rt = runtime(), sessionId) {
+  const baseRt = baseRuntime(rt);
+  if (!baseRt?.config) return null;
+  if (!sessionId || !baseRt.storageRoot) return effectiveRuntimeConfig(baseRt) ?? baseRt.config;
+  if (TeamStore.exists(baseRt.storageRoot, sessionId)) {
+    return runtimeForTeam(sessionId).config;
+  }
+  const baseCfg = effectiveRuntimeConfig(baseRt) ?? baseRt.config;
+  const sessionRec = readSessionConfigRecord(baseRt.storageRoot, sessionId);
+  return hasActiveSessionOverride(sessionRec)
+    ? applySessionPatchToConfig(baseCfg, sessionRec)
+    : baseCfg;
+}
+
+export function syncSessionLeaderSelectionFromHost(_ctx, rt = runtime(), agent, {
+  atUserTurnStart = false,
+  allowHostPrologue = false,
+} = {}) {
+  const baseRt = baseRuntime(rt);
+  if (!baseRt?.config || !baseRt?.storageRoot || !agent?.id) return { synced: false };
+  const inFlightCount = baseRt.inFlightToolDispatchesByTeam?.get?.(agent.id) ?? 0;
+  if (inFlightCount > (allowHostPrologue ? 1 : 0)) {
+    return { synced: false, skippedReason: 'in-tool-dispatch' };
+  }
+  const teamRt = runtimeForTeam(agent.id);
+  const cfg = teamRt.config;
+  const policy = cfg?.team?.leaderModelPolicy ?? 'follow';
+  if (policy !== 'follow') return { synced: false, policy };
+
+  let sel = null;
+  try { sel = agent.model?.current?.() ?? null; } catch { sel = null; }
+  if (!sel || typeof sel.provider !== 'string' || !sel.provider.trim() || typeof sel.model !== 'string' || !sel.model.trim()) {
+    return { synced: false };
+  }
+
+  const target = resolveModelTarget(cfg, cfg.roles.leader.route, cfg.roles.leader.effort);
+  const selEffort = typeof sel.reasoningEffort === 'string' && sel.reasoningEffort.trim() ? sel.reasoningEffort.trim() : null;
+  const effortMatches = cfg.roles.leader.effort === 'none'
+    ? (selEffort === null || selEffort === 'none')
+    : (selEffort === null || selEffort === cfg.roles.leader.effort);
+  if (sel.provider === target.provider && sel.model === target.model && effortMatches) {
+    return { synced: false, alreadyMatched: true };
+  }
+
+  const route = resolveCanonicalRouteFromHostSelection(cfg, sel.provider, sel.model, `${sel.provider}/${sel.model}`);
+  const discoveredModels = baseRt.upstreamCatalog?.models ?? [];
+  const rawBusy = inspectSessionBusyForConfig(baseRt, agent.id, { ignoreLeaderRunning: atUserTurnStart || allowHostPrologue });
+  const effectiveReasons = allowHostPrologue
+    ? rawBusy.reasons.filter(r => r !== 'tool_dispatch_in_flight')
+    : rawBusy.reasons;
+  const busyCheck = { busy: effectiveReasons.length > 0, reasons: effectiveReasons };
+  const patch = {
+    models: cfg.models?.[route]
+      ? {}
+      : {
+          [route]: {
+            provider: sel.provider,
+            upstreamModel: sel.model,
+            label: sel.model.split('/').pop() || sel.model,
+            efforts: ['none', 'low', 'medium', 'high', 'xhigh', 'max'],
+            defaultEffort: selEffort || 'high',
+          },
+        },
+    roles: {
+      leader: {
+        route,
+        ...(selEffort ? { effort: selEffort } : {}),
+      },
+    },
+  };
+
+  try {
+    const mut = mutateSessionConfig({
+      storageRoot: baseRt.storageRoot,
+      sessionId: agent.id,
+      baseConfig: baseRt.config,
+      patch,
+      action: 'merge',
+      principal: { kind: 'user', source: 'dsh-host-picker' },
+      isBusy: busyCheck.busy,
+      busyReasons: busyCheck.reasons,
+      discoveredModels,
+      autoHealPlaceholders: true,
+    });
+    if (mut.appliedImmediately) {
+      rebindTeamGovernanceSnapshot(baseRt, agent.id, {
+        principal: { kind: 'user', source: 'dsh-host-picker' },
+        forceAtSafeBoundary: true,
+      });
+    }
+    return {
+      synced: true,
+      appliedImmediately: mut.appliedImmediately,
+      stagedForSafeBoundary: mut.stagedForSafeBoundary,
+      route,
+      effort: selEffort,
+    };
+  } catch (e) {
+    baseRt.logger?.warn?.(`leaderteam: session leader auto-sync skipped: ${e instanceof Error ? e.message : String(e)}`);
+    return { synced: false, error: e };
+  }
+}
+
+/**
+ * Flush any staged `pendingPatch` once a session reaches a safe idle boundary (`onAgentStatus`).
+ */
+export function flushPendingSessionConfigAtSafeBoundary(_ctx, rt = runtime(), sessionId) {
+  const baseRt = baseRuntime(rt);
+  if (!baseRt?.config || !baseRt?.storageRoot || !sessionId) return { flushed: false };
+  const rec = readSessionConfigRecord(baseRt.storageRoot, sessionId);
+  if (!hasPendingSessionOverride(rec)) return { flushed: false };
+  const busyCheck = inspectSessionBusyForConfig(baseRt, sessionId);
+  if (busyCheck.busy) return { flushed: false, busy: true, reasons: busyCheck.reasons };
+
+  const res = flushPendingSessionConfig({
+    storageRoot: baseRt.storageRoot,
+    sessionId,
+    baseConfig: baseRt.config,
+    discoveredModels: baseRt.upstreamCatalog?.models ?? [],
+  });
+  if (res.flushed) {
+    rebindTeamGovernanceSnapshot(baseRt, sessionId, {
+      principal: { kind: 'user', source: 'dsh-host-picker' },
+      forceAtSafeBoundary: true,
+    });
+    const actor = baseRt.actors?.get?.(sessionId);
+    const agent = actor?.agent ?? baseRt.hostAgents?.get?.(sessionId) ?? null;
+    if (agent && typeof agent.model?.select === 'function' && res.effectiveConfig?.roles?.leader) {
+      try {
+        const tgt = resolveModelTarget(
+          res.effectiveConfig,
+          res.effectiveConfig.roles.leader.route,
+          res.effectiveConfig.roles.leader.effort,
+        );
+        agent.model.select(tgt);
+      } catch {}
+    }
+  }
+  return res;
 }

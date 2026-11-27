@@ -2,8 +2,9 @@
 // Kept free of bare `@deepseek-ai/*` imports so routes can be exercised directly in Node unit tests.
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { PLAN_CATEGORIES, PLAN_LIFECYCLE_STATES } from '../../core/constants.mjs';
-import { TeamStore } from '../../core/store.mjs';
+import { TeamStore, resolveTeamStoreLogicalId } from '../../core/store.mjs';
 import { checkLeaderModel } from '../../core/models.mjs';
 import { computeTimerSnapshot, resolveNowMs } from '../../core/timer.mjs';
 import { resolvePlanArchiveRoot, PlanArchiveStore } from '../../core/plan-archive.mjs';
@@ -23,13 +24,39 @@ import {
   rebindUnstartedTeamGovernance,
   rebindAllUnstartedTeams,
   resolveCanonicalRouteFromHostSelection,
+  inspectSessionBusyForConfig,
+  effectiveSessionConfig,
+  rebindTeamGovernanceSnapshot,
+  rebindAllIdleSessionsOnGlobalUserSave,
 } from '../../host/runtime.mjs';
+import {
+  readSessionConfigRecord,
+  hasActiveSessionOverride,
+  hasPendingSessionOverride,
+  mutateSessionConfig,
+  buildAutoAdoptedLocalOverrideFromDshModels,
+} from '../../core/session-config.mjs';
 import {
   collectCombinedDiscoveredModels,
   enrichChangesWithDiscoveredProviders,
   syncActiveModelsToDshHost,
 } from './public-api.mjs';
 import { resolveMagpieGatewayHostProvider } from '../../gateway/index.mjs';
+import { getHostCompatibilityMatrix } from '../../core/host-compat.mjs';
+import {
+  UPDATE_TRACKS,
+  readInstalledVersionInfo,
+  readUpdaterState,
+  listSavedBackups,
+  checkForUpdates,
+  performOneClickUpgrade,
+  rollbackToSavedBackup,
+} from '../../core/updater.mjs';
+import {
+  buildOnboardingSnapshot,
+  applyQuickOnboardingSetup,
+  writePersistedOnboardingRecord,
+} from '../../core/onboarding.mjs';
 
 export const PANEL_ROUTES = Object.freeze({
   STATE: '/api/leaderteam-panel/state',
@@ -38,6 +65,9 @@ export const PANEL_ROUTES = Object.freeze({
   ARCHIVE: '/api/leaderteam-panel/archive',
   RETROSPECT: '/api/leaderteam-panel/retrospect',
   CLEAN: '/api/leaderteam-panel/clean',
+  SESSION_CONFIG: '/api/leaderteam-panel/session-config',
+  UPDATE: '/api/leaderteam-panel/update',
+  ONBOARDING: '/api/leaderteam-panel/onboarding',
 });
 
 const isPlainObj = v => v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -50,9 +80,16 @@ function okReply(value) {
   return jsonReply({ ok: true, value });
 }
 
-function errReply(code, message, status = 200) {
+function errReply(code, message, status = 200, details = undefined) {
   return Response.json(
-    { ok: false, error: { code, message } },
+    {
+      ok: false,
+      error: {
+        code,
+        message,
+        ...(details !== undefined ? { details } : {}),
+      },
+    },
     { status, headers: { 'cache-control': 'no-store' } },
   );
 }
@@ -112,7 +149,8 @@ function collectRecentTeamTimers(rt, maxTeams = 30) {
   const rows = [];
   for (const dirent of entries.slice(0, maxTeams * 2)) {
     try {
-      const store = new TeamStore(rt.storageRoot, dirent.name);
+      const logicalTeamId = resolveTeamStoreLogicalId(rt.storageRoot, dirent.name);
+      const store = new TeamStore(rt.storageRoot, logicalTeamId);
       const tState = store.readTimerState();
       if (!tState) continue;
       const snap = computeTimerSnapshot(tState, rt.config, {
@@ -120,7 +158,7 @@ function collectRecentTeamTimers(rt, maxTeams = 30) {
         nowMs,
       });
       rows.push({
-        teamId: dirent.name,
+        teamId: logicalTeamId,
         workspace: tState.workspace ?? null,
         lastActivityAtMs: tState.lastActivityAtMs ?? 0,
         ...snap,
@@ -160,6 +198,43 @@ function collectLeaderSessionChecks(_ctx, rt) {
   return rows;
 }
 
+function collectPanelSessionConfigItems(rt) {
+  const base = baseRuntime(rt);
+  if (!base?.config || !base?.storageRoot) return [];
+  const byId = new Map();
+  for (const [sid, actor] of base.actors?.entries?.() ?? []) {
+    if (actor?.role === 'leader' && sid) {
+      byId.set(sid, { sessionId: sid, title: null, cwd: actor.cwd ?? null });
+    }
+  }
+  const teamsDir = path.join(base.storageRoot, 'teams');
+  if (fs.existsSync(teamsDir)) {
+    try {
+      for (const d of fs.readdirSync(teamsDir, { withFileTypes: true }).slice(0, 30)) {
+        if (!d.isDirectory()) continue;
+        const sid = resolveTeamStoreLogicalId(base.storageRoot, d.name);
+        if (!sid || byId.has(sid)) continue;
+        byId.set(sid, { sessionId: sid, title: null, cwd: null });
+      }
+    } catch {}
+  }
+  return [...byId.values()].map(item => {
+    const rec = readSessionConfigRecord(base.storageRoot, item.sessionId);
+    const eff = effectiveSessionConfig(base, item.sessionId) ?? base.config;
+    const busy = inspectSessionBusyForConfig(base, item.sessionId);
+    return {
+      ...item,
+      isLtSession: true,
+      isBusy: busy.busy,
+      busyReasons: busy.reasons,
+      hasSessionConfigOverride: hasActiveSessionOverride(rec),
+      hasPendingSessionConfig: hasPendingSessionOverride(rec),
+      effectiveLeaderRoute: eff?.roles?.leader?.route ?? null,
+      effectiveLeaderEffort: eff?.roles?.leader?.effort ?? null,
+    };
+  });
+}
+
 export async function buildPanelStateSnapshot(ctx, rt = runtime(), { probeEndpoints = false, forceDiscover = false } = {}) {
   syncRuntimeConfig(rt);
   if (!rt?.config || !rt?.configPath) {
@@ -194,7 +269,6 @@ export async function buildPanelStateSnapshot(ctx, rt = runtime(), { probeEndpoi
       recentPlans: [],
     };
 
-  // Merge configured models + upstream DSH & live Magpie discovered models into a unified selector catalog
   const magpieHostProv = resolveMagpieGatewayHostProvider(rt.config);
   const byRoute = new Map();
   for (const m of configSnapshot.models) {
@@ -236,6 +310,10 @@ export async function buildPanelStateSnapshot(ctx, rt = runtime(), { probeEndpoi
     }
   }
 
+  const pluginRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
+  const installedInfo = readInstalledVersionInfo(pluginRoot);
+  const hostVersion = rt?.hostCompatibility?.toolsVersion ?? null;
+
   return {
     activePlugins: activePluginsMap(rt),
     cordisCompositionMode: Boolean(rt.cordisCompositionMode),
@@ -244,13 +322,34 @@ export async function buildPanelStateSnapshot(ctx, rt = runtime(), { probeEndpoi
     unifiedModels: [...byRoute.values()],
     upstreamCatalog: catalog ?? { discoveredAt: null, providers: [], models: [], endpointErrors: [] },
     leaderSessionChecks: collectLeaderSessionChecks(ctx, rt),
+    sessionConfigs: collectPanelSessionConfigItems(rt),
     timers: collectRecentTeamTimers(rt),
     teams: recentTeamObservability(ctx, rt),
     archive: archiveView,
+    hostCompatibility: rt?.hostCompatibility ?? null,
+    compatibilityMatrix: getHostCompatibilityMatrix({
+      track: installedInfo.track,
+      currentHostVersion: hostVersion,
+    }),
+    updater: {
+      installed: installedInfo,
+      tracks: Object.values(UPDATE_TRACKS),
+      state: rt.storageRoot ? readUpdaterState(rt.storageRoot) : null,
+      backups: rt.storageRoot ? listSavedBackups(rt.storageRoot).slice(0, 5) : [],
+    },
+    onboarding: rt.storageRoot
+      ? buildOnboardingSnapshot({
+          storageRoot: rt.storageRoot,
+          hasLocalOverrides: Boolean(configSnapshot?.localOverrides?.exists),
+        })
+      : null,
   };
 }
 
-export function createPanelHandlers(ctx, rt = runtime()) {
+export function createPanelHandlers(ctx, rt = runtime(), options = {}) {
+  const explicitDshHome = typeof options?.dshHome === 'string' && options.dshHome.trim()
+    ? path.resolve(options.dshHome.trim())
+    : null;
   return {
     async state(request) {
       try {
@@ -331,6 +430,7 @@ export function createPanelHandlers(ctx, rt = runtime()) {
             target,
             dryRun: Boolean(body.dryRun),
             discoveredModels,
+            autoAlignRoleEfforts: true,
           })
           : null;
         let dshSettingsSync = { synced: false, reason: body.dryRun ? 'dry-run' : 'unchanged' };
@@ -338,6 +438,10 @@ export function createPanelHandlers(ctx, rt = runtime()) {
         const warnings = [...(applyResult?.warnings ?? [])];
         if (!body.dryRun) {
           syncRuntimeConfig(rt);
+          rebindAllIdleSessionsOnGlobalUserSave(rt, {
+            principal: { kind: 'user', source: 'panel-api' },
+          });
+          rebindAllUnstartedTeams(ctx, rt, { alignBlankSessions: true });
           if (applyResult) {
             dshSettingsSync = await syncActiveModelsToDshHost(
               ctx,
@@ -345,6 +449,8 @@ export function createPanelHandlers(ctx, rt = runtime()) {
               applyResult.effective,
               discoveredModels,
               gwStatus,
+              [],
+              { dshHome: explicitDshHome },
             );
             if (
               !dshSettingsSync.synced &&
@@ -355,7 +461,6 @@ export function createPanelHandlers(ctx, rt = runtime()) {
             }
             await refreshUpstreamCatalog(ctx, rt, { force: true }).catch(() => null);
           }
-          rebindAllUnstartedTeams(ctx, rt, { alignBlankSessions: true });
           if (alignReq && typeof alignReq.sessionId === 'string') {
             const base = baseRuntime(rt);
             const actor = base.actors?.get(alignReq.sessionId);
@@ -478,6 +583,203 @@ export function createPanelHandlers(ctx, rt = runtime()) {
         return errReply(e?.code ?? 'PANEL_CLEAN_FAILED', e instanceof Error ? e.message : String(e), e?.status ?? 200);
       }
     },
+
+    async sessionConfig(request) {
+      try {
+        syncRuntimeConfig(rt);
+        const body = await parseBody(request);
+        const action = String(body.action || 'get').trim().toLowerCase();
+        const principal = { kind: 'user', source: 'panel-api' };
+        const { gwStatus, discoveredModels } = await collectCombinedDiscoveredModels(ctx, rt);
+
+        if (action === 'auto-adopt-host') {
+          const poolCandidates = discoveredModels?.length > 0 ? discoveredModels : [];
+          const adopted = buildAutoAdoptedLocalOverrideFromDshModels(poolCandidates);
+          if (!adopted) return errReply('NO_USABLE_MODELS', '未发现可用的已连接 DSH 模型，请先在 DSH 设置或新手引导中连接模型。', 400);
+          const setRoles = Object.entries(adopted.roles).map(([role, spec]) => ({ role, ...spec }));
+          const upsertModels = Object.entries(adopted.models).map(([route, spec]) => ({ route, ...spec }));
+          applyModelConfigChanges(
+            { upsertModels, poolSet: adopted.team.executionPool, setRoles, leaderModelPolicy: 'follow' },
+            { configFile: rt.configPath, target: 'local', discoveredModels, autoAlignRoleEfforts: true },
+          );
+          syncRuntimeConfig(rt);
+          const idleRebind = rebindAllIdleSessionsOnGlobalUserSave(rt, { principal });
+          await syncActiveModelsToDshHost(ctx, rt, rt.config, discoveredModels, gwStatus, [], { dshHome: explicitDshHome }).catch(() => null);
+          return okReply({ idleRebind, state: await buildPanelStateSnapshot(ctx, rt) });
+        }
+
+        const sessionId = typeof body.sessionId === 'string' ? body.sessionId.trim() : '';
+        if (!sessionId) return errReply('BAD_SESSION_ID', 'sessionId is required', 400);
+        const busy = inspectSessionBusyForConfig(rt, sessionId);
+
+        if (action === 'get') {
+          const rec = readSessionConfigRecord(rt.storageRoot, sessionId);
+          const eff = effectiveSessionConfig(rt, sessionId) ?? rt.config;
+          return okReply({
+            sessionId,
+            hasOverride: hasActiveSessionOverride(rec),
+            hasPending: hasPendingSessionOverride(rec),
+            isBusy: busy.busy,
+            busyReasons: busy.reasons,
+            record: rec,
+            effective: {
+              roles: eff?.roles ?? {},
+              executionPool: eff?.team?.executionPool ?? [],
+              maxActiveMembers: eff?.team?.maxActiveMembers ?? 6,
+              leaderModelPolicy: eff?.team?.leaderModelPolicy ?? 'follow',
+            },
+          });
+        }
+
+        if (action === 'set') {
+          const rawPatch = isPlainObj(body.patch) ? body.patch : {};
+          const mut = mutateSessionConfig({
+            storageRoot: rt.storageRoot,
+            sessionId,
+            baseConfig: rt.config,
+            patch: { ...rawPatch, ...(body.syncAllRolesToLeader ? { syncAllRolesToLeader: true } : {}) },
+            action: body.replaceAll ? 'set' : 'merge',
+            principal,
+            isBusy: busy.busy,
+            busyReasons: busy.reasons,
+            discoveredModels,
+          });
+          if (mut.appliedImmediately) {
+            rebindTeamGovernanceSnapshot(rt, sessionId, { principal, forceAtSafeBoundary: true });
+            const baseRt = baseRuntime(rt);
+            const liveAgent = baseRt?.actors?.get?.(sessionId)?.agent ?? baseRt?.hostAgents?.get?.(sessionId) ?? null;
+            if (liveAgent && typeof liveAgent.model?.select === 'function' && rawPatch.roles?.leader) {
+              try {
+                const effCfg = runtimeForTeam(sessionId).config;
+                liveAgent.model.select(resolveModelTarget(effCfg, effCfg.roles.leader.route, effCfg.roles.leader.effort));
+              } catch {}
+            }
+          }
+          return okReply({
+            appliedImmediately: mut.appliedImmediately,
+            stagedForSafeBoundary: mut.stagedForSafeBoundary,
+            busyReasons: mut.busyReasons,
+            state: await buildPanelStateSnapshot(ctx, rt),
+          });
+        }
+
+        if (action === 'reset') {
+          const mut = mutateSessionConfig({
+            storageRoot: rt.storageRoot,
+            sessionId,
+            baseConfig: rt.config,
+            action: 'reset',
+            principal,
+            isBusy: busy.busy,
+            busyReasons: busy.reasons,
+          });
+          if (mut.appliedImmediately) {
+            rebindTeamGovernanceSnapshot(rt, sessionId, { principal, forceAtSafeBoundary: true });
+          }
+          return okReply({
+            appliedImmediately: mut.appliedImmediately,
+            stagedForSafeBoundary: mut.stagedForSafeBoundary,
+            state: await buildPanelStateSnapshot(ctx, rt),
+          });
+        }
+
+        return errReply('BAD_ACTION', `Unsupported session-config action: ${action}`, 400);
+      } catch (e) {
+        return errReply(e?.code ?? 'PANEL_SESSION_CONFIG_FAILED', e instanceof Error ? e.message : String(e), e?.statusCode ?? 200);
+      }
+    },
+
+    async update(request) {
+      try {
+        syncRuntimeConfig(rt);
+        const body = await parseBody(request);
+        const action = String(body.action || 'status').trim().toLowerCase();
+        const pluginRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
+        const hostVersion = rt?.hostCompatibility?.toolsVersion ?? null;
+
+        if (action === 'status') {
+          return okReply({
+            installed: readInstalledVersionInfo(pluginRoot),
+            state: readUpdaterState(rt.storageRoot),
+            backups: listSavedBackups(rt.storageRoot).slice(0, 5),
+          });
+        }
+        if (action === 'check') {
+          const check = await checkForUpdates({
+            pluginRoot,
+            storageRoot: rt.storageRoot,
+            track: body.track || null,
+            releaseTag: body.releaseTag || null,
+            force: body.force !== false,
+            currentHostVersion: hostVersion,
+          });
+          return okReply({ check, state: readUpdaterState(rt.storageRoot) });
+        }
+        if (action === 'apply') {
+          const result = await performOneClickUpgrade({
+            ctx,
+            rt,
+            pluginRoot,
+            storageRoot: rt.storageRoot,
+            dshHome: explicitDshHome,
+            targetTrack: body.targetTrack || null,
+            releaseTag: body.releaseTag || null,
+            confirmTrackSwitch: body.confirmTrackSwitch || null,
+            localTgzPath: body.localTgzPath || null,
+            currentHostVersion: hostVersion,
+          });
+          return okReply({ result, state: readUpdaterState(rt.storageRoot) });
+        }
+        if (action === 'rollback') {
+          const result = await rollbackToSavedBackup({
+            ctx,
+            rt,
+            storageRoot: rt.storageRoot,
+            dshHome: explicitDshHome,
+            backupId: body.backupId || null,
+          });
+          return okReply({ result, state: readUpdaterState(rt.storageRoot) });
+        }
+        return errReply('BAD_UPDATE_ACTION', `Unsupported update action: ${action}`, 400);
+      } catch (e) {
+        return errReply(e?.code ?? 'PANEL_UPDATE_FAILED', e instanceof Error ? e.message : String(e), e?.statusCode ?? 200, e?.details);
+      }
+    },
+
+    async onboarding(request) {
+      try {
+        syncRuntimeConfig(rt);
+        const body = await parseBody(request);
+        const action = String(body.action || 'status').trim().toLowerCase();
+        const pluginRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
+        if (action === 'apply-quick-setup') {
+          const applied = await applyQuickOnboardingSetup({
+            ctx,
+            rt,
+            storageRoot: rt.storageRoot,
+            dshHome: explicitDshHome,
+            configPath: rt.configPath,
+            bundledDefaultConfigPath: path.join(pluginRoot, 'config', 'leaderteam.config.json'),
+            providerId: body.providerId || 'deepseek',
+            apiKey: body.apiKey || '',
+            customBaseURL: body.customBaseURL || '',
+            modelId: body.modelId || '',
+            reasoningModel: body.reasoningModel || '',
+            chatModel: body.chatModel || '',
+            discoveredModels: Array.isArray(body.models) ? body.models : null,
+            collabPresetId: body.collabPresetId || 'balanced-team',
+            verifyConnectivity: Boolean(body.verifyConnectivity),
+          });
+          return okReply(applied);
+        }
+        if (action === 'dismiss') {
+          return okReply(writePersistedOnboardingRecord(rt.storageRoot, { dismissed: true }));
+        }
+        return okReply(buildOnboardingSnapshot({ storageRoot: rt.storageRoot }));
+      } catch (e) {
+        return errReply(e?.code ?? 'PANEL_ONBOARDING_FAILED', e instanceof Error ? e.message : String(e), 200);
+      }
+    },
   };
 }
 
@@ -494,6 +796,9 @@ export function registerPanelRoutes(effectScope, connection, ctxForHandlers, rt 
     [PANEL_ROUTES.ARCHIVE, handlers.archive, 'leaderteam-panel:archive'],
     [PANEL_ROUTES.RETROSPECT, handlers.retrospect, 'leaderteam-panel:retrospect'],
     [PANEL_ROUTES.CLEAN, handlers.clean, 'leaderteam-panel:clean'],
+    [PANEL_ROUTES.SESSION_CONFIG, handlers.sessionConfig, 'leaderteam-panel:session-config'],
+    [PANEL_ROUTES.UPDATE, handlers.update, 'leaderteam-panel:update'],
+    [PANEL_ROUTES.ONBOARDING, handlers.onboarding, 'leaderteam-panel:onboarding'],
   ];
   for (const [routePath, fn, label] of table) {
     effectScope.effect(

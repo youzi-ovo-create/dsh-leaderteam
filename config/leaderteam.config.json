@@ -323,7 +323,7 @@
     ],
     "maxPlanAgreements": 4,
     "maxRefsPerMember": 20,
-    "leaderModelPolicy": "enforce",
+    "leaderModelPolicy": "follow",
     "maxActiveMembers": 6,
     "autoIncludeUpstreamModels": false,
     "disabledFamilies": [

@@ -374,19 +374,34 @@ test('P1-2: locateHostAnchor and lt-doctor resolve strict non-hoisted pnpm layou
 });
 
 // ============================================================================
-// T4 (P1-3): Production whitelist strictly limited to E2E-verified `0.2.2-rc.1` & `0.2.2-rc.5`
+// T4 (P1-3 + Issue #1): Expanded verified core versions & adaptive structural range (`>=0.2.2-alpha.2 <1.0.0`)
 // ============================================================================
-test('P1-3: supportedCoreVersions and engines.dsh admit ONLY E2E-verified 0.2.2-rc.1 and 0.2.2-rc.5', async () => {
-  assert.deepEqual(INTERNAL_PKG.leaderteam.supportedCoreVersions, ['0.2.2-rc.1', '0.2.2-rc.5']);
-  assert.equal(ROOT_PKG.engines.dsh, '0.2.2-rc.1 || 0.2.2-rc.5');
+test('P1-3: supportedCoreVersions covers verified 0.2.2/0.2.3 releases and enforces strict/adaptive boundaries', async () => {
+  const { VERIFIED_CORE_VERSIONS, SUPPORTED_DSH_ENGINE_RANGE } = await import('../../leaderteam/core/host-compat.mjs');
+  assert.deepEqual(INTERNAL_PKG.leaderteam.supportedCoreVersions, [...VERIFIED_CORE_VERSIONS]);
+  assert.equal(ROOT_PKG.engines.dsh, SUPPORTED_DSH_ENGINE_RANGE);
   const { assertCompatiblePipeline } = await import('../../leaderteam/host/final-gate.mjs');
   const fakeProto = {
     resolveExecution() {},
     dispatchToolBody: new Function('exec', 'const tool = this.resolveExecution(exec.name, exec.agent, exec.parent !== void 0, exec.toolSet); return (async () => await tool.execute(exec.arguments, exec))();'),
   };
-  for (const unverified of ['0.2.2-rc.2', '0.2.2-rc.3', '0.2.2-rc.4', '0.2.3']) {
+  for (const verified of VERIFIED_CORE_VERSIONS) {
+    assert.doesNotThrow(() => assertCompatiblePipeline(fakeProto, verified, INTERNAL_PKG.leaderteam.supportedCoreVersions));
+  }
+  // Explicit pin list without adaptive option still rejects unlisted versions
+  for (const unlisted of ['0.2.4', '1.0.0', '0.2.1-rc.5']) {
     assert.throws(
-      () => assertCompatiblePipeline(fakeProto, unverified, INTERNAL_PKG.leaderteam.supportedCoreVersions),
+      () => assertCompatiblePipeline(fakeProto, unlisted, INTERNAL_PKG.leaderteam.supportedCoreVersions),
+      /not a verified core version/,
+    );
+  }
+  // Adaptive policy admits structural-compatible 0.2.4/0.3.0, while blocking <0.2.2-alpha.2 and >=1.0.0
+  assert.doesNotThrow(() =>
+    assertCompatiblePipeline(fakeProto, '0.2.4', INTERNAL_PKG.leaderteam.supportedCoreVersions, { policy: 'adaptive' }),
+  );
+  for (const outOfBounds of ['0.2.1-rc.5', '1.0.0']) {
+    assert.throws(
+      () => assertCompatiblePipeline(fakeProto, outOfBounds, INTERNAL_PKG.leaderteam.supportedCoreVersions, { policy: 'adaptive' }),
       /not a verified core version/,
     );
   }

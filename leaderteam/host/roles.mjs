@@ -2,7 +2,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { runtime, baseRuntime, teamStore, runtimeForTeam, isPluginActive, activePluginsMap, effectiveRuntimeConfig, recordSessionModelRequest, resolveCanonicalRouteFromHostSelection } from './runtime.mjs';
+import { runtime, baseRuntime, teamStore, runtimeForTeam, isPluginActive, activePluginsMap, effectiveRuntimeConfig, recordSessionModelRequest, resolveCanonicalRouteFromHostSelection, syncSessionLeaderSelectionFromHost, flushPendingSessionConfigAtSafeBoundary } from './runtime.mjs';
 import { TeamStore } from '../core/store.mjs';
 import { leaderSection, memberSection, directExecSection } from '../core/prompts.mjs';
 import { resolvePath, pathKey } from '../core/paths.mjs';
@@ -104,11 +104,27 @@ export function resolveActor(ctx, agent) {
   if (actor) { actor.agent = agent; rt.actors.set(agent.id, actor); }
   return actor;
 }
-function isLeaderRoot(ctx, agent) {
+export function isLeaderRoot(ctx, agent) {
+  if (!agent) return false;
   const rt = runtime();
   if (rt.surface === 'headless') return process.env.LEADERTEAM_HEADLESS_LEADER === '1';
-  const presets = ctx.get('agentPresets');
-  return presets?.presetForSession?.(agent.session) === rt.config.profiles.leader.preset;
+  const leaderPreset = rt.config?.profiles?.leader?.preset ?? 'leaderteam';
+  const presets = ctx?.get?.('agentPresets');
+  const resolved = presets?.presetForSession?.(agent.session);
+  return typeof resolved === 'string' && resolved === leaderPreset;
+}
+
+export function shouldApplyDefaultLeaderModel(rt, agent) {
+  if (typeof agent?.model?.select !== 'function') return false;
+  if (agent.model?.recordedSelection?.() !== null) return false;
+  const opts = agent.options;
+  if (rt?.surface !== 'headless') {
+    const desc = opts && typeof opts === 'object'
+      ? Object.getOwnPropertyDescriptor(opts, 'model')
+      : undefined;
+    return typeof desc?.get === 'function' || !opts?.model;
+  }
+  return !opts?.model;
 }
 
 export function onAgentCreated(ctx, { agent }) {
@@ -121,8 +137,7 @@ export function onAgentCreated(ctx, { agent }) {
     reconcileStaleMembers(rt, teamStore(actor.teamId));
     try { rt.onLeaderSessionReady?.(ctx, actor.teamId, actor.cwd); } catch {}
     // Apply the configured default only before this session has any durable or CLI-specified selection.
-    // Resuming a session or passing an explicit `--model` in headless preserves its actual model/effort.
-    if (agent.model?.recordedSelection?.() === null && !agent.options?.model) {
+    if (shouldApplyDefaultLeaderModel(rt, agent)) {
       try {
         const target = resolveModelTarget(cfg, cfg.roles.leader.route, cfg.roles.leader.effort);
         agent.model.select(target);
@@ -133,10 +148,14 @@ export function onAgentCreated(ctx, { agent }) {
     disposers.push(prompt.section({ name: 'leaderteam:role', order: 9000, interpolate: false, text: leaderSection(cfg, activePluginsMap(rt)) }));
     disposers.push(prompt.context?.({ name: 'leaderteam:current-plan', order: 125, interpolate: false,
       text: () => {
+        const curRt = runtimeForTeam(actor.teamId);
+        const curCfg = curRt.config ?? cfg;
         const seq = currentTaskSeq(ctx, actor.teamId);
-        if (cfg.team.rollingPlanning) return formatFrontierContext(teamStore(actor.teamId), seq, cfg);
-        const plan = readCurrentPlan(rt.storageRoot, actor.teamId, seq);
-        return `Current full task plan: ${currentPlanFile(rt.storageRoot, actor.teamId, seq)}. ${plan ? 'Read this file after context compaction; it is the source of plan review.' : 'Write the full plan using team_note(scope="current_plan", path="plan.md").'}`;
+        const store = teamStore(actor.teamId);
+        if (curCfg.team.rollingPlanning) return formatFrontierContext(store, seq, curCfg);
+        const logicalTeamId = store.rawTeamId ?? store.teamId;
+        const plan = readCurrentPlan(curRt.storageRoot, logicalTeamId, seq);
+        return `Current full task plan: ${currentPlanFile(curRt.storageRoot, logicalTeamId, seq)}. ${plan ? 'Read this file after context compaction; it is the source of plan review.' : 'Write the full plan using team_note(scope="current_plan", path="plan.md").'}`;
       } }));
     if (typeof rt.formatLeaderGovernanceSlot === 'function' || typeof rt.formatLeaderConcurrencySlot === 'function' || typeof rt.formatLeaderTimerSlot === 'function') {
       disposers.push(prompt.context?.({ name: 'leaderteam:governance', order: 127, interpolate: false, text: () => rt.formatLeaderGovernanceSlot?.(actor.teamId) ?? '' }));
@@ -322,7 +341,13 @@ export function onAgentStatus(ctx, { agent, status } = {}) {
   const actor = (rt.actors.get(agent.id)?.agent === agent ? rt.actors.get(agent.id) : null) ?? resolveActor(ctx, agent);
   rt = runtimeForTeam(actor?.teamId);
   if (actor?.role === 'leader') {
+    if (status === 'running') {
+      syncSessionLeaderSelectionFromHost(ctx, baseRuntime(rt), agent, { atUserTurnStart: true });
+      return;
+    }
     if (status === 'idle') {
+      flushPendingSessionConfigAtSafeBoundary(ctx, baseRuntime(rt), actor.teamId);
+      rt = runtimeForTeam(actor.teamId);
       const notified = rt.onLeaderIdle?.(ctx, actor.teamId);
       if (!notified) maybeAutoContinueLeader(ctx, rt, actor, agent);
     }
@@ -365,7 +390,40 @@ export function onAgentStatus(ctx, { agent, status } = {}) {
   }
 }
 
-const ACTIVE_MEMBER_STATES = new Set(['starting', 'started', 'running']);
+export const ACTIVE_MEMBER_STATES = new Set(['starting', 'started', 'running']);
+
+export function isProcessPidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  if (pid === process.pid) return true;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err?.code === 'EPERM';
+  }
+}
+
+export function isMemberStaleForRuntime(rt, store, m) {
+  if (!m || !ACTIVE_MEMBER_STATES.has(m.status) || !store) return false;
+  const hasValidOwnerPid = Number.isInteger(m.ownerPid) && m.ownerPid > 0;
+  if (hasValidOwnerPid && m.ownerPid !== process.pid) {
+    return !isProcessPidAlive(m.ownerPid);
+  }
+  if (!rt || !(rt.liveProcessMemberIds instanceof Set) || typeof rt.hostAgents?.get !== 'function') {
+    return false;
+  }
+  if (rt.liveProcessMemberIds.has(m.childId)) return false;
+  if (rt.hostAgents.get(m.childId) !== undefined) return false;
+
+  const baseRt = baseRuntime(rt);
+  const rawId = typeof store.rawTeamId === 'string' && store.rawTeamId ? store.rawTeamId : null;
+  const encId = typeof store.teamId === 'string' && store.teamId ? store.teamId : null;
+  const hasMountedLeader = Boolean(
+    (rawId && (baseRt?.actors?.has?.(rawId) || rt.actors?.has?.(rawId) || rt.hostAgents.get(rawId) !== undefined))
+    || (encId && (baseRt?.actors?.has?.(encId) || rt.actors?.has?.(encId) || rt.hostAgents.get(encId) !== undefined)),
+  );
+  return hasMountedLeader;
+}
 
 export function reconcileStaleMembers(rt, store) {
   if (!rt || !(rt.liveProcessMemberIds instanceof Set) || typeof rt.hostAgents?.get !== 'function' || !store) return;
@@ -376,6 +434,7 @@ export function reconcileStaleMembers(rt, store) {
       rt.liveProcessMemberIds.add(m.childId);
       continue;
     }
+    if (!isMemberStaleForRuntime(rt, store, m)) continue;
     try {
       store.setMemberStatus(m.childId, 'cancelled', 'interrupted by previous host exit');
     } catch {}

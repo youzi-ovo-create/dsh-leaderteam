@@ -230,7 +230,10 @@ export function validateConfig(raw) {
   }
 
   const g = isObj(raw.gate) ? raw.gate : (p.push('gate must be an object'), {});
-  onlyKeys(g, ['scope', 'sandboxDirectAllow', 'enablePatternCache', 'uncontrolledTools', 'shellTools', 'mutatingTools', 'pathArgs', 'requireReadBeforeWrite', 'maxArgChars', 'maxAuthorizationChars', 'dedupeDeniedCalls', 'maxReviewsPerMember', 'maxDenialsPerMember', 'maxReviewsPerTask', 'ruleOnlyTools', 'maxConsecutiveGateErrors', 'gateErrorCooldownMs'], 'gate');
+  onlyKeys(g, ['scope', 'sandboxDirectAllow', 'enablePatternCache', 'uncontrolledTools', 'shellTools', 'mutatingTools', 'pathArgs', 'requireReadBeforeWrite', 'maxArgChars', 'maxAuthorizationChars', 'dedupeDeniedCalls', 'maxReviewsPerMember', 'maxDenialsPerMember', 'maxReviewsPerTask', 'ruleOnlyTools', 'maxConsecutiveGateErrors', 'gateErrorCooldownMs', 'hostCompatibilityPolicy'], 'gate');
+  if (g.hostCompatibilityPolicy !== undefined && g.hostCompatibilityPolicy !== 'adaptive' && g.hostCompatibilityPolicy !== 'strict-verified') {
+    p.push('gate.hostCompatibilityPolicy must be "adaptive" or "strict-verified"');
+  }
   if (g.sandboxDirectAllow !== undefined) bool(g.sandboxDirectAllow, 'gate.sandboxDirectAllow');
   if (g.enablePatternCache !== undefined) bool(g.enablePatternCache, 'gate.enablePatternCache');
   // "all" was never a working mode: it left ordinary sessions without any tool. Only team sessions are governed.
@@ -280,7 +283,7 @@ export function validateConfig(raw) {
   if (strArr(t.planExemptProfiles, 'team.planExemptProfiles')) for (const x of t.planExemptProfiles) if (!memberProfiles.includes(x)) p.push(`team.planExemptProfiles: unknown profile "${x}"`);
   int(t.maxPlanAgreements, 'team.maxPlanAgreements', 1, 50); int(t.maxRefsPerMember, 'team.maxRefsPerMember', 0, 100);
   if (t.maxDiscussionsPerTask !== undefined && t.maxDiscussionsPerTask !== null) int(t.maxDiscussionsPerTask, 'team.maxDiscussionsPerTask', 1, 10000);
-  if (t.leaderModelPolicy !== undefined && !['enforce', 'warn', 'off'].includes(t.leaderModelPolicy)) p.push('team.leaderModelPolicy must be "enforce", "warn" or "off"');
+  if (t.leaderModelPolicy !== undefined && !['follow', 'enforce', 'warn', 'off'].includes(t.leaderModelPolicy)) p.push('team.leaderModelPolicy must be "follow", "enforce", "warn" or "off"');
   if (t.autoIncludeUpstreamModels !== undefined) bool(t.autoIncludeUpstreamModels, 'team.autoIncludeUpstreamModels');
   if (t.disabledModels !== undefined) strArr(t.disabledModels, 'team.disabledModels');
   if (t.disabledFamilies !== undefined && strArr(t.disabledFamilies, 'team.disabledFamilies')) {
@@ -606,7 +609,7 @@ export function validateConfig(raw) {
       ...(raw.scheduler?.memberMemoryMib ?? {}),
     },
   };
-  if (cfg.team.leaderModelPolicy === undefined) cfg.team.leaderModelPolicy = 'enforce';
+  if (cfg.team.leaderModelPolicy === undefined) cfg.team.leaderModelPolicy = 'follow';
   if (cfg.team.maxActiveMembers === undefined) cfg.team.maxActiveMembers = Math.min(cfg.team.maxMembersPerTeam, 8);
   if (cfg.team.maxDiscussionsPerTask === undefined) cfg.team.maxDiscussionsPerTask = null;
   if (cfg.team.autoIncludeUpstreamModels === undefined) cfg.team.autoIncludeUpstreamModels = false;

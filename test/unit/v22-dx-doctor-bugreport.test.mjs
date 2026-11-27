@@ -89,8 +89,21 @@ test('lt-doctor: classifies VERIFIED, UNVERIFIED_COMPATIBLE_SHAPE, and INCOMPATI
     assert.equal(resRc5.checks.dshHost.classification, 'VERIFIED');
     assert.equal(resRc5.checks.dshHost.productionAllowed, true);
 
+    const resAdaptive = runDoctorChecks({
+      checkHost: unverifiedHost,
+      nodeVersion: '22.19.0',
+      platform: 'linux',
+      execFileSyncImpl: () => 'GNU bash, version 5.2.21',
+      env: { DEEPSEEK_API_KEY: 'sk-unverified' },
+    });
+    assert.equal(resAdaptive.checks.dshHost.classification, 'CONTRACT_COMPATIBLE');
+    assert.equal(resAdaptive.checks.dshHost.productionAllowed, true);
+    assert.equal(resAdaptive.checks.dshHost.status, 'pass');
+    assert.equal(resAdaptive.ok, true);
+
     const resUnverified = runDoctorChecks({
       checkHost: unverifiedHost,
+      strictVerified: true,
       nodeVersion: '22.19.0',
       platform: 'linux',
       execFileSyncImpl: () => 'GNU bash, version 5.2.21',
@@ -263,10 +276,10 @@ test('lt-doctor CLI: executes with --json and --check-host without console popup
       execFileSyncImpl: () => 'bash 5.2',
       env: { DEEPSEEK_API_KEY: 'sk-asar' },
     });
-    assert.equal(asarCheck.checks.dshHost.classification, 'UNVERIFIED_COMPATIBLE_SHAPE');
+    assert.equal(asarCheck.checks.dshHost.classification, 'VERIFIED');
     assert.equal(asarCheck.checks.dshHost.toolsVersion, '0.2.2-rc.3');
-    assert.equal(asarCheck.checks.dshHost.status, 'warn');
-    assert.equal(asarCheck.checks.dshHost.productionAllowed, false);
+    assert.equal(asarCheck.checks.dshHost.status, 'pass');
+    assert.equal(asarCheck.checks.dshHost.productionAllowed, true);
 
     const proc = spawnSync(process.execPath, [DOCTOR_BIN, '--json', '--check-host', verifiedHost], {
       cwd: REPO_ROOT,

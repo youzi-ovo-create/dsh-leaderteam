@@ -18,8 +18,9 @@ import {
   resolveLtWebDistDir,
   serveLtWebStaticRequest,
 } from '../../leaderteam/plugins/leaderteam-panel/public-api.mjs';
-import { scanNoSecretLeakage } from '../../../lt-shared-contracts/tests/contract-validator.mjs';
-import { startMockMagpieServer } from '../../../lt-shared-contracts/mocks/mock-magpie-server.mjs';
+import { loadSharedContractsModules } from '../helpers/shared-contracts-loader.mjs';
+
+const { sharedContractsDir, scanNoSecretLeakage, startMockMagpieServer } = await loadSharedContractsModules();
 import { createPanelHandlers } from '../../leaderteam/plugins/leaderteam-panel/panel-api.mjs';
 import { startStandaloneLtUiServer } from '../../bin/lt-ui.mjs';
 import { loadConfig } from '../../leaderteam/core/config.mjs';
@@ -234,7 +235,7 @@ test('UI-02: workbenchTranscript confines session paths + encodes segments, and 
   // Seed `<dshHome>/sessions/proj-a` + an escaping symlink + an encoded `session:1` directory (`session~003A1`) + uncompressed `.jsonl`
   const slugDir = path.join(dshHome, 'sessions', 'proj-a');
   fs.mkdirSync(slugDir, { recursive: true });
-  fs.symlinkSync(outsideDir, path.join(slugDir, 'symlink-escape'), 'dir');
+  fs.symlinkSync(outsideDir, path.join(slugDir, 'symlink-escape'), process.platform === 'win32' ? 'junction' : 'dir');
 
   assert.equal(encodeDshSegment('session:1'), 'session~003A1');
   assert.equal(encodeDshSegment('..'), '~002E~002E');
@@ -681,9 +682,21 @@ test('UI-06, UI-07 & UI-12: serveLtWebStaticRequest hardening, /lt/?token= cooki
   fs.writeFileSync(path.join(customDist, 'index.html'), '<!doctype html><html data-lt-theme="white"></html>', 'utf8');
   fs.writeFileSync(path.join(customDist, 'assets', 'app.js'), 'console.log("ok");', 'utf8');
 
-  const outsideSecret = path.join(tmpDir, 'outside.txt');
+  const outsideSecretDir = path.join(tmpDir, 'outside-secret-dir');
+  fs.mkdirSync(outsideSecretDir, { recursive: true });
+  const outsideSecret = path.join(outsideSecretDir, 'outside.txt');
   fs.writeFileSync(outsideSecret, 'TOP_SECRET_OUTSIDE_DIST', 'utf8');
-  fs.symlinkSync(outsideSecret, path.join(customDist, 'leak.txt'));
+  let escapeReqUrl = 'http://127.0.0.1:3080/lt/leak.txt';
+  try {
+    fs.symlinkSync(outsideSecret, path.join(customDist, 'leak.txt'));
+  } catch (err) {
+    if (process.platform === 'win32' && err?.code === 'EPERM') {
+      fs.symlinkSync(outsideSecretDir, path.join(customDist, 'leak-dir'), 'junction');
+      escapeReqUrl = 'http://127.0.0.1:3080/lt/leak-dir/outside.txt';
+    } else {
+      throw err;
+    }
+  }
 
   // 1. UI-06: malformed URI returns 400 (never 500)
   const badUri = await serveLtWebStaticRequest(new Request('http://127.0.0.1:3080/lt/%E0%A4%A'), { distDir: customDist });
@@ -696,7 +709,7 @@ test('UI-06, UI-07 & UI-12: serveLtWebStaticRequest hardening, /lt/?token= cooki
   assert.equal(encSlash.status, 200);
 
   // 3. UI-06: symlink escaping outside `distDir` returns 403 Forbidden
-  const symEscape = await serveLtWebStaticRequest(new Request('http://127.0.0.1:3080/lt/leak.txt'), { distDir: customDist });
+  const symEscape = await serveLtWebStaticRequest(new Request(escapeReqUrl), { distDir: customDist });
   assert.equal(symEscape.status, 403);
 
   // 4. UI-06: missing asset extension returns 404 (not SPA fallback)
@@ -795,9 +808,38 @@ test('UI-06, UI-07 & UI-12: serveLtWebStaticRequest hardening, /lt/?token= cooki
       },
     },
   });
-  const vnodeTree = JSON.stringify(mainRenderer({}));
+  assert.equal(typeof mainRenderer, 'function');
+  const vnodeTree = JSON.stringify(plugin.ConsoleView({}));
   assert.equal(vnodeTree.includes('"href":"./lt/"'), false, 'file:// Desktop view must not render broken ./lt/ anchor');
   assert.equal(connFetchedPath, null); // useEffect stubbed in sync tree check
+
+  // 8. Official Windows DSH Desktop `dsh-app://app/` custom protocol renders in-window `/lt/` link without target="_blank"
+  let dshAppDesc = null;
+  const dshAppSandbox = {
+    window: {
+      location: { protocol: 'dsh-app:', pathname: '/' },
+      __ModuleLoader__: { load(d) { dshAppDesc = d; } },
+    },
+    fetch: async () => ({ ok: true, json: async () => ({ ok: true, value: {} }) }),
+  };
+  dshAppSandbox.globalThis = dshAppSandbox;
+  vm.runInNewContext(clientCode, dshAppSandbox);
+  const dshAppPlugin = dshAppDesc.factory(mod => (mod === 'react' ? fakeReact : null));
+  let dshAppMain = null;
+  dshAppPlugin.apply({
+    effect(fn) { fn(); return () => {}; },
+    slots: {
+      inject(_name, cb) { return cb(); },
+      register(reg, renderFn) {
+        if (reg.name === 'main') dshAppMain = renderFn;
+        return () => {};
+      },
+    },
+  });
+  assert.equal(typeof dshAppMain, 'function');
+  const dshAppTree = JSON.stringify(dshAppPlugin.ConsoleView({}));
+  assert.equal(dshAppTree.includes('"href":"/lt/"'), true, 'dsh-app:// Desktop view must render in-window /lt/ anchor');
+  assert.equal(dshAppTree.includes('"_blank"'), false, 'dsh-app:// Desktop view must never set target="_blank"');
 });
 
 test('UI-09, UI-10 & UI-11: archiveAction guards, requestWindow.windowsByProvider, and built web-dist theme/API/chart contracts', async t => {
@@ -1050,7 +1092,7 @@ test('Stage 4 Re-Audit Fixes (S3-UIGW-01, S3-UIGW-02, S3-UIGW-04, S3-UIGW-06): l
   // 2. S3-UIGW-04: ALL non-read-only `/api/lt/v1/*` routes reject GET with 405 Allow: POST and NEVER mutate disk!
   const allRoutes = Object.values(PUBLIC_API_ROUTES);
   const mutatingRoutes = allRoutes.filter(p => !PUBLIC_READONLY_API_ROUTES.has(p));
-  assert.equal(mutatingRoutes.length, 14);
+  assert.equal(mutatingRoutes.length, 17);
 
   const bundleBefore = await (await fetch(`${uiSrv.baseUrl}/api/lt/v1/bundle`, { headers: { Cookie: cookiePair } })).json();
   assert.equal(bundleBefore.data.usageStatus.enabled, true);
@@ -1141,7 +1183,7 @@ test('Stage 4 Re-Audit Fixes (S3-UIGW-01, S3-UIGW-02, S3-UIGW-04, S3-UIGW-06): l
   const combinedJs = jsFiles.map(f => fs.readFileSync(path.join(distDir, 'assets', f), 'utf8')).join('\n');
   assert.ok(combinedJs.includes('单凭据默认 (single)'), 'web-dist must include disabled single routing option');
 
-  const sharedDts = fs.readFileSync(path.resolve(repoRoot, '..', 'lt-shared-contracts', 'types', 'lt-public-v1.d.ts'), 'utf8');
+  const sharedDts = fs.readFileSync(path.join(sharedContractsDir, 'types', 'lt-public-v1.d.ts'), 'utf8');
   const webTs = fs.readFileSync(path.join(repoRoot, 'packages', 'lt-web', 'src', 'types', 'lt-public-v1.ts'), 'utf8');
   assert.equal(webTs, sharedDts, 'lt-web lt-public-v1.ts must stay byte-for-byte synced with lt-shared-contracts');
 });

@@ -10,12 +10,12 @@ import { getOrCreateGatewayManager } from '../../leaderteam/gateway/index.mjs';
 import { HengzhangUsageBridge } from '../../leaderteam/usage/hengzhang-bridge.mjs';
 import { createPublicContractHandlers } from '../../leaderteam/plugins/leaderteam-panel/public-api.mjs';
 import { extractReceipts, resolveStorageRoot } from '../../packages/lt-usage/index.mjs';
-import { startMockMagpieServer } from '../../../lt-shared-contracts/mocks/mock-magpie-server.mjs';
-import { validateContractBundle } from '../../../lt-shared-contracts/tests/contract-validator.mjs';
+import { loadSharedContractsModules, resolveLtUsagePluginDir } from '../helpers/shared-contracts-loader.mjs';
 
+const { startMockMagpieServer, validateContractBundle } = await loadSharedContractsModules();
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '..', '..');
-const ossRoot = path.resolve(repoRoot, '..');
+const ossRoot = path.dirname(resolveLtUsagePluginDir());
 
 function writeZstdSession(sessionDir, rows) {
   fs.mkdirSync(sessionDir, { recursive: true });

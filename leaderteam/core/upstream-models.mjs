@@ -1,8 +1,11 @@
 // Dynamic upstream model discovery & multi-provider route resolution for DeepSeek Harness.
 // Queries live DSH `ctx.llm` adapters and `/v1/models` endpoints so LeaderTeam automatically
 // obtains real `contextWindow` and `maxTokens` capacities without hardcoded caps.
+import fs from 'node:fs';
+import path from 'node:path';
 import { EFFORT_ID_RE, MODEL_ROUTE_RE, DSH_EFFORTS } from './constants.mjs';
 import { deepFreeze } from './canonical.mjs';
+import { writeFileAtomic } from './store.mjs';
 
 const LEGACY_HARDCODED_CONTEXT_WINDOW = 131072;
 const LEGACY_HARDCODED_MAX_TOKENS = 16384;
@@ -391,17 +394,17 @@ export async function discoverRuntimeModels(ctx, config, {
     if (llm && typeof llm.discoverModels === 'function') {
       const settings = ctx?.get?.('settings');
       const settingsMap = new Map();
-      try {
-        const desc = settings?.describe?.({ redactSecrets: false }) ?? settings?.describe?.({ redactSecrets: true });
-        for (const ns of desc?.namespaces ?? []) {
+      const ingestDescribe = rawDesc => {
+        const list = Array.isArray(rawDesc) ? rawDesc : (Array.isArray(rawDesc?.namespaces) ? rawDesc.namespaces : []);
+        for (const ns of list) {
           if (ns?.ns) settingsMap.set(ns.ns, ns);
         }
+      };
+      try {
+        ingestDescribe(settings?.describe?.({ redactSecrets: false }) ?? settings?.describe?.({ redactSecrets: true }));
       } catch {
         try {
-          const desc = settings?.describe?.({ redactSecrets: true });
-          for (const ns of desc?.namespaces ?? []) {
-            if (ns?.ns) settingsMap.set(ns.ns, ns);
-          }
+          ingestDescribe(settings?.describe?.({ redactSecrets: true }));
         } catch {}
       }
 
@@ -416,7 +419,8 @@ export async function discoverRuntimeModels(ctx, config, {
         const ns = cp?.settingsNs;
         if (!ns) continue;
         const nsSnap = settingsMap.get(ns);
-        const rawProviders = nsSnap?.data?.providers;
+        const snapSection = nsSnap?.value ?? nsSnap?.data ?? nsSnap?.user ?? null;
+        const rawProviders = snapSection?.providers;
         const provIds = rawProviders && typeof rawProviders === 'object'
           ? Object.keys(rawProviders)
           : providers.map(p => p.id);
@@ -574,60 +578,160 @@ export function mergeUpstreamModelsIntoConfig(baseConfig, catalog) {
   return deepFreeze(cloned);
 }
 
-/**
- * Live-register or update upstream models into DSH's `settings` service (`llm-pi-ai`).
- * Never injects hardcoded `131072` / `16384` limits: passes real `contextWindow` and `maxTokens`
- * when known, omits them otherwise (letting DSH `llm-pi-ai` use its native unthrottled defaults),
- * and cleans up stale hardcoded `131072`/`16384` entries on existing models.
- */
-export async function syncUpstreamModelsToDshSettings(ctx, modelsToEnsure = [], defaultProvider = 'magpie', options = {}) {
+function isPlainRecord(v) {
+  return v !== null && typeof v === 'object' && !Array.isArray(v);
+}
+
+function extractSettingsDescriptors(desc) {
+  if (Array.isArray(desc)) return desc;
+  if (Array.isArray(desc?.namespaces)) return desc.namespaces;
+  return [];
+}
+
+function readDescriptorSectionObject(nsEntry) {
+  if (!isPlainRecord(nsEntry)) return null;
+  if (isPlainRecord(nsEntry.value)) return nsEntry.value;
+  if (isPlainRecord(nsEntry.data)) return nsEntry.data;
+  if (isPlainRecord(nsEntry.user)) return nsEntry.user;
+  return {};
+}
+
+function renderYamlScalar(val) {
+  if (val === null || val === undefined) return 'null';
+  if (typeof val === 'boolean' || typeof val === 'number') return String(val);
+  return JSON.stringify(String(val));
+}
+
+function renderYamlBlock(value, indent = 0) {
+  const pad = ' '.repeat(indent);
+  if (Array.isArray(value)) {
+    if (value.length === 0) return `${pad}[]`;
+    return value.map(item => {
+      if (isPlainRecord(item)) {
+        const entries = Object.entries(item).filter(([, v]) => v !== undefined);
+        if (entries.length === 0) return `${pad}- {}`;
+        const [firstK, firstV] = entries[0];
+        const fmtKey = k => (/^[A-Za-z0-9_-]+$/.test(k) ? k : JSON.stringify(k));
+        const firstLine = (firstV !== null && typeof firstV === 'object')
+          ? `${pad}- ${fmtKey(firstK)}:\n${renderYamlBlock(firstV, indent + 4)}`
+          : `${pad}- ${fmtKey(firstK)}: ${renderYamlScalar(firstV)}`;
+        const restLines = entries.slice(1).map(([k, v]) => {
+          if (v !== null && typeof v === 'object') {
+            return `${pad}  ${fmtKey(k)}:\n${renderYamlBlock(v, indent + 4)}`;
+          }
+          return `${pad}  ${fmtKey(k)}: ${renderYamlScalar(v)}`;
+        });
+        return [firstLine, ...restLines].join('\n');
+      }
+      return `${pad}- ${renderYamlScalar(item)}`;
+    }).join('\n');
+  }
+  if (isPlainRecord(value)) {
+    const entries = Object.entries(value).filter(([, v]) => v !== undefined);
+    if (entries.length === 0) return `${pad}{}`;
+    return entries.map(([k, v]) => {
+      const safeKey = /^[A-Za-z0-9_-]+$/.test(k) ? k : JSON.stringify(k);
+      if (v !== null && typeof v === 'object') {
+        if (Array.isArray(v) && v.length === 0) return `${pad}${safeKey}: []`;
+        if (!Array.isArray(v) && Object.keys(v).length === 0) return `${pad}${safeKey}: {}`;
+        return `${pad}${safeKey}:\n${renderYamlBlock(v, indent + 2)}`;
+      }
+      return `${pad}${safeKey}: ${renderYamlScalar(v)}`;
+    }).join('\n');
+  }
+  return `${pad}${renderYamlScalar(value)}`;
+}
+
+function buildUpdatedLlmPiAiProviders(existingProviders = {}, modelsToEnsure = [], defaultProvider = 'magpie', options = {}) {
   const providerTemplates = options?.providerTemplates ?? null;
-  const settings = ctx?.get?.('settings');
-  if (!settings || typeof settings.describe !== 'function' || typeof settings.update !== 'function') {
-    return { synced: false, reason: 'settings-service-unavailable', updatedProviders: [] };
-  }
-  let desc;
-  try { desc = settings.describe({ redactSecrets: false }); } catch {
-    try { desc = settings.describe({ redactSecrets: true }); } catch {
-      return { synced: false, reason: 'settings-describe-failed', updatedProviders: [] };
-    }
-  }
-  const llmNs = (desc?.namespaces ?? []).find(n => n?.ns === 'llm-pi-ai' || (n?.data && typeof n.data === 'object' && 'providers' in n.data));
-  if (!llmNs?.ns || !llmNs.data || typeof llmNs.data !== 'object') {
-    return { synced: false, reason: 'llm-namespace-not-found', updatedProviders: [] };
-  }
-  const nextData = structuredClone(llmNs.data);
-  nextData.providers ??= {};
+  const overrideProviderBaseUrls = options?.overrideProviderBaseUrls ?? null;
+  const includeCompanionCatalogModels = Boolean(options?.includeCompanionCatalogModels);
+  const nextProviders = isPlainRecord(existingProviders) ? structuredClone(existingProviders) : {};
   const updatedProviders = [];
 
   for (const item of modelsToEnsure) {
+    if (!item) continue;
     const prov = item.provider ?? defaultProvider;
     const modelId = item.upstreamModel ?? item.route;
+    if (!prov || !modelId) continue;
     const tpl = providerTemplates?.[prov] ?? null;
-    let provObj = nextData.providers[prov];
-    if ((!provObj || typeof provObj !== 'object') && tpl) {
-      const { modelMetadata: _meta, ...profileFields } = tpl;
+    let provObj = nextProviders[prov];
+    if (!isPlainRecord(provObj) && tpl) {
+      const { modelMetadata: _meta, clearApiKeyEnv, ...profileFields } = tpl;
       provObj = { ...profileFields, models: [] };
-      nextData.providers[prov] = provObj;
+      if (clearApiKeyEnv) delete provObj.apiKeyEnv;
+      nextProviders[prov] = provObj;
       if (!updatedProviders.includes(prov)) updatedProviders.push(prov);
     }
-    if (!provObj || typeof provObj !== 'object') continue;
+    if (!isPlainRecord(provObj)) continue;
+
+    // Clean legacy pre-release fields rejected by DSH `llm-pi-ai`
+    delete provObj.provider;
+    delete provObj.maxRetries;
+    delete provObj.maxRetryDelayMs;
+
+    if (tpl) {
+      if (tpl.clearApiKeyEnv && provObj.apiKeyEnv !== undefined) {
+        delete provObj.apiKeyEnv;
+        if (!updatedProviders.includes(prov)) updatedProviders.push(prov);
+      } else if (!tpl.clearApiKeyEnv && tpl.apiKeyEnv && !provObj.apiKeyEnv) {
+        provObj.apiKeyEnv = tpl.apiKeyEnv;
+        if (!updatedProviders.includes(prov)) updatedProviders.push(prov);
+      }
+      if (tpl.baseURL && !provObj.baseURL) {
+        provObj.baseURL = tpl.baseURL;
+        if (!updatedProviders.includes(prov)) updatedProviders.push(prov);
+      }
+      if (tpl.api && !provObj.api) {
+        provObj.api = tpl.api;
+        if (!updatedProviders.includes(prov)) updatedProviders.push(prov);
+      }
+      if (isPlainRecord(tpl.headers) && !isPlainRecord(provObj.headers)) {
+        provObj.headers = { ...tpl.headers };
+        if (!updatedProviders.includes(prov)) updatedProviders.push(prov);
+      }
+    }
+
+    const explicitBase = overrideProviderBaseUrls?.[prov];
+    if (typeof explicitBase === 'string' && explicitBase.trim() && provObj.baseURL !== explicitBase.trim()) {
+      provObj.baseURL = explicitBase.trim();
+      if (!provObj.api) provObj.api = tpl?.api || 'openai-completions';
+      if (!updatedProviders.includes(prov)) updatedProviders.push(prov);
+    }
+
     provObj.models = Array.isArray(provObj.models) ? provObj.models : [];
-    const rawEfforts = item.efforts ?? [];
-    const realEfforts = rawEfforts.filter(e => e && e !== 'none');
-    const hasNoneWithThinking = realEfforts.length > 0 && rawEfforts.includes('none') && !realEfforts.includes('off');
+    // DSH `llm-pi-ai` forbids `modelOverrides` alongside `models`; fold any prior overrides into `models`
+    if (isPlainRecord(provObj.modelOverrides)) {
+      for (const [ovId, ovFields] of Object.entries(provObj.modelOverrides)) {
+        if (!ovId || !isPlainRecord(ovFields)) continue;
+        if (!provObj.models.some(m => (typeof m === 'string' ? m : m?.id) === ovId)) {
+          provObj.models.push({ id: ovId, ...ovFields });
+        }
+      }
+      delete provObj.modelOverrides;
+      if (!updatedProviders.includes(prov)) updatedProviders.push(prov);
+    }
+
+    // If OpenAI (`catalogRoute`) has custom models or custom baseURL without route `api`, ensure `api` is present
+    if (prov === 'openai' && !provObj.api && (provObj.baseURL || !['gpt-4.1', 'gpt-4.1-mini', 'gpt-4o', 'gpt-4o-mini', 'o3', 'o4-mini'].includes(modelId))) {
+      provObj.api = 'openai-completions';
+    }
+
+    const rawEfforts = Array.isArray(item.efforts) ? item.efforts : [];
+    const thinkingLevels = rawEfforts.filter(e => e && e !== 'none' && e !== 'off');
+    const hasOffOption = thinkingLevels.length > 0 && (rawEfforts.includes('none') || rawEfforts.includes('off'));
     const existingIdx = provObj.models.findIndex(m => (typeof m === 'string' ? m : m?.id) === modelId);
-    const explicitWireMap = (item.reasoningEfforts && typeof item.reasoningEfforts === 'object' && !Array.isArray(item.reasoningEfforts))
-      ? item.reasoningEfforts
-      : null;
-    const reasoningEfforts = realEfforts.length > 0
+    const explicitWireMap = isPlainRecord(item.reasoningEfforts) ? item.reasoningEfforts : null;
+    const reasoningEfforts = thinkingLevels.length > 0
       ? {
-          ...(hasNoneWithThinking ? { off: explicitWireMap && typeof explicitWireMap.off === 'string' ? explicitWireMap.off : 'none' } : {}),
-          ...Object.fromEntries(realEfforts.map(e => [
+          ...(hasOffOption
+            ? { off: explicitWireMap && typeof explicitWireMap.off === 'string' ? explicitWireMap.off : 'none' }
+            : {}),
+          ...Object.fromEntries(thinkingLevels.map(e => [
             e,
             explicitWireMap && typeof explicitWireMap[e] === 'string'
               ? explicitWireMap[e]
-              : (e === 'off' ? 'none' : e),
+              : e,
           ])),
         }
       : undefined;
@@ -646,17 +750,20 @@ export async function syncUpstreamModelsToDshSettings(ctx, modelsToEnsure = [], 
         ...(desiredCompat ? { compat: { ...desiredCompat } } : {}),
       });
       if (!updatedProviders.includes(prov)) updatedProviders.push(prov);
-    } else if (typeof provObj.models[existingIdx] === 'object' && provObj.models[existingIdx] !== null) {
+    } else if (isPlainRecord(provObj.models[existingIdx])) {
       const cur = { ...provObj.models[existingIdx] };
       let entryChanged = false;
       if (reasoningEfforts) {
-        const curEff = (cur.reasoningEfforts && typeof cur.reasoningEfforts === 'object') ? cur.reasoningEfforts : {};
+        const curEff = isPlainRecord(cur.reasoningEfforts) ? cur.reasoningEfforts : {};
         const nextEff = { ...reasoningEfforts, ...curEff, ...(explicitWireMap ?? {}) };
         if (Object.keys(nextEff).some(k => curEff[k] !== nextEff[k])) {
-          // Preserve existing user/gateway wire values while applying newly discovered keys and explicit LT wire overrides
           cur.reasoningEfforts = nextEff;
           entryChanged = true;
         }
+      } else if (isPlainRecord(cur.reasoningEfforts) && Object.keys(cur.reasoningEfforts).every(k => k === 'off')) {
+        if (tplModelMeta) cur.reasoningEfforts = false;
+        else delete cur.reasoningEfforts;
+        entryChanged = true;
       }
       if (desiredCtx !== undefined && cur.contextWindow !== desiredCtx) {
         cur.contextWindow = desiredCtx;
@@ -677,14 +784,276 @@ export async function syncUpstreamModelsToDshSettings(ctx, modelsToEnsure = [], 
         if (!updatedProviders.includes(prov)) updatedProviders.push(prov);
       }
     }
+
+    // For DeepSeek onboarding/installer, also register companion public API IDs (`deepseek-reasoner`, `deepseek-chat`)
+    // in DSH `llm-pi-ai` so both V4 catalog IDs and standard `api.deepseek.com` IDs are immediately selectable in DSH!
+    if (includeCompanionCatalogModels && prov === 'deepseek' && isPlainRecord(tpl?.modelMetadata)) {
+      const companionDefs = [
+        { id: 'deepseek-reasoner', reasoningEfforts: { off: 'none', low: 'low', medium: 'medium', high: 'high' }, input: ['text'] },
+        { id: 'deepseek-chat', reasoningEfforts: false, input: ['text'] },
+      ];
+      for (const comp of companionDefs) {
+        if (provObj.models.some(m => (typeof m === 'string' ? m : m?.id) === comp.id)) continue;
+        const cMeta = tpl.modelMetadata[comp.id] ?? {};
+        provObj.models.push({
+          id: comp.id,
+          ...(positiveInt(cMeta.contextWindow) ? { contextWindow: cMeta.contextWindow } : {}),
+          ...(positiveInt(cMeta.maxTokens) ? { maxTokens: cMeta.maxTokens } : {}),
+          input: comp.input,
+          reasoningEfforts: comp.reasoningEfforts,
+          ...(cMeta.compat ? { compat: { ...cMeta.compat } } : {}),
+        });
+        if (!updatedProviders.includes(prov)) updatedProviders.push(prov);
+      }
+    }
   }
 
+  return { nextProviders, updatedProviders };
+}
+
+function splitTopLevelYamlSequenceBlocks(rawYamlText) {
+  const norm = String(rawYamlText ?? '').replace(/\r\n/g, '\n').trim();
+  if (!norm || norm === '[]') return [];
+  const lines = norm.split('\n');
+  const blocks = [];
+  let current = [];
+  for (const line of lines) {
+    if (/^-\s/.test(line)) {
+      if (current.length > 0) blocks.push(current.join('\n'));
+      current = [line];
+    } else if (current.length > 0) {
+      current.push(line);
+    }
+  }
+  if (current.length > 0) blocks.push(current.join('\n'));
+  return blocks;
+}
+
+function isSequenceBlockForEntryId(blockText, targetId) {
+  const hasInsert = /(?:^|\n)(?:-\s+|\s{2})insert\s*:/.test(blockText);
+  if (hasInsert) return false;
+  const re = new RegExp(`(?:^|\\n)(?:-\\s+|\\s{2})["']?id["']?\\s*:\\s*["']?${targetId}["']?(?:\\s*(?:#.*)?)$`, 'm');
+  return re.test(blockText);
+}
+
+export function persistDshHostSettingsToDisk({
+  dshHome,
+  modelsToEnsure = [],
+  defaultProvider = 'magpie',
+  providerTemplates = null,
+  overrideProviderBaseUrls = null,
+  includeCompanionCatalogModels = false,
+  leaderTarget = null,
+  selectLeaderAsHostDefault = false,
+  fsImpl = fs,
+} = {}) {
+  if (!dshHome) return { synced: false, reason: 'no-dsh-home', updatedProviders: [] };
+  fsImpl.mkdirSync(dshHome, { recursive: true });
+  const stateDir = path.join(dshHome, 'leaderteam');
+  fsImpl.mkdirSync(stateDir, { recursive: true });
+  const sidecarFile = path.join(stateDir, 'dsh-host-providers.json');
+  let priorState = { providers: {}, defaultModel: null };
+  if (fsImpl.existsSync(sidecarFile)) {
+    try {
+      const parsed = JSON.parse(fsImpl.readFileSync(sidecarFile, 'utf8'));
+      if (isPlainRecord(parsed)) {
+        priorState = {
+          providers: isPlainRecord(parsed.providers) ? parsed.providers : {},
+          defaultModel: isPlainRecord(parsed.defaultModel) ? parsed.defaultModel : null,
+        };
+      }
+    } catch {}
+  }
+
+  const { nextProviders, updatedProviders } = buildUpdatedLlmPiAiProviders(
+    priorState.providers,
+    modelsToEnsure,
+    defaultProvider,
+    { providerTemplates, overrideProviderBaseUrls, includeCompanionCatalogModels },
+  );
+
+  const nextDefaultModel =
+    selectLeaderAsHostDefault && leaderTarget?.provider && leaderTarget?.model
+      ? {
+          provider: String(leaderTarget.provider),
+          model: String(leaderTarget.model),
+          ...(leaderTarget.reasoningEffort ? { reasoningEffort: String(leaderTarget.reasoningEffort) } : {}),
+        }
+      : priorState.defaultModel;
+
+  writeFileAtomic(
+    sidecarFile,
+    `${JSON.stringify({ providers: nextProviders, defaultModel: nextDefaultModel }, null, 2)}\n`,
+  );
+
+  const settingsDoc = {
+    'llm-pi-ai': { providers: nextProviders },
+    ...(nextDefaultModel ? { 'agent-default-model': nextDefaultModel } : {}),
+  };
+  const renderedSettingsYaml = `${renderYamlBlock(settingsDoc, 0)}\n`;
+  writeFileAtomic(path.join(dshHome, 'settings.yml'), renderedSettingsYaml);
+
+  // Patch any initialized profile `cordis.patch.yml` (`desktop`, `web`) preserving all other bundle/plugin entries
+  const patchedProfiles = [];
+  for (const prof of ['desktop', 'web']) {
+    const profDir = path.join(dshHome, 'profiles', prof);
+    const patchFile = path.join(profDir, 'cordis.patch.yml');
+    if (!fsImpl.existsSync(patchFile) && !fsImpl.existsSync(path.join(profDir, 'package.json'))) {
+      continue;
+    }
+    let rawPatch = '';
+    try {
+      if (fsImpl.existsSync(patchFile)) rawPatch = fsImpl.readFileSync(patchFile, 'utf8');
+    } catch {}
+    const keptBlocks = splitTopLevelYamlSequenceBlocks(rawPatch).filter(b => {
+      if (isSequenceBlockForEntryId(b, 'llm-pi-ai')) return false;
+      if (nextDefaultModel && isSequenceBlockForEntryId(b, 'agent-default-model')) return false;
+      return true;
+    });
+    const newEntries = [
+      {
+        id: 'llm-pi-ai',
+        name: '@deepseek-ai/dsh-llm-pi-ai',
+        config: { providers: nextProviders },
+      },
+      ...(nextDefaultModel
+        ? [
+            {
+              id: 'agent-default-model',
+              name: '@deepseek-ai/dsh-agent-default-model',
+              config: nextDefaultModel,
+            },
+          ]
+        : []),
+    ];
+    const combinedYaml = [...keptBlocks, renderYamlBlock(newEntries, 0)].filter(Boolean).join('\n') + '\n';
+    writeFileAtomic(patchFile, combinedYaml);
+    patchedProfiles.push(prof);
+  }
+
+  // When no profile has been initialized yet, also stage `settings.yaml` so DSH `importLegacyDocument()` imports on first launch
+  if (patchedProfiles.length === 0) {
+    writeFileAtomic(path.join(dshHome, 'settings.yaml'), renderedSettingsYaml);
+  }
+
+  return {
+    synced: true,
+    changed: updatedProviders.length > 0 || Boolean(selectLeaderAsHostDefault && nextDefaultModel),
+    mode: 'dsh-home-files',
+    updatedProviders,
+    defaultModelSelected: Boolean(selectLeaderAsHostDefault && nextDefaultModel),
+    patchedProfiles,
+  };
+}
+
+/**
+ * Live-register or update upstream models into DSH's `settings` service (`llm-pi-ai`) and optional `agentDefaultModel`,
+ * with automatic fallback to `$DSH_HOME` profile/settings persistence when running standalone (`ctx === null`).
+ */
+export async function syncUpstreamModelsToDshSettings(ctx, modelsToEnsure = [], defaultProvider = 'magpie', options = {}) {
+  const settings = ctx?.get?.('settings') ?? ctx?.settings ?? ctx?.root?.get?.('settings') ?? null;
+  if (!settings || typeof settings.describe !== 'function' || typeof settings.update !== 'function') {
+    if (options?.dshHome) {
+      return persistDshHostSettingsToDisk({
+        dshHome: options.dshHome,
+        modelsToEnsure,
+        defaultProvider,
+        providerTemplates: options.providerTemplates ?? null,
+        overrideProviderBaseUrls: options.overrideProviderBaseUrls ?? null,
+        includeCompanionCatalogModels: Boolean(options.includeCompanionCatalogModels),
+        leaderTarget: options.leaderTarget ?? null,
+        selectLeaderAsHostDefault: Boolean(options.selectLeaderAsHostDefault),
+      });
+    }
+    return { synced: false, reason: 'settings-service-unavailable', updatedProviders: [] };
+  }
+  let desc;
+  try { desc = settings.describe({ redactSecrets: false }); } catch {
+    try { desc = settings.describe({ redactSecrets: true }); } catch {
+      return { synced: false, reason: 'settings-describe-failed', updatedProviders: [] };
+    }
+  }
+  const descriptors = extractSettingsDescriptors(desc);
+  const llmNs = descriptors.find(n => {
+    if (n?.ns === 'llm-pi-ai') return true;
+    const sec = readDescriptorSectionObject(n);
+    return Boolean(sec && 'providers' in sec);
+  });
+  const currentLlmSection = readDescriptorSectionObject(llmNs);
+  if (!llmNs?.ns || !isPlainRecord(currentLlmSection)) {
+    return { synced: false, reason: 'llm-namespace-not-found', updatedProviders: [] };
+  }
+  const nextData = structuredClone(currentLlmSection);
+  const { nextProviders, updatedProviders } = buildUpdatedLlmPiAiProviders(
+    nextData.providers ?? {},
+    modelsToEnsure,
+    defaultProvider,
+    options,
+  );
+  nextData.providers = nextProviders;
+
+  let defaultModelSelected = false;
+  const applyHostDefaultSelection = async () => {
+    const lt = options?.leaderTarget;
+    if (!lt?.provider || !lt?.model) return;
+    const agentDefaultSvc =
+      ctx?.get?.('agentDefaultModel') ??
+      ctx?.agentDefaultModel ??
+      ctx?.root?.get?.('agentDefaultModel') ??
+      null;
+    let shouldSelect = Boolean(options?.selectLeaderAsHostDefault);
+    if (!shouldSelect && options?.autoSelectIfDefaultUnconfigured && agentDefaultSvc?.currentSelection) {
+      try {
+        const cur = agentDefaultSvc.currentSelection();
+        if (!cur?.provider || (cur.provider === 'deepseek-official' && lt.provider !== 'deepseek-official')) {
+          shouldSelect = true;
+        }
+      } catch {}
+    }
+    if (!shouldSelect) return;
+    const nextSel = {
+      provider: String(lt.provider),
+      model: String(lt.model),
+      ...(lt.reasoningEffort ? { reasoningEffort: String(lt.reasoningEffort) } : {}),
+    };
+    if (agentDefaultSvc && typeof agentDefaultSvc.saveSelection === 'function') {
+      try {
+        await agentDefaultSvc.saveSelection(nextSel);
+        defaultModelSelected = true;
+        return;
+      } catch {}
+    }
+    const admNs = descriptors.find(n => n?.ns === 'agent-default-model');
+    if (admNs?.ns) {
+      try {
+        await settings.update(admNs.ns, nextSel);
+        defaultModelSelected = true;
+      } catch {}
+    }
+  };
+
   if (updatedProviders.length === 0) {
-    return { synced: true, changed: false, updatedProviders: [] };
+    await applyHostDefaultSelection();
+    return { synced: true, changed: defaultModelSelected, updatedProviders: [], defaultModelSelected };
   }
   try {
     await settings.update(llmNs.ns, nextData);
-    return { synced: true, changed: true, updatedProviders };
+    await applyHostDefaultSelection();
+    if (options?.dshHome && options?.persistToDshHome) {
+      try {
+        persistDshHostSettingsToDisk({
+          dshHome: options.dshHome,
+          modelsToEnsure,
+          defaultProvider,
+          providerTemplates: options.providerTemplates ?? null,
+          overrideProviderBaseUrls: options.overrideProviderBaseUrls ?? null,
+          includeCompanionCatalogModels: Boolean(options.includeCompanionCatalogModels),
+          leaderTarget: options.leaderTarget ?? null,
+          selectLeaderAsHostDefault: Boolean(options.selectLeaderAsHostDefault),
+        });
+      } catch {}
+    }
+    return { synced: true, changed: true, updatedProviders, defaultModelSelected };
   } catch (e) {
     return { synced: false, reason: e instanceof Error ? e.message : String(e), updatedProviders: [] };
   }
