@@ -348,10 +348,12 @@ export class HengzhangUsageBridge {
       await withBoundedTimeout(this.triggerBackgroundMagpieSync(), 1200);
     }
     const pricing = this.getPricing();
-    const overview = fs.existsSync(path.join(resolvedHome, 'sessions'))
+    const storageRootForHome = this._storageRootForHome(resolvedHome);
+    const hasSessionsDir = fs.existsSync(path.join(resolvedHome, 'sessions'));
+    const overview = hasSessionsDir
       ? overviewFor(resolvedHome, pricing, {
         gatewayRecords: this.gatewayRecords,
-        storageRoot: this._storageRootForHome(resolvedHome),
+        storageRoot: storageRootForHome,
       })
       : {
         totals: {
@@ -377,7 +379,53 @@ export class HengzhangUsageBridge {
         sessions: [],
         errors: [],
       };
-    return { enabled: true, dshHome: resolvedHome, pricing, pricingCatalog, overview };
+    const now = new Date();
+    const startOfTodayMs = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+    const todayDateKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+    let todayCallsTotal = 0;
+    let todayCallsSucceeded = 0;
+    let todayUnmeteredCalls = 0;
+    let todayUnpricedCalls = 0;
+    let todayKnownCostCalls = 0;
+    let todayCostCny = 0;
+    if (hasSessionsDir && Array.isArray(overview.sessions)) {
+      for (const sess of overview.sessions) {
+        const lastMs = typeof sess?.lastActivityMs === 'number' ? sess.lastActivityMs : sess?.startedAtMs;
+        if (typeof lastMs !== 'number' || lastMs < startOfTodayMs) continue;
+        const repRes = reportFor(resolvedHome, sess.sessionId, pricing, {
+          gatewayRecords: this.gatewayRecords,
+          storageRoot: storageRootForHome,
+        });
+        for (const call of repRes?.report?.calls ?? []) {
+          if (typeof call?.timeMs !== 'number' || call.timeMs < startOfTodayMs) continue;
+          todayCallsTotal += 1;
+          if (call.ok !== false) todayCallsSucceeded += 1;
+          if (call.unmetered) {
+            todayUnmeteredCalls += 1;
+          } else if (call.ok !== false && typeof call.costActualCny === 'number' && Number.isFinite(call.costActualCny)) {
+            todayCostCny += call.costActualCny;
+            todayKnownCostCalls += 1;
+          } else if (call.ok !== false) {
+            todayUnpricedCalls += 1;
+          }
+        }
+      }
+    }
+    const overviewWithToday = {
+      ...overview,
+      today: {
+        dateKey: todayDateKey,
+        startOfDayMs: startOfTodayMs,
+        callsTotal: todayCallsTotal,
+        callsSucceeded: todayCallsSucceeded,
+        unmeteredCalls: todayUnmeteredCalls,
+        unpricedCalls: todayUnpricedCalls,
+        costActualCny: todayCallsSucceeded > 0 && todayKnownCostCalls === 0
+          ? null
+          : Number(todayCostCny.toFixed(4)),
+      },
+    };
+    return { enabled: true, dshHome: resolvedHome, pricing, pricingCatalog, overview: overviewWithToday };
   }
 
   async getSessions({ home = null, syncGateway = false, allowExternalOverride = true } = {}) {

@@ -16,6 +16,72 @@ import { DSH_EFFORTS } from '../core/constants.mjs';
 
 const CANONICAL_DSH_THINKING_ORDER = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
 
+export const DIRECT_SOLO_PROVIDER_IDS = Object.freeze(
+  new Set(
+    [
+      ...SOLO_PROVIDER_PRESETS.flatMap(p => [p.id, p.provider]),
+      'anthropic',
+      'google',
+      'gemini',
+      'claude',
+      'openrouter',
+      'xai',
+      'mistral',
+      'groq',
+      'deepseek-official',
+      'deepseek-account',
+      'openai-codex',
+      'azure',
+      'bedrock',
+      'vertex',
+    ]
+      .map(s => String(s || '').trim().toLowerCase())
+      .filter(Boolean),
+  ),
+);
+
+/**
+ * Resolve the DSH host provider namespace reserved for Magpie gateway routes.
+ * Never returns a direct Solo-Key vendor provider (such as `'deepseek'` from `buildSoloKeyStarterConfig`),
+ * binding Magpie gateway models strictly to `'magpie'` unless `cfg.magpie.gatewayProvider` explicitly
+ * names a custom Magpie namespace (`S8-E2E-01a`).
+ */
+export function resolveMagpieGatewayHostProvider(effectiveConfig = null) {
+  const explicitGw = typeof effectiveConfig?.magpie?.gatewayProvider === 'string'
+    ? effectiveConfig.magpie.gatewayProvider.trim()
+    : '';
+  if (explicitGw && !DIRECT_SOLO_PROVIDER_IDS.has(explicitGw.toLowerCase())) {
+    return explicitGw;
+  }
+  const legacyProv = typeof effectiveConfig?.magpie?.provider === 'string'
+    ? effectiveConfig.magpie.provider.trim()
+    : '';
+  if (legacyProv && !DIRECT_SOLO_PROVIDER_IDS.has(legacyProv.toLowerCase())) {
+    return legacyProv;
+  }
+  return 'magpie';
+}
+
+function classifyConfiguredModelRoute(routeId, spec, effectiveConfig, magpieHostProv, magpieGatewayRouteSet = null) {
+  const configuredDefaultProv = effectiveConfig?.magpie?.provider ?? magpieHostProv;
+  const effectiveSpecProv = spec?.provider ?? configuredDefaultProv;
+  const isMagpie =
+    effectiveSpecProv === magpieHostProv
+    || routeId.startsWith(`${magpieHostProv}/`)
+    || Boolean(magpieGatewayRouteSet?.has(routeId));
+  const hostProv = isMagpie ? magpieHostProv : effectiveSpecProv;
+  const rawUpstream = spec?.upstreamModel
+    ?? (routeId.startsWith(`${magpieHostProv}/`) ? routeId.slice(magpieHostProv.length + 1) : routeId);
+  const slashIdx = rawUpstream.indexOf('/');
+  const vendorPart = isMagpie
+    ? (slashIdx > 0 ? rawUpstream.slice(0, slashIdx) : 'magpie')
+    : hostProv;
+  const upstreamModelId = isMagpie && slashIdx > 0 ? rawUpstream.slice(slashIdx + 1) : rawUpstream;
+  const sourceKind = isMagpie ? 'magpie' : 'direct';
+  const providerId = `${sourceKind}:${vendorPart}`;
+  return { isMagpie, hostProv, rawUpstream, vendorPart, upstreamModelId, sourceKind, providerId };
+}
+
 const SAFE_MASKED_TAG_RE = /^(?:oauth:[A-Za-z0-9._+-]{1,32}|env:[A-Z0-9_]{2,64}(?:\s*\([^)]+\))?|pin:[A-Za-z0-9._-]{1,24}|configured)$/;
 const SAFE_MASKED_SECRET_RE = /^([^*.\u2026]{0,6})(?:\*{2,}|\u2026|\.\.\.)([^*.\u2026]{0,6})$/;
 
@@ -332,12 +398,18 @@ export function buildPublicProviders({
     }
   }
 
-  // 2. Direct Solo-Key Providers (configured via env or LT models with explicit provider)
+  // 2. Direct Solo-Key Providers (configured via env or LT models with explicit/Solo-Key provider)
   const configuredDirectProviders = new Set();
-  const defaultMagpieProv = effectiveConfig?.magpie?.provider ?? 'magpie';
-  for (const spec of Object.values(effectiveConfig?.models ?? {})) {
-    if (spec?.provider && spec.provider !== defaultMagpieProv) {
-      configuredDirectProviders.add(spec.provider);
+  const magpieHostProv = resolveMagpieGatewayHostProvider(effectiveConfig);
+  const magpieGatewayRouteSet = new Set(
+    (Array.isArray(magpieGatewayModels) ? magpieGatewayModels : [])
+      .map(m => (typeof m?.id === 'string' ? m.id.trim() : ''))
+      .filter(Boolean),
+  );
+  for (const [routeId, spec] of Object.entries(effectiveConfig?.models ?? {})) {
+    const info = classifyConfiguredModelRoute(routeId, spec, effectiveConfig, magpieHostProv, magpieGatewayRouteSet);
+    if (!info.isMagpie && info.hostProv) {
+      configuredDirectProviders.add(info.hostProv);
     }
   }
   for (const preset of SOLO_PROVIDER_PRESETS) {
@@ -440,15 +512,13 @@ export function buildPublicProviders({
   // 5. Backfill `unconfigured` provider descriptors for any vendor referenced by `effectiveConfig.models`
   //    so `ModelCatalogEntry.providerId` always maintains referential integrity in `lt.public.v1`.
   for (const [routeId, spec] of Object.entries(effectiveConfig?.models ?? {})) {
-    const hostProv = spec?.provider ?? defaultMagpieProv;
-    const isMagpie = hostProv === defaultMagpieProv;
-    const rawUpstream = spec?.upstreamModel ?? routeId;
-    const slashIdx = rawUpstream.indexOf('/');
-    const vendorPart = isMagpie
-      ? (slashIdx > 0 ? rawUpstream.slice(0, slashIdx) : 'magpie')
-      : hostProv;
-    const sourceKind = isMagpie ? 'magpie' : 'direct';
-    const providerId = `${sourceKind}:${vendorPart}`;
+    const { isMagpie, vendorPart, sourceKind, providerId } = classifyConfiguredModelRoute(
+      routeId,
+      spec,
+      effectiveConfig,
+      magpieHostProv,
+      magpieGatewayRouteSet,
+    );
     if (seenProviderIds.has(providerId)) continue;
     seenProviderIds.add(providerId);
     providers.push({
@@ -472,7 +542,7 @@ export function buildPublicProviders({
     const hostCounts = new Map();
     for (const dm of dshDiscoveredModels) {
       if (!dm?.route || !dm?.provider) continue;
-      const isMagpie = dm.provider === defaultMagpieProv;
+      const isMagpie = dm.provider === magpieHostProv;
       const rawUpstream = dm.upstreamModel || dm.route;
       const slashIdx = rawUpstream.indexOf('/');
       const vendorPart = isMagpie
@@ -550,8 +620,19 @@ export function buildPublicModelCatalog({
 } = {}) {
   const entries = [];
   const seenEntries = new Set();
-  const workingRoutes = { ...(effectiveConfig?.models ?? {}) };
-  const defaultMagpieHostProv = effectiveConfig?.magpie?.provider ?? 'magpie';
+  const magpieHostProv = resolveMagpieGatewayHostProvider(effectiveConfig);
+  const configuredDefaultProv = effectiveConfig?.magpie?.provider ?? magpieHostProv;
+  const workingRoutes = Object.fromEntries(
+    Object.entries(effectiveConfig?.models ?? {}).map(([r, s]) => [
+      r,
+      {
+        ...s,
+        provider: s?.provider ?? (r.startsWith(`${magpieHostProv}/`) ? magpieHostProv : configuredDefaultProv),
+      },
+    ]),
+  );
+  const magpieGatewayRouteSet = new Set();
+  const seenHostModels = new Set();
   const executionPoolSet = new Set(effectiveConfig?.team?.executionPool ?? []);
   const disabledSet = new Set(effectiveConfig?.team?.disabledModels ?? []);
 
@@ -566,14 +647,21 @@ export function buildPublicModelCatalog({
     const entryId = `magpie:${providerId}:${upstreamModelId}`;
     if (seenEntries.has(entryId)) continue;
     seenEntries.add(entryId);
+    seenHostModels.add(`${magpieHostProv}::${fullId}`);
 
     // Compute collision-safe LT routeId (never overwriting a direct route with the same bare name)
-    const routeId = canonicalRouteFor(defaultMagpieHostProv, fullId, {
-      defaultProvider: defaultMagpieHostProv,
+    const routeId = canonicalRouteFor(magpieHostProv, fullId, {
+      defaultProvider: magpieHostProv,
       existingModels: workingRoutes,
     }) || fullId;
+    magpieGatewayRouteSet.add(routeId);
+    magpieGatewayRouteSet.add(fullId);
 
-    const existingSpec = effectiveConfig?.models?.[routeId] ?? null;
+    const existingRuleSpec = effectiveConfig?.models?.[routeId] ?? null;
+    const existingIsMagpie = existingRuleSpec
+      ? classifyConfiguredModelRoute(routeId, existingRuleSpec, effectiveConfig, magpieHostProv, magpieGatewayRouteSet).isMagpie
+      : false;
+    const existingSpec = existingIsMagpie ? existingRuleSpec : null;
     const mappedEff = mapGatewayReasoningLevels(raw.reasoning_levels ?? raw.supported_reasoning_levels);
     const supportedEfforts = mappedEff.reasoning
       ? mappedEff.supported
@@ -594,7 +682,7 @@ export function buildPublicModelCatalog({
       : (existingSpec?.maxTokens ?? null);
 
     workingRoutes[routeId] ??= {
-      provider: defaultMagpieHostProv,
+      provider: magpieHostProv,
       upstreamModel: fullId,
     };
 
@@ -625,27 +713,28 @@ export function buildPublicModelCatalog({
         maxOutputTokens,
       },
       tier: inferModelTier({ family, modelId: fullId, reasoning: mappedEff.reasoning }),
-      inModelPool: Boolean(effectiveConfig?.models?.[routeId]),
-      inExecutionPool: executionPoolSet.has(routeId),
+      inModelPool: Boolean(existingIsMagpie),
+      inExecutionPool: Boolean(existingIsMagpie && executionPoolSet.has(routeId)),
       disabled: disabledSet.has(routeId),
     });
   }
 
   // 2. Configured LT models not already covered by live Magpie catalog (e.g., Direct Solo-Key or offline Magpie routes)
   for (const [routeId, spec] of Object.entries(effectiveConfig?.models ?? {})) {
-    const hostProv = spec?.provider ?? defaultMagpieHostProv;
-    const isMagpie = hostProv === defaultMagpieHostProv;
-    const sourceKind = isMagpie ? 'magpie' : 'direct';
-    const rawUpstream = spec?.upstreamModel ?? routeId;
-    const slashIdx = rawUpstream.indexOf('/');
-    const vendorPart = isMagpie
-      ? (slashIdx > 0 ? rawUpstream.slice(0, slashIdx) : 'magpie')
-      : hostProv;
-    const upstreamModelId = isMagpie && slashIdx > 0 ? rawUpstream.slice(slashIdx + 1) : rawUpstream;
-    const providerId = `${sourceKind}:${vendorPart}`;
+    const {
+      isMagpie,
+      hostProv,
+      rawUpstream,
+      vendorPart,
+      upstreamModelId,
+      sourceKind,
+      providerId,
+    } = classifyConfiguredModelRoute(routeId, spec, effectiveConfig, magpieHostProv, magpieGatewayRouteSet);
     const entryId = `${sourceKind}:${providerId}:${upstreamModelId}`;
     if (seenEntries.has(entryId)) continue;
     seenEntries.add(entryId);
+    seenHostModels.add(`${hostProv}::${rawUpstream}`);
+    seenHostModels.add(`${hostProv}::${upstreamModelId}`);
 
     const supported = Array.isArray(spec.efforts) && spec.efforts.length > 0 ? [...spec.efforts] : ['none'];
     const reasoning = supported.some(e => e !== 'none' && e !== 'off');
@@ -682,29 +771,37 @@ export function buildPublicModelCatalog({
     });
   }
 
-  // 3. Additional DSH runtime discovered models (never merging onto existing entryIds)
+  // 3. Additional DSH runtime discovered models (never duplicating already-cataloged `(provider, upstreamModel)` or colliding on `routeId`)
   for (const dm of dshDiscoveredModels) {
     if (!dm?.route || !dm?.provider) continue;
-    const isMagpie = dm.provider === defaultMagpieHostProv;
+    const isMagpie = dm.provider === magpieHostProv;
     const rawUpstream = dm.upstreamModel || dm.route;
     const slashIdx = rawUpstream.indexOf('/');
     const vendorPart = isMagpie
       ? (slashIdx > 0 ? rawUpstream.slice(0, slashIdx) : 'magpie')
       : dm.provider;
     const upstreamModelId = isMagpie && slashIdx > 0 ? rawUpstream.slice(slashIdx + 1) : rawUpstream;
+    if (seenHostModels.has(`${dm.provider}::${rawUpstream}`) || seenHostModels.has(`${dm.provider}::${upstreamModelId}`)) {
+      continue;
+    }
     const sourceKind = isMagpie ? 'magpie' : 'host-settings';
     const providerId = `${sourceKind === 'magpie' ? 'magpie' : 'direct'}:${vendorPart}`;
     const entryId = `${sourceKind}:${providerId}:${upstreamModelId}`;
     if (seenEntries.has(entryId)) continue;
     seenEntries.add(entryId);
+    seenHostModels.add(`${dm.provider}::${rawUpstream}`);
+    seenHostModels.add(`${dm.provider}::${upstreamModelId}`);
 
     // Ensure routeId never collides with an existing catalog route
     let routeId = dm.route;
     if (entries.some(e => e.routeId === routeId)) {
-      routeId = canonicalRouteFor(dm.provider, rawUpstream, {
-        defaultProvider: defaultMagpieHostProv,
-        existingModels: Object.fromEntries(entries.map(e => [e.routeId, { provider: e.sourceKind === 'magpie' ? defaultMagpieHostProv : dm.provider, upstreamModel: e.upstreamModelId }])),
-      }) || `${dm.provider}@host/${upstreamModelId}`;
+      const cand = canonicalRouteFor(dm.provider, rawUpstream, {
+        defaultProvider: magpieHostProv,
+        existingModels: Object.fromEntries(entries.map(e => [e.routeId, { provider: e.sourceKind === 'magpie' ? magpieHostProv : dm.provider, upstreamModel: e.upstreamModelId }])),
+      });
+      routeId = cand && !entries.some(e => e.routeId === cand)
+        ? cand
+        : `${dm.provider}@host/${upstreamModelId}`;
     }
 
     const supported = Array.isArray(dm.efforts) && dm.efforts.length > 0
@@ -753,10 +850,16 @@ export function buildModelUpsertsFromCatalogEntries(entries, {
   defaultMagpieHostProvider = 'magpie',
   enableInExecutionPool = true,
 } = {}) {
+  const safeMagpieHostProvider =
+    typeof defaultMagpieHostProvider === 'string'
+    && defaultMagpieHostProvider.trim()
+    && !DIRECT_SOLO_PROVIDER_IDS.has(defaultMagpieHostProvider.trim().toLowerCase())
+      ? defaultMagpieHostProvider.trim()
+      : 'magpie';
   return entries.map(entry => {
     const isMagpie = entry.sourceKind === 'magpie';
     const hostProvider = isMagpie
-      ? defaultMagpieHostProvider
+      ? safeMagpieHostProvider
       : entry.providerId.replace(/^(?:direct|ext):/, '');
     const upstreamModel = isMagpie
       ? (entry.magpieModelId || `${entry.providerId.replace(/^magpie:/, '')}/${entry.upstreamModelId}`)

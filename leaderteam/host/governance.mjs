@@ -2079,15 +2079,23 @@ export async function resolveHumanEscalationOnUserTurn({ ctx, rt, store, leaderA
   return true;
 }
 
-/** Concise governance snapshot injected into Leader's live runtime context. */
+/** Concise governance snapshot injected into Leader's live runtime context (empty when quiescent in normal phase). */
 export function formatLeaderGovernanceContext(store, taskSeq) {
   const gov = replayGovernanceState(store.governanceEvents(), taskSeq);
+  const isQuiescent = gov.phase === 'normal'
+    && !gov.pausingConference
+    && !gov.activeConference
+    && !gov.activeHumanEscalation
+    && gov.activeDirectives.length === 0
+    && (!gov.pendingSupervisions || gov.pendingSupervisions.length === 0)
+    && gov.advisoryNotes.length === 0;
+  if (isQuiescent) return '';
   const lines = [`LeaderTeam autonomous governance state: phase=${gov.phase}`];
   if (gov.pausingConference) {
     lines.push(`- PAUSING FOR CONFERENCE "${gov.pausingConference.conferenceId}" (dispute=${gov.pausingConference.disputeId}): Waiting for active execution models to checkpoint and pause before Stage 3 opens; dispatches and team_direct_exec are suspended.`);
   }
   if (gov.activeConference) {
-    lines.push(`- ACTIVE FORMAL CONFERENCE "${gov.activeConference.conferenceId}" (dispute=${gov.activeConference.disputeId}, strike=#${gov.activeConference.strike}): All execution dispatches and team_direct_exec are suspended. Respond via team_conference(action="respond", conference_id="${gov.activeConference.conferenceId}", ...).`);
+    lines.push(`- ACTIVE FORMAL CONFERENCE "${gov.activeConference.conferenceId}" (dispute=${gov.activeConference.disputeId}, strike=#${gov.activeConference.strike}): All execution dispatches, send_message, and team_direct_exec are suspended. Respond promptly via team_conference(action="respond", conference_id="${gov.activeConference.conferenceId}", explanation, new_evidence_files, proposed_alternative) with concrete workspace facts or a better alternative.`);
   }
   if (gov.activeHumanEscalation) {
     lines.push(`- HUMAN ESCALATION PENDING "${gov.activeHumanEscalation.escalationId}" (dispute=${gov.activeHumanEscalation.disputeId}, 3rd strike): All execution dispatches and team_direct_exec are paused. Declare team_status(stop_state="waiting_user") and present the dispute dossier to the user.`);

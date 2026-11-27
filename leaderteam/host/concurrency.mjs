@@ -681,7 +681,11 @@ export function formatLeaderConcurrencyContext(ctx, teamId) {
       const confirmedLabel = rw.confirmedSource === 'provider-confirmed'
         ? `${rw.confirmedRemainingPct !== null ? `${rw.confirmedRemainingPct}%` : 'confirmed'} (provider-confirmed)`
         : 'unknown';
-      lines.push(`- 5h request window: local_estimated=${rw.local_estimated_requests_5h} (local-estimate), provider_confirmed=${confirmedLabel}, tier=${rw.tier} (governance reviews never skipped)`);
+      if (rw.tier === 'normal' && rw.confirmedSource !== 'provider-confirmed') {
+        lines.push(`- 5h request window: tier=normal (governance reviews never skipped)`);
+      } else {
+        lines.push(`- 5h request window: local_estimated=${rw.local_estimated_requests_5h} (local-estimate), provider_confirmed=${confirmedLabel}, tier=${rw.tier} (governance reviews never skipped)`);
+      }
     }
     if (isTeamAwaitingUserAfterPowerPause(baseRt, teamId)) {
       lines.push(`- Battery-aware wind-down ACTIVE (${baseRt.powerMonitorState?.latched ? `${baseRt.powerMonitorState.lastBatteryPct ?? '<=20'}% on battery` : 'awaiting explicit user message to resume after low-battery pause'}): stop new non-essential dispatches, let active members reach safe checkpoints, persist progress & resume entry.`);

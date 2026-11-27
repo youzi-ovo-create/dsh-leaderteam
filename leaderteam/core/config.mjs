@@ -32,6 +32,63 @@ export function deepMergePlain(base, over) {
   return out;
 }
 
+/** Prune `team.executionFallbacks` entries so every primary and fallback route is an enabled route in `pool`. Pure. */
+export function pruneExecutionFallbacksMap(fallbacksObj, pool, models, disabledModels = [], disabledFamilies = []) {
+  if (!fallbacksObj || typeof fallbacksObj !== 'object' || Array.isArray(fallbacksObj)) {
+    return { next: undefined, pruned: [] };
+  }
+  const poolSet = new Set(Array.isArray(pool) ? pool : []);
+  const disRoutes = new Set(Array.isArray(disabledModels) ? disabledModels : []);
+  const disFams = new Set(Array.isArray(disabledFamilies) ? disabledFamilies : []);
+  const isEnabled = r => typeof r === 'string' && poolSet.has(r) && Boolean(models && Object.hasOwn(models, r)) && !disRoutes.has(r) && !disFams.has(models[r]?.family);
+  const next = {};
+  const pruned = [];
+  for (const [primary, list] of Object.entries(fallbacksObj)) {
+    if (!isEnabled(primary) || !Array.isArray(list)) {
+      pruned.push(`${primary} -> [${Array.isArray(list) ? list.join(', ') : ''}]`);
+      continue;
+    }
+    const kept = [];
+    for (const cand of list) {
+      if (cand !== primary && isEnabled(cand) && !kept.includes(cand)) kept.push(cand);
+      else pruned.push(`${primary} -> ${String(cand)}`);
+    }
+    if (kept.length > 0) next[primary] = kept;
+  }
+  return { next: Object.keys(next).length > 0 ? next : undefined, pruned };
+}
+
+export function mergeConfigLayers(base, over) {
+  const merged = deepMergePlain(base, over);
+  if (
+    merged && typeof merged === 'object' && !Array.isArray(merged)
+    && over && typeof over === 'object' && !Array.isArray(over)
+    && merged.team && typeof merged.team === 'object' && !Array.isArray(merged.team)
+    && over.team && typeof over.team === 'object' && !Array.isArray(over.team)
+  ) {
+    if (over.team.executionFallbacks !== undefined && over.team.executionFallbacks !== null && typeof over.team.executionFallbacks === 'object' && !Array.isArray(over.team.executionFallbacks)) {
+      merged.team.executionFallbacks = structuredClone(over.team.executionFallbacks);
+    } else if (
+      over.team.executionFallbacks === undefined
+      && (over.team.executionPool !== undefined || over.team.disabledModels !== undefined || over.team.disabledFamilies !== undefined)
+      && merged.team.executionFallbacks
+      && typeof merged.team.executionFallbacks === 'object'
+      && !Array.isArray(merged.team.executionFallbacks)
+    ) {
+      const { next } = pruneExecutionFallbacksMap(
+        merged.team.executionFallbacks,
+        merged.team.executionPool,
+        merged.models,
+        merged.team.disabledModels,
+        merged.team.disabledFamilies,
+      );
+      if (next) merged.team.executionFallbacks = next;
+      else delete merged.team.executionFallbacks;
+    }
+  }
+  return merged;
+}
+
 export function loadConfig(file, options = {}) {
   return validateConfig(loadRawConfig(file, options));
 }
@@ -45,7 +102,7 @@ export function loadRawConfig(file, options = {}) {
       if (localRaw === null || typeof localRaw !== 'object' || Array.isArray(localRaw)) {
         throw new LtError('BAD_CONFIG', `local config override ${localFile} must be a JSON object`);
       }
-      raw = deepMergePlain(raw, localRaw);
+      raw = mergeConfigLayers(raw, localRaw);
     }
   }
   return raw;
@@ -214,7 +271,7 @@ export function validateConfig(raw) {
   if (pa.leaderReadRoots !== undefined) strArr(pa.leaderReadRoots, 'paths.leaderReadRoots'); // optional: extra read-only roots for the leader
 
   const t = isObj(raw.team) ? raw.team : (p.push('team must be an object'), {});
-  onlyKeys(t, ['executionPool', 'maxMembersPerTeam', 'maxActiveMembers', 'requirePlanAgreement', 'planExemptProfiles', 'maxPlanAgreements', 'maxDiscussionsPerTask', 'maxRefsPerMember', 'leaderModelPolicy', 'leaderModelAsLastResort', 'autoIncludeUpstreamModels', 'disabledModels', 'disabledFamilies', 'rollingPlanning'], 'team');
+  onlyKeys(t, ['executionPool', 'executionFallbacks', 'maxMembersPerTeam', 'maxActiveMembers', 'requirePlanAgreement', 'planExemptProfiles', 'maxPlanAgreements', 'maxDiscussionsPerTask', 'maxRefsPerMember', 'leaderModelPolicy', 'leaderModelAsLastResort', 'autoIncludeUpstreamModels', 'disabledModels', 'disabledFamilies', 'rollingPlanning'], 'team');
   if (t.rollingPlanning !== undefined) bool(t.rollingPlanning, 'team.rollingPlanning');
   if (strArr(t.executionPool, 'team.executionPool', { nonEmpty: true })) for (const r of t.executionPool) if (!models[r]) p.push(`team.executionPool: "${r}" is not in models`);
   int(t.maxMembersPerTeam, 'team.maxMembersPerTeam', 1, 10000); bool(t.requirePlanAgreement, 'team.requirePlanAgreement');
@@ -228,6 +285,24 @@ export function validateConfig(raw) {
   if (t.disabledModels !== undefined) strArr(t.disabledModels, 'team.disabledModels');
   if (t.disabledFamilies !== undefined && strArr(t.disabledFamilies, 'team.disabledFamilies')) {
     for (const f of t.disabledFamilies) if (!FAMILIES.includes(f)) p.push(`team.disabledFamilies: unknown family "${f}"`);
+  }
+  if (t.executionFallbacks !== undefined) {
+    if (!isObj(t.executionFallbacks)) p.push('team.executionFallbacks must be an object');
+    else {
+      const pool = Array.isArray(t.executionPool) ? t.executionPool : [];
+      const disabledRoutes = new Set(Array.isArray(t.disabledModels) ? t.disabledModels : []);
+      const disabledFamilies = new Set(Array.isArray(t.disabledFamilies) ? t.disabledFamilies : []);
+      for (const [primary, fallbacks] of Object.entries(t.executionFallbacks)) {
+        const at = `team.executionFallbacks[${JSON.stringify(primary)}]`;
+        if (!strArr(fallbacks, at)) continue;
+        for (const route of [primary, ...fallbacks]) {
+          if (!pool.includes(route) || !Object.hasOwn(models, route) || disabledRoutes.has(route) || disabledFamilies.has(models[route]?.family)) {
+            p.push(`${at}: "${route}" must be an enabled execution pool route`);
+          }
+        }
+        if (fallbacks.includes(primary)) p.push(`${at}: fallback repeats the primary route`);
+      }
+    }
   }
 
   const a = isObj(raw.agreement) ? raw.agreement : (p.push('agreement must be an object'), {});
