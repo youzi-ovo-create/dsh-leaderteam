@@ -124,5 +124,5 @@ node bin/lt-bugreport.mjs --out lt-bugreport.md
   - [V1.1–V2.2：基于五项真实工程实测的架构演进与发展潜力分析](docs/benchmarks/LeaderTeam_V1.1至V2.2_架构演进与发展潜力分析.md)
   - [V2.1 双项复杂工程实跑测评报告（自举编译器 & 存量生态账本插件，含耗时/成本客观劣势披露）](docs/benchmarks/LeaderTeam_V2.1_双项工程实跑测评报告.md)
 - **核心设计与接口契约**：[架构总览与设计决定](docs/00-总览.md) · [配置与接口参考](docs/01-配置与接口.md) · [按需工具与技能](docs/07-按需工具与技能.md) · [可视化与用量账本](docs/08-可视化与用量.md)
-- **日常操作与客户端维护**：[一键安装、新手引导与自动更新指南](docs/11-一键安装新手引导与自动更新指南.md) · [历代设计原则与反退化台账](docs/12-历代设计原则与反退化台账.md) · [跨平台独立发行与长期工程治理规范](docs/13-跨平台独立发行与长期工程规范.md) · [使用指南](docs/使用指南.md) · [官方 Desktop 部署与恢复](docs/官方Desktop部署与恢复.md) · [CHANGELOG.md](CHANGELOG.md)
+- **日常操作与客户端维护**：[一键安装、新手引导与自动更新指南](docs/11-一键安装新手引导与自动更新指南.md) · [历代设计原则与反退化台账](docs/12-历代设计原则与反退化台账.md) · [跨平台独立发行与长期工程治理规范](docs/13-跨平台独立发行与长期工程规范.md) · [Windows 真机九项验收与独立复测指南](docs/14-Windows真机验收与独立复测指南.md) · [使用指南](docs/使用指南.md) · [官方 Desktop 部署与恢复](docs/官方Desktop部署与恢复.md) · [CHANGELOG.md](CHANGELOG.md)
 - **开源许可**：本项目采用 [Apache License 2.0](LICENSE) 许可发布，第三方组件声明见 [leaderteam/NOTICE](leaderteam/NOTICE)。
