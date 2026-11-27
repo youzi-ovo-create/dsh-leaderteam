@@ -1420,6 +1420,7 @@
                 h('option', { value: 'dashscope' }, '阿里云百炼 (Qwen)'),
                 h('option', { value: 'zhipu' }, '智谱 (GLM)'),
                 h('option', { value: 'openai' }, 'OpenAI'),
+                h('option', { value: 'openai-compatible' }, 'OpenAI 兼容接口'),
                 h('option', { value: 'openai-compatible' }, 'OpenAI 兼容接口')
               ),
               h('input', { type: 'password', style: { ...inputStyle, flex: 1, minWidth: '160px' }, placeholder: '粘贴 API Key (sk-...)', value: quickApiKey, onChange: e => setQuickApiKey(e.target.value) }),

@@ -222,7 +222,7 @@ test('inspectInstallerEnvironment & scanDshTargets detect custom DSH directory, 
       driveLetters: [],
     });
     assert.equal(snapCore.targets.length, 1);
-    assert.equal(snapCore.targets[0].installDir, path.win32.normalize(customApp));
+    assert.equal(snapCore.targets[0].installDir, /^[A-Za-z]:[\\/]/.test(customApp) ? path.win32.normalize(customApp) : path.resolve(customApp));
     assert.equal(snapCore.targets[0].dshVersion, '0.2.2-rc.1');
     assert.equal(snapCore.targets[0].compatible, true);
     assert.equal(snapCore.targets[0].verified, true);
@@ -246,6 +246,7 @@ test('inspectInstallerEnvironment & scanDshTargets detect custom DSH directory, 
         runOneClickInstallation({
           repoRoot: REPO_ROOT,
           dshHome,
+          platform: 'win32',
           customDshPath: customApp,
           spawnSyncImpl: mockRunningSpawn,
           installerRunner: async () => {
@@ -265,6 +266,7 @@ test('inspectInstallerEnvironment & scanDshTargets detect custom DSH directory, 
       () =>
         downloadAndInstallStandalone({
           dshHome,
+          platform: 'win32',
           customPath: customApp,
           spawnSyncImpl: mockRunningSpawn,
           runner: async () => {

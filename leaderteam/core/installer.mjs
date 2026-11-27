@@ -277,7 +277,9 @@ export function discoverWindowsDesktopCandidates({
     if (!raw || typeof raw !== 'string') return;
     const trimmed = raw.trim().replace(/^"+|"+$/g, '');
     if (!trimmed) return;
-    const dir = /\.(?:exe|cmd|bat)$/i.test(trimmed) ? path.dirname(trimmed) : trimmed;
+    const dir = /\.(?:exe|cmd|bat)$/i.test(trimmed)
+      ? (/^[A-Za-z]:[\\/]/.test(trimmed) ? path.win32.dirname(trimmed) : path.dirname(trimmed))
+      : trimmed;
     const resolved = /^[A-Za-z]:[\\/]/.test(dir) ? path.win32.normalize(dir) : path.resolve(dir);
     if (!candidates.includes(resolved)) candidates.push(resolved);
   };

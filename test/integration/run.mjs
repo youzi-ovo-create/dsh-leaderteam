@@ -35,8 +35,8 @@ async function runScenario(name, scenario) {
   const cfg = JSON.parse(fs.readFileSync(path.join(ROOT, 'config/leaderteam.config.json'), 'utf8'));
   merge(cfg, { storage: { root: store }, quota: { stateFile: path.join(workDir, 'quota.json') }, paths: { globalRefRoots: [globalRefs] } });
   merge(cfg, { planArchive: { root: path.join(os.tmpdir(), 'leaderteam-integration-plan-archives', path.basename(workDir)) } });
-  // Preserve old protocol coverage; rolling / sandbox-direct / autonomous scenarios explicitly enable the new protocol.
-  merge(cfg, { team: { rollingPlanning: false }, gate: { sandboxDirectAllow: false }, governance: { mode: 'approval' } });
+  // Preserve old protocol coverage; rolling / sandbox-direct / autonomous / follow scenarios explicitly enable the new protocol.
+  merge(cfg, { team: { rollingPlanning: false, leaderModelPolicy: 'enforce' }, gate: { sandboxDirectAllow: false }, governance: { mode: 'approval' } });
   merge(cfg, scenario.config);
   const cfgFile = path.join(workDir, 'leaderteam.config.json');
   fs.writeFileSync(cfgFile, JSON.stringify(cfg, null, 1));
