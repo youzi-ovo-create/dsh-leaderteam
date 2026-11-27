@@ -20,6 +20,29 @@ const ROLE_KEYS = Object.freeze([
 ]);
 
 export const SESSION_CONFIG_FILENAME = 'session-config.json';
+const SESSION_CONFIG_LOCK_TIMEOUT_MS = 8000;
+const SESSION_CONFIG_LOCK_STALE_MS = 15000;
+const SESSION_CONFIG_SLEEP_BUF = new Int32Array(new SharedArrayBuffer(4));
+
+function sleepSyncMs(ms) {
+  const waitMs = Math.max(1, Math.floor(ms));
+  try {
+    Atomics.wait(SESSION_CONFIG_SLEEP_BUF, 0, 0, waitMs);
+  } catch {
+    const end = Date.now() + waitMs;
+    while (Date.now() < end) {}
+  }
+}
+
+export function isProcessPidDead(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (err) {
+    return err?.code === 'ESRCH';
+  }
+}
 
 export const ALLOWED_USER_SOURCES = Object.freeze([
   'lt-public-v1',
@@ -146,7 +169,7 @@ export function isProtectedLeaderTeamConfigPath(targetPath, { storageRoot = null
   }
   if (storageRoot) {
     const stRoot = path.resolve(storageRoot).replace(/\\/g, '/').toLowerCase();
-    for (const sub of ['config', 'session-configs', 'session-modes', 'updater']) {
+    for (const sub of ['config', 'session-configs', 'session-modes', 'updater', 'active-turns']) {
       const fullSub = `${stRoot}/${sub}`;
       if (norm === fullSub || norm.startsWith(`${fullSub}/`)) return true;
     }
@@ -171,6 +194,160 @@ export function sessionConfigPath(storageRoot, sessionId) {
   if (!storageRoot || !sessionId) return null;
   const seg = encodeSessionSegment(sessionId);
   return path.join(storageRoot, 'session-configs', `${seg}.json`);
+}
+
+export function sessionConfigLockPath(storageRoot, sessionId) {
+  if (!storageRoot || !sessionId) return null;
+  const seg = encodeSessionSegment(sessionId);
+  return path.join(storageRoot, 'session-configs', `${seg}.lock`);
+}
+
+export function withSessionConfigLock(storageRoot, sessionId, fn, fsImpl = fs) {
+  const lockFile = sessionConfigLockPath(storageRoot, sessionId);
+  if (!lockFile || typeof fsImpl.openSync !== 'function') {
+    return fn();
+  }
+  fsImpl.mkdirSync(path.dirname(lockFile), { recursive: true });
+  const deadline = Date.now() + SESSION_CONFIG_LOCK_TIMEOUT_MS;
+  let acquired = false;
+  let attempt = 0;
+
+  while (!acquired) {
+    try {
+      const fd = fsImpl.openSync(lockFile, 'wx', 0o600);
+      try {
+        fsImpl.writeFileSync(fd, `${JSON.stringify({ pid: process.pid, at: Date.now() })}\n`, 'utf8');
+      } finally {
+        fsImpl.closeSync(fd);
+      }
+      acquired = true;
+      break;
+    } catch (err) {
+      if (err?.code !== 'EEXIST') throw err;
+      let shouldBreakStale = false;
+      try {
+        const st = fsImpl.statSync(lockFile);
+        const ageMs = Date.now() - st.mtimeMs;
+        if (ageMs > SESSION_CONFIG_LOCK_STALE_MS) {
+          shouldBreakStale = true;
+        } else {
+          const raw = fsImpl.readFileSync(lockFile, 'utf8');
+          if (raw.trim()) {
+            const parsed = JSON.parse(raw);
+            if (
+              Number.isInteger(parsed?.pid) &&
+              parsed.pid > 0 &&
+              parsed.pid !== process.pid &&
+              isProcessPidDead(parsed.pid)
+            ) {
+              shouldBreakStale = true;
+            }
+          }
+        }
+      } catch (inspectErr) {
+        if (inspectErr?.code === 'ENOENT') continue;
+      }
+
+      if (shouldBreakStale) {
+        try { fsImpl.unlinkSync(lockFile); } catch {}
+        continue;
+      }
+      if (Date.now() >= deadline) {
+        throw new LtError('SESSION_CONFIG_LOCK_TIMEOUT', `timed out waiting for session config lock (${lockFile})`);
+      }
+      attempt += 1;
+      sleepSyncMs(Math.min(12, 2 + (attempt % 7)));
+    }
+  }
+
+  try {
+    return fn();
+  } finally {
+    try { fsImpl.rmSync(lockFile, { force: true }); } catch {}
+  }
+}
+
+export function markProcessActiveTurn(storageRoot, sessionId, active, fsImpl = fs) {
+  if (!storageRoot || typeof sessionId !== 'string' || !sessionId.trim()) return;
+  try {
+    const seg = encodeSessionSegment(sessionId);
+    const dir = path.join(storageRoot, 'active-turns');
+    const file = path.join(dir, `${seg}--${process.pid}.json`);
+    if (active) {
+      fsImpl.mkdirSync(dir, { recursive: true });
+      writeFileAtomic(
+        file,
+        `${JSON.stringify({ v: 1, pid: process.pid, sessionId: sessionId.trim(), startedAt: Date.now() })}\n`,
+      );
+    } else {
+      fsImpl.rmSync(file, { force: true });
+    }
+  } catch {}
+}
+
+export function clearAllProcessActiveTurns(storageRoot, fsImpl = fs) {
+  if (!storageRoot) return;
+  try {
+    const dir = path.join(storageRoot, 'active-turns');
+    if (!fsImpl.existsSync(dir)) return;
+    const suffix = `--${process.pid}.json`;
+    for (const entry of fsImpl.readdirSync(dir)) {
+      if (entry.endsWith(suffix)) {
+        try { fsImpl.rmSync(path.join(dir, entry), { force: true }); } catch {}
+      }
+    }
+  } catch {}
+}
+
+/**
+ * Read-only check for whether ANY live process (by default other processes; optionally self)
+ * currently holds an active turn marker for `sessionId` under `<storageRoot>/active-turns/`.
+ * Strictly zero disk writes so GET /workbench/mode remains read-only.
+ */
+export function hasLiveCrossProcessActiveTurn(storageRoot, sessionId, { includeSelf = false, fsImpl = fs } = {}) {
+  if (!storageRoot || typeof sessionId !== 'string' || !sessionId.trim()) {
+    return { active: false, pids: [] };
+  }
+  const seg = encodeSessionSegment(sessionId);
+  const dir = path.join(storageRoot, 'active-turns');
+  if (!fsImpl.existsSync(dir)) return { active: false, pids: [] };
+  const prefix = `${seg}--`;
+  const livePids = [];
+  try {
+    for (const entry of fsImpl.readdirSync(dir)) {
+      if (!entry.startsWith(prefix) || !entry.endsWith('.json')) continue;
+      const pidStr = entry.slice(prefix.length, -'.json'.length);
+      const pid = Number.parseInt(pidStr, 10);
+      if (!Number.isInteger(pid) || pid <= 0) continue;
+      if (!includeSelf && pid === process.pid) continue;
+      if (pid !== process.pid && isProcessPidDead(pid)) continue;
+      livePids.push(pid);
+    }
+  } catch {}
+  return { active: livePids.length > 0, pids: livePids };
+}
+
+/**
+ * Remove a stale legacy `session-configs/<sid>.json` that was written strictly BEFORE
+ * a brand-new session was created (`updatedAt < sessionCreatedAt`).
+ */
+export function purgePreCreationOrphanSessionConfig(storageRoot, sessionId, sessionCreatedAt, fsImpl = fs) {
+  if (!storageRoot || !sessionId || sessionCreatedAt == null) return false;
+  const createdMs = typeof sessionCreatedAt === 'number'
+    ? sessionCreatedAt
+    : Date.parse(String(sessionCreatedAt));
+  if (!Number.isFinite(createdMs) || createdMs <= 0) return false;
+  const cfgFile = sessionConfigPath(storageRoot, sessionId);
+  if (!cfgFile || !fsImpl.existsSync(cfgFile)) return false;
+  try {
+    const raw = JSON.parse(fsImpl.readFileSync(cfgFile, 'utf8'));
+    const updatedMs = typeof raw?.updatedAt === 'string' ? Date.parse(raw.updatedAt) : Number(raw?.updatedAt);
+    if (Number.isFinite(updatedMs) && updatedMs > 0 && updatedMs < createdMs) {
+      fsImpl.rmSync(cfgFile, { force: true });
+      return true;
+    }
+  } catch {}
+  return false;
 }
 
 export function readSessionConfigRecord(storageRoot, sessionId, fsImpl = fs) {
@@ -518,93 +695,102 @@ export function mutateSessionConfig({
   }
 
   const file = sessionConfigPath(storageRoot, sessionId);
-  const prev = readSessionConfigRecord(storageRoot, sessionId, fsImpl);
-  const nowIso = new Date().toISOString();
+  return withSessionConfigLock(
+    storageRoot,
+    sessionId,
+    () => {
+      const prev = readSessionConfigRecord(storageRoot, sessionId, fsImpl);
+      const nowIso = new Date().toISOString();
 
-  if (action === 'reset') {
-    const nextRecord = isBusy
-      ? {
-          ...prev,
-          updatedAt: nowIso,
-          updatedBy: verifiedPrincipal.source,
-          pendingPatch: { __resetToGlobal: true },
-          pendingMeta: { stagedAt: nowIso, source: verifiedPrincipal.source, busyReasons },
-          audit: [
-            ...prev.audit.slice(-29),
-            { at: nowIso, event: 'staged-reset', by: verifiedPrincipal.source, busyReasons },
-          ],
-        }
-      : {
-          ...prev,
-          updatedAt: nowIso,
-          updatedBy: verifiedPrincipal.source,
-          activePatch: {},
-          pendingPatch: null,
-          pendingMeta: null,
-          audit: [
-            ...prev.audit.slice(-29),
-            { at: nowIso, event: 'reset-applied', by: verifiedPrincipal.source },
-          ],
+      if (action === 'reset') {
+        const nextRecord = isBusy
+          ? {
+              ...prev,
+              updatedAt: nowIso,
+              updatedBy: verifiedPrincipal.source,
+              pendingPatch: { __resetToGlobal: true },
+              pendingMeta: { stagedAt: nowIso, source: verifiedPrincipal.source, busyReasons },
+              audit: [
+                ...prev.audit.slice(-29),
+                { at: nowIso, event: 'staged-reset', by: verifiedPrincipal.source, busyReasons },
+              ],
+            }
+          : {
+              ...prev,
+              updatedAt: nowIso,
+              updatedBy: verifiedPrincipal.source,
+              activePatch: {},
+              pendingPatch: null,
+              pendingMeta: null,
+              audit: [
+                ...prev.audit.slice(-29),
+                { at: nowIso, event: 'reset-applied', by: verifiedPrincipal.source },
+              ],
+            };
+        fsImpl.mkdirSync(path.dirname(file), { recursive: true });
+        writeFileAtomic(file, `${JSON.stringify(nextRecord, null, 2)}\n`);
+        return {
+          appliedImmediately: !isBusy,
+          stagedForSafeBoundary: Boolean(isBusy),
+          busyReasons: isBusy ? busyReasons : [],
+          record: nextRecord,
+          effectiveConfig: isBusy ? applySessionPatchToConfig(baseConfig, nextRecord) : baseConfig,
+          targetEffectiveConfig: baseConfig,
         };
-    fsImpl.mkdirSync(path.dirname(file), { recursive: true });
-    writeFileAtomic(file, `${JSON.stringify(nextRecord, null, 2)}\n`);
-    return {
-      appliedImmediately: !isBusy,
-      stagedForSafeBoundary: Boolean(isBusy),
-      busyReasons: isBusy ? busyReasons : [],
-      record: nextRecord,
-      effectiveConfig: isBusy ? applySessionPatchToConfig(baseConfig, nextRecord) : baseConfig,
-    };
-  }
-
-  const startingPatch = action === 'set'
-    ? {}
-    : (isBusy && isPlainObj(prev.pendingPatch) && !prev.pendingPatch.__resetToGlobal
-        ? deepMergeConfig(prev.activePatch, prev.pendingPatch)
-        : prev.activePatch);
-
-  const { normalizedPatch, validatedConfig } = buildNormalizedSessionPatch(
-    baseConfig,
-    startingPatch,
-    patch,
-    { discoveredModels, autoHealPlaceholders },
-  );
-
-  const nextRecord = isBusy
-    ? {
-        ...prev,
-        updatedAt: nowIso,
-        updatedBy: verifiedPrincipal.source,
-        pendingPatch: normalizedPatch,
-        pendingMeta: { stagedAt: nowIso, source: verifiedPrincipal.source, busyReasons },
-        audit: [
-          ...prev.audit.slice(-29),
-          { at: nowIso, event: 'staged-for-safe-boundary', by: verifiedPrincipal.source, busyReasons },
-        ],
       }
-    : {
-        ...prev,
-        updatedAt: nowIso,
-        updatedBy: verifiedPrincipal.source,
-        activePatch: normalizedPatch,
-        pendingPatch: null,
-        pendingMeta: null,
-        audit: [
-          ...prev.audit.slice(-29),
-          { at: nowIso, event: 'applied-immediately', by: verifiedPrincipal.source },
-        ],
+
+      const startingPatch = action === 'set'
+        ? {}
+        : (isBusy && isPlainObj(prev.pendingPatch) && !prev.pendingPatch.__resetToGlobal
+            ? deepMergeConfig(prev.activePatch, prev.pendingPatch)
+            : prev.activePatch);
+
+      const { normalizedPatch, validatedConfig } = buildNormalizedSessionPatch(
+        baseConfig,
+        startingPatch,
+        patch,
+        { discoveredModels, autoHealPlaceholders },
+      );
+
+      const nextRecord = isBusy
+        ? {
+            ...prev,
+            updatedAt: nowIso,
+            updatedBy: verifiedPrincipal.source,
+            pendingPatch: normalizedPatch,
+            pendingMeta: { stagedAt: nowIso, source: verifiedPrincipal.source, busyReasons },
+            audit: [
+              ...prev.audit.slice(-29),
+              { at: nowIso, event: 'staged-for-safe-boundary', by: verifiedPrincipal.source, busyReasons },
+            ],
+          }
+        : {
+            ...prev,
+            updatedAt: nowIso,
+            updatedBy: verifiedPrincipal.source,
+            activePatch: normalizedPatch,
+            pendingPatch: null,
+            pendingMeta: null,
+            audit: [
+              ...prev.audit.slice(-29),
+              { at: nowIso, event: 'applied-immediately', by: verifiedPrincipal.source },
+            ],
+          };
+
+      fsImpl.mkdirSync(path.dirname(file), { recursive: true });
+      writeFileAtomic(file, `${JSON.stringify(nextRecord, null, 2)}\n`);
+
+      return {
+        appliedImmediately: !isBusy,
+        stagedForSafeBoundary: Boolean(isBusy),
+        busyReasons: isBusy ? busyReasons : [],
+        record: nextRecord,
+        effectiveConfig: isBusy ? applySessionPatchToConfig(baseConfig, nextRecord) : validatedConfig,
+        targetEffectiveConfig: validatedConfig,
       };
-
-  fsImpl.mkdirSync(path.dirname(file), { recursive: true });
-  writeFileAtomic(file, `${JSON.stringify(nextRecord, null, 2)}\n`);
-
-  return {
-    appliedImmediately: !isBusy,
-    stagedForSafeBoundary: Boolean(isBusy),
-    busyReasons: isBusy ? busyReasons : [],
-    record: nextRecord,
-    effectiveConfig: isBusy ? applySessionPatchToConfig(baseConfig, nextRecord) : validatedConfig,
-  };
+    },
+    fsImpl,
+  );
 }
 
 /**
@@ -619,43 +805,51 @@ export function flushPendingSessionConfig({
 } = {}) {
   const file = sessionConfigPath(storageRoot, sessionId);
   if (!file || !fsImpl.existsSync(file)) return { flushed: false, record: null, effectiveConfig: baseConfig };
-  const prev = readSessionConfigRecord(storageRoot, sessionId, fsImpl);
-  if (!hasPendingSessionOverride(prev)) {
-    return { flushed: false, record: prev, effectiveConfig: applySessionPatchToConfig(baseConfig, prev) };
-  }
+  return withSessionConfigLock(
+    storageRoot,
+    sessionId,
+    () => {
+      if (!fsImpl.existsSync(file)) return { flushed: false, record: null, effectiveConfig: baseConfig };
+      const prev = readSessionConfigRecord(storageRoot, sessionId, fsImpl);
+      if (!hasPendingSessionOverride(prev)) {
+        return { flushed: false, record: prev, effectiveConfig: applySessionPatchToConfig(baseConfig, prev) };
+      }
 
-  const nowIso = new Date().toISOString();
-  let nextActive = {};
-  let effectiveConfig = baseConfig;
+      const nowIso = new Date().toISOString();
+      let nextActive = {};
+      let effectiveConfig = baseConfig;
 
-  if (!prev.pendingPatch.__resetToGlobal) {
-    try {
-      const built = buildNormalizedSessionPatch(baseConfig, {}, prev.pendingPatch, { discoveredModels });
-      nextActive = built.normalizedPatch;
-      effectiveConfig = built.validatedConfig;
-    } catch {
-      nextActive = prev.activePatch;
-      effectiveConfig = applySessionPatchToConfig(baseConfig, prev);
-    }
-  }
+      if (!prev.pendingPatch.__resetToGlobal) {
+        try {
+          const built = buildNormalizedSessionPatch(baseConfig, {}, prev.pendingPatch, { discoveredModels });
+          nextActive = built.normalizedPatch;
+          effectiveConfig = built.validatedConfig;
+        } catch {
+          nextActive = prev.activePatch;
+          effectiveConfig = applySessionPatchToConfig(baseConfig, prev);
+        }
+      }
 
-  const nextRecord = {
-    ...prev,
-    updatedAt: nowIso,
-    activePatch: nextActive,
-    pendingPatch: null,
-    pendingMeta: null,
-    audit: [
-      ...prev.audit.slice(-29),
-      { at: nowIso, event: 'flushed-at-safe-boundary', by: prev.pendingMeta?.source ?? 'safe-boundary' },
-    ],
-  };
-  writeFileAtomic(file, `${JSON.stringify(nextRecord, null, 2)}\n`);
-  return {
-    flushed: true,
-    record: nextRecord,
-    effectiveConfig,
-  };
+      const nextRecord = {
+        ...prev,
+        updatedAt: nowIso,
+        activePatch: nextActive,
+        pendingPatch: null,
+        pendingMeta: null,
+        audit: [
+          ...prev.audit.slice(-29),
+          { at: nowIso, event: 'flushed-at-safe-boundary', by: prev.pendingMeta?.source ?? 'safe-boundary' },
+        ],
+      };
+      writeFileAtomic(file, `${JSON.stringify(nextRecord, null, 2)}\n`);
+      return {
+        flushed: true,
+        record: nextRecord,
+        effectiveConfig,
+      };
+    },
+    fsImpl,
+  );
 }
 
 /**

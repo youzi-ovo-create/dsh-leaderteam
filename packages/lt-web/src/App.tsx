@@ -489,7 +489,7 @@ export function App() {
           <main className="stage">
             <div className="empty" style={{ height: '80%' }}>
               <HeluoxuMark size={36} />
-              <h3>无法连接本地 Leader Team 服务</h3>
+              <h3>无法连接本地 Open Leader Team (OLT) 服务</h3>
               <p className="t-small" style={{ maxWidth: 460, margin: 0 }}>
                 {loadError}
               </p>
@@ -534,7 +534,7 @@ export function App() {
         <footer className="status">
           <span className="status-item">
             <i className="dot idle" />
-            正在载入 Leader Team 工程工作台…
+            正在载入 Open Leader Team (OLT) 工程工作台…
           </span>
         </footer>
       </div>

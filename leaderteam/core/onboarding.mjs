@@ -562,16 +562,25 @@ export async function applyQuickOnboardingSetup({
         .filter(Boolean)
     : [];
 
+  const ambientProbeKey = !cleanKey
+    ? (() => {
+        const ambientMap = readDshEnvCredentialsMap({ dshHome, env });
+        const k = preset.envVars.find(v => ambientMap[v]);
+        return k ? String(ambientMap[k]).trim() : '';
+      })()
+    : '';
+  const probeKey = cleanKey || ambientProbeKey;
+
   const shouldAutoProbeCustom =
     endpointDiscoveredModels.length === 0 &&
-    cleanKey &&
+    probeKey &&
     typeof fetchImpl === 'function' &&
     (verifyConnectivity || hasExplicitCustomBaseURL || preset.id === 'openai-compatible');
 
   if (shouldAutoProbeCustom) {
     const probe = await probeProviderKeyConnectivity({
       baseURL: effectiveBaseURL,
-      apiKey: cleanKey,
+      apiKey: probeKey,
       fetchImpl,
       timeoutMs: verifyConnectivity ? 8000 : 3500,
     });

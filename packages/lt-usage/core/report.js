@@ -31,10 +31,20 @@ function sanitizeTokenNumber(raw, issues, field) {
   return Math.trunc(num);
 }
 
+function hasPositiveTokens(u) {
+  return Boolean(
+    u &&
+    (u.inputTokens > 0 ||
+      u.cacheReadTokens > 0 ||
+      u.cacheWriteTokens > 0 ||
+      u.outputTokens > 0 ||
+      u.totalTokens > 0)
+  );
+}
+
 function normalizeUsage(usage, ok, issues) {
-  if (!ok) return { usage: zeroUsage(), unmetered: false };
   if (!usage || typeof usage !== 'object') {
-    return { usage: zeroUsage(), unmetered: true };
+    return { usage: zeroUsage(), unmetered: Boolean(ok) };
   }
   const hasAnyTokenField =
     usage.inputTokens !== undefined ||
@@ -43,7 +53,7 @@ function normalizeUsage(usage, ok, issues) {
     usage.outputTokens !== undefined ||
     usage.totalTokens !== undefined;
   if (!hasAnyTokenField) {
-    return { usage: zeroUsage(), unmetered: true };
+    return { usage: zeroUsage(), unmetered: Boolean(ok) };
   }
   const inputTokens = sanitizeTokenNumber(usage.inputTokens, issues, 'inputTokens');
   const cacheReadTokens = sanitizeTokenNumber(usage.cacheReadTokens, issues, 'cacheReadTokens');
@@ -58,8 +68,12 @@ function normalizeUsage(usage, ok, issues) {
     }
     totalTokens = reportedTotal;
   }
+  const parsed = { inputTokens, cacheReadTokens, cacheWriteTokens, outputTokens, totalTokens };
+  if (!ok && !hasPositiveTokens(parsed)) {
+    return { usage: zeroUsage(), unmetered: false };
+  }
   return {
-    usage: { inputTokens, cacheReadTokens, cacheWriteTokens, outputTokens, totalTokens },
+    usage: parsed,
     unmetered: false
   };
 }
@@ -226,6 +240,7 @@ function makeLedgerRow(spec, pricing, issues, matchGateway = null) {
   if (!resolved && actualProvider !== 'unknown' && actualModel !== 'unknown') {
     resolved = resolveRates(`${actualProvider}/${actualModel}`, spec.timeMs, pricing);
   }
+  const billedWork = ok || hasPositiveTokens(usage);
   let cnyPeak = null;
   let cnyOffPeak = null;
   let cnyActual = null;
@@ -234,8 +249,8 @@ function makeLedgerRow(spec, pricing, issues, matchGateway = null) {
   let usdActual = null;
   let cacheSavingsCny = 0;
 
-  if (!ok) {
-    // 失败调用未产生计费 Token，费用确认为 0，不误报为未定价。
+  if (!billedWork) {
+    // 失败调用且未产生任何计费 Token，费用确认为 0，不误报为未定价。
     cnyPeak = zeroCost();
     cnyOffPeak = zeroCost();
     cnyActual = zeroCost();
@@ -278,7 +293,7 @@ function makeLedgerRow(spec, pricing, issues, matchGateway = null) {
     rawReasoning !== null && rawReasoning !== undefined && rawReasoning !== '' && Number.isFinite(Number(rawReasoning))
       ? Math.max(0, Math.trunc(Number(rawReasoning)))
       : null;
-  if (!ok || unmetered) {
+  if (!billedWork || unmetered) {
     reasoningTokens = null;
   } else if (reasoningTokens !== null && reasoningTokens > usage.outputTokens) {
     reasoningTokens = usage.outputTokens;
@@ -309,7 +324,7 @@ function makeLedgerRow(spec, pricing, issues, matchGateway = null) {
     usage,
     reasoningTokens,
     priced: resolved !== null,
-    costKnown: !ok || (!unmetered && resolved !== null),
+    costKnown: !billedWork || (!unmetered && resolved !== null),
     cnyPeak,
     cnyOffPeak,
     cnyActual,
@@ -329,19 +344,22 @@ function aggregateRows(rows) {
   let offPeakCnyTotal = 0;
   let actualCnyTotal = 0;
   let savingsTotal = 0;
-  let knownSucceededCount = 0;
+  let knownBilledCount = 0;
+  let anyBilledCall = false;
 
   for (const row of rows) {
+    const rowBilled = row.ok || hasPositiveTokens(row.usage);
+    if (rowBilled) anyBilledCall = true;
     agg.callsTotal++;
     if (row.ok) agg.callsSucceeded++;
     if (row.unmetered) agg.unmeteredCalls++;
     for (const field of TOKEN_FIELDS) agg[field] += row.usage[field];
-    if (row.ok && !row.unmetered && !row.priced) {
+    if (rowBilled && !row.unmetered && !row.priced) {
       agg.unpricedCalls++;
       continue;
     }
     if (!row.costKnown) continue;
-    if (row.ok) knownSucceededCount++;
+    if (rowBilled) knownBilledCount++;
     for (const field of COST_FIELDS) {
       peak[field] += row.cnyPeak[field];
       offPeak[field] += row.cnyOffPeak[field];
@@ -357,7 +375,7 @@ function aggregateRows(rows) {
   }
 
   agg.cacheHitRatePct = cacheHitRate(agg);
-  if (agg.callsSucceeded > 0 && knownSucceededCount === 0) {
+  if (anyBilledCall && knownBilledCount === 0) {
     agg.costPeakCny = null;
     agg.costOffPeakCny = null;
     agg.costActualCny = null;
@@ -524,8 +542,10 @@ function buildByModel(ledger, pricing, grandTotalTokens) {
     const found = lookupPricingEntry(route, pricing);
     const entry = found?.entry;
     const hasRate = Boolean(entry?.peak);
-    const hasKnownSucceeded = rows.some((r) => r.ok && r.costKnown);
-    const costAvailable = agg.callsSucceeded === 0 ? true : hasKnownSucceeded;
+    const hasKnownBilled = rows.some((r) => (r.ok || hasPositiveTokens(r.usage)) && r.costKnown);
+    const zeroOnlyUnbilledFailed =
+      agg.callsSucceeded === 0 && agg.totalTokens === 0 && agg.unmeteredCalls === 0 && agg.unpricedCalls === 0;
+    const costAvailable = zeroOnlyUnbilledFailed ? true : hasKnownBilled;
     const item = { route };
     if (entry?.label) item.label = entry.label;
     if (entry?.vendor) item.vendor = entry.vendor;
@@ -541,7 +561,7 @@ function buildByModel(ledger, pricing, grandTotalTokens) {
       cacheHitRatePct: agg.cacheHitRatePct,
       shareOfTotalTokensPct:
         grandTotalTokens > 0 ? round2((agg.totalTokens / grandTotalTokens) * 100) : 0,
-      priced: hasRate || hasKnownSucceeded,
+      priced: hasRate || hasKnownBilled,
       costPeakCny: costAvailable ? agg.costPeakCny : null,
       costOffPeakCny: costAvailable ? agg.costOffPeakCny : null,
       costActualCny: costAvailable ? agg.costActualCny : null
@@ -624,9 +644,10 @@ function buildByProvider(ledger, grandTotalTokens) {
   const out = [];
   for (const [provider, rows] of map) {
     const agg = aggregateRows(rows);
-    const hasAnyKnownCost = rows.some((r) => r.ok && r.costKnown && r.priced);
-    const zeroOnlyFailed = agg.callsSucceeded === 0;
-    const costAvailable = (hasAnyKnownCost && agg.unpricedCalls === 0) || zeroOnlyFailed;
+    const hasAnyKnownCost = rows.some((r) => (r.ok || hasPositiveTokens(r.usage)) && r.costKnown && r.priced);
+    const zeroOnlyUnbilledFailed =
+      agg.callsSucceeded === 0 && agg.totalTokens === 0 && agg.unmeteredCalls === 0 && agg.unpricedCalls === 0;
+    const costAvailable = (hasAnyKnownCost && agg.unpricedCalls === 0) || zeroOnlyUnbilledFailed;
     out.push({
       provider,
       callsTotal: agg.callsTotal,
@@ -655,8 +676,9 @@ function buildByTask(ledger) {
   const out = [];
   for (const [taskKey, rows] of map) {
     const agg = aggregateRows(rows);
-    const zeroOnlyFailed = agg.callsSucceeded === 0;
-    const costAvailable = (agg.unpricedCalls === 0 && agg.unmeteredCalls === 0) || zeroOnlyFailed;
+    const zeroOnlyUnbilledFailed =
+      agg.callsSucceeded === 0 && agg.totalTokens === 0 && agg.unmeteredCalls === 0 && agg.unpricedCalls === 0;
+    const costAvailable = (agg.unpricedCalls === 0 && agg.unmeteredCalls === 0) || zeroOnlyUnbilledFailed;
     out.push({
       taskSeq: typeof taskKey === 'number' ? taskKey : null,
       callsTotal: agg.callsTotal,

@@ -150,7 +150,7 @@ export function OnboardingModal({
       className="modal-backdrop"
       role="dialog"
       aria-modal="true"
-      aria-label="LeaderTeam 新手引导向导"
+      aria-label="Open Leader Team (OLT) 新手引导向导"
       style={{
         position: 'fixed',
         inset: 0,
@@ -177,7 +177,7 @@ export function OnboardingModal({
         <div className="row" style={{ justifyContent: 'space-between', marginBottom: 14 }}>
           <div>
             <span className="t-overline">快速上手 · 零命令行引导</span>
-            <h2 style={{ margin: '2px 0 0', fontSize: 20 }}>欢迎使用 LeaderTeam</h2>
+            <h2 style={{ margin: '2px 0 0', fontSize: 20 }}>欢迎使用 Open Leader Team (OLT)</h2>
           </div>
           <button
             type="button"

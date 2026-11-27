@@ -20,6 +20,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import zlib from 'node:zlib';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -250,12 +251,28 @@ async function main() {
       })).json();
       assert.equal(updStatusJson.ok, true);
 
+      const ghostRes = await fetch(`${origin}/api/lt/v1/workbench/session-config`, {
+        method: 'POST',
+        headers: postHeaders,
+        body: JSON.stringify({ action: 'get', sessionId: 'e2e-linux-ghost' }),
+      });
+      assert.equal(ghostRes.status, 404);
+
+      const e2eSid = 'e2e-linux-sess';
+      fs.mkdirSync(path.join(dshHome, 'sessions', e2eSid), { recursive: true });
+      fs.writeFileSync(
+        path.join(dshHome, 'sessions', e2eSid, 'session.v4.jsonl.zstd'),
+        zlib.zstdCompressSync(
+          Buffer.from(`${JSON.stringify({ type: 'session', id: e2eSid, createdAt: Date.now(), cwd: workDir, agentPreset: 'leaderteam' })}\n`),
+        ),
+      );
+
       const scJson = await (await fetch(`${origin}/api/lt/v1/workbench/session-config`, {
         method: 'POST',
         headers: postHeaders,
         body: JSON.stringify({
           action: 'set',
-          sessionId: 'e2e-linux-sess',
+          sessionId: e2eSid,
           syncAllRolesToLeader: true,
           patch: {
             models: {

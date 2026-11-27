@@ -1,8 +1,16 @@
 {
   "name": "dsh-leaderteam",
-  "version": "2.2.3",
-  "description": "Autonomous multi-agent governance, 0ms deterministic host safety gate, and 4-bucket physical token ledger for DeepSeek Harness (Linux & Windows).",
+  "displayName": "Open Leader Team (OLT)",
+  "version": "1.0.0",
+  "description": "Open Leader Team (OLT) — Autonomous multi-agent governance, 0ms deterministic host safety gate, and 4-bucket physical token ledger for DeepSeek Harness (Linux & Windows).",
   "license": "Apache-2.0",
+  "leaderteam": {
+    "distributionTrack": "open-source",
+    "brand": "open-leader-team",
+    "brandDisplayName": "Open Leader Team",
+    "brandShortName": "OLT",
+    "releaseEpoch": 2
+  },
   "type": "module",
   "icon": "icon.svg",
   "engines": {

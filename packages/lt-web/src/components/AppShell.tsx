@@ -115,7 +115,7 @@ export function Rail({
         type="button"
         className="rail-brand"
         onClick={onOpenPalette}
-        title="河洛 · Leader Team（Ctrl+K 命令面板）"
+        title="河洛 · Open Leader Team (OLT)（Ctrl+K 命令面板）"
       >
         <HeluoxuMark size={24} />
       </button>

@@ -1,6 +1,6 @@
 {
   "name": "leaderteam-panel",
-  "version": "2.2.1",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
   "description": "In-DSH LeaderTeam visual console: dynamic upstream model discovery & role/pool editor, detachable plugin switches, engineering timers, and external plan archive retrospective/cleanup.",

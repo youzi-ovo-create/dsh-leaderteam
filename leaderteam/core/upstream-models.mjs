@@ -585,6 +585,44 @@ function applyModelsToProvidersMap(curProviders = {}, modelsToEnsure = [], defau
   const nextProviders = structuredClone(curProviders && typeof curProviders === 'object' ? curProviders : {});
   const updatedProviders = [];
 
+  if (providerTemplates && typeof providerTemplates === 'object') {
+    for (const [prov, tpl] of Object.entries(providerTemplates)) {
+      const provObj = nextProviders[prov];
+      if (!provObj || typeof provObj !== 'object' || !tpl || typeof tpl !== 'object') continue;
+      const isAuthoritativeTpl = !tpl.modelMetadata || Boolean(tpl.clearApiKeyEnv || tpl.headers || tpl.forceBaseURL === true);
+      if (!isAuthoritativeTpl) continue;
+      let provChanged = false;
+      if (tpl.baseURL && provObj.baseURL !== tpl.baseURL) {
+        provObj.baseURL = tpl.baseURL;
+        provChanged = true;
+      }
+      if (tpl.api && !provObj.api) {
+        provObj.api = tpl.api;
+        provChanged = true;
+      }
+      if (tpl.displayName && !provObj.displayName) {
+        provObj.displayName = tpl.displayName;
+        provChanged = true;
+      }
+      if (tpl.headers && typeof tpl.headers === 'object' && !Array.isArray(tpl.headers)) {
+        const curHeaders = (provObj.headers && typeof provObj.headers === 'object' && !Array.isArray(provObj.headers))
+          ? provObj.headers
+          : {};
+        if (Object.keys(tpl.headers).some(k => curHeaders[k] !== tpl.headers[k])) {
+          provObj.headers = { ...curHeaders, ...tpl.headers };
+          provChanged = true;
+        }
+      }
+      if (tpl.clearApiKeyEnv === true && 'apiKeyEnv' in provObj) {
+        delete provObj.apiKeyEnv;
+        provChanged = true;
+      }
+      if (provChanged && !updatedProviders.includes(prov)) {
+        updatedProviders.push(prov);
+      }
+    }
+  }
+
   for (const item of modelsToEnsure) {
     if (!item || typeof item !== 'object') continue;
     const prov = item.provider ?? defaultProvider;

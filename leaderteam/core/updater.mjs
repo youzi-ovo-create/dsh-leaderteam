@@ -10,6 +10,8 @@ import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { writeFileAtomic } from './store.mjs';
+import { hashJson } from './canonical.mjs';
+import { isProcessPidDead } from './session-config.mjs';
 import {
   parseDshSemver,
   compareDshSemver,
@@ -22,16 +24,22 @@ import {
 const THIS_DIR = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_PLUGIN_ROOT = path.resolve(THIS_DIR, '..', '..');
 
+export const OLT_BRAND_ID = 'open-leader-team';
+export const OLT_BRAND_DISPLAY_NAME = 'Open Leader Team';
+export const OLT_BRAND_SHORT_NAME = 'OLT';
+export const LEGACY_LT_EPOCH = 1;
+export const OLT_RELEASE_EPOCH = 2;
+
 export const UPDATE_TRACKS = Object.freeze({
   'open-source': Object.freeze({
     id: 'open-source',
-    label: '开源维护版 (Apache-2.0)',
-    shortLabel: '开源版',
+    label: 'Open Leader Team (OLT · Apache-2.0)',
+    shortLabel: 'OLT 开源版',
     license: 'Apache-2.0',
     repo: 'youzi-ovo-create/dsh-leaderteam',
     releasesApiUrl: 'https://api.github.com/repos/youzi-ovo-create/dsh-leaderteam/releases',
     releasesHtmlUrl: 'https://github.com/youzi-ovo-create/dsh-leaderteam/releases',
-    description: '纯 Node.js ESM 开源源码与标准安装包发行分支（Apache-2.0 协议）。',
+    description: 'Open Leader Team (OLT) 纯 Node.js ESM 开源源码与标准安装包发行分支（Apache-2.0 协议）。',
   }),
   'closed-free': Object.freeze({
     id: 'closed-free',
@@ -44,6 +52,83 @@ export const UPDATE_TRACKS = Object.freeze({
     description: '包含预编译 Rust 原生模型映射核心与增强特性的免费公开发行分支。',
   }),
 });
+
+export function inferPackageReleaseEpoch({
+  version = null,
+  track = 'open-source',
+  rootPkg = null,
+  internalPkg = null,
+  explicitEpoch = null,
+} = {}) {
+  if (track && track !== 'open-source') return LEGACY_LT_EPOCH;
+  if (Number.isInteger(explicitEpoch) && explicitEpoch >= LEGACY_LT_EPOCH) return explicitEpoch;
+  const declaredInternal = internalPkg?.leaderteam?.releaseEpoch;
+  if (Number.isInteger(declaredInternal) && declaredInternal >= LEGACY_LT_EPOCH) return declaredInternal;
+  const declaredRoot = rootPkg?.leaderteam?.releaseEpoch;
+  if (Number.isInteger(declaredRoot) && declaredRoot >= LEGACY_LT_EPOCH) return declaredRoot;
+  const brand = String(internalPkg?.leaderteam?.brand ?? rootPkg?.leaderteam?.brand ?? '').trim().toLowerCase();
+  if (brand === OLT_BRAND_ID || brand === 'olt') return OLT_RELEASE_EPOCH;
+  const parsed = parseDshSemver(version);
+  // Historical open-source LeaderTeam releases started at v2.1.0 (frozen at v2.2.3).
+  // Open Leader Team (OLT) reset semver at v1.0.0 under releaseEpoch 2.
+  if (parsed && parsed.major === 1) return OLT_RELEASE_EPOCH;
+  return LEGACY_LT_EPOCH;
+}
+
+export function inferGitHubReleaseEpoch(rel, { track = 'open-source', parsedTag = null } = {}) {
+  if (track && track !== 'open-source') return LEGACY_LT_EPOCH;
+  const tag = String(rel?.tag_name ?? parsedTag?.tagName ?? '').trim();
+  const title = String(rel?.name ?? '').trim();
+  const body = String(rel?.body ?? '');
+  const assets = Array.isArray(rel?.assets) ? rel.assets : [];
+
+  const epochBodyMatch = /LT-RELEASE-EPOCH\s*:\s*(\d+)/i.exec(body);
+  if (epochBodyMatch) {
+    const parsedEpoch = Number(epochBodyMatch[1]);
+    if (Number.isInteger(parsedEpoch) && parsedEpoch >= LEGACY_LT_EPOCH) return parsedEpoch;
+  }
+  if (/^olt-/i.test(tag)) return OLT_RELEASE_EPOCH;
+  if (/\b(?:Open\s+Leader\s+Team|OLT)\b/i.test(title)) return OLT_RELEASE_EPOCH;
+  if (/\bOpen\s+Leader\s+Team\b/i.test(body)) return OLT_RELEASE_EPOCH;
+  if (assets.some(a => typeof a?.name === 'string' && /^(?:olt|open-leader-team|dsh-leaderteam-olt)/i.test(a.name))) {
+    return OLT_RELEASE_EPOCH;
+  }
+  const parsedVer = parseDshSemver(parsedTag?.version ?? rel?.version ?? null);
+  if (parsedVer && parsedVer.major === 1) return OLT_RELEASE_EPOCH;
+  return LEGACY_LT_EPOCH;
+}
+
+/**
+ * Epoch-aware release version comparator:
+ * Compares `releaseEpoch` first (OLT epoch 2 > Legacy LT 2.x epoch 1), then standard semver.
+ * Ensures OLT v1.0.0 is strictly recognized as an UPGRADE over legacy LT v2.1.x / v2.2.x,
+ * and historical v2.2.3 releases never appear as upgrades over OLT v1.0.0.
+ */
+export function compareReleaseVersions(a, b) {
+  const norm = x => {
+    if (typeof x === 'string') {
+      return {
+        version: x,
+        epoch: inferPackageReleaseEpoch({ version: x, track: 'open-source' }),
+      };
+    }
+    const ver = String(x?.version ?? '').trim();
+    const track = x?.track ?? x?.installedTrack ?? 'open-source';
+    const explicitEpoch = Number.isInteger(x?.releaseEpoch)
+      ? x.releaseEpoch
+      : (Number.isInteger(x?.epoch) ? x.epoch : null);
+    return {
+      version: ver,
+      epoch: explicitEpoch ?? inferPackageReleaseEpoch({ version: ver, track }),
+    };
+  };
+  const na = norm(a);
+  const nb = norm(b);
+  if (na.epoch !== nb.epoch) {
+    return na.epoch > nb.epoch ? 1 : -1;
+  }
+  return compareDshSemver(na.version, nb.version);
+}
 
 export const DEFAULT_CHECK_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
 export const MAX_TARBALL_BYTES = 80 * 1024 * 1024; // 80 MiB safety ceiling
@@ -83,16 +168,37 @@ export function readInstalledVersionInfo(pluginRoot = DEFAULT_PLUGIN_ROOT, fsImp
   let version = '0.0.0';
   let name = 'dsh-leaderteam';
   let enginesDsh = SUPPORTED_DSH_ENGINE_RANGE;
+  let rootPkg = null;
+  let internalPkg = null;
   try {
-    const rootPkg = JSON.parse(fsImpl.readFileSync(path.join(pluginRoot, 'package.json'), 'utf8'));
+    rootPkg = JSON.parse(fsImpl.readFileSync(path.join(pluginRoot, 'package.json'), 'utf8'));
     if (typeof rootPkg.version === 'string') version = rootPkg.version.trim();
     if (typeof rootPkg.name === 'string') name = rootPkg.name.trim();
     if (typeof rootPkg.engines?.dsh === 'string') enginesDsh = rootPkg.engines.dsh.trim();
   } catch {}
+  try {
+    const internalPath = path.join(pluginRoot, 'leaderteam', 'package.json');
+    if (fsImpl.existsSync(internalPath)) {
+      internalPkg = JSON.parse(fsImpl.readFileSync(internalPath, 'utf8'));
+    }
+  } catch {}
   const track = detectInstalledTrack(pluginRoot, fsImpl);
+  const releaseEpoch = inferPackageReleaseEpoch({ version, track, rootPkg, internalPkg });
+  const isOlt = track === 'open-source' && releaseEpoch >= OLT_RELEASE_EPOCH;
+  const brand = isOlt ? OLT_BRAND_ID : 'leaderteam';
+  const brandDisplayName = isOlt
+    ? String(internalPkg?.leaderteam?.brandDisplayName ?? rootPkg?.leaderteam?.brandDisplayName ?? OLT_BRAND_DISPLAY_NAME)
+    : 'LeaderTeam';
+  const brandShortName = isOlt
+    ? String(internalPkg?.leaderteam?.brandShortName ?? rootPkg?.leaderteam?.brandShortName ?? OLT_BRAND_SHORT_NAME)
+    : 'LT';
   return {
     name,
     version,
+    brand,
+    brandDisplayName,
+    brandShortName,
+    releaseEpoch,
     track,
     trackInfo: UPDATE_TRACKS[track] ?? UPDATE_TRACKS['open-source'],
     enginesDsh,
@@ -172,7 +278,12 @@ export function inspectTgzPackage(tgzFileOrBuffer, fsImpl = fs) {
 
   const files = [];
   const extractedTexts = new Map();
-  const wantedTextPaths = new Set(['package/package.json', 'package/leaderteam/package.json', 'package/cordis.patch.yml']);
+  const wantedTextPaths = new Set([
+    'package/package.json',
+    'package/leaderteam/package.json',
+    'package/cordis.patch.yml',
+    'package/leaderteam/core/config.mjs',
+  ]);
   let offset = 0;
   let paxPathOverride = null;
 
@@ -247,6 +358,20 @@ export function inspectTgzPackage(tgzFileOrBuffer, fsImpl = fs) {
     try { internalPkg = JSON.parse(internalRaw); } catch {}
   }
 
+  if (
+    files.includes('package/leaderteam/plugins/leaderteam-panel/public-api.mjs') &&
+    !files.includes('package/leaderteam/plugins/leaderteam-panel/web-dist/index.html')
+  ) {
+    const err = new Error('安装包不完整：缺少工作台前端入口 leaderteam/plugins/leaderteam-panel/web-dist/index.html');
+    err.code = 'INCOMPLETE_BUNDLE_ASSETS';
+    throw err;
+  }
+
+  const configMjsText = extractedTexts.get('package/leaderteam/core/config.mjs');
+  const supportsFollowPolicy = typeof configMjsText === 'string'
+    ? /['"]follow['"]/.test(configMjsText)
+    : true;
+
   const nativeFiles = files.filter(f => f.startsWith('package/leaderteam/native/') && f.endsWith('.node'));
   const declaredTrack = internalPkg?.leaderteam?.distributionTrack;
   const inferredTrack =
@@ -256,9 +381,21 @@ export function inspectTgzPackage(tgzFileOrBuffer, fsImpl = fs) {
         ? 'closed-free'
         : 'open-source';
 
+  const inferredVersion = String(rootPkg.version || '').trim();
+  const releaseEpoch = inferPackageReleaseEpoch({
+    version: inferredVersion,
+    track: inferredTrack,
+    rootPkg,
+    internalPkg,
+  });
+  const isOlt = inferredTrack === 'open-source' && releaseEpoch >= OLT_RELEASE_EPOCH;
+
   return {
     name: rootPkg.name,
-    version: String(rootPkg.version || '').trim(),
+    version: inferredVersion,
+    brand: isOlt ? OLT_BRAND_ID : 'leaderteam',
+    brandDisplayName: isOlt ? OLT_BRAND_DISPLAY_NAME : 'LeaderTeam',
+    releaseEpoch,
     license: rootPkg.license || null,
     track: inferredTrack,
     enginesDsh: rootPkg.engines?.dsh ?? null,
@@ -268,6 +405,7 @@ export function inspectTgzPackage(tgzFileOrBuffer, fsImpl = fs) {
     supportedCoreRange: internalPkg?.leaderteam?.supportedCoreRange ?? rootPkg.engines?.dsh ?? null,
     compatibilityPolicy: internalPkg?.leaderteam?.compatibilityPolicy ?? null,
     hasCordisPatch: Boolean(extractedTexts.get('package/cordis.patch.yml')),
+    supportsFollowPolicy,
     nativeFiles: nativeFiles.map(f => path.posix.basename(f)),
     fileCount: files.length,
   };
@@ -426,7 +564,7 @@ export function normalizeUpdaterPlatform(rawPlatform = process.platform) {
 export function parseReleaseTagForPlatform(rawTag) {
   const tag = String(rawTag ?? '').trim();
   if (!tag) return null;
-  const prefMatch = /^(windows|linux)-v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$/i.exec(tag);
+  const prefMatch = /^(?:olt-)?(windows|linux|darwin)-v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$/i.exec(tag);
   if (prefMatch) {
     const prefix = prefMatch[1].toLowerCase();
     const version = prefMatch[2];
@@ -435,10 +573,10 @@ export function parseReleaseTagForPlatform(rawTag) {
       tagName: tag,
       version,
       prefix,
-      platformScope: prefix === 'windows' ? 'win32' : 'linux',
+      platformScope: prefix === 'windows' ? 'win32' : prefix,
     };
   }
-  const legacyMatch = /^v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$/i.exec(tag);
+  const legacyMatch = /^(?:olt-)?v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$/i.exec(tag);
   if (legacyMatch && !tag.includes('/')) {
     const version = legacyMatch[1];
     if (!parseDshSemver(version)) return null;
@@ -485,17 +623,64 @@ export function assertTargetReleaseTagMatchesPlatform(targetVersion, platform = 
   return parsed;
 }
 
-function normalizeReleaseEntry(rel, track) {
+function classifyTgzAssetPlatform(assetName) {
+  const stem = String(assetName ?? '').trim().replace(/\.tgz$/i, '').toLowerCase();
+  const osMatch = /(?:^|[-_.])(linux|windows|win32|win|darwin|macos|osx|freebsd|openbsd|netbsd|sunos|aix)(?=$|[-_.])/.exec(stem);
+  const archMatch = /(?:^|[-_.])(x86_64|amd64|x64|aarch64|arm64|armv7l|armv7|armhf|armv6l|arm32|arm|ia32|i686|i386|x86|386|riscv64|ppc64le|ppc64|s390x|loong64|mips64el|mips64|mips)(?=$|[-_.])/.exec(stem);
+  const rawOs = osMatch ? osMatch[1] : null;
+  const rawArch = archMatch ? archMatch[1] : null;
+  const assetPlatform =
+    rawOs === 'linux'
+      ? 'linux'
+      : rawOs === 'windows' || rawOs === 'win32' || rawOs === 'win'
+        ? 'win32'
+        : rawOs === 'darwin' || rawOs === 'macos' || rawOs === 'osx'
+          ? 'darwin'
+          : rawOs;
+  const assetArch =
+    rawArch === 'x64' || rawArch === 'amd64' || rawArch === 'x86_64'
+      ? 'x64'
+      : rawArch === 'arm64' || rawArch === 'aarch64'
+        ? 'arm64'
+        : rawArch === 'ia32' || rawArch === 'x86' || rawArch === 'i386' || rawArch === 'i686' || rawArch === '386'
+          ? 'ia32'
+          : rawArch;
+  return { assetPlatform, assetArch };
+}
+
+function isPrimaryLeaderTeamTarballName(assetName) {
+  const name = String(assetName ?? '').trim();
+  return /^dsh-leaderteam(?:[-_.].*)?\.tgz$/i.test(name);
+}
+
+function selectPlatformCompatibleTgzAsset(assets, { platform = process.platform, arch = process.arch } = {}) {
+  const normPlat = normalizeUpdaterPlatform(platform);
+  const normArch = String(arch ?? process.arch).trim().toLowerCase();
+  const candidates = [];
+  for (const a of Array.isArray(assets) ? assets : []) {
+    if (!a || typeof a.name !== 'string' || !isPrimaryLeaderTeamTarballName(a.name)) continue;
+    const { assetPlatform, assetArch } = classifyTgzAssetPlatform(a.name);
+    if (assetPlatform && assetPlatform !== normPlat) continue;
+    if (assetArch && assetArch !== normArch) continue;
+    let score = 100;
+    if (assetPlatform === normPlat && assetArch === normArch) score += 40;
+    else if (assetPlatform === normPlat && !assetArch) score += 25;
+    else if (!assetPlatform && assetArch === normArch) score += 15;
+    else if (!assetPlatform && !assetArch) score += 10;
+    candidates.push({ asset: a, score });
+  }
+  candidates.sort((x, y) => y.score - x.score);
+  return candidates[0]?.asset ?? null;
+}
+
+function normalizeReleaseEntry(rel, track, { platform = process.platform, arch = process.arch } = {}) {
   if (!rel || typeof rel !== 'object' || rel.draft) return null;
   const rawTag = String(rel.tag_name ?? '').trim();
   const parsedTag = parseReleaseTagForPlatform(rawTag);
   if (!parsedTag) return null;
   const cleanVersion = parsedTag.version;
   const assets = Array.isArray(rel.assets) ? rel.assets : [];
-  const tgzAsset =
-    assets.find(a => typeof a?.name === 'string' && /^dsh-leaderteam-.*\.tgz$/i.test(a.name)) ??
-    assets.find(a => typeof a?.name === 'string' && a.name.endsWith('.tgz')) ??
-    null;
+  const tgzAsset = selectPlatformCompatibleTgzAsset(assets, { platform, arch });
   const sumsAsset =
     assets.find(a => typeof a?.name === 'string' && /^SHA256SUMS/i.test(a.name)) ??
     null;
@@ -506,10 +691,15 @@ function normalizeReleaseEntry(rel, track) {
     if (/^[0-9a-f]{64}$/.test(hex)) assetDigestSha256 = hex;
   }
 
+  const releaseEpoch = inferGitHubReleaseEpoch(rel, { track, parsedTag });
+  const brand = track === 'open-source' && releaseEpoch >= OLT_RELEASE_EPOCH ? OLT_BRAND_ID : 'leaderteam';
+
   return {
     track,
     tagName: rawTag,
     version: cleanVersion,
+    releaseEpoch,
+    brand,
     platformScope: parsedTag.platformScope,
     platformPrefix: parsedTag.prefix,
     name: String(rel.name || rawTag),
@@ -535,10 +725,12 @@ function normalizeReleaseEntry(rel, track) {
  * - Prefers same-platform prefixed releases (`windows-v*` on `win32`, `linux-v*` on `linux`),
  *   falling back to historical unprefixed `vX.Y.Z` ONLY when zero same-platform prefixed releases exist.
  * - Throws `PLATFORM_RELEASE_TAG_MISMATCH` if `targetVersion` explicitly names another platform's prefix.
+ * - Sorts newest-first using epoch-aware `compareReleaseVersions` (OLT epoch 2 > legacy LT 2.x epoch 1).
  */
 export function selectReleasesForPlatform(rawList, {
   track = 'open-source',
   platform = process.platform,
+  arch = process.arch,
   includePrerelease = false,
   targetVersion = null,
 } = {}) {
@@ -546,7 +738,7 @@ export function selectReleasesForPlatform(rawList, {
   const parsedTarget = assertTargetReleaseTagMatchesPlatform(targetVersion, normPlat);
 
   const normalized = (Array.isArray(rawList) ? rawList : [rawList])
-    .map(r => normalizeReleaseEntry(r, track))
+    .map(r => normalizeReleaseEntry(r, track, { platform: normPlat, arch }))
     .filter(r => r !== null && (includePrerelease || !r.prerelease || (parsedTarget && r.version === parsedTarget.version)));
 
   const allowedForPlat = normalized.filter(r => {
@@ -567,7 +759,7 @@ export function selectReleasesForPlatform(rawList, {
         const aPref = a.platformScope === normPlat ? 1 : 0;
         const bPref = b.platformScope === normPlat ? 1 : 0;
         if (aPref !== bPref) return bPref - aPref;
-        return compareDshSemver(b.version, a.version) ?? 0;
+        return compareReleaseVersions(b, a) ?? 0;
       });
     return exactMatches;
   }
@@ -577,7 +769,7 @@ export function selectReleasesForPlatform(rawList, {
     ? samePlatPrefixed
     : allowedForPlat.filter(r => r.platformScope === 'universal');
 
-  return candidatePool.sort((a, b) => compareDshSemver(b.version, a.version) ?? 0);
+  return candidatePool.sort((a, b) => compareReleaseVersions(b, a) ?? 0);
 }
 
 /**
@@ -590,6 +782,7 @@ export async function checkForUpdates({
   storageRoot = null,
   track = null,
   platform = process.platform,
+  arch = process.arch,
   targetVersion = null,
   includePrerelease = false,
   force = false,
@@ -599,6 +792,8 @@ export async function checkForUpdates({
   cacheTtlMs = DEFAULT_CHECK_CACHE_TTL_MS,
 } = {}) {
   const normPlat = normalizeUpdaterPlatform(platform);
+  const normArch = String(arch ?? process.arch).trim().toLowerCase();
+  const wantPre = Boolean(includePrerelease);
   assertTargetReleaseTagMatchesPlatform(targetVersion, normPlat);
   const installed = readInstalledVersionInfo(pluginRoot);
   const queryTrack = track && UPDATE_TRACKS[track] ? track : installed.track;
@@ -606,7 +801,7 @@ export async function checkForUpdates({
   const isCrossTrackPreview = queryTrack !== installed.track;
 
   const cacheFile = storageRoot && !targetVersion
-    ? path.join(resolveUpdaterDir(storageRoot), `check-cache-${queryTrack}-${normPlat}.json`)
+    ? path.join(resolveUpdaterDir(storageRoot), `check-cache-${queryTrack}-${normPlat}-${normArch}-${wantPre ? 'pre' : 'stable'}.json`)
     : null;
 
   if (!force && !targetVersion && !apiUrlOverride && cacheFile && fs.existsSync(cacheFile)) {
@@ -618,7 +813,10 @@ export async function checkForUpdates({
         age >= 0 &&
         age < cacheTtlMs &&
         cached.installedVersion === installed.version &&
-        cached.platform === normPlat
+        (cached.installedEpoch ?? inferPackageReleaseEpoch({ version: cached.installedVersion, track: cached.installedTrack ?? queryTrack })) === installed.releaseEpoch &&
+        cached.platform === normPlat &&
+        (!cached.targetPlatform || cached.targetPlatform === `${normPlat}-${normArch}`) &&
+        Boolean(cached.includePrerelease) === wantPre
       ) {
         return { ...cached, fromCache: true };
       }
@@ -652,18 +850,29 @@ export async function checkForUpdates({
   const releases = selectReleasesForPlatform(rawList, {
     track: queryTrack,
     platform: normPlat,
-    includePrerelease,
+    arch: normArch,
+    includePrerelease: wantPre,
     targetVersion,
   });
 
-  const latest = releases.find(r => r.asset?.downloadUrl) ?? releases[0] ?? null;
-  const hasUpdate = latest
+  const selectableReleases = releases.filter(r => r.asset?.downloadUrl);
+  const allRawReleasesLackAssets = rawList.every(r => !Array.isArray(r?.assets) || r.assets.length === 0);
+  const latest = selectableReleases[0] ?? (releases.length > 0 && allRawReleasesLackAssets ? releases[0] : null);
+  const latestCmp = latest ? (compareReleaseVersions(latest, installed) ?? 0) : 0;
+  const migrationFromLegacyLt = Boolean(
+    latest &&
+      !isCrossTrackPreview &&
+      queryTrack === 'open-source' &&
+      installed.releaseEpoch < OLT_RELEASE_EPOCH &&
+      latest.releaseEpoch >= OLT_RELEASE_EPOCH,
+  );
+  const hasUpdate = latest && (latest.asset?.downloadUrl || allRawReleasesLackAssets)
     ? (
         targetVersion
-          ? latest.version !== installed.version || queryTrack !== installed.track
+          ? latest.version !== installed.version || latest.releaseEpoch !== installed.releaseEpoch || queryTrack !== installed.track
           : (isCrossTrackPreview
               ? latest.version !== installed.version || queryTrack !== installed.track
-              : compareDshSemver(latest.version, installed.version) > 0)
+              : latestCmp > 0)
       )
     : false;
 
@@ -672,12 +881,19 @@ export async function checkForUpdates({
     checkedAt,
     fromCache: false,
     platform: normPlat,
+    targetPlatform: `${normPlat}-${normArch}`,
+    includePrerelease: wantPre,
     installedVersion: installed.version,
+    installedBrand: installed.brand,
+    installedBrandDisplayName: installed.brandDisplayName,
+    installedEpoch: installed.releaseEpoch,
     installedTrack: installed.track,
     installedTrackInfo: installed.trackInfo,
     queriedTrack: queryTrack,
     queriedTrackInfo: trackMeta,
     isCrossTrack: isCrossTrackPreview,
+    migrationFromLegacyLt,
+    isDowngrade: Boolean(latest && !isCrossTrackPreview && latestCmp < 0),
     crossTrackConfirmationToken: isCrossTrackPreview ? requiredTrackSwitchToken(queryTrack) : null,
     currentHostVersion,
     hasUpdate,
@@ -702,24 +918,91 @@ export async function checkForUpdates({
   return result;
 }
 
-export function isRuntimeIdleForUpgrade(rt) {
-  if (!rt) return { idle: true, reasons: [] };
+export function isRuntimeIdleForUpgrade(rt, { storageRoot = null, fsImpl = fs } = {}) {
   const reasons = [];
-  if (rt.liveProcessMemberIds instanceof Set && rt.liveProcessMemberIds.size > 0) {
-    reasons.push(`当前有 ${rt.liveProcessMemberIds.size} 个团队执行成员正在运行`);
-  }
-  if (rt.inFlightShellCallsBySession instanceof Map && rt.inFlightShellCallsBySession.size > 0) {
-    reasons.push('当前有正在执行的受控终端工具调用');
-  }
-  if (rt.actors instanceof Map) {
-    for (const actor of rt.actors.values()) {
-      const status = typeof actor?.agent?.status === 'function' ? actor.agent.status() : actor?.agent?.status;
-      if (status === 'running' || status === 'busy' || status === 'streaming') {
-        reasons.push(`会话 ${actor.teamId || ''} 主代理正在执行回合`);
-        break;
+  if (rt) {
+    if (rt.liveProcessMemberIds instanceof Set && rt.liveProcessMemberIds.size > 0) {
+      reasons.push(`当前有 ${rt.liveProcessMemberIds.size} 个团队执行成员正在运行`);
+    }
+    if (rt.inFlightShellCallsBySession instanceof Map && rt.inFlightShellCallsBySession.size > 0) {
+      reasons.push('当前有正在执行的受控终端工具调用');
+    }
+    if (rt.actors instanceof Map) {
+      for (const actor of rt.actors.values()) {
+        const status = typeof actor?.agent?.status === 'function' ? actor.agent.status() : actor?.agent?.status;
+        if (status === 'running' || status === 'busy' || status === 'streaming') {
+          reasons.push(`会话 ${actor.teamId || ''} 主代理正在执行回合`);
+          break;
+        }
       }
     }
   }
+
+  // Cross-process active-turn guard (protects live DSH Web sessions against external CLI `lt-update`)
+  const effStorageRoot = storageRoot ?? rt?.storageRoot ?? null;
+  if (effStorageRoot) {
+    const activeTurnsDir = path.join(effStorageRoot, 'active-turns');
+    if (fsImpl.existsSync(activeTurnsDir)) {
+      try {
+        for (const entry of fsImpl.readdirSync(activeTurnsDir)) {
+          if (!entry.endsWith('.json')) continue;
+          const full = path.join(activeTurnsDir, entry);
+          try {
+            const parsed = JSON.parse(fsImpl.readFileSync(full, 'utf8'));
+            const pid = parsed?.pid;
+            if (Number.isInteger(pid) && pid > 0) {
+              if (pid !== process.pid && isProcessPidDead(pid)) {
+                try { fsImpl.rmSync(full, { force: true }); } catch {}
+                continue;
+              }
+              reasons.push(`会话 ${parsed.sessionId || ''} 正在活跃执行回合（宿主进程 PID ${pid}）`);
+              break;
+            }
+          } catch {}
+        }
+      } catch {}
+    }
+
+    if (reasons.length === 0) {
+      const teamsDir = path.join(effStorageRoot, 'teams');
+      if (fsImpl.existsSync(teamsDir)) {
+        try {
+          for (const d of fsImpl.readdirSync(teamsDir, { withFileTypes: true })) {
+            if (!d.isDirectory()) continue;
+            const mFile = path.join(teamsDir, d.name, 'members.jsonl');
+            if (!fsImpl.existsSync(mFile)) continue;
+            try {
+              const latestByChild = new Map();
+              for (const line of fsImpl.readFileSync(mFile, 'utf8').split(/\r?\n/)) {
+                if (!line.trim()) continue;
+                try {
+                  const rec = JSON.parse(line);
+                  if (!rec?.childId) continue;
+                  if (rec.type === 'member') {
+                    latestByChild.set(rec.childId, { status: rec.status ?? 'starting', ownerPid: rec.ownerPid ?? null });
+                  } else if (rec.type === 'member-status' && latestByChild.has(rec.childId)) {
+                    latestByChild.get(rec.childId).status = rec.status;
+                  }
+                } catch {}
+              }
+              let foundLiveMember = false;
+              for (const m of latestByChild.values()) {
+                if (!['starting', 'started', 'running'].includes(m.status)) continue;
+                if (Number.isInteger(m.ownerPid) && m.ownerPid > 0) {
+                  if (m.ownerPid !== process.pid && isProcessPidDead(m.ownerPid)) continue;
+                  reasons.push(`团队子代理正在运行（宿主进程 PID ${m.ownerPid}）`);
+                  foundLiveMember = true;
+                  break;
+                }
+              }
+              if (foundLiveMember) break;
+            } catch {}
+          }
+        } catch {}
+      }
+    }
+  }
+
   return { idle: reasons.length === 0, reasons };
 }
 
@@ -735,12 +1018,330 @@ function copyDirRecursiveSync(src, dest) {
   }
 }
 
+function computeDirectoryFileHashes(rootDir, fsImpl = fs) {
+  const fileHashes = {};
+  const walk = (curDir, relPrefix) => {
+    const entries = fsImpl.readdirSync(curDir, { withFileTypes: true });
+    entries.sort((a, b) => a.name.localeCompare(b.name));
+    for (const entry of entries) {
+      if (entry.name === '.git' || entry.name === 'node_modules') continue;
+      if (entry.isSymbolicLink()) continue;
+      const full = path.join(curDir, entry.name);
+      const rel = relPrefix ? `${relPrefix}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) {
+        walk(full, rel);
+      } else if (entry.isFile()) {
+        fileHashes[rel] = computeFileSha256(full, fsImpl);
+      }
+    }
+  };
+  if (fsImpl.existsSync(rootDir)) {
+    walk(rootDir, '');
+  }
+  return {
+    fileCount: Object.keys(fileHashes).length,
+    fileHashes,
+  };
+}
+
+function extractWebDistReferencedAssets(htmlText) {
+  const refs = [];
+  const seen = new Set();
+  const attrRe = /<(?:script|link)\b[^>]*(?:\bsrc|\bhref)\s*=\s*["']([^"']+)["'][^>]*>/gi;
+  let m;
+  while ((m = attrRe.exec(String(htmlText ?? ''))) !== null) {
+    const raw = String(m[1] ?? '').trim();
+    if (!raw || /^(?:https?:|data:|blob:|mailto:|#|\/\/)/i.test(raw)) continue;
+    const clean = raw.split(/[?#]/)[0].replace(/^\.\//, '').replace(/^\/+/, '');
+    if (!clean) continue;
+    if (!/\.(?:m?js|css)$/i.test(clean)) continue;
+    if (!seen.has(clean)) {
+      seen.add(clean);
+      refs.push(clean);
+    }
+  }
+  return refs;
+}
+
+export function verifyBackupSnapshotIntegrity(backupRecord, fsImpl = fs) {
+  const snapDir = backupRecord?.pluginSnapshotDir;
+  if (!snapDir || !fsImpl.existsSync(snapDir)) {
+    return { intact: false, reason: '备份目录不存在', missing: ['plugin-package'], tampered: [] };
+  }
+  const missing = [];
+  const tampered = [];
+  const requiredBase = ['package.json', 'cordis.patch.yml', 'leaderteam/package.json'];
+
+  let rootPkg = null;
+  let internalPkg = null;
+  const rootPkgPath = path.join(snapDir, 'package.json');
+  if (fsImpl.existsSync(rootPkgPath)) {
+    try {
+      rootPkg = JSON.parse(fsImpl.readFileSync(rootPkgPath, 'utf8'));
+    } catch {
+      rootPkg = null;
+    }
+  }
+  const internalPkgPath = path.join(snapDir, 'leaderteam', 'package.json');
+  if (fsImpl.existsSync(internalPkgPath)) {
+    try {
+      internalPkg = JSON.parse(fsImpl.readFileSync(internalPkgPath, 'utf8'));
+    } catch {
+      internalPkg = null;
+    }
+  }
+
+  const backupVersion =
+    (typeof rootPkg?.version === 'string' && rootPkg.version.trim()) ||
+    (typeof backupRecord?.fromVersion === 'string' && backupRecord.fromVersion.trim()) ||
+    null;
+  const backupTrack = backupRecord?.fromTrack ?? internalPkg?.leaderteam?.distributionTrack ?? 'open-source';
+  const backupEpoch = inferPackageReleaseEpoch({
+    version: backupVersion,
+    track: backupTrack,
+    rootPkg,
+    internalPkg,
+    explicitEpoch: backupRecord?.fromEpoch,
+  });
+  const panelDir = path.join(snapDir, 'leaderteam', 'plugins', 'leaderteam-panel');
+  const webDistDir = path.join(panelDir, 'web-dist');
+  const hasFileHashManifest = Boolean(
+    backupRecord?.fileHashes &&
+      typeof backupRecord.fileHashes === 'object' &&
+      !Array.isArray(backupRecord.fileHashes) &&
+      Object.keys(backupRecord.fileHashes).length > 0,
+  );
+  const expectsWebWorkbench = Boolean(
+    backupEpoch >= OLT_RELEASE_EPOCH ||
+      (backupVersion && (compareDshSemver(backupVersion, '2.2.2') ?? 0) >= 0) ||
+      rootPkg?.bin?.['lt-ui'] ||
+      (hasFileHashManifest && (
+        'leaderteam/plugins/leaderteam-panel/public-api.mjs' in backupRecord.fileHashes ||
+        'leaderteam/plugins/leaderteam-panel/web-dist/index.html' in backupRecord.fileHashes
+      )) ||
+      fsImpl.existsSync(webDistDir) ||
+      fsImpl.existsSync(path.join(panelDir, 'public-api.mjs')),
+  );
+
+  if (fsImpl.existsSync(panelDir)) {
+    requiredBase.push('leaderteam/entry-core.mjs');
+    if (expectsWebWorkbench) {
+      requiredBase.push(
+        'leaderteam/plugins/leaderteam-panel/public-api.mjs',
+        'leaderteam/plugins/leaderteam-panel/web-dist/index.html',
+      );
+      if (rootPkg?.bin?.['lt-ui'] || fsImpl.existsSync(path.join(webDistDir, 'assets'))) {
+        requiredBase.push(
+          'leaderteam/plugins/leaderteam-panel/index.mjs',
+          'leaderteam/plugins/leaderteam-panel/client.js',
+        );
+      }
+    } else {
+      // Historical < 2.2.2 packages (e.g. V2.2.0 / V2.2.1) shipped the embedded DSH panel only
+      // without public-api.mjs or web-dist/index.html.
+      requiredBase.push(
+        'leaderteam/plugins/leaderteam-panel/index.mjs',
+        'leaderteam/plugins/leaderteam-panel/client.js',
+      );
+    }
+  }
+
+  for (const rel of requiredBase) {
+    const full = path.join(snapDir, ...rel.split('/'));
+    if (!fsImpl.existsSync(full)) {
+      missing.push(rel);
+      continue;
+    }
+    try {
+      const st = fsImpl.statSync(full);
+      if (!st.isFile() || st.size <= 0) tampered.push(rel);
+    } catch {
+      missing.push(rel);
+    }
+  }
+  if (!missing.includes('package.json')) {
+    if (!rootPkg || rootPkg?.name !== 'dsh-leaderteam' || !rootPkg?.dsh?.bundle) {
+      if (!tampered.includes('package.json')) tampered.push('package.json');
+    }
+  }
+
+  // Verify local JS/CSS assets referenced by web-dist/index.html (protects legacy backups without fileHashes too!)
+  const indexHtmlPath = path.join(webDistDir, 'index.html');
+  if (expectsWebWorkbench && fsImpl.existsSync(indexHtmlPath) && !tampered.includes('leaderteam/plugins/leaderteam-panel/web-dist/index.html')) {
+    try {
+      const htmlText = fsImpl.readFileSync(indexHtmlPath, 'utf8');
+      const assetRefs = extractWebDistReferencedAssets(htmlText);
+      const hasScriptAsset = assetRefs.some(r => /\.(?:m?js)$/i.test(r));
+      const mustHaveScriptAsset = Boolean(
+        rootPkg?.bin?.['lt-ui'] ||
+          fsImpl.existsSync(path.join(webDistDir, 'assets')) ||
+          /<script\b/i.test(htmlText),
+      );
+      if (mustHaveScriptAsset && !hasScriptAsset) {
+        tampered.push('leaderteam/plugins/leaderteam-panel/web-dist/index.html');
+      } else {
+        const resolvedWebDist = path.resolve(webDistDir);
+        for (const relAsset of assetRefs) {
+          const fullAsset = path.resolve(resolvedWebDist, relAsset);
+          if (fullAsset !== resolvedWebDist && !fullAsset.startsWith(`${resolvedWebDist}${path.sep}`)) {
+            tampered.push(`leaderteam/plugins/leaderteam-panel/web-dist/${relAsset}`);
+            continue;
+          }
+          const manifestRel = `leaderteam/plugins/leaderteam-panel/web-dist/${relAsset.replace(/\\/g, '/')}`;
+          if (!fsImpl.existsSync(fullAsset)) {
+            if (!missing.includes(manifestRel)) missing.push(manifestRel);
+            continue;
+          }
+          try {
+            const st = fsImpl.statSync(fullAsset);
+            if (!st.isFile() || st.size <= 0) {
+              if (!tampered.includes(manifestRel)) tampered.push(manifestRel);
+            }
+          } catch {
+            if (!missing.includes(manifestRel)) missing.push(manifestRel);
+          }
+        }
+      }
+    } catch {
+      tampered.push('leaderteam/plugins/leaderteam-panel/web-dist/index.html');
+    }
+  }
+
+  if (hasFileHashManifest) {
+    const { fileHashes: actualHashes } = computeDirectoryFileHashes(snapDir, fsImpl);
+    for (const [rel, expectedSha] of Object.entries(backupRecord.fileHashes)) {
+      if (!(rel in actualHashes)) {
+        if (!missing.includes(rel)) missing.push(rel);
+      } else if (actualHashes[rel] !== expectedSha) {
+        if (!tampered.includes(rel)) tampered.push(rel);
+      }
+    }
+  }
+  if (missing.length > 0 || tampered.length > 0) {
+    const parts = [];
+    if (missing.length > 0) parts.push(`缺失文件 [${missing.slice(0, 5).join(', ')}]`);
+    if (tampered.length > 0) parts.push(`校验异常 [${tampered.slice(0, 5).join(', ')}]`);
+    return {
+      intact: false,
+      reason: `备份快照不完整或已损坏（${parts.join('；')}）`,
+      missing,
+      tampered,
+    };
+  }
+  return { intact: true, reason: null, missing: [], tampered: [] };
+}
+
+export function doesDirectorySupportFollowPolicy(pluginDir, fsImpl = fs) {
+  if (!pluginDir) return true;
+  const cfgMjs = path.join(pluginDir, 'leaderteam', 'core', 'config.mjs');
+  if (!fsImpl.existsSync(cfgMjs)) return true;
+  try {
+    return /['"]follow['"]/.test(fsImpl.readFileSync(cfgMjs, 'utf8'));
+  } catch {
+    return true;
+  }
+}
+
+export function reconcileConfigForTargetCapabilities(storageRoot, { supportsFollowPolicy = true } = {}) {
+  if (!storageRoot) return;
+  const compatFile = path.join(resolveUpdaterDir(storageRoot), 'compat-downgraded-policy.json');
+  const configDir = path.join(storageRoot, 'config');
+  const teamsDir = path.join(storageRoot, 'teams');
+
+  if (!supportsFollowPolicy) {
+    let record = { v: 1, files: {}, teams: {} };
+    if (fs.existsSync(compatFile)) {
+      try {
+        const prev = JSON.parse(fs.readFileSync(compatFile, 'utf8'));
+        if (prev && typeof prev === 'object') {
+          record = {
+            v: 1,
+            files: { ...(prev.files || {}) },
+            teams: { ...(prev.teams || {}) },
+          };
+        }
+      } catch {}
+    }
+    let changedAny = false;
+    for (const cfgName of ['leaderteam.config.json', 'leaderteam.local.json']) {
+      const full = path.join(configDir, cfgName);
+      if (!fs.existsSync(full)) continue;
+      try {
+        const parsed = JSON.parse(fs.readFileSync(full, 'utf8'));
+        if (parsed?.team?.leaderModelPolicy === 'follow') {
+          parsed.team.leaderModelPolicy = 'warn';
+          writeFileAtomic(full, `${JSON.stringify(parsed, null, 2)}\n`);
+          record.files[cfgName] = 'follow';
+          changedAny = true;
+        }
+      } catch {}
+    }
+    if (fs.existsSync(teamsDir)) {
+      try {
+        for (const d of fs.readdirSync(teamsDir, { withFileTypes: true })) {
+          if (!d.isDirectory()) continue;
+          const govFile = path.join(teamsDir, d.name, 'governance.json');
+          if (!fs.existsSync(govFile)) continue;
+          try {
+            const parsed = JSON.parse(fs.readFileSync(govFile, 'utf8'));
+            if (parsed?.v === 1 && parsed?.config?.team?.leaderModelPolicy === 'follow') {
+              parsed.config.team.leaderModelPolicy = 'warn';
+              parsed.sourceSha256 = hashJson(parsed.config);
+              writeFileAtomic(govFile, JSON.stringify(parsed, null, 1));
+              record.teams[d.name] = 'follow';
+              changedAny = true;
+            }
+          } catch {}
+        }
+      } catch {}
+    }
+    if (changedAny) {
+      fs.mkdirSync(path.dirname(compatFile), { recursive: true });
+      writeFileAtomic(compatFile, `${JSON.stringify(record, null, 2)}\n`);
+    }
+    return;
+  }
+
+  if (!fs.existsSync(compatFile)) return;
+  try {
+    const record = JSON.parse(fs.readFileSync(compatFile, 'utf8'));
+    for (const [cfgName, origPolicy] of Object.entries(record?.files || {})) {
+      if (origPolicy !== 'follow') continue;
+      const full = path.join(configDir, cfgName);
+      if (!fs.existsSync(full)) continue;
+      try {
+        const parsed = JSON.parse(fs.readFileSync(full, 'utf8'));
+        if (parsed?.team?.leaderModelPolicy === 'warn') {
+          parsed.team.leaderModelPolicy = 'follow';
+          writeFileAtomic(full, `${JSON.stringify(parsed, null, 2)}\n`);
+        }
+      } catch {}
+    }
+    for (const [teamDir, origPolicy] of Object.entries(record?.teams || {})) {
+      if (origPolicy !== 'follow') continue;
+      const govFile = path.join(teamsDir, teamDir, 'governance.json');
+      if (!fs.existsSync(govFile)) continue;
+      try {
+        const parsed = JSON.parse(fs.readFileSync(govFile, 'utf8'));
+        if (parsed?.v === 1 && parsed?.config?.team?.leaderModelPolicy === 'warn') {
+          parsed.config.team.leaderModelPolicy = 'follow';
+          parsed.sourceSha256 = hashJson(parsed.config);
+          writeFileAtomic(govFile, JSON.stringify(parsed, null, 1));
+        }
+      } catch {}
+    }
+    fs.rmSync(compatFile, { force: true });
+  } catch {}
+}
+
 export function createPreUpgradeBackup({
   storageRoot,
   pluginRoot = DEFAULT_PLUGIN_ROOT,
   profileDir = null,
   targetVersion,
   targetTrack,
+  targetEpoch = null,
+  targetBrand = null,
 }) {
   const installed = readInstalledVersionInfo(pluginRoot);
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -751,6 +1352,7 @@ export function createPreUpgradeBackup({
   // 1. Copy installed plugin package directory (without node_modules/.git) for 100% offline rollback
   const pkgSnapshotDir = path.join(backupDir, 'plugin-package');
   copyDirRecursiveSync(pluginRoot, pkgSnapshotDir);
+  const { fileCount, fileHashes } = computeDirectoryFileHashes(pkgSnapshotDir);
 
   // 2. Snapshot user configs (note: upgrade never overwrites these, but snapshot protects rollback)
   const configDir = path.join(storageRoot, 'config');
@@ -775,15 +1377,22 @@ export function createPreUpgradeBackup({
     }
   }
 
+  const resolvedToEpoch = targetEpoch ?? inferPackageReleaseEpoch({ version: targetVersion, track: targetTrack ?? installed.track });
   const manifest = {
     backupId,
     createdAt: new Date().toISOString(),
     fromVersion: installed.version,
+    fromBrand: installed.brand,
+    fromEpoch: installed.releaseEpoch,
     fromTrack: installed.track,
     toVersion: targetVersion,
+    toBrand: targetBrand ?? (resolvedToEpoch >= OLT_RELEASE_EPOCH ? OLT_BRAND_ID : 'leaderteam'),
+    toEpoch: resolvedToEpoch,
     toTrack: targetTrack,
     profileDir: profileDir || null,
     pluginSnapshotDir: pkgSnapshotDir,
+    fileCount,
+    fileHashes,
   };
   writeFileAtomic(path.join(backupDir, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`);
   return { backupId, backupDir, manifest };
@@ -977,7 +1586,7 @@ export async function performOneClickUpgrade({
   assertTargetReleaseTagMatchesPlatform(targetVersion, platform);
 
   if (!allowBusy) {
-    const idleCheck = isRuntimeIdleForUpgrade(rt);
+    const idleCheck = isRuntimeIdleForUpgrade(rt, { storageRoot });
     if (!idleCheck.idle) {
       const err = new Error(`为保证会话与团队记录完整性，请等待当前运行中的任务完成后再执行升级：${idleCheck.reasons.join('；')}`);
       err.code = 'UPGRADE_BUSY';
@@ -1094,6 +1703,31 @@ export async function performOneClickUpgrade({
       profileCtx?.dir ??
       (dshHome ? path.join(dshHome, 'profiles', effectiveProfile) : null);
 
+    const targetEpoch = staged.inspection.releaseEpoch ?? inferPackageReleaseEpoch({
+      version: staged.inspection.version,
+      track: staged.inspection.track,
+    });
+    const targetBrand = staged.inspection.brand ?? (targetEpoch >= OLT_RELEASE_EPOCH ? OLT_BRAND_ID : 'leaderteam');
+    const targetVersionCmp = compareReleaseVersions(
+      { version: staged.inspection.version, releaseEpoch: targetEpoch, track: staged.inspection.track },
+      installed,
+    ) ?? 0;
+    const migrationFromLegacyLt = Boolean(
+      installed.track === 'open-source' &&
+        staged.inspection.track === 'open-source' &&
+        installed.releaseEpoch < OLT_RELEASE_EPOCH &&
+        targetEpoch >= OLT_RELEASE_EPOCH,
+    );
+    const isDowngrade = installed.track === staged.inspection.track && targetVersionCmp < 0;
+    const upgradeMeta = {
+      fromEpoch: installed.releaseEpoch,
+      fromBrand: installed.brand,
+      toEpoch: targetEpoch,
+      toBrand: targetBrand,
+      migrationFromLegacyLt,
+      isDowngrade,
+    };
+
     writeUpdaterState(storageRoot, { phase: 'backing_up' });
     const backup = createPreUpgradeBackup({
       storageRoot,
@@ -1101,6 +1735,8 @@ export async function performOneClickUpgrade({
       profileDir,
       targetVersion: staged.inspection.version,
       targetTrack: staged.inspection.track,
+      targetEpoch,
+      targetBrand,
     });
 
     writeUpdaterState(storageRoot, {
@@ -1108,16 +1744,23 @@ export async function performOneClickUpgrade({
       activeUpgrade: {
         fromVersion: installed.version,
         toVersion: staged.inspection.version,
+        ...upgradeMeta,
         track: staged.inspection.track,
         backupId: backup.backupId,
         startedAt: new Date().toISOString(),
       },
     });
 
+    const targetSupportsFollow = staged.inspection.supportsFollowPolicy !== false;
+
     const runRollback = async failureReason => {
       let rollbackOk = false;
       let rollbackError = null;
       try {
+        const snapIntegrity = verifyBackupSnapshotIntegrity(backup.manifest);
+        if (!snapIntegrity.intact) {
+          throw new Error(snapIntegrity.reason);
+        }
         if (typeof installerHook === 'function') {
           await installerHook({
             mode: 'rollback',
@@ -1153,6 +1796,9 @@ export async function performOneClickUpgrade({
           }
         }
         restoreConfigSnapshotIfMissing(backup.backupDir, storageRoot);
+        reconcileConfigForTargetCapabilities(storageRoot, {
+          supportsFollowPolicy: doesDirectorySupportFollowPolicy(backup.manifest.pluginSnapshotDir),
+        });
       } catch (rbErr) {
         rollbackError = rbErr.message;
       }
@@ -1187,12 +1833,14 @@ export async function performOneClickUpgrade({
           dshHome,
         });
         restoreConfigSnapshotIfMissing(backup.backupDir, storageRoot);
+        reconcileConfigForTargetCapabilities(storageRoot, { supportsFollowPolicy: targetSupportsFollow });
         const completed = {
           ok: true,
           mode: 'hook',
           requiresRestart: Boolean(hookRes?.requiresRestart),
           fromVersion: installed.version,
           toVersion: staged.inspection.version,
+          ...upgradeMeta,
           track: staged.inspection.track,
           sha256: staged.sha256,
           backupId: backup.backupId,
@@ -1239,6 +1887,7 @@ export async function performOneClickUpgrade({
               throw new Error(addRes?.error?.diagnostic || '安装新版插件包失败');
             }
             restoreConfigSnapshotIfMissing(backup.backupDir, storageRoot);
+            reconcileConfigForTargetCapabilities(storageRoot, { supportsFollowPolicy: targetSupportsFollow });
             writeUpdaterState(storageRoot, {
               phase: 'succeeded',
               activeUpgrade: null,
@@ -1269,10 +1918,13 @@ export async function performOneClickUpgrade({
         requiresRestart: false,
         fromVersion: installed.version,
         toVersion: staged.inspection.version,
+        ...upgradeMeta,
         track: staged.inspection.track,
         sha256: staged.sha256,
         backupId: backup.backupId,
-        message: `正在后台热替换升级至 v${staged.inspection.version}（约 3~8 秒自动生效，无需命令行或重启）…`,
+        message: migrationFromLegacyLt
+          ? `正在从旧版 LeaderTeam v${installed.version} 无损迁移升级至 Open Leader Team (OLT) v${staged.inspection.version}（约 3~8 秒自动生效）…`
+          : `正在后台热替换升级至 v${staged.inspection.version}（约 3~8 秒自动生效，无需命令行或重启）…`,
       };
     }
 
@@ -1284,17 +1936,21 @@ export async function performOneClickUpgrade({
           throw new Error(addRes?.error?.diagnostic || '宿主插件管理器安装返回失败');
         }
         restoreConfigSnapshotIfMissing(backup.backupDir, storageRoot);
+        reconcileConfigForTargetCapabilities(storageRoot, { supportsFollowPolicy: targetSupportsFollow });
         const completed = {
           ok: true,
           mode: 'plugin-manager-restart',
           requiresRestart: true,
           fromVersion: installed.version,
           toVersion: staged.inspection.version,
+          ...upgradeMeta,
           track: staged.inspection.track,
           sha256: staged.sha256,
           backupId: backup.backupId,
           finishedAt: new Date().toISOString(),
-          message: `已完成 v${staged.inspection.version} 安装，重启 DeepSeek Harness 客户端后生效（全部配置与历史会话已保留）。`,
+          message: migrationFromLegacyLt
+            ? `已完成从旧版 LeaderTeam v${installed.version} 到 Open Leader Team (OLT) v${staged.inspection.version} 的平滑迁移升级，重启 DeepSeek Harness 客户端后生效（全部配置与历史会话已保留）。`
+            : `已完成 v${staged.inspection.version} 安装，重启 DeepSeek Harness 客户端后生效（全部配置与历史会话已保留）。`,
         };
         writeUpdaterState(storageRoot, {
           phase: 'succeeded',
@@ -1364,17 +2020,21 @@ export async function performOneClickUpgrade({
     }
 
     restoreConfigSnapshotIfMissing(backup.backupDir, storageRoot);
+    reconcileConfigForTargetCapabilities(storageRoot, { supportsFollowPolicy: targetSupportsFollow });
     const completed = {
       ok: true,
       mode: 'dsh-cli',
       requiresRestart: true,
       fromVersion: installed.version,
       toVersion: staged.inspection.version,
+      ...upgradeMeta,
       track: staged.inspection.track,
       sha256: staged.sha256,
       backupId: backup.backupId,
       finishedAt: new Date().toISOString(),
-      message: `已成功安装 v${staged.inspection.version}（模型配置、历史会话与团队账本已完整保留）。`,
+      message: migrationFromLegacyLt
+        ? `已成功从旧版 LeaderTeam v${installed.version} 迁移升级至 Open Leader Team (OLT) v${staged.inspection.version}（模型配置、历史会话与团队账本已完整保留）。`
+        : `已成功安装 v${staged.inspection.version}（模型配置、历史会话与团队账本已完整保留）。`,
     };
     writeUpdaterState(storageRoot, {
       phase: 'succeeded',
@@ -1410,7 +2070,7 @@ export async function rollbackToSavedBackup({
   installerHook = null,
 } = {}) {
   if (!storageRoot) throw new Error('storageRoot is required for rollback');
-  const idleCheck = isRuntimeIdleForUpgrade(rt);
+  const idleCheck = isRuntimeIdleForUpgrade(rt, { storageRoot });
   if (!idleCheck.idle) {
     const err = new Error(`请等待当前任务空闲后再执行版本回滚：${idleCheck.reasons.join('；')}`);
     err.code = 'ROLLBACK_BUSY';
@@ -1427,6 +2087,16 @@ export async function rollbackToSavedBackup({
     throw err;
   }
 
+  const integrity = verifyBackupSnapshotIntegrity(chosen);
+  if (!integrity.intact) {
+    const err = new Error(`无法执行回滚：${integrity.reason}。当前运行安装保持不变。`);
+    err.code = 'CORRUPT_BACKUP_SNAPSHOT';
+    err.statusCode = 422;
+    err.details = integrity;
+    throw err;
+  }
+
+  const targetSupportsFollow = doesDirectorySupportFollowPolicy(chosen.pluginSnapshotDir);
   const rootCtx = ctx?.root ?? ctx;
   const pluginManager = typeof rootCtx?.get === 'function' ? rootCtx.get('pluginManager') : null;
   const hasHmr = Boolean(typeof rootCtx?.get === 'function' && rootCtx.get('hmr'));
@@ -1448,6 +2118,7 @@ export async function rollbackToSavedBackup({
           await pluginManager.removeBundle('dsh-leaderteam').catch(() => null);
           await pluginManager.installBundle(chosen.pluginSnapshotDir, { enabled: true });
           restoreConfigSnapshotIfMissing(chosen.backupDir, storageRoot);
+          reconcileConfigForTargetCapabilities(storageRoot, { supportsFollowPolicy: targetSupportsFollow });
           writeUpdaterState(storageRoot, {
             phase: 'rolled_back',
             activeUpgrade: null,
@@ -1492,14 +2163,22 @@ export async function rollbackToSavedBackup({
   }
 
   restoreConfigSnapshotIfMissing(chosen.backupDir, storageRoot);
+  reconcileConfigForTargetCapabilities(storageRoot, { supportsFollowPolicy: targetSupportsFollow });
   writeUpdaterState(storageRoot, {
     phase: 'rolled_back',
     activeUpgrade: null,
     lastError: null,
   });
+  const restoredEpoch = chosen.fromEpoch ?? inferPackageReleaseEpoch({
+    version: chosen.fromVersion,
+    track: chosen.fromTrack ?? 'open-source',
+  });
+  const restoredBrand = chosen.fromBrand ?? (restoredEpoch >= OLT_RELEASE_EPOCH ? OLT_BRAND_ID : 'leaderteam');
   return {
     ok: true,
     restoredVersion: chosen.fromVersion,
+    restoredEpoch,
+    restoredBrand,
     restoredTrack: chosen.fromTrack,
     backupId: chosen.backupId,
     requiresRestart: !hasHmr,

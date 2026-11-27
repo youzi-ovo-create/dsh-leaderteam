@@ -29,6 +29,7 @@ import {
 } from '../../host/runtime.mjs';
 import { resolveModelTarget } from '../../core/upstream-models.mjs';
 import {
+  sessionConfigPath,
   readSessionConfigRecord,
   hasActiveSessionOverride,
   hasPendingSessionOverride,
@@ -446,10 +447,6 @@ export function createPanelHandlers(ctx, rt = runtime(), options = {}) {
         const warnings = [...(applyResult?.warnings ?? [])];
         if (!body.dryRun) {
           syncRuntimeConfig(rt);
-          rebindAllIdleSessionsOnGlobalUserSave(rt, {
-            principal: { kind: 'user', source: 'panel-api' },
-          });
-          rebindAllUnstartedTeams(ctx, rt, { alignBlankSessions: !alignReq });
           if (applyResult) {
             dshSettingsSync = await syncActiveModelsToDshHost(
               ctx,
@@ -470,6 +467,13 @@ export function createPanelHandlers(ctx, rt = runtime(), options = {}) {
             ) {
               warnings.push(`DSH settings live-sync warning: ${dshSettingsSync.reason}`);
             }
+          }
+          rebindAllIdleSessionsOnGlobalUserSave(rt, {
+            principal: { kind: 'user', source: 'panel-api' },
+            ctx,
+          });
+          rebindAllUnstartedTeams(ctx, rt, { alignBlankSessions: !alignReq });
+          if (applyResult) {
             await refreshUpstreamCatalog(ctx, rt, { force: true }).catch(() => null);
           }
           if (alignReq && typeof alignReq.sessionId === 'string') {
@@ -662,17 +666,28 @@ export function createPanelHandlers(ctx, rt = runtime(), options = {}) {
             { configFile: rt.configPath, target: 'local', discoveredModels, autoAlignRoleEfforts: true },
           );
           syncRuntimeConfig(rt);
-          const idleRebind = rebindAllIdleSessionsOnGlobalUserSave(rt, { principal });
           await syncActiveModelsToDshHost(ctx, rt, rt.config, discoveredModels, gwStatus, [], {
             dshHome: explicitDshHome,
             syncDefaultModel: true,
           }).catch(() => null);
+          const idleRebind = rebindAllIdleSessionsOnGlobalUserSave(rt, { principal, ctx });
           return okReply({ idleRebind, state: await buildPanelStateSnapshot(ctx, rt) });
         }
 
         const sessionId = typeof body.sessionId === 'string' ? body.sessionId.trim() : '';
         if (!sessionId) return errReply('BAD_SESSION_ID', 'sessionId is required', 400);
-        const busy = inspectSessionBusyForConfig(rt, sessionId);
+        const rawBusy = inspectSessionBusyForConfig(rt, sessionId);
+
+        const hints = await resolveHostSessionModeHints(ctx, rt, sessionId, explicitDshHome);
+        if (!hints.sessionExists) {
+          return errReply('SESSION_NOT_FOUND', `Session "${sessionId}" does not exist`, 404);
+        }
+        const modeState = inspectSessionModeState(ctx, rt, sessionId, hints);
+        const busyReasons = [...rawBusy.reasons];
+        if (modeState.activeTurn && !busyReasons.includes('leader_turn_running')) {
+          busyReasons.push('leader_turn_running');
+        }
+        const busy = { busy: busyReasons.length > 0, reasons: busyReasons };
 
         if (action === 'get') {
           const rec = readSessionConfigRecord(rt.storageRoot, sessionId);
@@ -693,6 +708,10 @@ export function createPanelHandlers(ctx, rt = runtime(), options = {}) {
           });
         }
 
+        if (!modeState.isLtSession) {
+          return errReply('MODE_NOT_LT_SESSION', modeState.busyReason || `Session "${sessionId}" is not a LeaderTeam session`, 400);
+        }
+
         if (action === 'set') {
           const rawPatch = isPlainObj(body.patch) ? body.patch : {};
           const mut = mutateSessionConfig({
@@ -706,16 +725,20 @@ export function createPanelHandlers(ctx, rt = runtime(), options = {}) {
             busyReasons: busy.reasons,
             discoveredModels,
           });
+          await syncActiveModelsToDshHost(
+            ctx,
+            rt,
+            mut.targetEffectiveConfig ?? mut.effectiveConfig,
+            discoveredModels,
+            gwStatus,
+          ).catch(() => null);
           if (mut.appliedImmediately) {
-            rebindTeamGovernanceSnapshot(rt, sessionId, { principal, forceAtSafeBoundary: true });
-            const baseRt = baseRuntime(rt);
-            const liveAgent = baseRt?.actors?.get?.(sessionId)?.agent ?? baseRt?.hostAgents?.get?.(sessionId) ?? null;
-            if (liveAgent && typeof liveAgent.model?.select === 'function' && rawPatch.roles?.leader) {
-              try {
-                const effCfg = runtimeForTeam(sessionId).config;
-                liveAgent.model.select(resolveModelTarget(effCfg, effCfg.roles.leader.route, effCfg.roles.leader.effort));
-              } catch {}
-            }
+            rebindTeamGovernanceSnapshot(rt, sessionId, {
+              principal,
+              forceAtSafeBoundary: true,
+              ctx,
+              syncAgentModel: true,
+            });
           }
           return okReply({
             appliedImmediately: mut.appliedImmediately,
@@ -736,7 +759,13 @@ export function createPanelHandlers(ctx, rt = runtime(), options = {}) {
             busyReasons: busy.reasons,
           });
           if (mut.appliedImmediately) {
-            rebindTeamGovernanceSnapshot(rt, sessionId, { principal, forceAtSafeBoundary: true });
+            await syncActiveModelsToDshHost(ctx, rt, rt.config, discoveredModels, gwStatus).catch(() => null);
+            rebindTeamGovernanceSnapshot(rt, sessionId, {
+              principal,
+              forceAtSafeBoundary: true,
+              ctx,
+              syncAgentModel: true,
+            });
           }
           return okReply({
             appliedImmediately: mut.appliedImmediately,

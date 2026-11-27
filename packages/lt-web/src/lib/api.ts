@@ -386,10 +386,11 @@ export function computeTodayUsageSummary(
       ) {
         for (const c of activeReport.calls) {
           if (typeof c?.timeMs !== 'number' || c.timeMs < startOfTodayMs) continue;
-          if (c.ok !== false) succeededCount += 1;
+          const billed = c.ok !== false || (Number(c.totalTokens) || 0) > 0 || (Number(c.inputTokens) || 0) > 0 || (Number(c.outputTokens) || 0) > 0;
+          if (billed) succeededCount += 1;
           if (c.unmetered) {
             unknownCount += 1;
-          } else if (c.ok !== false) {
+          } else if (billed) {
             const amt = extractCnyAmount(c.costActualCny);
             if (amt !== null) {
               costSum += amt;
@@ -402,8 +403,12 @@ export function computeTodayUsageSummary(
         continue;
       }
 
-      const sessSucc = Number(s?.callsSucceeded) || 0;
-      succeededCount += sessSucc;
+      const sessBilled =
+        (Number(s?.callsSucceeded) || 0) > 0 ||
+        (Number(s?.totalTokens) || 0) > 0 ||
+        (Number(s?.unpricedCalls) || 0) > 0 ||
+        (Number(s?.unmeteredCalls) || 0) > 0;
+      if (sessBilled) succeededCount += 1;
       unknownCount += (Number(s?.unmeteredCalls) || 0) + (Number(s?.unpricedCalls) || 0);
       const amt = extractCnyAmount(s?.costActualCny);
       if (amt !== null) {
@@ -420,10 +425,11 @@ export function computeTodayUsageSummary(
   if (Array.isArray(activeReport?.calls)) {
     for (const c of activeReport.calls) {
       if (typeof c?.timeMs !== 'number' || c.timeMs < startOfTodayMs) continue;
-      if (c.ok !== false) succeededCount += 1;
+      const billed = c.ok !== false || (Number(c.totalTokens) || 0) > 0 || (Number(c.inputTokens) || 0) > 0 || (Number(c.outputTokens) || 0) > 0;
+      if (billed) succeededCount += 1;
       if (c.unmetered) {
         unknownCount += 1;
-      } else if (c.ok !== false) {
+      } else if (billed) {
         const amt = extractCnyAmount(c.costActualCny);
         if (amt !== null) {
           costSum += amt;

@@ -33,6 +33,9 @@ import {
   inspectTgzPackage,
   checkCandidatePackageCompatibility,
   computeFileSha256,
+  compareReleaseVersions,
+  reconcileConfigForTargetCapabilities,
+  doesDirectorySupportFollowPolicy,
   assertTargetReleaseTagMatchesPlatform,
 } from './updater.mjs';
 import {
@@ -782,12 +785,15 @@ function findBundledLocalTarballs(searchDirs = [], fsImpl = fs) {
             fileName: name,
             sizeBytes: fsImpl.statSync(full).size,
             version: info.version,
+            brand: info.brand,
+            releaseEpoch: info.releaseEpoch,
             track: info.track,
           });
         } catch {}
       }
     } catch {}
   }
+  found.sort((a, b) => compareReleaseVersions(b, a) ?? 0);
   return found;
 }
 
@@ -962,7 +968,7 @@ export function inspectInstallerEnvironment({
   }
 
   const bundledTarballs = findBundledLocalTarballs(
-    [process.cwd(), repoRoot, path.dirname(repoRoot), ...extraPackageDirs],
+    [env?.LT_INSTALLER_SOURCE_DIR, process.cwd(), repoRoot, path.dirname(repoRoot), ...extraPackageDirs],
     fsImpl,
   );
 
@@ -1172,6 +1178,7 @@ export async function runOneClickInstallation({
   let installedVersion = null;
   let installedTrack = track;
   let sha256 = null;
+  let targetSupportsFollow = true;
 
   if (sourceKind === 'local-tgz' || (sourceKind === 'auto' && localTgzPath)) {
     const fullTgz = path.resolve(localTgzPath);
@@ -1190,6 +1197,7 @@ export async function runOneClickInstallation({
     installedVersion = info.version;
     installedTrack = info.track;
     sha256 = computeFileSha256(fullTgz);
+    targetSupportsFollow = info.supportsFollowPolicy !== false;
   } else if (sourceKind === 'auto' && !targetVersion && envSnap.bundledTarballs.length > 0) {
     const picked = envSnap.bundledTarballs[0];
     const info = inspectTgzPackage(picked.path);
@@ -1206,10 +1214,12 @@ export async function runOneClickInstallation({
     installedVersion = info.version;
     installedTrack = info.track;
     sha256 = computeFileSha256(picked.path);
+    targetSupportsFollow = info.supportsFollowPolicy !== false;
   } else if ((sourceKind === 'local-source' || sourceKind === 'auto') && !targetVersion && envSnap.localSourceBundle.available) {
     installSpec = envSnap.localSourceBundle.path;
     installedVersion = envSnap.localSourceBundle.version;
     installedTrack = 'open-source';
+    targetSupportsFollow = doesDirectorySupportFollowPolicy(envSnap.localSourceBundle.path);
   } else {
     reportStep('download', `正在从 GitHub 下载最新「${UPDATE_TRACKS[track]?.shortLabel || track}」安装包并校验 SHA-256…`);
     const relCheck = await checkReleaseUpdates({
@@ -1247,6 +1257,7 @@ export async function runOneClickInstallation({
     installedVersion = downloaded.inspection.version;
     installedTrack = downloaded.inspection.track;
     sha256 = downloaded.sha256;
+    targetSupportsFollow = downloaded.inspection.supportsFollowPolicy !== false;
   }
 
   let desktopProfileInit = null;
@@ -1254,7 +1265,7 @@ export async function runOneClickInstallation({
     desktopProfileInit = ensureDesktopProfileInitialized(resolvedHome);
   }
 
-  reportStep('install', `正在向 DSH (${selectedTarget.profile} profile) 安装 LeaderTeam v${installedVersion || ''}…`);
+  reportStep('install', `正在向 DSH (${selectedTarget.profile} profile) 安装 Open Leader Team (OLT) v${installedVersion || ''}…`);
   if (typeof installerRunner === 'function') {
     await installerRunner({
       target: selectedTarget,
@@ -1276,6 +1287,11 @@ export async function runOneClickInstallation({
       throw err;
     }
   }
+
+  // Reconcile leaderModelPolicy compatibility record (e.g. restore 'follow' after upgrading back from legacy R3 'warn')
+  try {
+    reconcileConfigForTargetCapabilities(storageRoot, { supportsFollowPolicy: targetSupportsFollow });
+  } catch {}
 
   // 4b. Post-install Desktop `cordis.patch.yml` hygiene: remove stale manual `leaderteam-*` `- insert:` rows
   // while preserving provider/model patches and ensuring `- id: tool-web` (`fetch: true, searchTimeoutMs: 60000`)!
@@ -1359,8 +1375,8 @@ export async function runOneClickInstallation({
     dshHome: resolvedHome,
     nextStepHint:
       selectedTarget.kind === 'official-desktop'
-        ? '点击“立即启动客户端”即可直接打开 DeepSeek Harness 桌面端并进入新手引导。'
-        : '点击“立即启动 Web 控制台”即可直接在浏览器进入 LeaderTeam 工作台与新手引导。',
+        ? '点击“立即启动客户端”即可直接打开 DeepSeek Harness 桌面端并进入 Open Leader Team (OLT) 新手引导。'
+        : '点击“立即启动 Web 控制台”即可直接在浏览器进入 Open Leader Team (OLT) 工作台与新手引导。',
   };
 }
 

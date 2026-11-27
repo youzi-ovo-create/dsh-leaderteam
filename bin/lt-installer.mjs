@@ -502,8 +502,8 @@ export function renderInstallerHtml() {
 
       prog.textContent += '正在执行环境检查、插件安装与健康验证（首次安装可能需要 10~40 秒，请稍候）…\\n';
       const out = await api('/api/installer/install', payload);
-      prog.textContent += '✔ 安装成功！版本：v' + (out.installedVersion || '') + ' (' + out.installedTrack + ')\\n';
-      resBox.innerHTML = '<div class="alert ok"><strong>LeaderTeam v' + esc(out.installedVersion || '') + ' 安装成功！</strong><br>' + esc(out.nextStepHint) + '</div>';
+      prog.textContent += '✔ 安装成功！版本：Open Leader Team (OLT) v' + (out.installedVersion || '') + ' (' + out.installedTrack + ')\\n';
+      resBox.innerHTML = '<div class="alert ok"><strong>Open Leader Team (OLT) v' + esc(out.installedVersion || '') + ' 安装成功！</strong><br>' + esc(out.nextStepHint) + '</div>';
       document.getElementById('sp1').className = 'step-pill done';
       document.getElementById('sp3').className = 'step-pill done';
       document.getElementById('sp4').className = 'step-pill active';
@@ -837,7 +837,7 @@ if (isMain(import.meta.url)) {
           launchRes = await launchInstalledClient({ dshHome: opts.dshHome, targetId: res.target.id });
         }
         if (opts.json) console.log(JSON.stringify({ ok: true, install: res, launch: launchRes }, null, 2));
-        else console.log(`✔ LeaderTeam v${res.installedVersion} installed into ${res.target.label}.\n${res.nextStepHint}`);
+        else console.log(`✔ Open Leader Team (OLT) v${res.installedVersion} installed into ${res.target.label}.\n${res.nextStepHint}`);
         process.exit(0);
       } catch (e) {
         const f = e.friendly || translateInstallErrorToPlainChinese(e);
@@ -854,7 +854,7 @@ if (isMain(import.meta.url)) {
     });
     console.log([
       '============================================================',
-      '  LeaderTeam 图形化一键安装向导已启动',
+      '  Open Leader Team (OLT) 图形化一键安装向导已启动',
       `  请在浏览器打开：${srv.url}`,
       '  （完成安装后按 Ctrl+C 即可关闭本窗口）',
       '============================================================',

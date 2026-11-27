@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { runtime, baseRuntime, teamStore, runtimeForTeam, isPluginActive, activePluginsMap, effectiveRuntimeConfig, recordSessionModelRequest, resolveCanonicalRouteFromHostSelection, syncSessionLeaderSelectionFromHost, flushPendingSessionConfigAtSafeBoundary } from './runtime.mjs';
+import { markProcessActiveTurn, purgePreCreationOrphanSessionConfig } from '../core/session-config.mjs';
 import { TeamStore } from '../core/store.mjs';
 import { leaderSection, memberSection, directExecSection, singleModeSection } from '../core/prompts.mjs';
 import { readSessionModeHistory } from '../core/session-mode.mjs';
@@ -356,6 +357,12 @@ export function shouldApplyDefaultLeaderModel(rt, agent) {
 export function onAgentCreated(ctx, { agent }) {
   const actor = resolveActor(ctx, agent);
   if (!actor) return;
+  if (actor.role === 'leader') {
+    const baseRtForOrphan = baseRuntime(runtime());
+    if (baseRtForOrphan?.storageRoot && agent?.session?.header?.createdAt != null) {
+      purgePreCreationOrphanSessionConfig(baseRtForOrphan.storageRoot, actor.teamId, agent.session.header.createdAt);
+    }
+  }
   const rt = runtimeForTeam(actor.teamId), cfg = rt.config;
   if (actor.role === 'leader') {
     const mode = actor.executionMode ?? getSessionExecutionMode(rt, actor.teamId);
@@ -459,7 +466,13 @@ export function onAgentDisposed({ agent }) {
     }
     rt.memberErrors?.delete(agent.id);
   }
-  if (agent) disposeHandleList(subagentPromptDisposers, agent);
+  if (agent) {
+    disposeHandleList(subagentPromptDisposers, agent);
+    if (agent.id) {
+      markProcessActiveTurn(rt.storageRoot, agent.id, false);
+      baseRuntime(rt).liveRunningTurnSessions?.delete?.(agent.id);
+    }
+  }
   if (actor?.agent === agent) { rt.actors.delete(agent.id); rt.reads.delete(agent.id); rt.readProgress?.delete(agent.id); baseRuntime(rt).circuitStates?.delete(agent.id); baseRuntime(rt).pendingMemberContinuations?.delete(agent.id); }
 }
 
@@ -609,22 +622,50 @@ function maybeRecoverSingleLeaderMaxTokens(rt, actor, agent) {
 export function onAgentStatus(ctx, { agent, status } = {}) {
   let rt = runtime();
   if (!rt.config || !rt.storageRoot || !agent) return;
+  const baseRt = baseRuntime(rt);
+  if (agent.id) {
+    if (status === 'running' || status === 'streaming' || status === 'busy') {
+      markProcessActiveTurn(baseRt.storageRoot, agent.id, true);
+    } else if (status === 'idle' || status === 'error' || status === 'aborted' || status === 'cancelled' || status === 'stopped') {
+      markProcessActiveTurn(baseRt.storageRoot, agent.id, false);
+    }
+  }
   // DSH announces running before resolving the first step's model, tools and prompt.
   if (status === 'running') syncDesktopLeaderRole(ctx, agent);
   const actor = (rt.actors.get(agent.id)?.agent === agent ? rt.actors.get(agent.id) : null) ?? resolveActor(ctx, agent);
   rt = runtimeForTeam(actor?.teamId);
   if (actor?.role === 'leader') {
     if (status === 'running') {
-      const syncSel = syncSessionLeaderSelectionFromHost(ctx, baseRuntime(rt), agent, { atUserTurnStart: true });
+      baseRt.liveRunningTurnSessions ??= new Set();
+      const isFreshTurnStart = !baseRt.liveRunningTurnSessions.has(actor.teamId);
+      baseRt.liveRunningTurnSessions.add(actor.teamId);
+      let flushedCrashPending = false;
+      if (isFreshTurnStart) {
+        if (baseRt.storageRoot && TeamStore.exists(baseRt.storageRoot, actor.teamId)) {
+          try { reconcileStaleMembers(rt, teamStore(actor.teamId)); } catch {}
+        }
+        const flushRes = flushPendingSessionConfigAtSafeBoundary(ctx, baseRt, actor.teamId, {
+          ignoreLeaderRunning: true,
+        });
+        flushedCrashPending = Boolean(flushRes?.flushed);
+      }
+      const syncSel = syncSessionLeaderSelectionFromHost(ctx, baseRt, agent, { atUserTurnStart: true });
       rt = runtimeForTeam(actor.teamId);
       const liveMode = getSessionExecutionMode(rt, actor.teamId);
-      if (syncSel?.appliedImmediately || actor.executionMode !== liveMode || actor.promptAppliedMode !== liveMode) {
+      if (
+        flushedCrashPending ||
+        syncSel?.appliedImmediately ||
+        syncSel?.refreshedHostFromLtConfig ||
+        actor.executionMode !== liveMode ||
+        actor.promptAppliedMode !== liveMode
+      ) {
         syncLeaderAgentMode(ctx, rt, actor.teamId);
       }
       return;
     }
     if (status === 'idle') {
-      flushPendingSessionConfigAtSafeBoundary(ctx, baseRuntime(rt), actor.teamId);
+      baseRt.liveRunningTurnSessions?.delete?.(actor.teamId);
+      flushPendingSessionConfigAtSafeBoundary(ctx, baseRt, actor.teamId);
       rt = runtimeForTeam(actor.teamId);
       if (getSessionExecutionMode(rt, actor.teamId) === 'single') {
         maybeRecoverSingleLeaderMaxTokens(rt, actor, agent);
