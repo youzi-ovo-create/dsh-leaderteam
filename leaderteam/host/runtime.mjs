@@ -48,6 +48,111 @@ export function runtime() {
 
 export function baseRuntime(rt = runtime()) { return rt[BASE_RUNTIME] ?? rt; }
 
+/** True once a team has recorded any workflow, member, agreement, or governance activity (after which governance is immutable). */
+export function isTeamExecutionStarted(store) {
+  if (!store) return false;
+  try {
+    if (store.workflowEvents().length > 0) return true;
+    if (store.members().size > 0) return true;
+    if (store.agreementIds().length > 0) return true;
+    if (store.governanceEvents().length > 0) return true;
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+/** Rebind `governance.json` to current `rt.config` ONLY when the team has not started any workflow/execution yet. */
+export function rebindUnstartedTeamGovernance(rt = runtime(), teamId) {
+  rt = baseRuntime(rt);
+  if (!teamId || !rt.config || !rt.storageRoot) return { rebound: false, reason: 'not-ready' };
+  let storeId;
+  try { storeId = encodeTeamStoreId(teamId, rt.storageRoot); } catch { return { rebound: false, reason: 'bad-id' }; }
+  const store = teamStore(teamId);
+  if (!fs.existsSync(store.dir)) return { rebound: false, reason: 'no-store' };
+  if (isTeamExecutionStarted(store)) return { rebound: false, reason: 'already-started' };
+  const file = path.join(store.dir, 'governance.json');
+  let prevRecord = null;
+  try {
+    if (fs.existsSync(file)) prevRecord = JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch {}
+  let prevLeaderTarget = null;
+  if (prevRecord?.config?.roles?.leader?.route) {
+    try {
+      const prevValidated = validateConfig(prevRecord.config);
+      prevLeaderTarget = resolveModelTarget(prevValidated, prevValidated.roles.leader.route, prevValidated.roles.leader.effort);
+    } catch {}
+  }
+  const sessionRec = readSessionConfigRecord(rt.storageRoot, teamId);
+  const mergedCfg = applySessionPatchToConfig(rt.config, sessionRec);
+  const config = structuredClone(mergedCfg);
+  delete config.derived;
+  const sourceSha256 = hashJson(config);
+  const changed = !prevRecord || prevRecord.sourceSha256 !== sourceSha256;
+  if (changed) {
+    const record = {
+      v: 1,
+      createdAt: prevRecord?.createdAt ?? new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      sourceSha256,
+      config,
+    };
+    writeFileAtomic(file, JSON.stringify(record, null, 1));
+  }
+  rt.teamConfigViews?.delete(`${rt.storageRoot}:${storeId}`);
+  rt.teamConfigViews?.delete(`${rt.storageRoot}:${teamId}`);
+  const nextLeaderTarget = resolveModelTarget(mergedCfg, mergedCfg.roles.leader.route, mergedCfg.roles.leader.effort);
+  return { rebound: true, changed, prevLeaderTarget, nextLeaderTarget };
+}
+
+/** Refresh all unstarted team governance snapshots (and optionally align blank 0-message Leader sessions) after config save. */
+export function rebindAllUnstartedTeams(_ctx, rt = runtime(), { alignBlankSessions = true } = {}) {
+  rt = baseRuntime(rt);
+  if (!rt?.config || !rt?.storageRoot) return { reboundTeamIds: [], alignedSessionIds: [] };
+  const candidateIds = new Set();
+  for (const actor of rt.actors?.values() ?? []) {
+    if (actor?.role === 'leader' && actor.teamId) candidateIds.add(actor.teamId);
+  }
+  const prefix = `${rt.storageRoot}:`;
+  for (const key of rt.teamConfigViews?.keys() ?? []) {
+    if (key.startsWith(prefix)) {
+      try { candidateIds.add(resolveTeamStoreLogicalId(rt.storageRoot, key.slice(prefix.length))); } catch { candidateIds.add(key.slice(prefix.length)); }
+    }
+  }
+  const teamsDir = path.join(rt.storageRoot, 'teams');
+  try {
+    if (fs.existsSync(teamsDir)) {
+      for (const d of fs.readdirSync(teamsDir, { withFileTypes: true }).slice(0, 60)) {
+        if (d.isDirectory()) {
+          try { candidateIds.add(resolveTeamStoreLogicalId(rt.storageRoot, d.name)); } catch { candidateIds.add(d.name); }
+        }
+      }
+    }
+  } catch {}
+  const reboundTeamIds = [];
+  for (const tid of candidateIds) {
+    const res = rebindUnstartedTeamGovernance(rt, tid);
+    if (res.rebound && res.changed) reboundTeamIds.push(tid);
+  }
+  const alignedSessionIds = [];
+  if (alignBlankSessions) {
+    for (const actor of rt.actors?.values() ?? []) {
+      if (actor?.role !== 'leader' || !actor.agent?.model?.select) continue;
+      const store = teamStore(actor.teamId);
+      if (isTeamExecutionStarted(store)) continue;
+      const userMsgs = (actor.agent.session?.snapshotEvents?.() ?? []).filter(e => e?.type === 'user/message');
+      if (userMsgs.length > 0) continue;
+      try {
+        const teamCfg = runtimeForTeam(actor.teamId).config;
+        const target = resolveModelTarget(teamCfg, teamCfg.roles.leader.route, teamCfg.roles.leader.effort);
+        actor.agent.model.select(target);
+        alignedSessionIds.push(actor.teamId);
+      } catch {}
+    }
+  }
+  return { reboundTeamIds, alignedSessionIds };
+}
+
 /** Immutable during active execution; user-rebindable when idle and layerable with per-session overrides. */
 export function runtimeForTeam(teamId) {
   const rt = runtime();

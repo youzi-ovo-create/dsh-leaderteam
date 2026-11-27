@@ -60,9 +60,11 @@ export function formatFrontierContext(store, taskSeq, cfg = null) {
   });
   const remaining = { missing_stage_ids: v.overview.future_work.filter(id => !v.stages.some(s => s.stage_id === id)), provisional_stage_ids: v.stages.filter(s => !s.ready).map(s => s.stage_id) };
   if (autonomous) {
-    const next = frontierNeedsPlanning(store, taskSeq)
-      ? 'Autonomous execution mode: dispatch ready stages (`ready_to_dispatch`) immediately with `team_dispatch` WITHOUT waiting for `plan_id` or Dual Reviewers; Dual Reviewers supervise asynchronously in the background. Keep planning useful future stages as needed.'
-      : 'Autonomous execution mode: dispatch any unblocked `ready_to_dispatch` stage immediately with `team_dispatch` (or use `team_direct_exec` for local checks/fixes). If dependencies, write scopes or capacity block remaining dispatches, declare `team_status(stop_state="waiting_members")` once and END THIS TURN.';
+    const next = v.stages.length === 0
+      ? 'Autonomous progressive planning: define ONLY the first executable stage(s) (`ready=true` for their own boundary; leave downstream stages in `future_work` or `ready=false`) and call `team_dispatch` immediately — do NOT wait to design every future stage up front.'
+      : frontierNeedsPlanning(store, taskSeq)
+        ? 'Autonomous execution mode: dispatch ready stages (`ready_to_dispatch`) immediately with `team_dispatch` WITHOUT waiting for `plan_id` or Dual Reviewers; Dual Reviewers supervise asynchronously in the background. Elaborate remaining future stages incrementally while members run.'
+        : 'Autonomous execution mode: dispatch any unblocked `ready_to_dispatch` stage immediately with `team_dispatch` (or use `team_direct_exec` for workspace-confined checks/fixes). If dependencies, write scopes or capacity block remaining dispatches, declare `team_status(stop_state="waiting_members")` once and END THIS TURN.';
     const stages = v.stages.map(({ verification, ...stage }) => ({ ...stage, ...(verification && { verification_state: verification.status }) }));
     return `LeaderTeam rolling planning revision ${v.revision}:\n` + JSON.stringify({ stages, remaining_planning: remaining, ...(feedback.length ? { recent_feedback: feedback } : {}) }) + '\n' + next + ' `member_done` records member completion; verify actual behavior before final delivery.';
   }

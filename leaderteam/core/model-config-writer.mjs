@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { LtError, FAMILIES, MODEL_ROUTE_RE, EFFORT_ID_RE, DSH_EFFORTS } from './constants.mjs';
-import { validateConfig, deepMergePlain, routeModel } from './config.mjs';
+import { validateConfig, deepMergePlain, mergeConfigLayers, pruneExecutionFallbacksMap, routeModel } from './config.mjs';
 import { writeFileAtomic, writeFilesTransactional, appendJsonl } from './store.mjs';
 import { hashJson } from './canonical.mjs';
 
@@ -969,12 +969,45 @@ export function applyModelConfigChanges(changes = {}, options = {}) {
     }
   }
 
+  // 5c. Auto-prune stale `team.executionFallbacks` routes when `executionPool`, families, or models change
+  if (touched.pool || touched.removedModels.size > 0 || (changes.poolDisableFamilies?.length ?? 0) > 0) {
+    if (target === 'base' && isPlainObj(nextBase.team?.executionFallbacks)) {
+      const { next, pruned } = pruneExecutionFallbacksMap(
+        nextBase.team.executionFallbacks,
+        nextBase.team.executionPool,
+        nextBase.models,
+        nextBase.team.disabledModels,
+        nextBase.team.disabledFamilies,
+      );
+      if (pruned.length > 0) {
+        if (next) nextBase.team.executionFallbacks = next;
+        else delete nextBase.team.executionFallbacks;
+        warnings.push(`pruned ${pruned.length} stale team.executionFallbacks route(s) after executionPool update (${pruned.slice(0, 4).join('; ')}${pruned.length > 4 ? '; ...' : ''})`);
+      }
+    }
+    if (hasExistingLocal && isPlainObj(nextLocal.team?.executionFallbacks)) {
+      const preview = mergeConfigLayers(nextBase, nextLocal);
+      const { next, pruned } = pruneExecutionFallbacksMap(
+        nextLocal.team.executionFallbacks,
+        preview.team?.executionPool,
+        preview.models,
+        preview.team?.disabledModels,
+        preview.team?.disabledFamilies,
+      );
+      if (pruned.length > 0) {
+        if (next) nextLocal.team.executionFallbacks = next;
+        else delete nextLocal.team.executionFallbacks;
+        warnings.push(`pruned ${pruned.length} stale local team.executionFallbacks route(s) after executionPool update`);
+      }
+    }
+  }
+
   pruneEmptyObjects(nextLocal);
 
   // 6. Strict validation of BOTH standalone base and merged (base + local) before any disk write
   const validatedBase = validateConfig(nextBase);
   const hasEffectiveLocal = hasExistingLocal || Object.keys(nextLocal).length > 0;
-  const mergedRaw = hasEffectiveLocal ? deepMergePlain(nextBase, nextLocal) : nextBase;
+  const mergedRaw = hasEffectiveLocal ? mergeConfigLayers(nextBase, nextLocal) : nextBase;
   const effective = validateConfig(mergedRaw);
 
   // 7. Detect local overrides shadowing base edits
