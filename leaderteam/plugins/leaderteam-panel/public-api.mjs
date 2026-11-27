@@ -438,7 +438,7 @@ export function buildCapabilitiesPayload(ctx, rt, { hostKindOverride = null } = 
   const hasDshWeb = hostKind === 'dsh-web';
 
   return {
-    backendLine: 'v2.2.x-oss',
+    backendLine: 'olt-v1.0-oss',
     backendVersion: pkg.version,
     hostKind,
     frontendSwitch: {

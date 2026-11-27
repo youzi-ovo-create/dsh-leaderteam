@@ -26,6 +26,9 @@ import {
   inspectTgzPackage,
   checkCandidatePackageCompatibility,
   checkForUpdates,
+  downloadAndVerifyReleaseTarball,
+  isRuntimeIdleForUpgrade,
+  readUpdaterState,
   performOneClickUpgrade,
   rollbackToSavedBackup,
 } from '../../leaderteam/core/updater.mjs';
@@ -420,6 +423,19 @@ test('Issue #3: Dual-track isolation, SHA-256 verification, host pre-check, data
     assert.equal(checkRes.latestRelease.version, '2.2.9');
     assert.match(checkRes.latestRelease.body, /Auto update & rollback/);
 
+    const previewFetch = async () => Response.json([
+      { tag_name: 'v2.3.0-rc.1', prerelease: true, assets: [{ name: 'dsh-leaderteam-2.3.0-rc.1.tgz', browser_download_url: 'https://example.test/p.tgz' }] },
+    ]);
+    const preview = await checkForUpdates({ pluginRoot: fakePluginRoot, storageRoot, fetchImpl: previewFetch, includePrerelease: true });
+    assert.equal(preview.latestRelease.version, '2.3.0-rc.1');
+    const stable = await checkForUpdates({ pluginRoot: fakePluginRoot, storageRoot, fetchImpl: previewFetch });
+    assert.equal(stable.latestRelease.version, '2.2.9');
+    assert.equal(stable.fromCache, true);
+
+    const download = { storageRoot, downloadUrl: 'https://mock.example/dsh-leaderteam-2.2.9.tgz', fetchImpl: mockFetch };
+    await assert.rejects(downloadAndVerifyReleaseTarball(download), { code: 'SHA256_UNAVAILABLE' });
+    await assert.rejects(downloadAndVerifyReleaseTarball({ ...download, expectedSha256: v229Sha, expectedVersion: '2.2.8' }), { code: 'PACKAGE_VERSION_MISMATCH' });
+
     // 3. Tampered SHA-256 MUST abort before installerHook runs
     let hookCalls = [];
     await assert.rejects(
@@ -527,7 +543,30 @@ test('Issue #3: Dual-track isolation, SHA-256 verification, host pre-check, data
     assert.equal(rbOk.ok, true);
     assert.equal(rbOk.restoredVersion, '2.2.3');
     assert.equal(installedSpecVersion, '2.2.3');
+
+    const manager = {
+      async removeBundle() { return { application: 'succeeded' }; },
+      async installBundle() { return { application: 'failed', error: { diagnostic: 'restore rejected' } }; },
+    };
+    const ctx = { get(name) { return { pluginManager: manager, hmr: true }[name]; } };
+    const scheduled = await rollbackToSavedBackup({ ctx, storageRoot, backupId: upgOk.backupId });
+    assert.equal(scheduled.asyncApplying, true);
+    await new Promise(resolve => setTimeout(resolve, 180));
+    const state = readUpdaterState(storageRoot);
+    assert.equal(state.phase, 'failed');
+    assert.equal(state.lastError, 'restore rejected');
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
+});
+
+test('upgrades distinguish terminal member history from active members and in-flight calls', () => {
+  const records = new Map([['m', { childId: 'm', status: 'done' }]]);
+  const rt = { liveProcessMemberIds: new Set(['m']), stores: new Map([['t', { members: () => records }]]) };
+  assert.equal(isRuntimeIdleForUpgrade(rt).idle, true);
+  records.get('m').status = 'running';
+  assert.equal(isRuntimeIdleForUpgrade(rt).idle, false);
+  records.get('m').status = 'failed';
+  rt.inFlightShellCallsBySession = new Map([['t', 1]]);
+  assert.equal(isRuntimeIdleForUpgrade(rt).idle, false);
 });

@@ -286,7 +286,7 @@ export class Gate {
         cmdLower.includes('session-config.json') ||
         (cmdLower.includes('governance.json') && cmdLower.includes('teams'))
       ) {
-        if (/(?:>|tee\b|sed\s+-i|mv\b|cp\b|rm\b|python|node\s+-e|writefile)/i.test(args.command)) {
+        if (/(?:>|tee\b|sed\s+-i|mv\b|cp\b|rm\b|python|node\s+-e|writefile|\b(?:set-content|add-content|out-file|copy-item|move-item|remove-item|rename-item|clear-content)\b)/i.test(args.command.replaceAll('`', ''))) {
           return {
             rule: 'protected-lt-config',
             reason: 'Shell commands initiated by an agent may not modify LeaderTeam configuration or governance files.',

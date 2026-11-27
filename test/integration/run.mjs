@@ -22,7 +22,11 @@ const fwd = p => p.replace(/\\/g, '/');
 function merge(a, b) { for (const [k, v] of Object.entries(b ?? {})) { if (v && typeof v === 'object' && !Array.isArray(v) && a[k] && typeof a[k] === 'object' && !Array.isArray(a[k])) merge(a[k], v); else a[k] = v; } return a; }
 
 async function runScenario(name, scenario) {
-  const workDir = path.join(process.env.LT_WORK_DIR ?? path.join(ROOT, 'test-work'), `${name}-${Date.now()}`);
+  // On Windows, place default scenario workspaces under user-owned os.tmpdir() so @deepseek-ai/dsh-sandbox-windows-acl
+  // SetNamedSecurityInfoW (grantWrite / WRITE_DAC) succeeds even when the repo checkout sits on a shared drive with Modify-only ACLs.
+  const autoTempWorkRoot = !process.env.LT_WORK_DIR && process.platform === 'win32';
+  const baseWorkRoot = process.env.LT_WORK_DIR ?? (autoTempWorkRoot ? path.join(os.tmpdir(), 'olt-integration-work') : path.join(ROOT, 'test-work'));
+  const workDir = path.join(baseWorkRoot, `${name}-${Date.now()}`);
   const ws = path.join(workDir, 'ws'), home = path.join(workDir, 'home'), store = path.join(workDir, 'lt-store'), globalRefs = path.join(workDir, 'global-refs');
   for (const d of [ws, home, store, globalRefs]) fs.mkdirSync(d, { recursive: true });
   fs.writeFileSync(path.join(globalRefs, 'GLOBAL.md'), 'global reference\n');
@@ -49,6 +53,14 @@ async function runScenario(name, scenario) {
     let payload; try { payload = JSON.parse(body); } catch { res.writeHead(400); res.end('bad'); return; }
     const c = classify(payload);
     c.index = calls.filter(x => x.kind === c.kind && x.who === c.who).length + 1;
+    const maxCalls = scenario.maxCalls ?? 150;
+    if (calls.length >= maxCalls) {
+      t.exceededMaxCalls = `Scenario "${name}" exceeded max LLM calls (${maxCalls}) — possible infinite loop`;
+      res.writeHead(500, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: t.exceededMaxCalls } }));
+      setTimeout(() => t.activeChild?.kill(), 50);
+      return;
+    }
     let reply;
     try { reply = await scenario.respond(c, t); } catch (e) { reply = { content: `SCENARIO_ERROR ${e.message}` }; }
     reply ??= { content: 'NO_SCRIPT' };
@@ -56,6 +68,16 @@ async function runScenario(name, scenario) {
 
     calls.push({ ...c, reply });
     if (reply.httpStatus) { res.writeHead(reply.httpStatus, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: { message: 'scripted failure' } })); return; }
+    if (reply.hangStream) {
+      if (reply.sendHeaders !== false) {
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        if (typeof reply.rawPreface === 'string') res.write(reply.rawPreface);
+      }
+      const hangTimer = setTimeout(() => { try { res.destroy(); } catch {} }, reply.hangMs ?? 30000);
+      hangTimer.unref?.();
+      req.on('close', () => clearTimeout(hangTimer));
+      return;
+    }
     const common = { id: `chatcmpl-${calls.length}`, object: 'chat.completion.chunk', created: 1, model: payload.model };
     const adaptToolArgs = (toolName, rawArgs) => {
       if ((toolName === 'send_message' || toolName === 'interrupt_agent') && rawArgs && typeof rawArgs === 'object' && 'agent_id' in rawArgs && !('agent' in rawArgs)) {
@@ -111,17 +133,20 @@ async function runScenario(name, scenario) {
   const patches = [mat(path.join(ROOT, 'config/magpie-models.patch.yml')), mat(path.join(ROOT, 'config/headless.patch.yml')), ...(scenario.extraPatches ?? []).map(p => mat(path.join(ROOT, p)))];
   const runtime = resolveDshRuntime();
   const runOnce = (task, sessionId) => new Promise(resolve => {
-    const args = [...runtime.cliArgs, 'headless', ...patches.flatMap(p => ['--patch', p]), '--json', ...(sessionId ? ['--session-id', sessionId] : []), '-'];
+    const useStdin = process.platform !== 'win32';
+    const args = [...runtime.cliArgs, 'headless', ...patches.flatMap(p => ['--patch', p]), '--json', ...(sessionId ? ['--session-id', sessionId] : []), ...(useStdin ? ['-'] : ['--', task])];
     const nodeBinDir = path.dirname(process.execPath);
     const curPath = process.env.PATH ?? '';
     const childPath = curPath.split(path.delimiter).includes(nodeBinDir) ? curPath : `${nodeBinDir}${path.delimiter}${curPath}`;
-    const child = spawn(runtime.exe, args, { cwd: ws, env: { ...process.env, PATH: childPath, ELECTRON_RUN_AS_NODE: '1', DSH_HOME: home, DSH_TELEMETRY_DISABLED: '1', LT_TEST_KEY: 'local-test-key', LEADERTEAM_HEADLESS_LEADER: scenario.teamLeader === false ? '0' : '1' }, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+    const child = spawn(runtime.exe, args, { cwd: ws, env: { ...process.env, PATH: childPath, ELECTRON_RUN_AS_NODE: '1', DSH_HOME: home, DSH_TELEMETRY_DISABLED: '1', LT_TEST_KEY: 'local-test-key', LEADERTEAM_HEADLESS_LEADER: scenario.teamLeader === false ? '0' : '1' }, windowsHide: true, stdio: [useStdin ? 'pipe' : 'ignore', 'pipe', 'pipe'] });
+    t.activeChild = child;
     let out = '', err = '';
     child.stdout.on('data', d => out += d); child.stderr.on('data', d => err += d);
-    child.stdin.end(task);
+    if (useStdin) child.stdin.end(task);
     const timer = setTimeout(() => child.kill(), (scenario.timeoutSec ?? 150) * 1000);
     child.on('close', code => {
       clearTimeout(timer);
+      if (t.activeChild === child) t.activeChild = null;
       const events = out.split(/\r?\n/).filter(l => l.startsWith('{')).map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
       const run = { code, events, stderr: err, final: events.find(e => e.type === 'final'), sessionId: events.find(e => e.type === 'session')?.sessionId };
       t.runs.push(run); resolve(run);
@@ -134,6 +159,7 @@ async function runScenario(name, scenario) {
       const prev = t.runs.at(-1);
       if (scenario.beforeRun) await scenario.beforeRun(t, { cfgFile, index: t.runs.length });
       await runOnce(step.task, step.resume ? prev?.sessionId : undefined);
+      if (t.exceededMaxCalls) throw new Error(t.exceededMaxCalls);
     }
     await scenario.assert(t);
     result = { name, pass: true, ms: Date.now() - started };
@@ -141,6 +167,9 @@ async function runScenario(name, scenario) {
     result = { name, pass: false, ms: Date.now() - started, error: e.stack ?? String(e), stderrTail: t.runs.at(-1)?.stderr.split('\n').filter(l => !l.startsWith('[harness-node]')).slice(-25).join('\n') };
   } finally { await new Promise(r => server.close(r)); }
   fs.writeFileSync(path.join(workDir, 'result.json'), JSON.stringify({ ...result, calls: calls.map(({ payload, ...c }) => c), runs: t.runs.map(r => ({ code: r.code, final: r.final, events: r.events })) }, null, 1));
+  if (result.pass && autoTempWorkRoot && process.env.LT_KEEP_WORK_DIR !== '1') {
+    try { fs.rmSync(workDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); } catch {}
+  }
   return result;
 }
 

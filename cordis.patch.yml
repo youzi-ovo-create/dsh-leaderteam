@@ -23,8 +23,8 @@
       name: '@deepseek-ai/dsh-agent-preset'
       config:
         id: leaderteam
-        name: LeaderTeam
-        description: 分权自治多Agent协作、0ms确定性安全门与四维物理Token账本
+        name: Open Leader Team (OLT)
+        description: 分权自治多Agent协作、0ms确定性安全门与四维物理Token账本（兼容继承 Leader Team）
         order: 0
         plugins:
           - id: persona
@@ -75,7 +75,7 @@
       name: '@deepseek-ai/dsh-agent-preset'
       config:
         id: lt-member-readonly
-        name: LeaderTeam 成员（只读）
+        name: Open Leader Team 成员（只读）
         order: 90
         plugins:
           - id: persona
@@ -113,7 +113,7 @@
       name: '@deepseek-ai/dsh-agent-preset'
       config:
         id: lt-member-code
-        name: LeaderTeam 成员（代码）
+        name: Open Leader Team 成员（代码）
         order: 91
         plugins:
           - id: persona
@@ -147,7 +147,7 @@
       name: '@deepseek-ai/dsh-agent-preset'
       config:
         id: lt-member-shell
-        name: LeaderTeam 成员（代码+命令行）
+        name: Open Leader Team 成员（代码+命令行）
         order: 92
         plugins:
           - id: persona

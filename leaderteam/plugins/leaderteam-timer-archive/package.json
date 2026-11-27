@@ -1,6 +1,6 @@
 {
   "name": "@leaderteam/plugin-timer-archive",
-  "version": "2.2.0",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
   "description": "Detachable LeaderTeam engineering timer, fixed external plan archive, anti-stagnation best-plan selector, and post-execution retrospective plugin.",

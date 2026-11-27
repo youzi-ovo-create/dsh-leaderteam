@@ -142,7 +142,7 @@ test('V2.2.3 Contracts (1.1.0): bundle capabilities.features.inSessionDualMode, 
   const webTs = fs.readFileSync(path.join(repoRoot, 'packages', 'lt-web', 'src', 'types', 'lt-public-v1.ts'), 'utf8');
   assert.equal(webTs, sharedDts);
 
-  // Live bundle emits 1.1.0 + backendVersion 2.2.3 + inSessionDualMode: true and passes validator
+  // Live bundles report the installed version and retain the dual-mode contract.
   const fakeCtx = {
     webServer: { port: 3080 },
     sessionController: { async list() { return { items: [] }; } },
@@ -155,7 +155,7 @@ test('V2.2.3 Contracts (1.1.0): bundle capabilities.features.inSessionDualMode, 
   const bundleEnvelope = await (await h.bundle(makeJsonPost({}, 'http://127.0.0.1/api/lt/v1/bundle'))).json();
   assert.equal(bundleEnvelope.ok, true);
   assert.equal(bundleEnvelope.contractVersion, '1.1.0');
-  assert.equal(bundleEnvelope.data.capabilities.backendVersion, '2.2.3');
+  assert.equal(bundleEnvelope.data.capabilities.backendVersion, JSON.parse(fs.readFileSync(path.join(repoRoot, 'package.json'), 'utf8')).version);
   assert.equal(bundleEnvelope.data.capabilities.features.inSessionDualMode, true);
   const liveCheck = validateContractBundle(bundleEnvelope);
   assert.equal(liveCheck.ok, true, liveCheck.errors.join('; '));
@@ -706,7 +706,7 @@ test('V2.2.3 DSH Panel (`panel-api.mjs` & `client.js`) + LT Native Frontend (`ap
   assert.ok(renderedTree.includes('切换为 Team'));
 
   // Verify `lt-web/src/lib/api.ts` preserves `LtApiError` (`code`, `status`, `details.modeState`) on 409 responses
-  const { LtApiError, switchWorkbenchSessionMode } = await import('../../packages/lt-web/src/lib/api.ts');
+  const { LtApiError, switchWorkbenchSessionMode } = (await import('./lt-web-api.mjs')).default;
   const prevFetch = globalThis.fetch;
   const prevWin = globalThis.window;
   try {
@@ -1132,7 +1132,7 @@ test('Stage 7 Frontend Regressions (V223-UI-05, UI-06, UI-08): WorkbenchView HUD
   const { createRequire } = await import('node:module');
   const webRequire = createRequire(path.join(repoRoot, 'packages', 'lt-web', 'package.json'));
   const esbuild = webRequire('esbuild');
-  const { applyThemeToDom, computeContrastRatio } = await import('../../packages/lt-web/src/lib/api.ts');
+  const { applyThemeToDom, computeContrastRatio } = (await import('./lt-web-api.mjs')).default;
 
   // 1. V223-UI-08 (Theme): Dark `custom` theme (`surfLum < 0.25`) sets WCAG AA semantic tokens & cleans up when leaving custom/dark
   const prevDoc = globalThis.document;
@@ -2066,6 +2066,5 @@ test('Stage 9 Product Regressions (S8-E2E-01a/b/c, S8-E2E-02, S8-E2E-03, S8-E2E-
   assert.match(noticesText, /MIT/);
   assert.match(noticesText, /packages\/lt-usage\/NOTICE\.md/);
   const rootPkg = JSON.parse(fs.readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
-  assert.equal(rootPkg.version, '2.2.3');
   assert.ok(rootPkg.files.includes('THIRD_PARTY_NOTICES.md'));
 });

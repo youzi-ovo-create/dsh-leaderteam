@@ -145,6 +145,14 @@ export default {
         }
         return { content: 'Waiting for impl-compiler to complete.' };
       }
+      if (mem && ['blocked', 'failed', 'cancelled'].includes(mem.status)) {
+        const reason = `member ${mem.name} entered ${mem.status}${mem.error ? `: ${mem.error}` : ''}`;
+        if (!t.state.declaredMemberFailed) {
+          t.state.declaredMemberFailed = true;
+          return tool('team_status', { stop_state: 'blocked', reason });
+        }
+        return { content: `BLOCKED: ${reason}` };
+      }
       if (mem?.status === 'done') {
         if (!t.state.delivered) {
           t.state.delivered = true;

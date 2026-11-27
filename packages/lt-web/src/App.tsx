@@ -534,7 +534,7 @@ export function App() {
         <footer className="status">
           <span className="status-item">
             <i className="dot idle" />
-            正在载入 Leader Team 工程工作台…
+            正在载入 Open Leader Team (OLT) 工程工作台…
           </span>
         </footer>
       </div>

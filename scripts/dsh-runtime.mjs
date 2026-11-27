@@ -124,6 +124,60 @@ function resolveNpmCliRuntime(dir) {
   };
 }
 
+const WIN_CUSTOM_DRIVE_SUBPATHS = [
+  ['Apps', 'DeepSeek-Harness'],
+  ['Apps', 'DeepSeek Harness'],
+  ['Program Files', 'DeepSeek Harness'],
+  ['Program Files', 'DeepSeek-Harness'],
+  ['Programs', 'DeepSeek-Harness'],
+  ['Programs', 'DeepSeek Harness'],
+  ['Software', 'DeepSeek-Harness'],
+  ['Software', 'DeepSeek Harness'],
+  ['DeepSeek-Harness'],
+  ['DeepSeek Harness'],
+];
+
+function discoverWindowsOfficialDesktopDir() {
+  for (const envKey of ['DSH_DESKTOP_DIR', 'DSH_APP_DIR']) {
+    const v = process.env[envKey]?.trim();
+    if (v && fs.existsSync(path.join(v, OFFICIAL_EXE_WIN))) return v;
+  }
+  const localPrograms = process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Programs', 'DeepSeek Harness') : null;
+  if (localPrograms && fs.existsSync(path.join(localPrograms, OFFICIAL_EXE_WIN))) return localPrograms;
+  for (let code = 67; code <= 90; code++) {
+    const drive = `${String.fromCharCode(code)}:\\`;
+    if (!fs.existsSync(drive)) continue;
+    for (const sub of WIN_CUSTOM_DRIVE_SUBPATHS) {
+      const cand = path.join(drive, ...sub);
+      if (fs.existsSync(path.join(cand, OFFICIAL_EXE_WIN))) return cand;
+    }
+  }
+  for (const regRoot of [
+    'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall',
+    'HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall',
+    'HKLM\\Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall',
+  ]) {
+    try {
+      const res = spawnSync('reg.exe', ['query', regRoot, '/s', '/f', 'DeepSeek'], {
+        encoding: 'utf8',
+        windowsHide: true,
+        timeout: 3000,
+      });
+      if (res.status === 0 && res.stdout) {
+        for (const rawLine of res.stdout.split(/\r?\n/)) {
+          const m = /^\s*(?:InstallLocation|DisplayIcon)\s+REG_(?:EXPAND_)?SZ\s+(.+)$/i.exec(rawLine);
+          if (!m) continue;
+          let cand = m[1].trim().replace(/,\s*-?\d+\s*$/, '').replace(/^"+|"+$/g, '');
+          if (/\.(?:exe|ico)$/i.test(cand)) cand = path.win32.dirname(cand);
+          cand = cand.replace(/[\\/]+$/, '');
+          if (cand && fs.existsSync(path.join(cand, OFFICIAL_EXE_WIN))) return cand;
+        }
+      }
+    } catch {}
+  }
+  return null;
+}
+
 function defaultAppPath() {
   if (fs.existsSync(DEFAULT_APP)) return DEFAULT_APP;
   try {
@@ -133,8 +187,8 @@ function defaultAppPath() {
     }
   } catch {}
   if (process.platform === 'win32') {
-    const localPrograms = process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Programs', 'DeepSeek Harness') : null;
-    if (localPrograms && fs.existsSync(localPrograms)) return localPrograms;
+    const discoveredWin = discoverWindowsOfficialDesktopDir();
+    if (discoveredWin) return discoveredWin;
   } else {
     const unixCandidates = [
       '/opt/DeepSeek Harness',

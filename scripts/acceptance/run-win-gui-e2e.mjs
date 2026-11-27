@@ -18,6 +18,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { pnpmStoreEnv } from '../../installer/lt-installer-standalone.mjs';
 
 function printHelp() {
   console.log(`Usage:
@@ -128,6 +129,7 @@ async function main() {
   const runDir = path.join(workRoot, `win-gui-${shortId}`);
   const dshHome = path.join(runDir, 'dsh-home');
   const agentsHome = path.join(runDir, 'agents-home');
+  Object.assign(process.env, pnpmStoreEnv(dshHome));
   // Pure-ASCII temp path for Chromium `--user-data-dir` so Win32/Chromium SingletonLock avoids non-ASCII issues
   const userDataDir = path.join(os.tmpdir(), `lt-dsh-ud-${shortId}`);
   const workspaceDir = path.join(runDir, 'workspace');
@@ -326,6 +328,7 @@ async function probeAclAt(AclSandbox, workspaceWriteSid, tempWriteSid, workspace
     screenshotHelperCs,
     `
 using System;
+using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Imaging;
 using System.Runtime.InteropServices;
@@ -357,11 +360,11 @@ class CaptureWindow {
             int w = rc.Right - rc.Left;
             int h = rc.Bottom - rc.Top;
             if (w >= 240 && h >= 180) {
+                StringBuilder sb = new StringBuilder(256);
+                if (GetWindowText(hWnd, sb, sb.Capacity) <= 0) return true;
                 if (!IsWindowVisible(hWnd)) ShowWindow(hWnd, 4);
                 best = hWnd;
                 bestRect = rc;
-                StringBuilder sb = new StringBuilder(256);
-                GetWindowText(hWnd, sb, sb.Capacity);
                 bestTitle = sb.ToString();
                 return false;
             }
@@ -389,22 +392,46 @@ class CaptureWindow {
             Console.WriteLine("");
             return 3;
         }
-        Thread.Sleep(2000);
-        GetWindowRect(hwnd, out rc);
-        int w = Math.Max(320, rc.Right - rc.Left);
-        int h = Math.Max(240, rc.Bottom - rc.Top);
-        using (Bitmap bmp = new Bitmap(w, h, PixelFormat.Format32bppArgb)) {
-            using (Graphics g = Graphics.FromImage(bmp)) {
-                IntPtr hdc = g.GetHdc();
-                bool ok = PrintWindow(hwnd, hdc, 2);
-                g.ReleaseHdc(hdc);
-                if (!ok) g.CopyFromScreen(rc.Left, rc.Top, 0, 0, new Size(w, h));
+        for (int attempt = 0; attempt < 72; attempt++) {
+            hwnd = FindVisibleWindowForPid(pid, out rc, out title);
+            if (hwnd != IntPtr.Zero) {
+                using (Bitmap bmp = new Bitmap(rc.Right - rc.Left, rc.Bottom - rc.Top, PixelFormat.Format32bppArgb)) {
+                    bool captured;
+                    using (Graphics graphics = Graphics.FromImage(bmp)) {
+                        IntPtr hdc = graphics.GetHdc();
+                        captured = PrintWindow(hwnd, hdc, 2);
+                        graphics.ReleaseHdc(hdc);
+                    }
+                    var colors = new HashSet<int>();
+                    int nonWhiteSidebarOrFooter = 0;
+                    int chromaticPixels = 0;
+                    int sidebarMaxX = Math.Max(48, bmp.Width / 4);
+                    int footerMinY = Math.Max(96, (bmp.Height * 3) / 4);
+                    for (int y = 64; y < bmp.Height - 24; y += 8) {
+                        for (int x = 24; x < bmp.Width - 24; x += 8) {
+                            Color px = bmp.GetPixel(x, y);
+                            colors.Add(px.ToArgb() & 0xF0F0F0);
+                            int maxCh = Math.Max(px.R, Math.Max(px.G, px.B));
+                            int minCh = Math.Min(px.R, Math.Min(px.G, px.B));
+                            if (maxCh - minCh >= 18) chromaticPixels++;
+                            if ((x < sidebarMaxX || y > footerMinY) && (px.R < 248 || px.G < 248 || px.B < 248)) {
+                                nonWhiteSidebarOrFooter++;
+                            }
+                        }
+                    }
+                    bool uiLoadedPastSplash = attempt >= 6 && (nonWhiteSidebarOrFooter >= 35 || chromaticPixels >= 14);
+                    bool fallbackReady = attempt >= 64 && colors.Count >= 8;
+                    if (captured && colors.Count >= 8 && (uiLoadedPastSplash || fallbackReady)) {
+                        bmp.Save(outPng, ImageFormat.Png);
+                        Console.WriteLine(hwnd.ToInt64().ToString());
+                        Console.WriteLine(title ?? "");
+                        return 0;
+                    }
+                }
             }
-            bmp.Save(outPng, ImageFormat.Png);
+            Thread.Sleep(900);
         }
-        Console.WriteLine(hwnd.ToInt64().ToString());
-        Console.WriteLine(title ?? "");
-        return 0;
+        return 4;
     }
 }
 `,
@@ -510,7 +537,7 @@ class CaptureWindow {
       spawnSync('schtasks.exe', ['/Run', '/TN', taskName], { encoding: 'utf8', windowsHide: true, timeout: 15000 });
     }
 
-    const evDeadline = Date.now() + 95000;
+    const evDeadline = Date.now() + 120000;
     while (!fs.existsSync(guiEvidenceJson) && Date.now() < evDeadline) {
       await new Promise(r => setTimeout(r, 500));
     }
@@ -557,7 +584,7 @@ class CaptureWindow {
   const screenshotSaved = fs.existsSync(screenshotPath) && fs.statSync(screenshotPath).size > 1000;
 
   report.interactiveGuiLaunch = {
-    ok: Boolean(taskCreated && taskDeleted && guiEv && guiEv.mainWindowHandle && guiEv.mainWindowHandle !== 0),
+    ok: Boolean(taskCreated && taskDeleted && guiEv?.surfaceKind === 'dsh-desktop-electron' && Number(guiEv.mainWindowHandle) > 0 && screenshotSaved),
     scheduledTaskName: taskName,
     taskCreated,
     taskCleanedUpImmediately: taskDeleted,
@@ -613,6 +640,7 @@ class CaptureWindow {
   };
 
   report.passed = Boolean(
+    report.desktopPluginInstall.exitCode === 0 &&
     report.desktopPluginInstall.desktopBundleInstalled &&
     report.windowsAclPwshProbe.ok &&
     report.interactiveGuiLaunch.ok &&

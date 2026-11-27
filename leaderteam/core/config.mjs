@@ -443,7 +443,7 @@ export function validateConfig(raw) {
     else {
       const cb = raw.circuitBreaker;
       onlyKeys(cb, [
-        'enabled', 'investigatorRole',
+        'enabled', 'investigatorRole', 'firstOutputTimeoutMs',
         'zeroProgressTruncationSoft', 'zeroProgressTruncationHard',
         'repeatedFailureSoft', 'repeatedFailureHard',
         'identicalSignatureSoft', 'identicalSignatureHard',
@@ -452,6 +452,7 @@ export function validateConfig(raw) {
         'cooldownMs', 'maxConsolidationsPerAgent',
       ], 'circuitBreaker');
       if (cb.enabled !== undefined) bool(cb.enabled, 'circuitBreaker.enabled');
+      if (cb.firstOutputTimeoutMs !== undefined) int(cb.firstOutputTimeoutMs, 'circuitBreaker.firstOutputTimeoutMs', 50, 3600000);
       if (cb.investigatorRole !== undefined && !['arbiter', 'discussA', 'discussB', 'gate'].includes(cb.investigatorRole)) {
         p.push('circuitBreaker.investigatorRole must be one of arbiter, discussA, discussB, gate');
       }

@@ -102,42 +102,36 @@ function readBoundedBody(req, maxBytes = MAX_BODY_BYTES) {
   });
 }
 
-function sendPayloadTooLargeAndDestroy(req, res, maxBytes = MAX_BODY_BYTES) {
+function sendPayloadTooLarge(req, res, maxBytes = MAX_BODY_BYTES) {
   let discarded = 0;
   const maxDrainBytes = Math.max(maxBytes * 4, 8 * 1024 * 1024);
+  // Finish ordinary loopback uploads before closing so the client can read the 413 on Windows.
   const onDrainData = chunk => {
     discarded += chunk.length;
-    if (discarded > maxDrainBytes) {
-      req.removeListener('data', onDrainData);
-      try { req.destroy(); } catch {}
-    }
+    if (discarded >= maxDrainBytes) finish();
   };
-  req.on('data', onDrainData);
-  try { req.resume(); } catch {}
-  const timer = setTimeout(() => {
+  function finish() {
+    clearTimeout(timer);
     req.removeListener('data', onDrainData);
-    try { req.destroy(); } catch {}
-  }, 300);
-  timer.unref?.();
-  res.writeHead(413, {
-    'Content-Type': 'application/json; charset=utf-8',
-    'Cache-Control': 'no-store',
-    Connection: 'close',
-  });
-  res.end(
-    JSON.stringify({
+    req.removeListener('end', finish);
+    if (res.destroyed || res.writableEnded) return;
+    res.writeHead(413, {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Cache-Control': 'no-store',
+      Connection: 'close',
+    });
+    res.end(JSON.stringify({
       ok: false,
       error: { code: 'PAYLOAD_TOO_LARGE', message: `Request body exceeds ${maxBytes} bytes` },
-    }),
-    () => {
-      const finTimer = setTimeout(() => {
-        clearTimeout(timer);
-        req.removeListener('data', onDrainData);
-        try { req.destroy(); } catch {}
-      }, 150);
-      finTimer.unref?.();
-    },
-  );
+    }));
+  }
+  const timer = setTimeout(finish, 300);
+  timer.unref?.();
+  req.once('close', () => clearTimeout(timer));
+  if (req.readableEnded) return finish();
+  req.once('end', finish);
+  req.on('data', onDrainData);
+  req.resume();
 }
 
 export async function startStandaloneLtUiServer({
@@ -287,7 +281,7 @@ export async function startStandaloneLtUiServer({
 
         const declaredLen = req.headers['content-length'] !== undefined ? Number(req.headers['content-length']) : null;
         if (declaredLen !== null && Number.isFinite(declaredLen) && declaredLen > MAX_BODY_BYTES) {
-          sendPayloadTooLargeAndDestroy(req, res, MAX_BODY_BYTES);
+          sendPayloadTooLarge(req, res, MAX_BODY_BYTES);
           return;
         }
 
@@ -295,7 +289,7 @@ export async function startStandaloneLtUiServer({
         if (req.method !== 'GET' && req.method !== 'HEAD') {
           const readRes = await readBoundedBody(req, MAX_BODY_BYTES);
           if (readRes.tooLarge) {
-            sendPayloadTooLargeAndDestroy(req, res, MAX_BODY_BYTES);
+            sendPayloadTooLarge(req, res, MAX_BODY_BYTES);
             return;
           }
           bodyBuf = readRes.buffer;

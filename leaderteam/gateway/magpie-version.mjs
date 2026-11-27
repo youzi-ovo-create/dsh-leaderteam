@@ -15,7 +15,7 @@ const ED25519_SPKI_PREFIX = Buffer.from('302a300506032b6570032100', 'hex');
 export function parseMagpieVersion(ver) {
   if (typeof ver !== 'string') return null;
   const clean = ver.trim().replace(/^v/i, '');
-  const m = clean.match(/^(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/);
+  const m = clean.match(/^(\d+)\.(\d+)\.(\d+)(?:-[\da-z.-]+)?(?:\+[\da-z.-]+)?$/i);
   if (!m) return null;
   return [Number(m[1]), Number(m[2]), Number(m[3])];
 }

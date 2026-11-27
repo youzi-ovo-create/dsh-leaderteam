@@ -5,6 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { findFreeLoopbackPort } from '../../leaderteam/gateway/magpie-process.mjs';
 import {
   MagpieGatewayManager,
   MagpieClient,
@@ -201,8 +202,35 @@ test('Magpie adapter & client: provider CRUD, multi-key pool, discovery, non-mer
     assert.equal(normRow.gatewayCostUsd, null); // cost: 0 on unpriced/subscription is null, never fake 0
   } finally {
     await srv.close();
-    fs.rmSync(tmpDir, { recursive: true, force: true });
+    fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 15, retryDelay: 150 });
   }
+});
+
+test('a local Magpie binary with no readable version cannot be recorded as the pinned release', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'lt-magpie-version-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true, maxRetries: 15, retryDelay: 150 }));
+  const source = path.join(root, 'invalid-magpie');
+  fs.writeFileSync(source, '');
+  const mgr = new MagpieGatewayManager({ storageRoot: root });
+  await assert.rejects(mgr.install({ sourceBinaryPath: source }), /determine the version/);
+  assert.equal(fs.existsSync(mgr.currentPointerFile), false);
+});
+
+test('Magpie downloads require signed checksums for the requested release', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'lt-magpie-metadata-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true, maxRetries: 15, retryDelay: 150 }));
+  let fetches = 0;
+  const mgr = new MagpieGatewayManager({
+    storageRoot: root,
+    fetchImpl: async () => {
+      fetches++;
+      return Response.json({ version: '0.1.4731' });
+    },
+  });
+  await assert.rejects(mgr.install({ downloadFromUpstream: true }), /signature verification/);
+  await assert.rejects(mgr.install({ downloadFromUpstream: true, version: '0.1.4797' }), /requested version/);
+  assert.equal(fetches, 2);
+  assert.equal(fs.existsSync(mgr.currentPointerFile), false);
 });
 
 test('Real Magpie binary lifecycle: isolated install, start, health, crash recovery, version rollback, and clean stop', async t => {
@@ -222,10 +250,12 @@ test('Real Magpie binary lifecycle: isolated install, start, health, crash recov
 
   const mgr = new MagpieGatewayManager({
     storageRoot: path.join(tmpDir, 'lt-storage'),
+    defaultGatewayPort: await findFreeLoopbackPort(),
+    defaultWebPort: await findFreeLoopbackPort(),
   });
 
   try {
-    // 1. Install verified 0.1.4731 binary
+    // 1. Install the available local binary and record its detected version.
     const inst = await mgr.install({ sourceBinaryPath: sysMagpie });
     assert.equal(inst.installed, true);
     assert.ok(inst.version);
@@ -245,7 +275,7 @@ test('Real Magpie binary lifecycle: isolated install, start, health, crash recov
     // Confirm live compatibility probe passes against verified (>= 0.1.4731) binary, or accurately flags older local host binary
     const compat = await mgr.checkCompatibility();
     if (evaluateMagpieVersionCompatibility(inst.version).compatible) {
-      assert.equal(compat.ok, true);
+      assert.equal(compat.ok, true, JSON.stringify(compat.checks));
     } else {
       assert.equal(compat.versionCompatibility.status, 'older-than-minimum');
     }
@@ -280,6 +310,6 @@ test('Real Magpie binary lifecycle: isolated install, start, health, crash recov
     assert.equal(stopped.state, 'stopped');
   } finally {
     await mgr.stop().catch(() => {});
-    try { fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 150 }); } catch {}
+    try { fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 15, retryDelay: 150 }); } catch {}
   }
 });

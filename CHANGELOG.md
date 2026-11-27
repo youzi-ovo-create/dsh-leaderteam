@@ -2,6 +2,36 @@
 
 本项目的所有重要版本变更均记录于此文件，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [1.0.0] - 2026-11-28 — Open Leader Team (OLT) 品牌启用与集中缺陷披露修复专版
+
+> **品牌演进与历史不可变声明**：自原定 `V2.2.4` 的集中稳定性修复版本起，开源产品线正式启用 **Open Leader Team（OLT）** 品牌，版本号重置为 **`V1.0.0`**，标志着开源线进入独立演进与高质量工程维护的新阶段。此前已发布的 `V2.2.2` 与 `V2.2.3` 完整保留原 `Leader Team` 品牌与版本号，不追溯更名、不修改历史发行记录。`OLT V1.0.0` 保持底层 DSH 插件包名（`dsh-leaderteam`）、会话预设 ID（`leaderteam` / `lt-member-*`）、公共接口契约（`lt.public.v1` `1.1.0`）及 `$DSH_HOME/leaderteam/` 存储结构 100% 兼容，支持 `Leader Team 2.2.x → OLT 1.0.0 → Leader Team 2.2.3` 无损升级与离线快照回滚，新增 `Install-OpenLeaderTeam.cmd`、`install-open-leaderteam.sh` 与 `olt-*` CLI 命令别名。
+
+### 集中披露与根治缺陷（Real Bugs · Root Causes · Verified Fixes）
+
+- **`[BUG-COMMON-01]` 子代理上游流式零字节长挂死熔断与零工具前置回退链（`stream-stall-guard.mjs` + `roles.mjs` + `team-tools.mjs`）**
+  - **现象**：上游模型建立 HTTP 连接后长期不吐出有效流式分片（如高推理档位连接静默挂起 10+ 分钟）时，子代理无限等待，团队与并发槽位被长期卡死。
+  - **根因**：此前仅 `llm.mjs` 治理审查调用配置了超时与 `roleRouteChain` 回退，常驻执行子代理（`team_dispatch` 与 `team_direct_exec`）缺少针对 `agent/assistant-stream` 流式分片的首包/分片活性看门狗与 `executionFallbacks` 运行时接线。
+  - **修复**：新增确定性流式看门狗（默认 `circuitBreaker.firstOutputTimeoutMs = 120000` ms，在 `step/start` 挂载、收到非空 `chunk` 刷新、进入 `tool/call` 工具执行期立即撤防以免误杀长耗时测试命令）；超时或首包前报错时严格核验 **5 类工具与副作用事件源全为 `0`**（`DP-08`：会话 `tool/call`、`tool/result`、消息 `tool-call` 块、`gate.jsonl` 回执、`memberExecutionProgress` 均等于 `0`，且非 `CONTENT_REFUSED` 策略拒绝）后自动取消挂起实例并切换至 `team.executionFallbacks` 下一路由；若已产生任何工具副作用则严禁跨模型盲目重跑，立即落盘明确 `[STREAM_FIRST_OUTPUT_TIMEOUT]` 原因并释放并发槽位。
+- **`[BUG-COMMON-02]` 集成收尾阶段无头浏览器过度验证减法（`prompts.mjs` + `roles.mjs`）**
+  - **现象**：纯后端/CLI/算法任务在核心模块与 `npm test` / `node --test` 已全绿后，领队续接提示与收尾阶段仍诱导成员强行拉起无头浏览器或截图探测，拖慢收尾并浪费配额。
+  - **根因**：`roles.mjs` 续接提示对 `profile="shell"` 硬编码要求携带 `read_image` 与 `run real execution/browser verification`。
+  - **修复**：移除非视觉任务的强制 `read_image`/浏览器校验诱导，在四类领队与成员系统提示词中固化按需成比例验证规则（`DP-07`）：当核心模块与自动化测试套件已通过且用户需求/阶段契约未要求视觉 UI 渲染时，禁止在集成收尾阶段额外启动无头浏览器或 CDP 截图探测。
+- **`[BUG-OSS-IT44]` Windows 共享盘工作区 `Win32 5` 导致成员无报错文本进入 `blocked` 及集成测试框架 4 GiB OOM（`roles.mjs` + `test/integration/run.mjs` + `dsh-runtime.mjs`）**
+  - **现象**：原 `v2.2.4` 候选包在非系统盘共享目录运行 `it44` 时成员进入 `blocked` 且 `error` 为空，模拟领队死循环查询状态导致进程耗尽 4 GiB 堆内存崩溃。
+  - **根因**：共享目录仅继承 `Authenticated Users:(M)` 而缺少 `WRITE_DAC`，触发 `@deepseek-ai/dsh-sandbox-windows-acl` 的 `SetNamedSecurityInfoW (Win32 5)`，使 `caller.shellFailure` 将成员覆盖为 `blocked`，但 `roles.mjs:1512` 调用 `setMemberStatus(..., 'blocked')` 时漏传 `shellFailure` 原因文本；同时 `run.mjs` 未设置单场景最大请求数护栏且默认在仓库共享盘下创建测试工作区。
+  - **修复**：`roles.mjs` 在成员因 `shellFailure` 或 `STATUS: blocked` 结束回合时完整写入具体阻塞原因；`run.mjs` 在 Windows 默认使用当前用户拥有完整 DACL 权限的 `%TEMP%\olt-integration-work` 隔离目录并增加 `maxCalls` 硬熔断；`scripts/dsh-runtime.mjs` 补齐 `C:..Z:` 自定义盘符与注册表 `Uninstall` 自动寻址（零环境变量识别 `D:\Apps\DeepSeek-Harness`）。
+- **`[BUG-OSS-MAGPIE-WIN]` Windows Node 24 并行运行下 Magpie 临时目录 `EPERM` 文件锁竞态（`magpie-process.mjs`）**
+  - **根因**：`_killChildRef()` 与 `stop()` 在子进程 `exit` 事件触发或跨进程 `_stoppingPids` 登记后立即返回，Windows 内核尚未完全释放 `magpie-cli.exe` 及 SQLite WAL/SHM 文件句柄。
+  - **修复**：在 `_killChildRef()` 与 `stop()` 中增加目标 PID 与 `_stoppingPids` 彻底退出轮询及 Windows 句柄释放窗口，并为网关/用量单测临时目录清理统一补齐有界重试参数。
+- **`[BUG-OSS-HZ01]` 衡账 `getOverview()` 同步重复全量解压扫描会话目录（`lt-usage/reader/service.js` + `hengzhang-bridge.mjs`）**
+  - **根因**：`HengzhangUsageBridge.getOverview()` 调用 `overviewFor()` 后，在统计今日费用循环中对每个当日活跃会话再次调用 `reportFor()`，每次均重新执行 `loadHome()` 遍历并解压全部 `.jsonl.zstd` 会话文件（复杂度 `O(M * N)`）。
+  - **修复**：`overviewFor`、`reportFor`、`listSessions` 支持复用预加载 `options.preloadedHome` 快照，`getOverview()` 单次请求仅执行 **1 次** `loadHome()` 并直接命中 `REPORT_CACHE`。
+- **继承并合入原 `v2.2.4` 候选补丁全部 10 项底层修复**：
+  - 自动配齐角色去重与大模型目录领队路由保留；安装器/更新器强制核验 SHA-256、包内版本与目标平台标签，并在的基础上升级支持 `OLT` 品牌纪元平滑比较（`Epoch 2 > Epoch 1`）；
+  - Windows NTFS 模式切换原子写盘退避重试、写盘失败临时文件清理、失效 `pnpm` 缓存目录联接自动隔离回退；
+  - 本地 Magpie 版本探测超时防误判、上游下载 Ed25519 签名 + SHA-256 双重校验、独立工作台大请求体排空防 `ECONNRESET`；
+  - Node.js `22.15` 等待治理监督任务防提前退出、`lt-doctor` 宿主 `cordis.patch.yml` 供应商同步状态提示，以及真机 GUI 验收截图等待插件加载完成后再采样。
+
 ## [2.2.3] - 2026-11-27
 
 会话内 `Single / Team` 双模协同、河洛（Heluo）原生控制台 v2、Magpie 网关与衡账（`lt-usage`）融合、历代设计原则（`DP-01`..`DP-06`）防退化护栏、DSH 模型选择器全链路同步修复，以及 Windows / Linux 跨平台独立发行版（`Apache-2.0`）：
@@ -64,13 +94,13 @@
 
 ### Fixed
 - 修正 [docs/01-配置与接口.md](docs/01-配置与接口.md) 与 [docs/07-按需工具与技能.md](docs/07-按需工具与技能.md) 中的配置契约与默认值错误：`governance.mode` 仅接受 `"autonomous"` / `"approval"`（移除错误的 `"legacy"`）、补齐精确字段名（`caucusQuorumNumerator`、`caucusQuorumDenominator`、`maxInternalArbitrationRounds`、`maxConferenceDialogueTurns`、`directExecMaxSteps`、`pauseBarrierTimeoutMs` 及 `circuitBreaker.*` 白名单）、更新 `gate.ruleOnlyTools` 允许列表（`team_note`/`team_plan`/`team_conference`）、修正 `team.maxMembersPerTeam` 默认值（`128`）与 `roles.gate.maxTokens`（`8000`，无固定 `16384` 上限）。
-- 更新 [docs/05-验收清单.md](docs/05-验收清单.md)，明确区分 V2.1 默认自治模式场景（`it42`–`it45`）与审批兼容/通用核心场景（`it01`–`it40`），核准场景文件名与数量（38 个单元测试文件、45 个集成场景文件）；同步修正 [test/install-desktop.test.ps1](test/install-desktop.test.ps1) 中硬编码旧模型名 `antigravity/gemini-4-argon` 的断言，改为动态读取 `config/leaderteam.config.json` 中的模型列表。
+- 更新 [docs/05-验收清单.md](docs/05-验收清单.md)，明确区分 V2.1 默认自治模式场景（`it42`–`it45`）与审批兼容/通用核心场景（`it01`–`it40`），核准场景文件名与数量（38 个单元测试文件、45 个集成场景文件）；同步修正 [test/install-desktop.test.ps1](https://github.com/youzi-ovo-create/dsh-leaderteam/blob/ee98e667d6ccbb97e7c46304b13f913627b1c7d7/test/install-desktop.test.ps1) 中硬编码旧模型名 `antigravity/gemini-4-argon` 的断言，改为动态读取 `config/leaderteam.config.json` 中的模型列表。
 - 统一 [README.md](README.md)、[docs/官方Desktop部署与恢复.md](docs/官方Desktop部署与恢复.md) 与 [docs/08-可视化与用量.md](docs/08-可视化与用量.md) 的 Node.js 版本说明（LT 核心 `>= 22.15`，构建随仓 `dsh-context` 为 `^22.19.0 || >= 24.0.0`，建议 `22.19+` 或 `24.x`）。
 
 ### Added & Improved
 - 优化 [README.md](README.md) 首次使用体验：前置环境要求与快速安装步骤，明确标注默认配置中的 `codex/*`、`zcode/*`、`antigravity/*` 为示例路由，提示用户按自身网关修改。
 - 补全 [leaderteam/NOTICE](leaderteam/NOTICE) 第三方署名与修改声明，涵盖 `dsh-auto-review v0.15.0`、`dsh-context 0.82.1-leaderteam.1`（`bowenliang123/dsh-context`）与 `@deepseek-ai/dsh-sandbox-windows-acl`。
-- 新增最小 Windows 单元测试工作流 [.github/workflows/unit-tests.yml](.github/workflows/unit-tests.yml)（Node 22/24，不依赖真实 Desktop 或付费模型）。
+- 新增最小 Windows 单元测试工作流 [.github/workflows/unit-tests.yml](https://github.com/youzi-ovo-create/dsh-leaderteam/blob/ee98e667d6ccbb97e7c46304b13f913627b1c7d7/.github/workflows/unit-tests.yml)（Node 22/24，不依赖真实 Desktop 或付费模型）。
 
 ## [2.1.0] - 2026-11-23
 

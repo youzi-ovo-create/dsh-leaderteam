@@ -10,6 +10,11 @@ import { requireReady, teamStore, runtime, baseRuntime, recordUsage, runtimeForT
 import { resolveActor, userTaskText, currentTaskSeq, reconcileStaleMembers } from './roles.mjs';
 import { callRoleJson } from './llm.mjs';
 import { roleRouteChain, degradedNote } from '../core/role-routes.mjs';
+import {
+  resolveMemberExecutionRouteChain,
+  inspectSubagentSideEffectSources,
+  isRetryablePreToolMemberError,
+} from '../core/stream-stall-guard.mjs';
 import { readQuotaStateFile } from '../core/quota.mjs';
 import { executionModelRows, quotaGate, checkLeaderModel } from '../core/models.mjs';
 import { resolvePath, isInside, normalizeGlob, relativeInside, realpathBestEffort, pathKey } from '../core/paths.mjs';
@@ -77,6 +82,7 @@ export async function startSubagentCompat(subagents, {
   agentPreset,
   agentOptions,
 }) {
+  const effectiveSignal = signal ?? new AbortController().signal;
   const isFlatSpec = typeof subagents?.resolveName === 'function' || typeof subagents?.waitForTreeWork === 'function';
   if (!isFlatSpec) {
     const res = await subagents.startActivation({
@@ -84,7 +90,7 @@ export async function startSubagentCompat(subagents, {
       childId,
       label,
       delivery,
-      signal,
+      signal: effectiveSignal,
       request: { prompt, parent, agentPreset, agentOptions },
     });
     return { ...res, hostAgentName: null };
@@ -95,7 +101,7 @@ export async function startSubagentCompat(subagents, {
     childId,
     label,
     delivery,
-    signal,
+    signal: effectiveSignal,
     prompt,
     parent,
     agentPreset,
@@ -811,10 +817,128 @@ export function registerTeamTools(ctx) {
           ? [...acceptance, ...fallbackGuardrails.slice(0, Math.max(0, 20 - acceptance.length)).map(g => `[Review guardrail] ${g}`)]
           : acceptance;
         if (args.stage_id) dispatchContract(store, cfg, taskSeq, args); // recheck after asynchronous tool/skill discovery
+        const routeChain = resolveMemberExecutionRouteChain(cfg, modelRoute, args.effort, { quotaState: quotaState(rt), now });
+        const registerFallbackChainForChild = (activeChildId, nextIdx) => {
+          if (nextIdx >= routeChain.length) return;
+          const nextSpec = routeChain[nextIdx];
+          const base = baseRuntime(rt);
+          base.memberFallbackSpawners ??= new Map();
+          base.memberFallbackSpawners.set(activeChildId, {
+            nextRoute: nextSpec.route,
+            nextEffort: nextSpec.effort,
+            async spawnFallback() {
+              if (rt.planningDisposed) throw new Error('planning runtime disposed');
+              if (isTeamAwaitingUserAfterPowerPause(rt, actor.teamId)) {
+                throw new Error('team is paused for low battery');
+              }
+              let lastErr = null;
+              for (let idx = nextIdx; idx < routeChain.length; idx++) {
+                const cand = routeChain[idx];
+                const candNow = new Date();
+                const candQg = quotaGate(cfg, quotaState(rt), cand.route, candNow);
+                if (!candQg.allowed) {
+                  lastErr = new Error(candQg.error);
+                  continue;
+                }
+                const fbChildId = randomUUID();
+                let fbReservation = null;
+                let fbAdded = false;
+                try {
+                  if (schedulerActive) {
+                    const liveMembers = [...store.members().values()];
+                    fbReservation = reserveTeamDispatch(ctx, actor.teamId, {
+                      id: fbChildId,
+                      name: args.name,
+                      taskSeq,
+                      profile: args.profile,
+                      activeMembers: liveMembers,
+                    });
+                    if (!fbReservation.allowed) {
+                      throw new Error(fbReservation.reason);
+                    }
+                  } else {
+                    rt.simpleDispatchInFlight ??= new Map();
+                    let fbSet = rt.simpleDispatchInFlight.get(actor.teamId);
+                    if (!fbSet) { fbSet = new Map(); rt.simpleDispatchInFlight.set(actor.teamId, fbSet); }
+                    fbSet.set(fbChildId, { id: fbChildId, name: args.name, taskSeq, profile: args.profile });
+                    fbReservation = {
+                      commit() { fbSet.delete(fbChildId); },
+                      cancel() { fbSet.delete(fbChildId); },
+                    };
+                  }
+                  const fbMember = {
+                    childId: fbChildId,
+                    name: args.name,
+                    taskSeq,
+                    planId: boundPlanId,
+                    ...(args.stage_id ? { stageId: args.stage_id, stageHash: args.stageHash, stageRevision: args.stageRevision } : {}),
+                    profile: args.profile,
+                    preset: profile.preset,
+                    model: cand.route,
+                    effort: cand.effort,
+                    ...grant,
+                    skills,
+                    writeScope,
+                    refs,
+                    task: args.task,
+                    acceptance: effectiveAcceptance,
+                    cwd: actor.cwd,
+                    userTask: userTaskText(ctx, actor.teamId, cfg.gate.maxAuthorizationChars),
+                    quotaAtDispatch: candQg.quota.status,
+                  };
+                  if (rt.liveProcessMemberIds instanceof Set) rt.liveProcessMemberIds.add(fbChildId);
+                  store.addMember(fbMember);
+                  fbAdded = true;
+                  registerFallbackChainForChild(fbChildId, idx + 1);
+                  const fbTarget = resolveModelTarget(cfg, cand.route, cand.effort);
+                  const fbStarted = await startSubagentCompat(ctx.subagents, {
+                    provider: 'spawn',
+                    childId: fbChildId,
+                    name: args.name,
+                    taskSeq,
+                    label: args.name,
+                    delivery: 'parent',
+                    signal: new AbortController().signal,
+                    prompt: [{ type: 'text', text: memberInitialPrompt(fbMember, cfg.paths.protectedDirs) }],
+                    parent: exec.agent,
+                    agentPreset: profile.preset,
+                    agentOptions: fbTarget,
+                  });
+                  if (fbStarted.hostAgentName) {
+                    store.setMemberHostName(fbChildId, fbStarted.hostAgentName);
+                  }
+                  if (store.getMember(fbChildId)?.status === 'starting') store.setMemberStatus(fbChildId, 'started');
+                  if (boundPlanId) {
+                    recordArchivedMemberDispatched({
+                      rt,
+                      workspace,
+                      planId: boundPlanId,
+                      memberSummary: store.getMember(fbChildId) ?? fbMember,
+                    });
+                  }
+                  const fbPostSnap = schedulerActive ? evaluateTeamConcurrency(ctx, actor.teamId) : null;
+                  fbReservation.commit(fbPostSnap);
+                  return { childId: fbStarted.childId, route: cand.route, effort: cand.effort };
+                } catch (fbErr) {
+                  lastErr = fbErr;
+                  base.memberFallbackSpawners?.delete(fbChildId);
+                  if (rt.liveProcessMemberIds instanceof Set) rt.liveProcessMemberIds.delete(fbChildId);
+                  if (fbAdded) {
+                    store.setMemberStatus(fbChildId, 'failed', fbErr instanceof Error ? fbErr.message : String(fbErr));
+                  }
+                  fbReservation?.cancel();
+                }
+              }
+              throw lastErr ?? new Error('all executionFallbacks failed to spawn');
+            },
+          });
+        };
+
         const member = { childId, name: args.name, taskSeq, planId: boundPlanId, ...(args.stage_id ? { stageId: args.stage_id, stageHash: args.stageHash, stageRevision: args.stageRevision } : {}), profile: args.profile, preset: profile.preset, model: modelRoute, effort: args.effort, ...grant, skills, writeScope, refs, task: args.task, acceptance: effectiveAcceptance, cwd: actor.cwd, userTask: userTaskText(ctx, actor.teamId, cfg.gate.maxAuthorizationChars), quotaAtDispatch: qg.quota.status };
         if (rt.liveProcessMemberIds instanceof Set) rt.liveProcessMemberIds.add(childId);
         store.addMember(member);
         addedToStore = true;
+        registerFallbackChainForChild(childId, 1);
         const target = resolveModelTarget(cfg, modelRoute, args.effort);
         const started = await startSubagentCompat(ctx.subagents, {
           provider: 'spawn',
@@ -882,6 +1006,7 @@ export function registerTeamTools(ctx) {
           : fallbackConcurrencySnapshot(cfg, store, rt, actor.teamId);
         return { member: args.name, child_id: started.childId, task_seq: taskSeq, ...(boundPlanId ? { plan_id: boundPlanId } : {}), ...(autonomous ? { governance_mode: 'autonomous' } : {}), model: modelRoute, provider: target.provider, upstream_model: target.model, effort: args.effort, profile: args.profile, tools: grant.allowedTools, loaded_tools: grant.loadedTools, skills: skills.map(({ id, name, sha256 }) => ({ id, name, sha256 }) ), write_scope: writeScope, refs, quota: qg.quota.status, concurrency };
       } catch (e) {
+        baseRuntime(rt).memberFallbackSpawners?.delete(childId);
         if (rt.liveProcessMemberIds instanceof Set) rt.liveProcessMemberIds.delete(childId);
         if (addedToStore) {
           store.setMemberStatus(childId, 'failed', e instanceof Error ? e.message : String(e));
@@ -944,7 +1069,18 @@ export function registerTeamTools(ctx) {
 
       const now = new Date();
       const q = quotaState(rt);
-      const chain = roleRouteChain(cfg, 'directExec', currentSelection(exec.agent) ?? null);
+      const baseChain = roleRouteChain(cfg, 'directExec', currentSelection(exec.agent) ?? null);
+      const chain = [...baseChain];
+      if (chain[0]) {
+        const execFallbacks = resolveMemberExecutionRouteChain(cfg, chain[0].route, chain[0].effort, { quotaState: q, now });
+        const seenRoutes = new Set(chain.map(c => c.route));
+        for (const fb of execFallbacks) {
+          if (fb.isFallback && !seenRoutes.has(fb.route)) {
+            seenRoutes.add(fb.route);
+            chain.push({ route: fb.route, effort: fb.effort, isFallback: true });
+          }
+        }
+      }
       const windowEligible = chain.filter(
         t => quotaGate(cfg, q, t.route, now).allowed
           && !evaluateTeamRequestWindow(rt, actor.teamId, now.getTime(), { targetRoute: t.route, skipAuditWrite: true })?.triggerCheckpointPause,
@@ -1048,15 +1184,59 @@ export function registerTeamTools(ctx) {
             : (settled?.stopReason?.kind ?? 'completed');
           const curRec = store.getMember(childId);
           const wasPausedForConf = curRec?.status === 'paused' || /^\s*STATUS:\s*paused\b/im.test(outputText);
+          const base = baseRuntime(rt);
+          const stallMarker = base.directExecStallMarkers?.get(childId) ?? null;
+          base.directExecStallMarkers?.delete(childId);
+          const liveChild = rt.hostAgents?.get?.(childId) ?? base.actors?.get(childId)?.agent ?? null;
+          const sideEffects = inspectSubagentSideEffectSources({
+            sessionEvents: typeof liveChild?.session?.snapshotEvents === 'function' ? (liveChild.session.snapshotEvents() ?? []) : [],
+            gateReceipts: store.gateReceipts(),
+            memberProgressCount: rt.memberExecutionProgress?.get(childId)?.size ?? 0,
+            circuitState: base.circuitStates?.get(childId) ?? null,
+            childId,
+          });
+          if (stallMarker) {
+            if (sideEffects.canFallback && !exec.signal?.aborted && candIdx + 1 < candidates.length) {
+              store.setMemberStatus(
+                childId,
+                'failed',
+                truncate(`${stallMarker.stallMsg} Switching to fallback route "${candidates[candIdx + 1].route}".`, 600),
+              );
+              store.appendWorkflowEvent({
+                type: 'direct-exec-fallback',
+                trigger: 'stream-first-output-timeout',
+                taskSeq,
+                fromChildId: childId,
+                fromModel: chosen.route,
+                toModel: candidates[candIdx + 1].route,
+                timeoutMs: stallMarker.timeoutMs,
+              });
+              continue;
+            }
+            store.setMemberStatus(
+              childId,
+              sideEffects.hasMutatingSideEffects ? 'blocked' : 'failed',
+              truncate(stallMarker.stallMsg, 600),
+            );
+            throw new Error(stallMarker.stallMsg);
+          }
           if (curRec && ACTIVE_MEMBER_STATUSES.has(curRec.status)) {
             store.setMemberStatus(childId, wasPausedForConf ? 'paused' : (stopKind === 'error' ? 'failed' : 'done'));
           }
           const childReceipts = store.gateReceipts().filter(r => r.agentId === childId);
           const allowedOps = childReceipts.filter(r => r.decision === 'allow').length;
+          const errDetail = settled?.stopReason?.failure?.message ?? settled?.stopReason?.message ?? outputText;
+          const errCode = settled?.stopReason?.failure?.code ?? '';
 
-          // If the model failed before executing ANY workspace tool (e.g. retired model / 404 / 429 / 503 / timeout),
-          // automatically fall back to the next configured route in `roles.directExec`!
-          if (stopKind === 'error' && !wasPausedForConf && allowedOps === 0 && !exec.signal?.aborted && candIdx + 1 < candidates.length) {
+          // Enforce DP-08: only fall back to the next route when ALL 5 side-effect sources == 0 and error is retryable!
+          if (
+            stopKind === 'error'
+            && !wasPausedForConf
+            && sideEffects.canFallback
+            && isRetryablePreToolMemberError({ errorCode: errCode, errorMessage: errDetail })
+            && !exec.signal?.aborted
+            && candIdx + 1 < candidates.length
+          ) {
             continue;
           }
 
@@ -1079,15 +1259,31 @@ export function registerTeamTools(ctx) {
             output: truncate(outputText, 16000),
           };
         } catch (err) {
+          const base = baseRuntime(rt);
+          const stallMarker = base.directExecStallMarkers?.get(childId) ?? null;
+          base.directExecStallMarkers?.delete(childId);
+          const liveChild = rt.hostAgents?.get?.(childId) ?? base.actors?.get(childId)?.agent ?? null;
+          const sideEffects = inspectSubagentSideEffectSources({
+            sessionEvents: typeof liveChild?.session?.snapshotEvents === 'function' ? (liveChild.session.snapshotEvents() ?? []) : [],
+            gateReceipts: store.gateReceipts(),
+            memberProgressCount: rt.memberExecutionProgress?.get(childId)?.size ?? 0,
+            circuitState: base.circuitStates?.get(childId) ?? null,
+            childId,
+          });
+          const errText = stallMarker ? stallMarker.stallMsg : (err instanceof Error ? err.message : String(err));
           const curRec = store.getMember(childId);
           if (curRec && ACTIVE_MEMBER_STATUSES.has(curRec.status)) {
-            store.setMemberStatus(childId, 'failed', err instanceof Error ? err.message : String(err));
+            store.setMemberStatus(childId, sideEffects.hasMutatingSideEffects ? 'blocked' : 'failed', truncate(errText, 600));
           }
-          const allowedOps = store.gateReceipts().filter(r => r.agentId === childId && r.decision === 'allow').length;
-          if (allowedOps === 0 && !exec.signal?.aborted && candIdx + 1 < candidates.length) {
+          if (
+            sideEffects.canFallback
+            && isRetryablePreToolMemberError({ errorCode: err?.code ?? '', errorMessage: errText })
+            && !exec.signal?.aborted
+            && candIdx + 1 < candidates.length
+          ) {
             continue;
           }
-          throw err;
+          throw stallMarker ? new Error(stallMarker.stallMsg) : err;
         } finally {
           if (rt.liveProcessMemberIds instanceof Set) rt.liveProcessMemberIds.delete(childId);
           await started?.dispose?.().catch(() => {});

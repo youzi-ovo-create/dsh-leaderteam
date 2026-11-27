@@ -415,7 +415,7 @@ export function renderInstallerHtml() {
     if (envData.localSourceBundle && envData.localSourceBundle.available) {
       opts.push({ val: 'local-source', label: '使用当前本地目录插件源码包 (v' + envData.localSourceBundle.version + ')' });
     }
-    opts.push({ val: 'download:open-source', label: '在线下载最新「开源维护版 (Apache-2.0)」官方发布包' });
+    opts.push({ val: 'download:open-source', label: '在线下载最新「Open Leader Team 开源版 (Apache-2.0)」官方发布包' });
     opts.push({ val: 'download:closed-free', label: '在线下载最新「闭源免费公开发行版」官方发布包' });
     opts.push({ val: 'upload-tgz', label: '手动选择电脑上的 .tgz 安装包文件…' });
     opts.push({ val: 'path-tgz', label: '手动输入本地 .tgz 安装包完整路径…' });

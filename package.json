@@ -1,7 +1,7 @@
 {
   "name": "dsh-leaderteam",
-  "version": "2.2.3",
-  "description": "Autonomous multi-agent governance, 0ms deterministic host safety gate, and 4-bucket physical token ledger for DeepSeek Harness (Linux & Windows).",
+  "version": "1.0.0",
+  "description": "Open Leader Team (OLT): autonomous multi-agent governance, 0ms deterministic host safety gate, and 4-bucket physical token ledger for DeepSeek Harness (Linux & Windows).",
   "license": "Apache-2.0",
   "type": "module",
   "icon": "icon.svg",
@@ -18,7 +18,13 @@
     "lt-magpie": "./bin/lt-magpie.mjs",
     "lt-ui": "./bin/lt-ui.mjs",
     "lt-installer": "./bin/lt-installer.mjs",
-    "lt-update": "./bin/lt-update.mjs"
+    "lt-update": "./bin/lt-update.mjs",
+    "olt-doctor": "./bin/lt-doctor.mjs",
+    "olt-bugreport": "./bin/lt-bugreport.mjs",
+    "olt-magpie": "./bin/lt-magpie.mjs",
+    "olt-ui": "./bin/lt-ui.mjs",
+    "olt-installer": "./bin/lt-installer.mjs",
+    "olt-update": "./bin/lt-update.mjs"
   },
   "main": "./leaderteam/plugins/leaderteam-panel/index.mjs",
   "exports": {
@@ -38,6 +44,8 @@
   },
   "files": [
     "cordis.patch.yml",
+    "Install-OpenLeaderTeam.cmd",
+    "install-open-leaderteam.sh",
     "Install-LeaderTeam.cmd",
     "install-leaderteam.sh",
     "icon.svg",
@@ -47,6 +55,7 @@
     "config/*.json",
     "config/*.yml",
     "docs/*.md",
+    "docs/benchmarks/**",
     "docs/HeLuoDoc/**",
     "leaderteam/**",
     "packages/lt-usage/**",

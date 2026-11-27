@@ -838,18 +838,34 @@ export function checkConfigurationAndSoloKey({
         disableSnippet: '"powerMonitor": { "enabled": false }',
         privacyNote: 'Reads ONLY (onBattery, batteryPct) every 12m; set "powerMonitor": { "enabled": false } to disable.',
       },
-      summary: `Legacy V2.1 profile patch conflict detected (${conflictFiles}): overrides dsh-leaderteam@2.2.3 bundle entries. Run "npx lt-doctor --clean-legacy-patch" and restart DSH.`,
+      summary: `Legacy V2.1 profile patch conflict detected (${conflictFiles}): overrides installed dsh-leaderteam bundle entries. Run "npx lt-doctor --clean-legacy-patch" and restart DSH.`,
     };
   }
+
+  const dshCredentialsFile = path.join(effectiveDshHome, '.credentials.yaml');
+  const dshCredentialsPresent = fsImpl.existsSync(dshCredentialsFile);
+  const desktopPatchFile = path.join(effectiveDshHome, 'profiles', 'desktop', 'cordis.patch.yml');
+  const webPatchFile = path.join(effectiveDshHome, 'profiles', 'web', 'cordis.patch.yml');
+  const existingProfilePatches = [desktopPatchFile, webPatchFile].filter(p => fsImpl.existsSync(p));
+  const dshPatchHasProvider = existingProfilePatches.some(p => {
+    try {
+      return /\bllm-pi-ai\b/.test(fsImpl.readFileSync(p, 'utf8'));
+    } catch {
+      return false;
+    }
+  });
+  const missingHostProviderSync = detectedSoloKeys.length === 0
+    && existingProfilePatches.length > 0
+    && !dshPatchHasProvider;
 
   const authSummary = detectedSoloKeys.length > 0
     ? `Solo-Key env detected (${detectedSoloKeys.join(', ')})`
     : (hasLocalOverride || configSource === 'dsh-home'
-      ? `Gateway/profile config present (provider="${gatewayProvider ?? 'custom'}")`
+      ? `Gateway/profile config present (provider="${gatewayProvider ?? 'custom'}")${missingHostProviderSync ? '; note: DSH profile cordis.patch.yml has no llm-pi-ai provider entry yet — start DSH once or save provider credentials in Open Leader Team Settings' : ''}`
       : `Using example repo config (set DEEPSEEK_API_KEY for Solo-Key quick start or create config/leaderteam.local.json for gateway "${gatewayProvider ?? 'magpie'}")`);
 
   return {
-    status: readinessReady ? 'pass' : 'warn',
+    status: readinessReady && !missingHostProviderSync ? 'pass' : 'warn',
     configFile: selectedConfig,
     configSource,
     configValid: true,
@@ -857,6 +873,8 @@ export function checkConfigurationAndSoloKey({
     soloKeyEnvVarsPresent: detectedSoloKeys,
     gatewayProvider,
     hasLocalOverride,
+    dshCredentialsPresent,
+    dshPatchHasProvider: existingProfilePatches.length > 0 ? dshPatchHasProvider : null,
     powerMonitor: {
       enabled: powerEnabled,
       pollIntervalMinutes: pollMinutes,

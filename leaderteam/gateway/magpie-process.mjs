@@ -19,12 +19,14 @@ import net from 'node:net';
 import crypto from 'node:crypto';
 import { spawn, execFileSync } from 'node:child_process';
 import { writeFileAtomic } from '../core/store.mjs';
+import { parseSha256SumsText } from '../core/updater.mjs';
 import { MagpieClient } from './magpie-client.mjs';
 import { sanitizeMaskedPreview } from './magpie-adapter.mjs';
 import {
   MAGPIE_MANIFEST,
   computeFileSha256,
   evaluateMagpieVersionCompatibility,
+  parseMagpieVersion,
   probeMagpieApiCompatibility,
   resolveMagpiePlatformAsset,
   verifyMagpieReleaseSignature,
@@ -122,12 +124,12 @@ export function detectBinaryVersion(binaryPath) {
   try {
     const out = execFileSync(binaryPath, ['--version'], {
       encoding: 'utf8',
-      timeout: 4000,
+      timeout: 15000,
       windowsHide: true,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
-    const m = String(out || '').trim().match(/magpie\s+v?(\d+\.\d+\.\d+[^\s]*)/i);
-    return m ? m[1] : String(out || '').trim().split(/\s+/)[0] || null;
+    const m = String(out || '').trim().match(/(?:^|\bmagpie\s+)v?(\d+\.\d+\.\d+(?:[-+][\w.+-]+)?)(?=\s|$)/i);
+    return m?.[1] || null;
   } catch {
     return null;
   }
@@ -554,7 +556,10 @@ export class MagpieGatewayManager {
       if (!fs.existsSync(srcPath)) {
         throw new Error(`Magpie source binary does not exist: ${srcPath}`);
       }
-      const detectedVer = (version || detectBinaryVersion(srcPath) || MAGPIE_MANIFEST.pinnedVersion).replace(/^v/i, '');
+      const detectedVer = (version || detectBinaryVersion(srcPath))?.replace(/^v/i, '');
+      if (!parseMagpieVersion(detectedVer)) {
+        throw new Error('Cannot determine the version of the local Magpie binary');
+      }
       const sha256 = computeFileSha256(srcPath);
       const assetName = resolveMagpiePlatformAsset();
       const pinnedExpected = expectedSha256 || (assetName ? MAGPIE_MANIFEST.knownSha256?.[detectedVer]?.[assetName] : null);
@@ -592,18 +597,22 @@ export class MagpieGatewayManager {
       throw new Error(`Failed to query Magpie release metadata (${metaRes.status})`);
     }
     const meta = await metaRes.json();
-    const relVer = String(version || meta?.version || MAGPIE_MANIFEST.pinnedVersion).replace(/^v/i, '');
-    if (meta?.signed?.sums && meta?.signed?.sig) {
-      const sigOk = verifyMagpieReleaseSignature({
-        version: meta.version || relVer,
-        sumsText: meta.signed.sums,
-        signatureBase64: meta.signed.sig,
-      });
-      if (!sigOk) {
-        throw new Error('Magpie release Ed25519 signature verification failed');
-      }
+    const relVer = String(meta?.version || '').replace(/^v/i, '');
+    if (!parseMagpieVersion(relVer) || (version && String(version).replace(/^v/i, '') !== relVer)) {
+      throw new Error('Magpie release metadata does not match the requested version');
+    }
+    if (!verifyMagpieReleaseSignature({
+      version: relVer,
+      sumsText: meta?.signed?.sums,
+      signatureBase64: meta?.signed?.sig,
+    })) {
+      throw new Error('Magpie release Ed25519 signature verification failed');
     }
     const assetInfo = meta?.assets?.[assetName];
+    const expSha = parseSha256SumsText(meta.signed.sums, assetName);
+    if (!expSha || [expectedSha256, assetInfo?.sha256].some(hash => hash && String(hash).toLowerCase() !== expSha)) {
+      throw new Error(`Magpie signed SHA-256 missing or inconsistent for ${assetName}`);
+    }
     const downloadUrl = assetInfo?.url || `https://github.com/yetone/magpie-releases/releases/download/v${relVer}/${assetName}`;
     const binRes = await this.fetchImpl(downloadUrl);
     if (!binRes.ok) {
@@ -611,8 +620,7 @@ export class MagpieGatewayManager {
     }
     const buf = Buffer.from(await binRes.arrayBuffer());
     const sha256 = crypto.createHash('sha256').update(buf).digest('hex');
-    const expSha = expectedSha256 || assetInfo?.sha256;
-    if (expSha && sha256.toLowerCase() !== expSha.toLowerCase()) {
+    if (sha256 !== expSha) {
       throw new Error(`Downloaded Magpie SHA-256 mismatch: expected ${expSha}, got ${sha256}`);
     }
 
@@ -1188,6 +1196,15 @@ export class MagpieGatewayManager {
       }, 2500);
       killTimer.unref?.();
     });
+    if (proc.pid) {
+      const pidDeadline = Date.now() + 2000;
+      while (isPidAlive(proc.pid) && Date.now() < pidDeadline) {
+        await new Promise(r => setTimeout(r, 30));
+      }
+      if (IS_WIN) {
+        await new Promise(r => setTimeout(r, 60));
+      }
+    }
     if (this.child === proc) {
       this.child = null;
       this._removeParentExitCleanup();
@@ -1253,6 +1270,26 @@ export class MagpieGatewayManager {
         await this._terminateOwnedPid(saved.pid);
       }
       this._removeManagedPidRecord(saved.pid);
+    }
+
+    if (this._stoppingPids.size > 0) {
+      const stopDeadline = Date.now() + 2500;
+      while (this._stoppingPids.size > 0 && Date.now() < stopDeadline) {
+        for (const pid of [...this._stoppingPids]) {
+          if (!isPidAlive(pid)) this._stoppingPids.delete(pid);
+        }
+        if (this._stoppingPids.size === 0) break;
+        await new Promise(r => setTimeout(r, 30));
+      }
+      for (const pid of [...this._stoppingPids]) {
+        if (isPidAlive(pid)) {
+          try { process.kill(pid, 'SIGKILL'); } catch {}
+        }
+        this._stoppingPids.delete(pid);
+      }
+      if (IS_WIN) {
+        await new Promise(r => setTimeout(r, 60));
+      }
     }
 
     this._removeParentExitCleanup();

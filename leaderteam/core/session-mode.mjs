@@ -1,7 +1,7 @@
 // Session-level execution mode ('team' | 'single') with DSH-safe path encoding and atomic disk persistence.
 import fs from 'node:fs';
 import path from 'node:path';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { LtError } from './constants.mjs';
 import { writeFileAtomic, appendJsonl, readJsonl } from './store.mjs';
 import { isInside } from './paths.mjs';
@@ -45,6 +45,7 @@ function attachWriteMeta(record, meta) {
 
 function withSessionModeLock(lockFile, fn) {
   const deadline = Date.now() + LOCK_TIMEOUT_MS;
+  const token = randomUUID();
   let acquired = false;
   let attempt = 0;
 
@@ -52,41 +53,31 @@ function withSessionModeLock(lockFile, fn) {
     try {
       const fd = fs.openSync(lockFile, 'wx', 0o600);
       try {
-        fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, at: Date.now() }) + '\n', 'utf8');
+        fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, at: Date.now(), token }) + '\n', 'utf8');
       } finally {
         fs.closeSync(fd);
       }
       acquired = true;
       break;
     } catch (err) {
-      if (err?.code !== 'EEXIST') throw err;
+      const windowsContention = process.platform === 'win32' && ['EACCES', 'EPERM'].includes(err.code);
+      if (err?.code !== 'EEXIST' && !windowsContention) throw err;
       let shouldBreakStale = false;
       try {
         const st = fs.statSync(lockFile);
         const ageMs = Date.now() - st.mtimeMs;
-        if (ageMs > LOCK_STALE_MS) {
-          shouldBreakStale = true;
-        } else {
-          const raw = fs.readFileSync(lockFile, 'utf8');
-          if (raw.trim()) {
-            const parsed = JSON.parse(raw);
-            if (
-              Number.isInteger(parsed?.pid)
-              && parsed.pid > 0
-              && parsed.pid !== process.pid
-              && isPidDead(parsed.pid)
-            ) {
-              shouldBreakStale = true;
-            }
-          }
-        }
+        const raw = fs.readFileSync(lockFile, 'utf8');
+        let owner;
+        try { owner = JSON.parse(raw); } catch {}
+        shouldBreakStale = Number.isInteger(owner?.pid) && owner.pid > 0
+          ? owner.pid !== process.pid && isPidDead(owner.pid)
+          : ageMs > LOCK_STALE_MS;
       } catch (inspectErr) {
-        if (inspectErr?.code === 'ENOENT') continue;
+        if (inspectErr?.code === 'ENOENT' && Date.now() >= deadline) throw err;
       }
 
       if (shouldBreakStale) {
-        try { fs.unlinkSync(lockFile); } catch {}
-        continue;
+        try { fs.unlinkSync(lockFile); continue; } catch {}
       }
 
       if (Date.now() >= deadline) {
@@ -100,7 +91,9 @@ function withSessionModeLock(lockFile, fn) {
   try {
     return fn();
   } finally {
-    try { fs.rmSync(lockFile, { force: true }); } catch {}
+    try {
+      if (JSON.parse(fs.readFileSync(lockFile, 'utf8')).token === token) fs.unlinkSync(lockFile);
+    } catch {}
   }
 }
 

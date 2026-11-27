@@ -61,8 +61,11 @@ test('root package.json and cordis.patch.yml conform to official DSH bundle rule
   const innerPkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'leaderteam/package.json'), 'utf8'));
   const webPkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'packages/lt-web/package.json'), 'utf8'));
   assert.equal(pkg.name, 'dsh-leaderteam');
-  assert.equal(pkg.version, '2.2.3');
+  assert.equal(pkg.version, '1.0.0');
   assert.equal(innerPkg.version, pkg.version);
+  assert.equal(innerPkg.leaderteam?.brand, 'Open Leader Team');
+  assert.equal(innerPkg.leaderteam?.shortBrand, 'OLT');
+  assert.equal(innerPkg.leaderteam?.brandEpoch, 2);
   assert.equal(webPkg.version, pkg.version);
   assert.equal(pkg.license, 'Apache-2.0');
   assert.equal(pkg.dsh?.bundle?.patch, './cordis.patch.yml');

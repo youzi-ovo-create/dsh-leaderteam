@@ -46,6 +46,7 @@ export const EXPECTED_SCENARIOS = [
   'it33-modular-plugins-and-upstream-models',
   'it34-adversarial-rationality',
   'it46-dual-mode-single-team',
+  'it47-olt-stream-stall-fallback',
 ];
 export const EXPECTED_PROVIDER_MERGE_CHECKS = 23;
 /** The verifier's own files: hashed at start and end so a result names the exact tool that produced it. */

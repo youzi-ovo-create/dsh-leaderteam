@@ -20,6 +20,7 @@ export const CIRCUIT_NODES = Object.freeze([
 export const DEFAULT_CIRCUIT_BREAKER_CONFIG = Object.freeze({
   enabled: true,
   investigatorRole: 'arbiter',
+  firstOutputTimeoutMs: 120000,
   zeroProgressTruncationSoft: 5,
   zeroProgressTruncationHard: 10,
   repeatedFailureSoft: 8,

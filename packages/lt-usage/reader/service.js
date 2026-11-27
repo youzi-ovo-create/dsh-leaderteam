@@ -688,7 +688,7 @@ function buildSessionResult(home, data, sessionId, pricing, options = {}) {
 
 export function reportFor(home, sessionId, pricingOrOptions = defaultPricing, maybeOptions = undefined) {
   const { pricing, options } = normalizePricingAndOptions(pricingOrOptions, maybeOptions);
-  const data = loadHome(home);
+  const data = options?.preloadedHome ?? loadHome(home);
   if (!data.byId.has(sessionId)) return null;
   return isTeam(home, sessionId, options)
     ? buildTeamResult(home, data, sessionId, pricing, options)
@@ -697,7 +697,7 @@ export function reportFor(home, sessionId, pricingOrOptions = defaultPricing, ma
 
 export function listSessions(home, pricingOrOptions = defaultPricing, maybeOptions = undefined) {
   const { pricing, options } = normalizePricingAndOptions(pricingOrOptions, maybeOptions);
-  const data = loadHome(home);
+  const data = options?.preloadedHome ?? loadHome(home);
   const memberToTeam = collectMemberOwnerMap(home, data, options);
   const rows = [];
   const seen = new Set();
@@ -725,6 +725,7 @@ export function listSessions(home, pricingOrOptions = defaultPricing, maybeOptio
     const isChild = Boolean(teamId || (parentSessionId && data.byId.has(parentSessionId)));
     let result;
     try {
+      if (session.error) throw session.error;
       result = isTeam(home, session.id, options)
         ? buildTeamResult(home, data, session.id, pricing, options)
         : buildSessionResult(home, data, session.id, pricing, options);
@@ -775,7 +776,7 @@ export function listSessions(home, pricingOrOptions = defaultPricing, maybeOptio
 
 export function overviewFor(home, pricingOrOptions = defaultPricing, maybeOptions = undefined) {
   const { pricing, options } = normalizePricingAndOptions(pricingOrOptions, maybeOptions);
-  const data = loadHome(home);
+  const data = options?.preloadedHome ?? loadHome(home);
   const memberToTeam = collectMemberOwnerMap(home, data, options);
   const reports = [];
   const errors = [];

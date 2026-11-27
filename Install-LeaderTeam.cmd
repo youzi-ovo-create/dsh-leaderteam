@@ -1,6 +1,6 @@
 @echo off
 setlocal EnableExtensions
-title LeaderTeam One-Click Graphical Installer
+title Open Leader Team (OLT) One-Click Graphical Installer
 
 set "SCRIPT_DIR=%~dp0"
 set "INSTALLER_JS="
@@ -25,10 +25,7 @@ if not defined INSTALLER_JS (
 )
 
 where node >nul 2>nul
-if %ERRORLEVEL% EQU 0 (
-  node "%INSTALLER_JS%" %*
-  exit /b %ERRORLEVEL%
-)
+if not errorlevel 1 goto run_node
 
 REM Zero-Node Fallback: Automatically locate Official DeepSeek Harness Desktop (including custom paths like D:\Apps\DeepSeek-Harness)
 set "FOUND_DSH_EXE="
@@ -60,14 +57,19 @@ if not defined FOUND_DSH_EXE (
   )
 )
 
-if defined FOUND_DSH_EXE (
-  for %%F in ("%FOUND_DSH_EXE%") do set "DSH_DESKTOP_DIR=%%~dpF"
-  set "ELECTRON_RUN_AS_NODE=1"
-  "%FOUND_DSH_EXE%" "%INSTALLER_JS%" %*
-  exit /b %ERRORLEVEL%
-)
+if defined FOUND_DSH_EXE goto run_desktop_node
 
 echo [LeaderTeam] Official DeepSeek Harness Desktop or Node.js was not detected on this computer.
 echo Please install Official DeepSeek Harness Desktop (^>= 0.2.2-rc.1) first, or set DSH_DESKTOP_DIR to your custom install folder, then double-click this installer again.
 pause
 exit /b 1
+
+:run_node
+node "%INSTALLER_JS%" %*
+exit /b %ERRORLEVEL%
+
+:run_desktop_node
+for %%F in ("%FOUND_DSH_EXE%") do set "DSH_DESKTOP_DIR=%%~dpF"
+set "ELECTRON_RUN_AS_NODE=1"
+"%FOUND_DSH_EXE%" "%INSTALLER_JS%" %*
+exit /b %ERRORLEVEL%

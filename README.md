@@ -1,6 +1,7 @@
-# LeaderTeam for DeepSeek Harness (V2.2)
+# Open Leader Team (OLT) for DeepSeek Harness (V1.0.0)
 
-![Version](https://img.shields.io/badge/version-2.2.3-blue)
+![Version](https://img.shields.io/badge/OLT-1.0.0-blue)
+![Legacy Lineage](https://img.shields.io/badge/inherits-Leader%20Team%20v2.2.x-informational)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows-success)
 ![DSH Host](https://img.shields.io/badge/DeepSeek%20Harness-%3E%3D0.2.2--alpha.2%20%3C1.0.0-5b6ee1)
 ![Node.js](https://img.shields.io/badge/node-%3E%3D22.15-339933)
@@ -8,7 +9,9 @@
 
 **提交一句工程需求，自动拉起多模型团队完成规划、并行施工、独立审查、纠偏与验收交付——无需人工逐个指挥子代理。**
 
-LeaderTeam 是运行在 **DeepSeek Harness（Linux & Windows）** 上的长周期多 Agent 工程协作与安全治理插件（纯 Node.js ESM，零第三方运行时依赖，支持接入 DeepSeek、阿里云百炼 Qwen、智谱 GLM、OpenAI Codex 等主流模型）：
+> **品牌演进与平滑迁移说明**：自本集中缺陷修复与稳定性加固版本起，原开源产品线正式启用 **Open Leader Team（OLT）** 品牌，版本号重置为 **`V1.0.0`**（历史已发布的 `Leader Team V2.2.2` / `V2.2.3` 保持原品牌与版本号不变，不追溯更名）。`OLT V1.0.0` 100% 继承此前开源线的提交历史、底层插件包名（`dsh-leaderteam`）、会话预设 ID 与 `$DSH_HOME/leaderteam/` 数据目录，支持从 `Leader Team V2.2.x` 原位无损升级与离线快照回滚。
+
+Open Leader Team（OLT）是运行在 **DeepSeek Harness（Linux & Windows）** 上的长周期多 Agent 工程协作与安全治理开源插件（纯 Node.js ESM，零第三方运行时依赖，支持接入 DeepSeek、阿里云百炼 Qwen、智谱 GLM、OpenAI Codex 等主流模型）：
 
 - **不用手管子代理，也不怕“主管一言堂”跑偏**：领队模型自动拆解阶段并并行派发执行成员；双评审在后台**异步非阻塞监督**，仅当双方一致提出异议并经独立裁断认可时才暂停纠偏；遇到连续空转由独立调查员原位引导恢复，同案争议满三次自动整理卷宗交由人工拍板。
 - **零模型调用的确定性宿主安全门**：挂载于宿主工具执行管道最后一环，工作区内的合规文件读写与常规命令按确定性规则直接放行（0 次额外审查模型调用），越界读写与 Shell 逃逸硬阻断，跨界操作才调用独立安全门模型复核；宿主版本未验真时严格 **Fail-Closed**。
@@ -26,22 +29,20 @@ LeaderTeam 是运行在 **DeepSeek Harness（Linux & Windows）** 上的长周�
   - **控制台内置新手引导与一键升级**：首次打开控制台自动弹出三步引导（免命令行粘贴 API Key、选择团队模式、创建首个任务），并在「设置 → 版本更新与兼容」中支持自动检查更新、SHA-256 校验一键升级与失败自动回滚（开源版与闭源免费版严格独立检查，详见《[一键安装、新手引导与自动更新指南](docs/11-一键安装新手引导与自动更新指南.md)》）。
 
 - **方式 A：图形化一键安装器（全程无需命令行）**：
-  - Windows：解压后双击 **`Install-LeaderTeam.cmd`**；
-  - Linux / WSL2：执行 **`./install-leaderteam.sh`**（或 `node bin/lt-installer.mjs --gui`），在自动打开的浏览器向导中点击安装并直接启动客户端。
+  - Windows：解压后双击 **`Install-OpenLeaderTeam.cmd`**（或兼容旧入口 `Install-LeaderTeam.cmd`）；
+  - Linux / WSL2：执行 **`./install-open-leaderteam.sh`**（兼容 `./install-leaderteam.sh` 或 `node bin/lt-installer.mjs --gui`），在自动打开的浏览器向导中点击安装并直接启动客户端。
 
 - **方式 B：标准 `dsh plugin` 命令行安装**：
 
-> **安装源与跨平台独立 Release 标签说明**：当前稳定版通过 [GitHub Releases](https://github.com/youzi-ovo-create/dsh-leaderteam/releases) 按平台独立分发离线 `.tgz` 插件包——Linux 发行标签为 **`linux-vX.Y.Z`**（如 `linux-v2.2.3`），Windows 发行标签为 **`windows-vX.Y.Z`**（如 `windows-v2.2.3`）；内置安装器与自动更新器会自动按当前系统匹配对应平台 Release（详见《[跨平台独立发行与长期工程治理规范](docs/13-跨平台独立发行与长期工程规范.md)》）：
+> **安装源与跨平台独立 Release 标签说明**：当前稳定版通过 [GitHub Releases](https://github.com/youzi-ovo-create/dsh-leaderteam/releases) 按平台独立分发离线 `.tgz` 插件包——Linux 发行标签为 **`linux-vX.Y.Z`**（或 `olt-linux-vX.Y.Z`，历史版本如 `linux-v2.2.3` 保持原样），Windows 发行标签为 **`windows-vX.Y.Z`**（如 `windows-v1.0.0`）；内置安装器与自动更新器已内置品牌纪元识别（`Epoch 2 >= Epoch 1`），可从 `2.2.2` / `2.2.3` 直接检测并平滑升级至 `OLT 1.0.0`（详见《[跨平台独立发行与长期工程治理规范](docs/13-跨平台独立发行与长期工程规范.md)》）：
 
 ```bash
-# 1A. Linux / WSL2：从 linux-v2.2.3 Release 下载并安装到 web profile
-curl -fLO https://github.com/youzi-ovo-create/dsh-leaderteam/releases/download/linux-v2.2.3/dsh-leaderteam-2.2.3.tgz
-dsh plugin --profile web add ./dsh-leaderteam-2.2.3.tgz
+# 1A. Linux / WSL2：从 Release 下载并安装到 web profile（历史 V2.2.3 示例见 linux-v2.2.3）
+curl -fLO https://github.com/youzi-ovo-create/dsh-leaderteam/releases/download/linux-v1.0.0/dsh-leaderteam-1.0.0.tgz
+dsh plugin --profile web add ./dsh-leaderteam-1.0.0.tgz
 
-# 1B. 官方 Windows Desktop：从 windows-v2.2.3 Release 下载并安装到 desktop profile
-# （推荐直接双击随附的 Install-LeaderTeam.cmd 图形向导自动识别默认/自定义安装目录；若用命令行安装：）
-curl.exe -fLO https://github.com/youzi-ovo-create/dsh-leaderteam/releases/download/windows-v2.2.3/dsh-leaderteam-2.2.3.tgz
-dsh plugin --profile desktop add ./dsh-leaderteam-2.2.3.tgz
+# 1B. 官方 Windows Desktop：在 OLT v1.0.0 安装包所在目录运行，或双击随包提供的 Install-OpenLeaderTeam.cmd
+dsh plugin --profile desktop add ./dsh-leaderteam-1.0.0.tgz
 ```
 
 > 若已 `git clone` 本仓库，也可在仓库根目录直接执行 `dsh plugin --profile web add .`；Windows 旧版脚本备份恢复流程见《[官方 Desktop 部署与恢复](docs/官方Desktop部署与恢复.md)》。

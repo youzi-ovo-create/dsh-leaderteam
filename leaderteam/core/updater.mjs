@@ -10,6 +10,7 @@ import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { writeFileAtomic } from './store.mjs';
+import { pnpmStoreEnv } from '../../installer/lt-installer-standalone.mjs';
 import {
   parseDshSemver,
   compareDshSemver,
@@ -25,13 +26,13 @@ const DEFAULT_PLUGIN_ROOT = path.resolve(THIS_DIR, '..', '..');
 export const UPDATE_TRACKS = Object.freeze({
   'open-source': Object.freeze({
     id: 'open-source',
-    label: '开源维护版 (Apache-2.0)',
-    shortLabel: '开源版',
+    label: 'Open Leader Team 开源版 (Apache-2.0)',
+    shortLabel: 'OLT 开源版',
     license: 'Apache-2.0',
     repo: 'youzi-ovo-create/dsh-leaderteam',
     releasesApiUrl: 'https://api.github.com/repos/youzi-ovo-create/dsh-leaderteam/releases',
     releasesHtmlUrl: 'https://github.com/youzi-ovo-create/dsh-leaderteam/releases',
-    description: '纯 Node.js ESM 开源源码与标准安装包发行分支（Apache-2.0 协议）。',
+    description: 'Open Leader Team (OLT) 纯 Node.js ESM 开源源码与标准安装包发行分支（Apache-2.0，无缝兼容升级旧版 Leader Team 2.2.x）。',
   }),
   'closed-free': Object.freeze({
     id: 'closed-free',
@@ -83,16 +84,32 @@ export function readInstalledVersionInfo(pluginRoot = DEFAULT_PLUGIN_ROOT, fsImp
   let version = '0.0.0';
   let name = 'dsh-leaderteam';
   let enginesDsh = SUPPORTED_DSH_ENGINE_RANGE;
+  let declaredBrandEpoch = null;
   try {
     const rootPkg = JSON.parse(fsImpl.readFileSync(path.join(pluginRoot, 'package.json'), 'utf8'));
     if (typeof rootPkg.version === 'string') version = rootPkg.version.trim();
     if (typeof rootPkg.name === 'string') name = rootPkg.name.trim();
     if (typeof rootPkg.engines?.dsh === 'string') enginesDsh = rootPkg.engines.dsh.trim();
+    if (Number.isInteger(rootPkg.leaderteam?.brandEpoch)) declaredBrandEpoch = rootPkg.leaderteam.brandEpoch;
+  } catch {}
+  try {
+    const internalPkgPath = path.join(pluginRoot, 'leaderteam', 'package.json');
+    if (fsImpl.existsSync(internalPkgPath)) {
+      const internalPkg = JSON.parse(fsImpl.readFileSync(internalPkgPath, 'utf8'));
+      if (Number.isInteger(internalPkg?.leaderteam?.brandEpoch)) {
+        declaredBrandEpoch = internalPkg.leaderteam.brandEpoch;
+      }
+    }
   } catch {}
   const track = detectInstalledTrack(pluginRoot, fsImpl);
+  const parsedSemver = parseDshSemver(version);
+  const brandEpoch = track === 'open-source'
+    ? (declaredBrandEpoch ?? (parsedSemver && parsedSemver.major === 1 ? 2 : 1))
+    : 1;
   return {
     name,
     version,
+    brandEpoch,
     track,
     trackInfo: UPDATE_TRACKS[track] ?? UPDATE_TRACKS['open-source'],
     enginesDsh,
@@ -426,7 +443,7 @@ export function normalizeUpdaterPlatform(rawPlatform = process.platform) {
 export function parseReleaseTagForPlatform(rawTag) {
   const tag = String(rawTag ?? '').trim();
   if (!tag) return null;
-  const prefMatch = /^(windows|linux)-v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$/i.exec(tag);
+  const prefMatch = /^(?:olt-)?(windows|linux)-v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$/i.exec(tag);
   if (prefMatch) {
     const prefix = prefMatch[1].toLowerCase();
     const version = prefMatch[2];
@@ -438,7 +455,7 @@ export function parseReleaseTagForPlatform(rawTag) {
       platformScope: prefix === 'windows' ? 'win32' : 'linux',
     };
   }
-  const legacyMatch = /^v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$/i.exec(tag);
+  const legacyMatch = /^(?:olt-)?v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$/i.exec(tag);
   if (legacyMatch && !tag.includes('/')) {
     const version = legacyMatch[1];
     if (!parseDshSemver(version)) return null;
@@ -450,6 +467,53 @@ export function parseReleaseTagForPlatform(rawTag) {
     };
   }
   return null;
+}
+
+/**
+ * Determine the open-source brand epoch for seamless `Leader Team 2.2.x (Epoch 1) -> Open Leader Team 1.0.0+ (Epoch 2)` migration:
+ * - Epoch 2 (`Open Leader Team / OLT`, reset at `1.0.0`):
+ *   * Explicit `brandEpoch >= 2`
+ *   * `olt-*` prefixed release tag (`olt-windows-v1.0.0`, `olt-linux-v1.0.0`, `olt-v1.0.0`)
+ *   * Platform-prefixed `windows-v1.*` / `linux-v1.*` (platform-prefixed tags did not exist prior to `2.2.2`)
+ *   * Release metadata/asset mentioning `Open Leader Team`, `\bOLT\b`, or `open-leaderteam-*`
+ *   * Open-source semver with `major === 1` (legacy Leader Team open-source started at `2.1.0`)
+ * - Epoch 1 (`Leader Team 2.x`): historical `2.1.0`..`2.2.3` (and `2.x` test fixtures without OLT markers).
+ */
+export function resolveOpenSourceReleaseEpoch(input = {}) {
+  if (!input) return 1;
+  if (typeof input === 'string') {
+    const parsedTag = parseReleaseTagForPlatform(input);
+    const ver = parsedTag ? parsedTag.version : input;
+    const sv = parseDshSemver(ver);
+    if (/^olt-/i.test(input.trim())) return 2;
+    if (parsedTag?.prefix && sv?.major === 1) return 2;
+    if (sv?.major === 1) return 2;
+    return 1;
+  }
+  if (Number.isInteger(input.brandEpoch) && input.brandEpoch >= 1) return input.brandEpoch;
+  const tagName = String(input.tagName ?? input.tag_name ?? '').trim();
+  if (/^olt-/i.test(tagName)) return 2;
+  const parsedTag = parseReleaseTagForPlatform(tagName);
+  const ver = String(input.version ?? parsedTag?.version ?? '').trim();
+  const sv = parseDshSemver(ver);
+  if ((parsedTag?.prefix || input.platformPrefix) && sv?.major === 1) return 2;
+  const assetName = String(input.asset?.name ?? '').trim();
+  if (/^open-leaderteam-/i.test(assetName)) return 2;
+  const metaText = `${input.name ?? ''} ${input.body ?? ''}`;
+  if (/open\s+leader\s*team|\bOLT\b/i.test(metaText) && sv && sv.major >= 1) {
+    if (sv.major === 1 || /^olt-/i.test(tagName)) return 2;
+  }
+  if (sv?.major === 1) return 2;
+  return 1;
+}
+
+export function compareOpenSourceReleases(left, right) {
+  const leftEpoch = resolveOpenSourceReleaseEpoch(left);
+  const rightEpoch = resolveOpenSourceReleaseEpoch(right);
+  if (leftEpoch !== rightEpoch) return leftEpoch > rightEpoch ? 1 : -1;
+  const leftVer = typeof left === 'string' ? (parseReleaseTagForPlatform(left)?.version ?? left) : String(left?.version ?? '');
+  const rightVer = typeof right === 'string' ? (parseReleaseTagForPlatform(right)?.version ?? right) : String(right?.version ?? '');
+  return compareDshSemver(leftVer, rightVer) ?? 0;
 }
 
 export function assertTargetReleaseTagMatchesPlatform(targetVersion, platform = process.platform) {
@@ -466,7 +530,6 @@ export function assertTargetReleaseTagMatchesPlatform(targetVersion, platform = 
   }
   if (
     parsed.platformScope !== 'universal' &&
-    (normPlat === 'win32' || normPlat === 'linux' || normPlat === 'darwin') &&
     parsed.platformScope !== normPlat
   ) {
     const expectedPrefix = normPlat === 'win32' ? 'windows-v' : `${normPlat}-v`;
@@ -493,7 +556,9 @@ function normalizeReleaseEntry(rel, track) {
   const cleanVersion = parsedTag.version;
   const assets = Array.isArray(rel.assets) ? rel.assets : [];
   const tgzAsset =
-    assets.find(a => typeof a?.name === 'string' && /^dsh-leaderteam-.*\.tgz$/i.test(a.name)) ??
+    assets.find(a => a?.name === `dsh-leaderteam-${cleanVersion}.tgz`) ??
+    assets.find(a => a?.name === `open-leaderteam-${cleanVersion}.tgz`) ??
+    assets.find(a => typeof a?.name === 'string' && /^(?:dsh|open)-leaderteam-.*\.tgz$/i.test(a.name)) ??
     assets.find(a => typeof a?.name === 'string' && a.name.endsWith('.tgz')) ??
     null;
   const sumsAsset =
@@ -506,7 +571,7 @@ function normalizeReleaseEntry(rel, track) {
     if (/^[0-9a-f]{64}$/.test(hex)) assetDigestSha256 = hex;
   }
 
-  return {
+  const entry = {
     track,
     tagName: rawTag,
     version: cleanVersion,
@@ -527,6 +592,8 @@ function normalizeReleaseEntry(rel, track) {
       : null,
     sha256SumsUrl: sumsAsset?.browser_download_url ?? null,
   };
+  entry.brandEpoch = track === 'open-source' ? resolveOpenSourceReleaseEpoch(entry) : 1;
+  return entry;
 }
 
 /**
@@ -549,11 +616,7 @@ export function selectReleasesForPlatform(rawList, {
     .map(r => normalizeReleaseEntry(r, track))
     .filter(r => r !== null && (includePrerelease || !r.prerelease || (parsedTarget && r.version === parsedTarget.version)));
 
-  const allowedForPlat = normalized.filter(r => {
-    if (normPlat === 'win32') return r.platformScope === 'win32' || r.platformScope === 'universal';
-    if (normPlat === 'linux') return r.platformScope === 'linux' || r.platformScope === 'universal';
-    return r.platformScope !== 'win32';
-  });
+  const allowedForPlat = normalized.filter(r => r.platformScope === normPlat || r.platformScope === 'universal');
 
   if (parsedTarget) {
     const exactMatches = allowedForPlat
@@ -567,7 +630,9 @@ export function selectReleasesForPlatform(rawList, {
         const aPref = a.platformScope === normPlat ? 1 : 0;
         const bPref = b.platformScope === normPlat ? 1 : 0;
         if (aPref !== bPref) return bPref - aPref;
-        return compareDshSemver(b.version, a.version) ?? 0;
+        return track === 'open-source'
+          ? compareOpenSourceReleases(b, a)
+          : (compareDshSemver(b.version, a.version) ?? 0);
       });
     return exactMatches;
   }
@@ -577,7 +642,11 @@ export function selectReleasesForPlatform(rawList, {
     ? samePlatPrefixed
     : allowedForPlat.filter(r => r.platformScope === 'universal');
 
-  return candidatePool.sort((a, b) => compareDshSemver(b.version, a.version) ?? 0);
+  return candidatePool.sort((a, b) => (
+    track === 'open-source'
+      ? compareOpenSourceReleases(b, a)
+      : (compareDshSemver(b.version, a.version) ?? 0)
+  ));
 }
 
 /**
@@ -606,7 +675,7 @@ export async function checkForUpdates({
   const isCrossTrackPreview = queryTrack !== installed.track;
 
   const cacheFile = storageRoot && !targetVersion
-    ? path.join(resolveUpdaterDir(storageRoot), `check-cache-${queryTrack}-${normPlat}.json`)
+    ? path.join(resolveUpdaterDir(storageRoot), `check-cache-${queryTrack}-${normPlat}-${includePrerelease ? 'preview' : 'stable'}.json`)
     : null;
 
   if (!force && !targetVersion && !apiUrlOverride && cacheFile && fs.existsSync(cacheFile)) {
@@ -660,10 +729,12 @@ export async function checkForUpdates({
   const hasUpdate = latest
     ? (
         targetVersion
-          ? latest.version !== installed.version || queryTrack !== installed.track
+          ? latest.version !== installed.version || (queryTrack === 'open-source' && latest.brandEpoch !== installed.brandEpoch) || queryTrack !== installed.track
           : (isCrossTrackPreview
               ? latest.version !== installed.version || queryTrack !== installed.track
-              : compareDshSemver(latest.version, installed.version) > 0)
+              : (queryTrack === 'open-source'
+                  ? compareOpenSourceReleases(latest, installed) > 0
+                  : compareDshSemver(latest.version, installed.version) > 0))
       )
     : false;
 
@@ -705,16 +776,23 @@ export async function checkForUpdates({
 export function isRuntimeIdleForUpgrade(rt) {
   if (!rt) return { idle: true, reasons: [] };
   const reasons = [];
-  if (rt.liveProcessMemberIds instanceof Set && rt.liveProcessMemberIds.size > 0) {
-    reasons.push(`当前有 ${rt.liveProcessMemberIds.size} 个团队执行成员正在运行`);
+  const activeMembers = new Set(rt.liveProcessMemberIds);
+  for (const store of rt.stores?.values() ?? []) {
+    for (const member of store.members().values()) {
+      if (['starting', 'started', 'running'].includes(member.status)) activeMembers.add(member.childId);
+      else activeMembers.delete(member.childId);
+    }
   }
-  if (rt.inFlightShellCallsBySession instanceof Map && rt.inFlightShellCallsBySession.size > 0) {
+  if (activeMembers.size > 0) {
+    reasons.push(`当前有 ${activeMembers.size} 个团队执行成员正在运行`);
+  }
+  if ([...(rt.inFlightShellCallsBySession?.values() ?? [])].some(count => count > 0)) {
     reasons.push('当前有正在执行的受控终端工具调用');
   }
   if (rt.actors instanceof Map) {
     for (const actor of rt.actors.values()) {
       const status = typeof actor?.agent?.status === 'function' ? actor.agent.status() : actor?.agent?.status;
-      if (status === 'running' || status === 'busy' || status === 'streaming') {
+      if (['running', 'busy', 'thinking', 'streaming'].includes(status)) {
         reasons.push(`会话 ${actor.teamId || ''} 主代理正在执行回合`);
         break;
       }
@@ -795,6 +873,7 @@ export async function downloadAndVerifyReleaseTarball({
   sha256SumsUrl = null,
   expectedSha256 = null,
   assetName = null,
+  expectedVersion = null,
   fetchImpl = globalThis.fetch,
 }) {
   const stagingRoot = path.join(resolveUpdaterDir(storageRoot), 'staging');
@@ -805,7 +884,7 @@ export async function downloadAndVerifyReleaseTarball({
     err.code = 'UNSUPPORTED_ASSET_TYPE';
     throw err;
   }
-  const destFile = path.join(stagingRoot, `${Date.now()}-${cleanName}`);
+  const destFile = path.join(stagingRoot, `${crypto.randomUUID()}-${cleanName}`);
 
   let resolvedExpectedSha = expectedSha256 ? String(expectedSha256).trim().toLowerCase() : null;
   if (!resolvedExpectedSha && sha256SumsUrl) {
@@ -816,6 +895,9 @@ export async function downloadAndVerifyReleaseTarball({
     }
   }
 
+  if (!resolvedExpectedSha) {
+    throw Object.assign(new Error(`缺少安装包 ${cleanName} 的 SHA-256 校验值`), { code: 'SHA256_UNAVAILABLE' });
+  }
   const pkgRes = await fetchImpl(downloadUrl, { method: 'GET' });
   if (!pkgRes.ok) {
     const err = new Error(`下载更新包失败（HTTP ${pkgRes.status}）`);
@@ -829,11 +911,8 @@ export async function downloadAndVerifyReleaseTarball({
     err.code = 'PACKAGE_TOO_LARGE';
     throw err;
   }
-  fs.writeFileSync(destFile, buf);
-
   const actualSha = crypto.createHash('sha256').update(buf).digest('hex');
-  if (resolvedExpectedSha && actualSha !== resolvedExpectedSha) {
-    try { fs.rmSync(destFile, { force: true }); } catch {}
+  if (actualSha !== resolvedExpectedSha) {
     const err = new Error(
       `安装包 SHA-256 校验不一致（期望 ${resolvedExpectedSha.slice(0, 12)}...，实际 ${actualSha.slice(0, 12)}...），已中止安装并清理临时文件。`,
     );
@@ -841,13 +920,9 @@ export async function downloadAndVerifyReleaseTarball({
     throw err;
   }
 
-  let inspection;
-  try {
-    inspection = inspectTgzPackage(buf);
-  } catch (e) {
-    try { fs.rmSync(destFile, { force: true }); } catch {}
-    throw e;
-  }
+  const inspection = inspectTgzPackage(buf);
+  assertPackageVersion(inspection.version, expectedVersion);
+  fs.writeFileSync(destFile, buf);
 
   return {
     tgzPath: destFile,
@@ -856,6 +931,12 @@ export async function downloadAndVerifyReleaseTarball({
     sizeBytes: buf.length,
     inspection,
   };
+}
+
+export function assertPackageVersion(actual, expected) {
+  if (expected && actual !== expected) {
+    throw Object.assign(new Error(`安装包版本 ${actual} 与目标版本 ${expected} 不符`), { code: 'PACKAGE_VERSION_MISMATCH' });
+  }
 }
 
 const WIN_UPDATER_DRIVE_SUBPATHS = Object.freeze([
@@ -870,6 +951,7 @@ const WIN_UPDATER_DRIVE_SUBPATHS = Object.freeze([
 ]);
 
 export function resolveDshCliCommand({ dshHome = null, profile = 'web', env = process.env, fsImpl = fs } = {}) {
+  const storeEnv = pnpmStoreEnv(dshHome, env, fsImpl);
   // 1. Official Windows Desktop bundled CLI (supports BOTH `desktop` and `web` profiles, custom install dirs like D:\Apps\DeepSeek-Harness, and LT_DSH_APP)
   if (process.platform === 'win32') {
     const appDirCandidates = [
@@ -895,17 +977,17 @@ export function resolveDshCliCommand({ dshHome = null, profile = 'web', env = pr
     for (const appDir of appDirCandidates) {
       const exePath = path.join(appDir, 'DeepSeek Harness.exe');
       const cliJsPath = path.join(appDir, 'resources', 'app.asar', 'dsh', 'node_modules', '@deepseek-ai', 'dsh-desktop-host', 'lib', 'cli.js');
-      if (fsImpl.existsSync(exePath) && fsImpl.existsSync(cliJsPath)) {
+      if (fsImpl.existsSync(exePath) && (fsImpl.existsSync(cliJsPath) || fsImpl.existsSync(path.join(appDir, 'resources', 'app.asar')))) {
         return {
           cmd: exePath,
           prefixArgs: ['--expose-internals', cliJsPath],
           shell: false,
-          extraEnv: { ELECTRON_RUN_AS_NODE: '1' },
+          extraEnv: { ...storeEnv, ELECTRON_RUN_AS_NODE: '1' },
         };
       }
       const dshCmd = path.join(appDir, 'resources', 'runtime', 'cli', 'bin', 'dsh.cmd');
       if (fsImpl.existsSync(dshCmd)) {
-        return { cmd: dshCmd, prefixArgs: [], shell: true, extraEnv: {} };
+        return { cmd: dshCmd, prefixArgs: [], shell: true, extraEnv: storeEnv };
       }
     }
   }
@@ -924,7 +1006,7 @@ export function resolveDshCliCommand({ dshHome = null, profile = 'web', env = pr
     for (const ext of exts) {
       const cand = path.join(dir, `dsh${ext}`);
       if (fsImpl.existsSync(cand)) {
-        return { cmd: cand, prefixArgs: [], shell: process.platform === 'win32' && ext === '.cmd', extraEnv: {} };
+        return { cmd: cand, prefixArgs: [], shell: process.platform === 'win32' && ext === '.cmd', extraEnv: storeEnv };
       }
     }
   }
@@ -974,7 +1056,7 @@ export async function performOneClickUpgrade({
   allowBusy = false,
 } = {}) {
   if (!storageRoot) throw new Error('storageRoot is required for performOneClickUpgrade');
-  assertTargetReleaseTagMatchesPlatform(targetVersion, platform);
+  const requested = assertTargetReleaseTagMatchesPlatform(targetVersion, platform);
 
   if (!allowBusy) {
     const idleCheck = isRuntimeIdleForUpgrade(rt);
@@ -1029,6 +1111,7 @@ export async function performOneClickUpgrade({
           downloadUrl,
           sha256SumsUrl,
           expectedSha256,
+          expectedVersion: requested?.version,
           fetchImpl,
         })),
         cleanupOnFinish: true,
@@ -1056,6 +1139,7 @@ export async function performOneClickUpgrade({
           sha256SumsUrl: checkRes.latestRelease.sha256SumsUrl,
           expectedSha256: expectedSha256 || checkRes.latestRelease.asset.sha256,
           assetName: checkRes.latestRelease.asset.name,
+          expectedVersion: checkRes.latestRelease.version,
           fetchImpl,
         })),
         cleanupOnFinish: true,
@@ -1063,6 +1147,7 @@ export async function performOneClickUpgrade({
     }
 
     writeUpdaterState(storageRoot, { phase: 'verifying' });
+    assertPackageVersion(staged.inspection.version, requested?.version);
 
     // Enforce track match on the actual inspected tarball too!
     validateTrackSwitch({
@@ -1086,9 +1171,10 @@ export async function performOneClickUpgrade({
     }
 
     const rootCtx = ctx?.root ?? ctx;
-    const pluginManager = typeof rootCtx?.get === 'function' ? rootCtx.get('pluginManager') : null;
-    const hasHmr = Boolean(typeof rootCtx?.get === 'function' && rootCtx.get('hmr'));
     const profileCtx = typeof rootCtx?.get === 'function' ? rootCtx.get('profileContext') : null;
+    const useDesktopCli = process.platform === 'win32' && dshHome && profileCtx?.dir && resolveDshCliCommand({ dshHome })?.extraEnv?.ELECTRON_RUN_AS_NODE;
+    const pluginManager = !useDesktopCli && rootCtx?.get?.('pluginManager');
+    const hasHmr = Boolean(pluginManager && rootCtx.get('hmr'));
     const effectiveProfile = profile || profileCtx?.profile || (process.platform === 'win32' ? 'web' : 'web');
     const profileDir =
       profileCtx?.dir ??
@@ -1145,7 +1231,7 @@ export async function performOneClickUpgrade({
                 windowsHide: true,
                 shell: dshCli.shell,
                 timeout: 120000,
-                env: { ...process.env, ...(dshHome ? { DSH_HOME: dshHome } : {}) },
+                env: { ...process.env, ...(dshCli.extraEnv ?? {}), ...(dshHome ? { DSH_HOME: dshHome } : {}) },
               },
             );
             rollbackOk = proc.status === 0;
@@ -1428,9 +1514,10 @@ export async function rollbackToSavedBackup({
   }
 
   const rootCtx = ctx?.root ?? ctx;
-  const pluginManager = typeof rootCtx?.get === 'function' ? rootCtx.get('pluginManager') : null;
-  const hasHmr = Boolean(typeof rootCtx?.get === 'function' && rootCtx.get('hmr'));
   const profileCtx = typeof rootCtx?.get === 'function' ? rootCtx.get('profileContext') : null;
+  const useDesktopCli = process.platform === 'win32' && dshHome && profileCtx?.dir && resolveDshCliCommand({ dshHome })?.extraEnv?.ELECTRON_RUN_AS_NODE;
+  const pluginManager = !useDesktopCli && rootCtx?.get?.('pluginManager');
+  const hasHmr = Boolean(pluginManager && rootCtx.get('hmr'));
   const effectiveProfile = profile || profileCtx?.profile || 'web';
 
   if (typeof installerHook === 'function') {
@@ -1445,15 +1532,19 @@ export async function rollbackToSavedBackup({
     if (hasHmr && typeof pluginManager.removeBundle === 'function') {
       setTimeout(() => {
         (async () => {
-          await pluginManager.removeBundle('dsh-leaderteam').catch(() => null);
-          await pluginManager.installBundle(chosen.pluginSnapshotDir, { enabled: true });
+          const removed = await pluginManager.removeBundle('dsh-leaderteam');
+          if (['failed', 'cancelled'].includes(removed?.application)) throw new Error(removed.error?.diagnostic || '卸载当前插件失败');
+          const result = await pluginManager.installBundle(chosen.pluginSnapshotDir, { enabled: true });
+          if (['failed', 'cancelled'].includes(result?.application)) throw new Error(result.error?.diagnostic || '宿主插件管理器回滚失败');
           restoreConfigSnapshotIfMissing(chosen.backupDir, storageRoot);
           writeUpdaterState(storageRoot, {
             phase: 'rolled_back',
             activeUpgrade: null,
             lastError: null,
           });
-        })().catch(() => {});
+        })().catch(err => {
+          writeUpdaterState(storageRoot, { phase: 'failed', activeUpgrade: null, lastError: err.message || String(err) });
+        });
       }, 120);
       return {
         ok: true,

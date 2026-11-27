@@ -2029,7 +2029,7 @@ export async function awaitTeamGovernanceJobs(rt, teamId, timeoutMs = 60000) {
   let timer;
   await Promise.race([
     Promise.allSettled(jobs.map(j => j.promise)),
-    new Promise(resolve => { timer = setTimeout(resolve, timeoutMs); timer.unref?.(); }),
+    new Promise(resolve => { timer = setTimeout(resolve, timeoutMs); }),
   ]);
   if (timer) clearTimeout(timer);
 }

@@ -17,6 +17,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { pnpmStoreEnv } from '../../installer/lt-installer-standalone.mjs';
 
 const THIS_DIR = path.dirname(fileURLToPath(import.meta.url));
 const BRIDGE_PLUGIN = path.join(THIS_DIR, 'lib', 'host-test-bridge.mjs');
@@ -272,9 +273,14 @@ async function startSimulatedOrProxyUpstream(mode, workspaceDir, liveConfig) {
     const upstreamOriginUrl = new URL(liveConfig.upstreamUrl);
     const upstreamBasePath = upstreamOriginUrl.pathname.replace(/\/+$/, '');
     const upstreamOrigin = upstreamOriginUrl.origin;
+    const proxyToken = crypto.randomUUID();
 
     // Transparent read-only recorder proxy fronting user-supplied OpenAI-compatible gateway
     const server = http.createServer(async (req, res) => {
+      if (req.headers.authorization !== `Bearer ${proxyToken}`) {
+        res.writeHead(401).end();
+        return;
+      }
       const chunks = [];
       for await (const c of req) chunks.push(c);
       const bodyBuf = Buffer.concat(chunks);
@@ -296,12 +302,16 @@ async function startSimulatedOrProxyUpstream(mode, workspaceDir, liveConfig) {
       const forwardPath = upstreamBasePath && reqPath.startsWith('/v1')
         ? `${upstreamBasePath}${reqPath.slice('/v1'.length)}`
         : reqPath;
-      const upstreamUrl = new URL(forwardPath, upstreamOrigin);
-      const fwdHeaders = { ...req.headers, host: upstreamOriginUrl.host };
+      const upstreamUrl = new URL(upstreamOrigin);
+      const requestUrl = new URL(forwardPath, upstreamOrigin);
+      upstreamUrl.pathname = requestUrl.pathname;
+      upstreamUrl.search = requestUrl.search;
+      const fwdHeaders = { ...req.headers, host: upstreamOriginUrl.host, authorization: `Bearer ${liveConfig.apiKey}` };
       try {
         const upRes = await fetch(upstreamUrl, {
           method: req.method,
           headers: fwdHeaders,
+          redirect: 'error',
           body: req.method !== 'GET' && req.method !== 'HEAD' ? bodyBuf : undefined,
         });
         entry.httpStatus = upRes.status;
@@ -320,7 +330,7 @@ async function startSimulatedOrProxyUpstream(mode, workspaceDir, liveConfig) {
     await new Promise(r => server.listen(port, '127.0.0.1', r));
     return {
       baseURL: `http://127.0.0.1:${port}/v1`,
-      apiKey: liveConfig.apiKey,
+      apiKey: proxyToken,
       primaryModel: liveConfig.primaryModel,
       secondaryModel: liveConfig.secondaryModel,
       requests,
@@ -951,12 +961,14 @@ async function main() {
   fs.mkdirSync(workRoot, { recursive: true });
 
   const detectedVersion = readTarballPackageVersion(tgzPath, workRoot);
-  const targetVersion = String(args.version || detectedVersion || '2.2.3').replace(/^v/i, '');
+  const targetVersion = String(args.version || detectedVersion || '').replace(/^v/i, '');
+  if (!detectedVersion || targetVersion !== detectedVersion) throw new Error('Candidate version must match the tarball manifest');
 
   const runId = `clean9-${targetVersion}-${mode}-${Date.now()}`;
   const runDir = path.join(workRoot, runId);
   const dshHome = path.join(runDir, 'dsh-home');
   const agentsHome = path.join(runDir, 'agents-home');
+  Object.assign(process.env, pnpmStoreEnv(dshHome));
   const userDataDir = path.join(os.tmpdir(), `lt-c9-ud-${Date.now().toString(36)}`);
   // Place workspaceDir under user-owned os.tmpdir() so Windows ACL sandbox SetNamedSecurityInfoW (WRITE_DAC) succeeds reliably
   const workspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), `lt-c9-ws-${targetVersion}-`));
@@ -972,11 +984,13 @@ async function main() {
 
   // Resolve upgrade / rollback tarballs for Item 8 (supports any future version!)
   let rollbackTgz = args['rollback-tgz'] ? path.resolve(args['rollback-tgz']) : tgzPath;
-  let rollbackVersion = readTarballPackageVersion(rollbackTgz, workRoot) || targetVersion;
+  const rollbackVersion = readTarballPackageVersion(rollbackTgz, workRoot);
+  if (!rollbackVersion) throw new Error('Cannot read rollback package version');
   let upgradeTgz = args['upgrade-tgz'] ? path.resolve(args['upgrade-tgz']) : null;
-  let upgradeVersion = upgradeTgz ? (readTarballPackageVersion(upgradeTgz, workRoot) || bumpPatchVersion(rollbackVersion)) : null;
+  let upgradeVersion = upgradeTgz ? readTarballPackageVersion(upgradeTgz, workRoot) : null;
   let upgradeTarballMode = 'explicit-tarballs';
-  if (!upgradeTgz || upgradeVersion === rollbackVersion) {
+  if (upgradeTgz && (!upgradeVersion || upgradeVersion === rollbackVersion)) throw new Error('Explicit upgrade and rollback tarballs must have distinct, readable versions');
+  if (!upgradeTgz) {
     const nextVer = bumpPatchVersion(rollbackVersion);
     upgradeTgz = createSyntheticPatchBumpTarball(tgzPath, nextVer, runDir);
     upgradeVersion = nextVer;
@@ -1072,7 +1086,7 @@ async function main() {
       ? JSON.parse(fs.readFileSync(installedPkgJsonPath, 'utf8')).version
       : null;
 
-    recordItem(1, 'Zero-State Plugin Installation', bundleRegisteredInWeb && Boolean(standaloneInstaller ? standaloneInstallResult.exitCode === 0 : true), {
+    recordItem(1, 'Zero-State Plugin Installation', bundleRegisteredInWeb && installedVersion === targetVersion && Boolean(standaloneInstaller ? standaloneInstallResult.exitCode === 0 : true), {
       standaloneInstaller: standaloneInstallResult,
       dshPluginAddWeb: dshPluginAddWebResult,
       bundleRegisteredInWeb,
@@ -1514,7 +1528,7 @@ async function main() {
     // ITEM 8: Install -> Upgrade -> Rollback + Cross-Platform Decoy Rejection + History SHA-256 Preservation
     // =========================================================================
     if (installedVersion !== rollbackVersion && fs.existsSync(rollbackTgz)) {
-      spawnSync(
+      const baselineInstall = spawnSync(
         dshExe,
         ['--expose-internals', dshCliJs, 'plugin', '--profile', 'web', 'add', rollbackTgz],
         {
@@ -1525,7 +1539,9 @@ async function main() {
           env: { ...process.env, ELECTRON_RUN_AS_NODE: '1', DSH_HOME: dshHome, DSH_AGENTS_HOME: agentsHome, DSH_TELEMETRY_DISABLED: '1' },
         },
       );
+      if (baselineInstall.status !== 0) throw new Error(`Could not install rollback baseline: ${baselineInstall.stderr || baselineInstall.stdout || baselineInstall.status}`);
     }
+    const versionBeforeUpgrade = JSON.parse(fs.readFileSync(installedPkgJsonPath, 'utf8')).version;
 
     const ltDir = path.join(dshHome, 'leaderteam');
     fs.mkdirSync(path.join(ltDir, 'config'), { recursive: true });
@@ -1550,11 +1566,9 @@ async function main() {
 
     try {
       const installedBundleDir = path.join(dshHome, 'profiles', 'web', 'node_modules', 'dsh-leaderteam');
-      const unpackUpdaterFallback = path.join(pkgRoot, 'leaderteam', 'core', 'updater.mjs');
       const updaterCandidates = [
         path.join(installedBundleDir, 'leaderteam', 'core', 'updater.mjs'),
         path.join(installedBundleDir, 'updater.mjs'),
-        unpackUpdaterFallback,
       ];
       const updaterModulePath = updaterCandidates.find(p => fs.existsSync(p)) ?? null;
       const ltUpdateCliPath = fs.existsSync(path.join(installedBundleDir, 'bin', 'lt-update.mjs'))
@@ -1572,7 +1586,7 @@ async function main() {
 
       if (updaterModulePath) {
         try {
-          const mod = await import(pathToFileURL(updaterModulePath).href);
+          const mod = await import(pathToFileURL(fs.realpathSync.native(updaterModulePath)).href);
           if (typeof mod.assertTargetReleaseTagMatchesPlatform === 'function') {
             try {
               mod.assertTargetReleaseTagMatchesPlatform(decoyLinuxTag, 'win32');
@@ -1581,15 +1595,31 @@ async function main() {
             }
           }
           if (typeof mod.checkForUpdates === 'function') {
-            checkResult = await mod.checkForUpdates({
-              pluginRoot: installedBundleDir,
-              storageRoot: ltDir,
-              track: 'open-source',
-              force: true,
-              currentHostVersion: '0.2.2-rc.1',
-              apiUrlOverride: ghSim.repoApiUrl,
-              platform: 'win32',
-            });
+            if (typeof mod.compareOpenSourceReleases === 'function') {
+              checkResult = await mod.checkForUpdates({
+                pluginRoot: installedBundleDir,
+                storageRoot: ltDir,
+                track: 'open-source',
+                force: true,
+                currentHostVersion: '0.2.2-rc.1',
+                apiUrlOverride: ghSim.repoApiUrl,
+                platform: 'win32',
+              });
+            } else {
+              // Historical pre-OLT baseline (e.g. Leader Team 2.2.3 -> OLT 1.0.0 brand-epoch reset):
+              // verify OLT epoch-aware auto-selection against the 2.2.3 install root while driving 2.2.3's explicit tag upgrade.
+              const repoUpdaterUrl = pathToFileURL(path.resolve(THIS_DIR, '../../leaderteam/core/updater.mjs')).href;
+              const oltUpdater = await import(repoUpdaterUrl);
+              checkResult = await oltUpdater.checkForUpdates({
+                pluginRoot: installedBundleDir,
+                storageRoot: ltDir,
+                track: 'open-source',
+                force: true,
+                currentHostVersion: '0.2.2-rc.1',
+                apiUrlOverride: ghSim.repoApiUrl,
+                platform: 'win32',
+              });
+            }
             selectedUpgradeTag = checkResult?.latestRelease?.tagName
               || checkResult?.latestRelease?.tag
               || checkResult?.tag
@@ -1599,7 +1629,8 @@ async function main() {
             const dlUrl = checkResult?.latestRelease?.asset?.downloadUrl
               || checkResult?.latestRelease?.tgzAsset?.downloadUrl
               || `${ghSim.apiBaseUrl}/assets/${ghSim.upgradeTag}/${ghSim.upgradeAssetName}`;
-            const sumsUrl = checkResult?.latestRelease?.sha256SumsAsset?.downloadUrl
+            const sumsUrl = checkResult?.latestRelease?.sha256SumsUrl
+              || checkResult?.latestRelease?.sha256SumsAsset?.downloadUrl
               || checkResult?.latestRelease?.sha256Asset?.downloadUrl
               || `${ghSim.apiBaseUrl}/assets/${ghSim.upgradeTag}/SHA256SUMS.txt`;
             upgradeResult = await mod.performOneClickUpgrade({
@@ -1616,8 +1647,9 @@ async function main() {
               versionAfterUpgrade = JSON.parse(fs.readFileSync(installedPkgJsonPath, 'utf8')).version;
             }
           }
-          if (typeof mod.rollbackToSavedBackup === 'function') {
-            rollbackResult = await mod.rollbackToSavedBackup({
+          if (versionAfterUpgrade === upgradeVersion) {
+            const upgraded = await import(pathToFileURL(fs.realpathSync.native(updaterModulePath)).href + '?after-upgrade');
+            rollbackResult = await upgraded.rollbackToSavedBackup({
               storageRoot: ltDir,
               dshHome,
               profile: 'web',
@@ -1643,12 +1675,13 @@ async function main() {
       const teamsPreserved = Object.entries(teamsHashesBefore).every(([k, v]) => teamsHashesAfter[k] === v);
       const allHistoryPreserved = configPreserved && sessionsPreserved && teamsPreserved;
 
-      const hitExpectedUpgradeTag = selectedUpgradeTag === ghSim.upgradeTag || versionAfterUpgrade === upgradeVersion;
+      const hitExpectedUpgradeTag = selectedUpgradeTag === ghSim.upgradeTag;
       const item8Passed = Boolean(
         (ltUpdateCliPath || updaterModulePath) &&
         decoyUntouched &&
         crossPlatformRejectOk &&
         hitExpectedUpgradeTag &&
+        versionBeforeUpgrade === rollbackVersion &&
         versionAfterUpgrade === upgradeVersion &&
         versionAfterRollback === rollbackVersion &&
         allHistoryPreserved &&
@@ -1662,6 +1695,7 @@ async function main() {
         decoyLinuxUntouched: decoyUntouched,
         crossPlatformRejectOk,
         selectedUpgradeTag,
+        versionBeforeUpgrade,
         versionAfterUpgrade,
         versionAfterRollback,
         item8Error,

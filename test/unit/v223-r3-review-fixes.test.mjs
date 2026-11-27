@@ -90,7 +90,7 @@ const { resolveStorageRoot, buildReport, defaultPricing } = await import('../../
 const {
   extractCnyAmount,
   computeTodayUsageSummary,
-} = await import('../../packages/lt-web/src/lib/api.ts');
+} = (await import('./lt-web-api.mjs')).default;
 
 const ORIG_TEST_CWD = process.cwd();
 

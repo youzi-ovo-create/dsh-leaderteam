@@ -117,6 +117,7 @@ function checkPackageVersionParity() {
   const innerPkg = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, 'leaderteam', 'package.json'), 'utf8'));
   const webPkgPath = path.join(REPO_ROOT, 'packages', 'lt-web', 'package.json');
   const webPkg = fs.existsSync(webPkgPath) ? JSON.parse(fs.readFileSync(webPkgPath, 'utf8')) : null;
+  const webLock = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, 'packages/lt-web/package-lock.json'), 'utf8'));
 
   if (rootPkg.license !== 'Apache-2.0') {
     errors.push(`Root package.json license must be Apache-2.0, got ${rootPkg.license}`);
@@ -126,6 +127,12 @@ function checkPackageVersionParity() {
   }
   if (webPkg && webPkg.version !== rootPkg.version) {
     errors.push(`packages/lt-web/package.json version (${webPkg.version}) != root package.json (${rootPkg.version})`);
+  }
+  if (webLock.version !== rootPkg.version || webLock.packages?.['']?.version !== rootPkg.version) {
+    errors.push('packages/lt-web/package-lock.json root versions must match package.json');
+  }
+  if (innerPkg.license !== rootPkg.license || webPkg?.license !== rootPkg.license) {
+    errors.push('All package manifests must use the root license');
   }
   return { ok: errors.length === 0, version: rootPkg.version, errors };
 }
@@ -137,11 +144,11 @@ function checkTagContract(refArg, pkgVersion) {
     return { ok: true, skipped: true, ref: ref || null, errors };
   }
   const tagName = ref.slice('refs/tags/'.length);
-  const m = /^(linux-v|windows-v|v)(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$/.exec(tagName);
+  const m = /^(?:olt-)?(linux-v|windows-v|v)(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$/.exec(tagName);
   if (!m) {
-    errors.push(`Unsupported release tag format "${tagName}". Expected linux-vX.Y.Z, windows-vX.Y.Z, or vX.Y.Z.`);
+    errors.push(`Unsupported release tag format "${tagName}". Expected (olt-)?linux-vX.Y.Z, (olt-)?windows-vX.Y.Z, or (olt-)?vX.Y.Z.`);
   } else {
-    const tagSemver = m[2].split('-')[0];
+    const tagSemver = m[2];
     if (tagSemver !== pkgVersion) {
       errors.push(`Release tag "${tagName}" semver (${tagSemver}) does not match package.json version (${pkgVersion}).`);
     }

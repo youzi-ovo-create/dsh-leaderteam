@@ -974,7 +974,7 @@ test('UI-09, UI-10 & UI-11: archiveAction guards, requestWindow.windowsByProvide
   assert.ok(combinedJs.includes('revokeObjectURL'));
 
   // 4. UI-11 & UI-12: Direct verification of `api.ts` (`resolveApiPrefix` & `applyThemeToDom`)
-  const { resolveApiPrefix, applyThemeToDom } = await import('../../packages/lt-web/src/lib/api.ts');
+  const { resolveApiPrefix, applyThemeToDom } = (await import('./lt-web-api.mjs')).default;
   const prevWindow = globalThis.window;
   const prevDoc = globalThis.document;
   const prevStorage = globalThis.localStorage;

@@ -9,7 +9,7 @@ import { resolveOrBootstrapConfigPath, buildSoloProviderSettingsTemplates } from
 import { buildAutoAdoptedLocalOverrideFromDshModels, readSessionConfigRecord, hasActiveSessionOverride } from './core/session-config.mjs';
 import { isPluginActive, runtimeForTeam, runtime, bindRuntimeConfigFile, syncRuntimeConfig, refreshUpstreamCatalog, effectiveRuntimeConfig, syncSessionLeaderSelectionFromHost, flushPendingSessionConfigAtSafeBoundary, rebindAllIdleSessionsOnGlobalUserSave, isTeamExecutionStarted, rebindUnstartedTeamGovernance } from './host/runtime.mjs';
 import { syncUpstreamModelsToDshSettings, resolveModelTarget } from './core/upstream-models.mjs';
-import { onAgentCreated, onAgentPresetSelected, onAgentDisposed, onAgentStatus, onAgentError, onSessionEvent, onToolResult, shouldApplyDefaultLeaderModel } from './host/roles.mjs';
+import { onAgentCreated, onAgentPresetSelected, onAgentDisposed, onAgentStatus, onAgentError, onAgentAssistantStream, clearAllSubagentStreamWatchdogs, onSessionEvent, onToolResult, shouldApplyDefaultLeaderModel } from './host/roles.mjs';
 import { bindHostImports } from './host/host-imports.mjs';
 import { disposePlanning } from './host/planning.mjs';
 import { frontierNeedsPlanning } from './core/frontier.mjs';
@@ -211,12 +211,13 @@ export function apply(ctx, config) {
   ctx.on('agent/disposed', event => onAgentDisposed(event));
   ctx.on('agent/status', event => onAgentStatus(ctx, event));
   ctx.on('agent/error', event => onAgentError(ctx, event));
+  ctx.on('agent/assistant-stream', event => onAgentAssistantStream(ctx, event), { global: true });
   ctx.on('session/event', (session, event) => onSessionEvent(ctx, session, event));
   ctx.on('tools/result', (exec, result) => onToolResult(exec, result));
   if (!rt.cordisCompositionMode && rt.config.plugins?.scheduler !== false) {
     ctx.effect(() => hostConcurrency.startConcurrencyWatchers(ctx), { label: 'leaderteam-core concurrency' });
   }
-  ctx.effect(() => () => { disposePlanning(rt); rt.gate = new ClosedGate(ctx); rt.startupReady = null; rt.hostAgents = null; rt.liveProcessMemberIds = null; }, { label: 'leaderteam-core gate' });
+  ctx.effect(() => () => { clearAllSubagentStreamWatchdogs(rt); disposePlanning(rt); rt.gate = new ClosedGate(ctx); rt.startupReady = null; rt.hostAgents = null; rt.liveProcessMemberIds = null; }, { label: 'leaderteam-core gate' });
   const ready = Object.freeze({ coreVersion: pkg.version, modular: rt.cordisCompositionMode });
   rt.startupReady = ready;
   ctx.provide('leaderteamReady', ready);

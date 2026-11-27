@@ -1,12 +1,16 @@
 {
   "name": "dsh-leaderteam-internal",
-  "version": "2.2.3",
+  "version": "1.0.0",
   "private": true,
-  "description": "LeaderTeam V2.2 core runtime for DeepSeek Harness (Linux & Windows): autonomous leader execution, 0ms deterministic safety gate, Solo-Key bootstrap, 5h request-window guard, and battery-aware graceful shutdown.",
+  "description": "Open Leader Team (OLT) V1.0 core runtime for DeepSeek Harness (Linux & Windows, inheriting Leader Team V2.2.x): autonomous leader execution, 0ms deterministic safety gate, stream-stall fallback guard, Solo-Key bootstrap, 5h request-window guard, and battery-aware graceful shutdown.",
   "type": "module",
   "license": "Apache-2.0",
   "engines": { "node": ">=22.15" },
   "leaderteam": {
+    "brand": "Open Leader Team",
+    "shortBrand": "OLT",
+    "brandEpoch": 2,
+    "legacyVersionSeries": "2.x",
     "distributionTrack": "open-source",
     "releaseRepository": "youzi-ovo-create/dsh-leaderteam",
     "supportedCoreRange": ">=0.2.2-alpha.2 <1.0.0",

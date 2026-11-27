@@ -589,6 +589,7 @@ function hasUnquotedBraceExpansion(unquotedShape) {
  * and `${...}` parameter expansion metadata.
  */
 export function scanPosixShell(command, { treatBacktickAsSubstitution = true } = {}) {
+  const escapeChar = treatBacktickAsSubstitution ? '\\' : '`';
   const tokens = [];
   const substitutions = [];
   const pendingHeredocs = [];
@@ -780,7 +781,7 @@ export function scanPosixShell(command, { treatBacktickAsSubstitution = true } =
       if (!quotedAny && wc === '=' && i + 1 < len && command[i + 1] === '~') {
         if (classifyTildeAt(command, i + 1, len)) hasTildePrefix = true;
       }
-      if (wc === '\\') {
+      if (wc === escapeChar) {
         if (i + 1 < len) {
           value += command[i + 1];
           rawSlice += command.slice(i, i + 2);
@@ -791,7 +792,7 @@ export function scanPosixShell(command, { treatBacktickAsSubstitution = true } =
         }
         continue;
       }
-      if (wc === '$' && command[i + 1] === "'") {
+      if (treatBacktickAsSubstitution && wc === '$' && command[i + 1] === "'") {
         quotedAny = true;
         hasAnsiCQuote = true;
         const ansi = decodeBashAnsiCQuote(command, i + 2);
@@ -820,7 +821,7 @@ export function scanPosixShell(command, { treatBacktickAsSubstitution = true } =
         unquotedShape += 'Q';
         i++;
         while (i < len && command[i] !== '"') {
-          if (command[i] === '\\' && i + 1 < len) {
+          if (command[i] === escapeChar && i + 1 < len) {
             value += command[i + 1];
             rawSlice += command.slice(i, i + 2);
             i += 2;
@@ -906,7 +907,7 @@ export function scanPosixShell(command, { treatBacktickAsSubstitution = true } =
       continue;
     }
 
-    const hasBraceExpansion = hasUnquotedBraceExpansion(unquotedShape);
+    const hasBraceExpansion = treatBacktickAsSubstitution && hasUnquotedBraceExpansion(unquotedShape);
     const hasExternalEnv = /\$(?:HOME|USERPROFILE|TMPDIR|TEMP|TMP|OLDPWD|XDG_[A-Z_]+)\b|\$\{(?:HOME|USERPROFILE|TMPDIR|TEMP|TMP|OLDPWD|XDG_[A-Z_]+)(?:[^A-Za-z0-9_].*)?\}|\$\{PWD[^A-Za-z0-9_}][^}]*\}/.test(rawSlice);
     tokens.push({
       type: 'word',
@@ -1924,7 +1925,7 @@ function inspectShellSandboxConfinement(args, workspace, realWorkspace, config, 
     while ((wm = WIN_DRIVE_TOKEN_RE.exec(command)) !== null) {
       const candidate = resolvePath(wm[1], effectiveWorkdir, 'win32');
       const wsWin = resolvePath(workspace, undefined, 'win32');
-      if (!candidate || !wsWin || !isInside(candidate, wsWin, 'win32')) {
+      if (!candidate || !wsWin || !isInside(candidate, wsWin, 'win32') || !isInside(realOf(candidate), realWorkspace, 'win32')) {
         return { confined: false, hardDenyInDirectExec: true, reason: `shell command references external path ${wm[1]}` };
       }
     }
@@ -2724,7 +2725,7 @@ export function classifySandboxBoundary(input, config) {
 
 const DIRECT_EXEC_INDIRECT_BYPASS_RE = /\b(?:Start-Process|Start-Job|sajb|wscript|cscript|mshta|rundll32|ssh|scp|sftp|ncat|netcat|socat|nohup|disown|setsid|daemonize|start-stop-daemon)\b|\bcmd(?:\.exe)?\s+\/[ck]\s+start\b|\b(?:powershell|pwsh)(?:\.exe)?\s+-(?:EncodedCommand|enc|WindowStyle\s+Hidden)\b|\b(?:http|https|net|tls)\.createServer\s*\(/i;
 
-export const SECRET_FILE_BASENAME_RE = /(?:^|\/)(?:\.env(?:\.[A-Za-z0-9._-]+)?|id_(?:rsa|dsa|ecdsa|ed25519)(?:\.pub)?|\.npmrc|\.pypirc|\.netrc|.*credentials.*\.json|.*\.(?:pem|key|pfx|p12))$/i;
+export const SECRET_FILE_BASENAME_RE = /(?:^|\/)(?:\.env(?:\.[A-Za-z0-9._-]+)?|id_(?:rsa|dsa|ecdsa|ed25519)(?:\.pub)?|\.npmrc|\.pypirc|\.netrc|\.credentials\.ya?ml|.*credentials.*\.json|.*\.(?:pem|key|pfx|p12))$/i;
 
 const DIRECT_EXEC_AMBIGUOUS_SHELL_RE = /\b(?:child_process|spawnSync|execSync|execFileSync|eval\s*\(|new\s+Function\s*\()\b|\b(?:python3?|node|nodejs|deno|bun|perl|ruby|php|lua)\b[^;|&]*?\s(?:-[A-Za-z]*[ceErpi]\b|--(?:eval|print|require|import|loader)(?:=|\b))|\bfind\b[^;|&]*?\s-(?:exec|execdir|ok|delete)\b|\b(?:gawk|mawk|nawk|awk)\b[^;|&]*?(?:\bsystem\s*\(|\bgetline\b|@[ \t]*(?:include|load)\b|\s-(?:f|l)\b|\s--(?:file|load)(?:=|\b))/i;
 
@@ -3054,7 +3055,7 @@ export function evaluateHardRules(input, config) {
       const boundaryHit = new RegExp(`(?:^|[\\s"'=(;,<>])${escNeedle}(?=$|[\\s"');,<>|/])`).test(hay);
       if (boundaryHit) return { rule: actor.role === 'direct_exec' ? 'direct-exec-sandbox-lock' : 'shell-touches-global-refs', reason: `shell commands must not reference the read-only global references root ${g}` };
     }
-    if (platform !== 'win32' || tool === 'bash') {
+    {
       let effectiveShellWorkdir = workspace;
       const rawShellWd = args && typeof args === 'object' ? (args.workdir ?? args.cwd) : undefined;
       if (rawShellWd !== undefined) {

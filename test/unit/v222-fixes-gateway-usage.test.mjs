@@ -226,7 +226,7 @@ test('CT-01 & CT-02 & GW-07 & GW-08: sanitizeMaskedPreview, external key clearin
       err => err?.code === 'FORBIDDEN_HOME',
     );
   } finally {
-    fs.rmSync(tmpDir, { recursive: true, force: true });
+    fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 15, retryDelay: 150 });
   }
 });
 
@@ -433,7 +433,7 @@ test('HZ-01 & HZ-03 & GW-04 (Mock): feed 410 cursor_reset recovery, in-place ups
     assert.equal(claudeProv.credentials[0].enabled, false);
   } finally {
     await srv.close();
-    fs.rmSync(tmpDir, { recursive: true, force: true });
+    fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 15, retryDelay: 150 });
   }
 });
 
@@ -709,7 +709,7 @@ test('Live Magpie 0.1.4731 binary verification: GW-01..06 & HZ-01 (providerJSON 
     const cliCleanupMgr = new MagpieGatewayManager({ storageRoot: cliStorageRoot });
     await cliCleanupMgr.stop().catch(() => {});
     await relay.close().catch(() => {});
-    fs.rmSync(tmpDir, { recursive: true, force: true });
+    fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 15, retryDelay: 150 });
   }
 });
 
@@ -954,6 +954,6 @@ test('Stage 4 Re-Audit Fixes (S3-UIGW-01, S3-UIGW-02, S3-UIGW-03, S3-UIGW-06): l
     if (liveMgr) await liveMgr.stop().catch(() => {});
     await mockSrv.close().catch(() => {});
     await relay.close().catch(() => {});
-    fs.rmSync(tmpDir, { recursive: true, force: true });
+    fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 15, retryDelay: 150 });
   }
 });

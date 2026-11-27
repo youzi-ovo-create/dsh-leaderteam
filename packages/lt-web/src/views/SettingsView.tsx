@@ -883,7 +883,7 @@ export function SettingsView({
                           <div className="row" style={{ gap: 8 }}>
                             <b style={{ fontSize: 16 }}>当前版本：v{installed?.version || bundle.capabilities.backendVersion}</b>
                             <span className="badge outline">
-                              {installed?.trackInfo?.label || '开源维护版 (Apache-2.0)'}
+                              {installed?.trackInfo?.label || 'Open Leader Team 开源版 (Apache-2.0)'}
                             </span>
                             {hostCompat && (
                               <span className={`badge ${hostCompat.productionAllowed ? 'success' : 'danger'}`}>
@@ -1103,9 +1103,9 @@ export function SettingsView({
                   <HeluoxuMark size={44} />
                   <div className="col" style={{ gap: 2 }}>
                     <span className="t-display" style={{ fontSize: 24 }}>
-                      Leader Team
+                      Open Leader Team (OLT)
                     </span>
-                    <span className="t-meta">河洛 · 多代理工程协作 · 开源版</span>
+                    <span className="t-meta">河洛 · 多代理工程协作 · 开源版（兼容继承 Leader Team V2.2.x）</span>
                   </div>
                 </div>
                 <div className="card card-pad">

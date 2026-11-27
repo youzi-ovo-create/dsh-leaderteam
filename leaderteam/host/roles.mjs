@@ -21,6 +21,12 @@ import { frontierState, frontierView, frontierNeedsPlanning, frontierHasDispatch
 import { formatFrontierContext } from './planning.mjs';
 import { hasAdmissibleFrontierWork, hasAdmissibleNonShellFrontierWork, hasUnfinishedNonShellPlanWork, resolveSendMessageTargetId } from './activation.mjs';
 import { createAgentCircuitState, recordToolOutcomeInCircuit, recordTurnEndInCircuit } from '../core/circuit-breaker.mjs';
+import {
+  DEFAULT_FIRST_OUTPUT_TIMEOUT_MS,
+  inspectSubagentSideEffectSources,
+  isMeaningfulAssistantStreamFrame,
+  isRetryablePreToolMemberError,
+} from '../core/stream-stall-guard.mjs';
 import { isHostShellInitFailureResult, recordShellToolResultForTeam } from '../core/shell-circuit-breaker.mjs';
 import { runCircuitInvestigation } from './investigator.mjs';
 import { isAutonomousGovernance, replayGovernanceState } from '../core/governance-protocol.mjs';
@@ -441,6 +447,14 @@ export function maskedGlobalTools(globalNames, allowedTools) {
 }
 export function onAgentDisposed({ agent }) {
   const rt = runtime();
+  if (agent) {
+    disarmSubagentStreamWatchdog(rt, agent.id);
+    const base = baseRuntime(rt);
+    base.memberFallbackSpawners?.delete(agent.id);
+    base.memberFallbackTransitions?.delete(agent.id);
+    base.memberStallTerminations?.delete(agent.id);
+    base.directExecStallMarkers?.delete(agent.id);
+  }
   const actor = agent ? rt.actors.get(agent.id) : undefined;
   if (actor?.role === 'member' || actor?.role === 'direct_exec') {
     const err = rt.memberErrors?.get(agent.id);
@@ -461,6 +475,232 @@ export function onAgentDisposed({ agent }) {
   }
   if (agent) disposeHandleList(subagentPromptDisposers, agent);
   if (actor?.agent === agent) { rt.actors.delete(agent.id); rt.reads.delete(agent.id); rt.readProgress?.delete(agent.id); baseRuntime(rt).circuitStates?.delete(agent.id); baseRuntime(rt).pendingMemberContinuations?.delete(agent.id); }
+}
+
+function disarmSubagentStreamWatchdog(rt, agentId) {
+  if (!rt || !agentId) return;
+  const map = baseRuntime(rt).subagentStreamWatchdogs;
+  const entry = map?.get(agentId);
+  if (!entry) return;
+  if (entry.timer) {
+    clearTimeout(entry.timer);
+    entry.timer = null;
+  }
+  map.delete(agentId);
+}
+
+export function clearAllSubagentStreamWatchdogs(rt = runtime()) {
+  if (!rt) return;
+  const map = baseRuntime(rt).subagentStreamWatchdogs;
+  if (!map) return;
+  for (const entry of map.values()) {
+    if (entry?.timer) clearTimeout(entry.timer);
+  }
+  map.clear();
+}
+
+async function handleSubagentStreamStallTimeout(ctx, rt, agentId) {
+  const base = baseRuntime(rt);
+  const entry = base.subagentStreamWatchdogs?.get(agentId);
+  if (!entry || entry.fired) return;
+  entry.fired = true;
+  if (entry.timer) {
+    clearTimeout(entry.timer);
+    entry.timer = null;
+  }
+  base.subagentStreamWatchdogs?.delete(agentId);
+
+  const actor = base.actors?.get(agentId) ?? entry.actor;
+  const agent = actor?.agent ?? entry.agent ?? base.hostAgents?.get?.(agentId) ?? null;
+  if (!actor || (actor.role !== 'member' && actor.role !== 'direct_exec') || !actor.teamId || !base.storageRoot) return;
+  const teamRt = runtimeForTeam(actor.teamId);
+  const store = teamStore(actor.teamId);
+  const rec = store.getMember(agentId);
+  if (!rec || !ACTIVE_MEMBER_STATES.has(rec.status)) return;
+
+  const sessionEvents = typeof agent?.session?.snapshotEvents === 'function'
+    ? (agent.session.snapshotEvents() ?? [])
+    : [];
+  const sideEffects = inspectSubagentSideEffectSources({
+    sessionEvents,
+    gateReceipts: store.gateReceipts(),
+    memberProgressCount: teamRt.memberExecutionProgress?.get(agentId)?.size ?? 0,
+    circuitState: base.circuitStates?.get(agentId) ?? null,
+    childId: agentId,
+  });
+  const stallMsg = `[STREAM_FIRST_OUTPUT_TIMEOUT] Upstream model stream produced no output for ${entry.timeoutMs}ms on route "${rec.model || actor.model || 'unknown'}" (chunks_received=${entry.receivedChunks}, tool_events=${sideEffects.totalToolEvents}).`;
+  teamRt.scheduler?.recordLlmOutcome?.({ ok: false, code: 'STREAM_FIRST_OUTPUT_TIMEOUT', message: stallMsg, retryable: true });
+
+  if (actor.role === 'direct_exec') {
+    base.directExecStallMarkers ??= new Map();
+    base.directExecStallMarkers.set(agentId, {
+      timeoutMs: entry.timeoutMs,
+      stallMsg,
+      sideEffects,
+    });
+    try { agent?.cancel?.({ kind: 'user' }); } catch {}
+    return;
+  }
+
+  const spawner = sideEffects.canFallback ? base.memberFallbackSpawners?.get(agentId) : null;
+  base.memberFallbackSpawners?.delete(agentId);
+
+  if (spawner) {
+    base.memberFallbackTransitions ??= new Map();
+    base.memberFallbackTransitions.set(agentId, {
+      nextRoute: spawner.nextRoute,
+      nextEffort: spawner.nextEffort,
+      reason: stallMsg,
+    });
+    if (base.liveProcessMemberIds instanceof Set) base.liveProcessMemberIds.delete(agentId);
+    store.setMemberStatus(
+      agentId,
+      'failed',
+      truncate(`${stallMsg} Automatically switching to executionFallback "${spawner.nextRoute}" (${spawner.nextEffort}).`, 600),
+      {
+        kind: 'stream-stall-fallback',
+        timeoutMs: entry.timeoutMs,
+        fallbackTo: spawner.nextRoute,
+        noExecutionProgress: true,
+      },
+    );
+    teamRt.scheduler?.recordMemberFinished?.(actor.teamId, rec.taskSeq ?? 1);
+    store.appendWorkflowEvent({
+      type: 'member-execution-fallback',
+      trigger: 'stream-first-output-timeout',
+      taskSeq: rec.taskSeq ?? 1,
+      fromChildId: agentId,
+      member: rec.name,
+      fromModel: rec.model,
+      fromEffort: rec.effort,
+      toModel: spawner.nextRoute,
+      toEffort: spawner.nextEffort,
+      timeoutMs: entry.timeoutMs,
+      sideEffectSources: sideEffects.sources,
+    });
+    try { agent?.cancel?.({ kind: 'user' }); } catch {}
+    try {
+      await spawner.spawnFallback({
+        trigger: 'stream-first-output-timeout',
+        previousChildId: agentId,
+        previousError: stallMsg,
+      });
+      return;
+    } catch (fallbackErr) {
+      base.memberFallbackTransitions?.delete(agentId);
+      const fbDetail = fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr);
+      store.appendWorkflowEvent({
+        type: 'member-stream-stall-terminated',
+        taskSeq: rec.taskSeq ?? 1,
+        childId: agentId,
+        member: rec.name,
+        model: rec.model,
+        timeoutMs: entry.timeoutMs,
+        fallbackSpawnError: truncate(fbDetail, 400),
+        sideEffectSources: sideEffects.sources,
+      });
+      teamRt.onMemberTerminalStatus?.(actor.teamId, rec.taskSeq ?? 1, agentId);
+      const leaderActor = base.actors?.get(actor.teamId);
+      if (leaderActor?.agent?.status === 'idle') {
+        void maybeAutoContinueLeader(ctx, teamRt, leaderActor, leaderActor.agent);
+      }
+      return;
+    }
+  }
+
+  const termStatus = sideEffects.hasMutatingSideEffects ? 'blocked' : 'failed';
+  const termFailure = {
+    kind: 'stream-first-output-timeout',
+    timeoutMs: entry.timeoutMs,
+    totalToolEvents: sideEffects.totalToolEvents,
+    hasMutatingSideEffects: sideEffects.hasMutatingSideEffects,
+    noExecutionProgress: sideEffects.totalToolEvents === 0,
+  };
+  base.memberStallTerminations ??= new Map();
+  base.memberStallTerminations.set(agentId, { status: termStatus, message: stallMsg, failure: termFailure });
+  if (base.liveProcessMemberIds instanceof Set) base.liveProcessMemberIds.delete(agentId);
+  store.setMemberStatus(agentId, termStatus, truncate(stallMsg, 600), termFailure);
+  store.appendWorkflowEvent({
+    type: 'member-stream-stall-terminated',
+    taskSeq: rec.taskSeq ?? 1,
+    childId: agentId,
+    member: rec.name,
+    model: rec.model,
+    timeoutMs: entry.timeoutMs,
+    status: termStatus,
+    sideEffectSources: sideEffects.sources,
+  });
+  teamRt.scheduler?.recordMemberFinished?.(actor.teamId, rec.taskSeq ?? 1);
+  teamRt.onMemberTerminalStatus?.(actor.teamId, rec.taskSeq ?? 1, agentId);
+  try { agent?.cancel?.({ kind: 'user' }); } catch {}
+  const leaderActor = base.actors?.get(actor.teamId);
+  if (leaderActor?.agent?.status === 'idle') {
+    void maybeAutoContinueLeader(ctx, teamRt, leaderActor, leaderActor.agent);
+  }
+}
+
+function armSubagentStreamWatchdog(ctx, rt, actor, agent, { resetElapsed = true } = {}) {
+  if (!rt || !actor || (actor.role !== 'member' && actor.role !== 'direct_exec') || !actor.teamId) return;
+  const agentId = agent?.id ?? actor.agentId;
+  if (!agentId) return;
+  const base = baseRuntime(rt);
+  const teamRt = runtimeForTeam(actor.teamId);
+  const rawTimeout = Number(teamRt.config?.circuitBreaker?.firstOutputTimeoutMs);
+  const timeoutMs = Number.isFinite(rawTimeout) && rawTimeout >= 50
+    ? rawTimeout
+    : DEFAULT_FIRST_OUTPUT_TIMEOUT_MS;
+  base.subagentStreamWatchdogs ??= new Map();
+  let entry = base.subagentStreamWatchdogs.get(agentId);
+  if (entry && !resetElapsed && entry.timer) {
+    entry.actor = actor;
+    if (agent) entry.agent = agent;
+    return;
+  }
+  if (entry?.timer) {
+    clearTimeout(entry.timer);
+    entry.timer = null;
+  }
+  if (!entry) {
+    entry = {
+      agentId,
+      actor,
+      agent: agent ?? actor.agent ?? null,
+      timeoutMs,
+      receivedChunks: 0,
+      armedAt: Date.now(),
+      lastActivityAt: Date.now(),
+      fired: false,
+      timer: null,
+    };
+    base.subagentStreamWatchdogs.set(agentId, entry);
+  } else {
+    entry.actor = actor;
+    if (agent) entry.agent = agent;
+    entry.timeoutMs = timeoutMs;
+    entry.lastActivityAt = Date.now();
+  }
+  entry.timer = setTimeout(() => {
+    void handleSubagentStreamStallTimeout(ctx, base, agentId);
+  }, timeoutMs);
+  entry.timer.unref?.();
+}
+
+export function onAgentAssistantStream(ctx, { agent, frame } = {}) {
+  const rt = runtime();
+  if (!rt.config || !rt.storageRoot || !agent || !frame) return;
+  const actor = (rt.actors.get(agent.id)?.agent === agent ? rt.actors.get(agent.id) : null) ?? resolveActor(ctx, agent);
+  if (actor?.role !== 'member' && actor?.role !== 'direct_exec') return;
+  if (frame.type === 'start') {
+    armSubagentStreamWatchdog(ctx, rt, actor, agent, { resetElapsed: false });
+  } else if (frame.type === 'chunk') {
+    if (isMeaningfulAssistantStreamFrame(frame)) {
+      const entry = baseRuntime(rt).subagentStreamWatchdogs?.get(agent.id);
+      if (entry) entry.receivedChunks += 1;
+      armSubagentStreamWatchdog(ctx, rt, actor, agent, { resetElapsed: true });
+    }
+  } else if (frame.type === 'end') {
+    disarmSubagentStreamWatchdog(rt, agent.id);
+  }
 }
 
 function ensureCircuitState(rt, agentId, role = 'member') {
@@ -641,11 +881,15 @@ export function onAgentStatus(ctx, { agent, status } = {}) {
   const rec = store.getMember(agent.id);
   const cur = rec?.status;
   if (!cur) return;
-  if (status === 'running' && cur !== 'running') {
-    rt.memberExecutionProgress ??= new Map();
-    rt.memberExecutionProgress.set(agent.id, new Set());
-    try { store.setMemberStatus(agent.id, 'running'); } catch {}
+  if (status === 'running') {
+    if (cur !== 'running') {
+      rt.memberExecutionProgress ??= new Map();
+      rt.memberExecutionProgress.set(agent.id, new Set());
+      try { store.setMemberStatus(agent.id, 'running'); } catch {}
+    }
+    armSubagentStreamWatchdog(ctx, rt, actor, agent, { resetElapsed: false });
   } else if (status === 'idle') {
+    disarmSubagentStreamWatchdog(rt, agent.id);
     const pendingCont = baseRuntime(rt).pendingMemberContinuations?.get(agent.id);
     if (pendingCont) {
       baseRuntime(rt).pendingMemberContinuations.delete(agent.id);
@@ -1147,9 +1391,9 @@ async function maybeAutoContinueLeader(ctx, rt, actor, agent) {
       : !declaration && streak === 1 && !invalidDeliveryClaim
       ? '[LeaderTeam workflow state] Before stopping, call team_status with stop_state delivered, waiting_members, waiting_user (with the actual question), or blocked (with the concrete reason). Continue routine implementation and verification autonomously; the host will check the stated stop reason.'
       : invalidDeliveryClaim
-      ? `[LeaderTeam workflow check] Your previous turn emitted "DELIVERY: approved${citedId ? ` (${citedId})` : ''}", which is invalid: ${citedId && activePlanIds.includes(citedId) ? `"${citedId}" is a kind="plan" agreement, NOT a kind="delivery" agreement` : `no approved kind="delivery" agreement exists for task_seq=${taskSeq} (approved_delivery_ids=${JSON.stringify(approvedDeliveryIds)})`}. Active approved plan_id="${activePlanId ?? 'none'}"; ${deliveryHint}. First ${planGuidance} (for profile="shell", include "read", "glob", "grep", "${hostShellTool}" and "read_image" in tools, plus "edit"/"write" if modifying files), then call team_discuss with kind="delivery" (attaching changed files and real verification output) and only emit "DELIVERY: approved (<delivery_agreement_id>)" in the user's language once kind="delivery" settles as "approve".`
+      ? `[LeaderTeam workflow check] Your previous turn emitted "DELIVERY: approved${citedId ? ` (${citedId})` : ''}", which is invalid: ${citedId && activePlanIds.includes(citedId) ? `"${citedId}" is a kind="plan" agreement, NOT a kind="delivery" agreement` : `no approved kind="delivery" agreement exists for task_seq=${taskSeq} (approved_delivery_ids=${JSON.stringify(approvedDeliveryIds)})`}. Active approved plan_id="${activePlanId ?? 'none'}"; ${deliveryHint}. First ${planGuidance} (for profile="shell", include "read", "glob", "grep", "${hostShellTool}" in tools, plus "edit"/"write" if modifying files, and "read_image" only when visual image inspection is explicitly required), then call team_discuss with kind="delivery" (attaching changed files and real verification output) and only emit "DELIVERY: approved (<delivery_agreement_id>)" in the user's language once kind="delivery" settles as "approve".`
       : prematureNotApproved
-      ? `[LeaderTeam workflow check] Your previous turn emitted "DELIVERY: not approved" prematurely after a non-terminal review (${deliveryHint}). An outcome of "revise" requires resolving every item in required_changes through team members and re-submitting with revises, NOT stopping. Immediately ${planGuidance} (for profile="shell", include "read", "glob", "grep", "${hostShellTool}" and "read_image" in tools, plus "edit"/"write" if modifying files, and a workspace-relative write_scope), run real execution/browser verification and any needed fixes, and call team_discuss(kind="delivery"${latestDelivery?.id ? `, revises="${latestDelivery.id}"` : ''}) before answering in the user's language.`
+      ? `[LeaderTeam workflow check] Your previous turn emitted "DELIVERY: not approved" prematurely after a non-terminal review (${deliveryHint}). An outcome of "revise" requires resolving every item in required_changes through team members and re-submitting with revises, NOT stopping. Immediately ${planGuidance} (for profile="shell", include "read", "glob", "grep", "${hostShellTool}" in tools, plus "edit"/"write" if modifying files, "read_image" only when visual image inspection is explicitly required, and a workspace-relative write_scope), run proportional CLI/test verification (do not launch headless browsers unless visual rendering was requested) and any needed fixes, and call team_discuss(kind="delivery"${latestDelivery?.id ? `, revises="${latestDelivery.id}"` : ''}) before answering in the user's language.`
       : `[LeaderTeam workflow continuation] Your turn ended while multi-step workflow work remains incomplete for task_seq=${taskSeq} (active_approved_plan_id="${activePlanId ?? 'none'}", running_members=${activeMembers.length}, ${deliveryHint}). Do not stop between waves: immediately ${planGuidance}, or once all acceptance criteria and real execution checks pass, call team_discuss with kind="delivery" and deliver in the user's language.`;
 
     agent.followup(buildContinuationMessage(rt, continuationText));
@@ -1204,6 +1448,20 @@ function resolveSessionAttemptSource(session, event, fallbackSel) {
 export function onSessionEvent(ctx, session, event) {
   const rt = runtime();
   if (!rt.config || !rt.storageRoot || !session || !event) return;
+  if (event.type === 'step/start' || event.type === 'tool/call' || event.type === 'step/end') {
+    const subForStep = [...rt.actors.values()].find(a => (a.role === 'member' || a.role === 'direct_exec') && a.agent?.session === session)
+      ?? (session.header?.origin === 'subagent' && typeof session.header?.parentSession === 'string' && typeof session.id === 'string' && TeamStore.exists(rt.storageRoot, session.header.parentSession)
+        ? { role: teamStore(session.header.parentSession).getMember(session.id)?.actorRole === 'direct_exec' ? 'direct_exec' : 'member', teamId: session.header.parentSession, agentId: session.id, agent: rt.hostAgents?.get?.(session.id) ?? null }
+        : null);
+    if (subForStep) {
+      if (event.type === 'step/start') {
+        armSubagentStreamWatchdog(ctx, rt, subForStep, subForStep.agent, { resetElapsed: true });
+      } else {
+        disarmSubagentStreamWatchdog(rt, subForStep.agentId);
+      }
+    }
+    return;
+  }
   if ((event.type === 'assistant/message' || event.type === 'assistant/attempt' || event.type === 'compaction/summary') && event.surfaceOp !== 'seed') {
     const leader = [...rt.actors.values()].find(a => a.role === 'leader' && (a.agent?.session === session || a.teamId === session.id));
     if (leader) {
@@ -1239,6 +1497,9 @@ export function onSessionEvent(ctx, session, event) {
         ? { role: teamStore(session.header.parentSession).getMember(session.id)?.actorRole === 'direct_exec' ? 'direct_exec' : 'member', teamId: session.header.parentSession, agentId: session.id }
         : null);
     if (subActor) {
+      if (event.type === 'assistant/message') {
+        disarmSubagentStreamWatchdog(rt, subActor.agentId);
+      }
       const rec = teamStore(subActor.teamId).getMember(subActor.agentId);
       const src = event.type === 'compaction/summary'
         ? {
@@ -1287,6 +1548,7 @@ export function onSessionEvent(ctx, session, event) {
       ? { role: teamStore(session.header.parentSession).getMember(session.id)?.actorRole === 'direct_exec' ? 'direct_exec' : 'member', teamId: session.header.parentSession, agentId: session.id }
       : null);
   if (!actor) return;
+  disarmSubagentStreamWatchdog(rt, actor.agentId);
   const pendingErr = rt.memberErrors?.get(actor.agentId);
   if (pendingErr && typeof event.seq === 'number' && event.seq >= pendingErr.seq) {
     rt.memberErrors.delete(actor.agentId);
@@ -1305,6 +1567,16 @@ export function onSessionEvent(ctx, session, event) {
       return;
     }
     if (kind === 'aborted' || kind === 'interrupted' || kind === 'cancelled') {
+      const base = baseRuntime(rt);
+      if (base.memberFallbackTransitions?.has(actor.agentId)) {
+        base.memberFallbackTransitions.delete(actor.agentId);
+        return;
+      }
+      if (base.memberStallTerminations?.has(actor.agentId)) {
+        base.memberStallTerminations.delete(actor.agentId);
+        return;
+      }
+      base.memberFallbackSpawners?.delete(actor.agentId);
       store.setMemberStatus(actor.agentId, 'cancelled', reason?.message ? truncate(String(reason.message), 600) : undefined);
       if (isOrdinaryMember) {
         rt.scheduler?.recordMemberFinished?.(actor.teamId, rec.taskSeq ?? 1);
@@ -1467,6 +1739,52 @@ export function onSessionEvent(ctx, session, event) {
     if (kind === 'error') {
       const detail = reason?.failure?.message ?? reason?.error?.message ?? reason?.message ?? kind;
       const errCode = String(reason?.failure?.code ?? kind);
+      const base = baseRuntime(rt);
+      const spawner = isOrdinaryMember ? base.memberFallbackSpawners?.get(actor.agentId) : null;
+      base.memberFallbackSpawners?.delete(actor.agentId);
+      if (spawner) {
+        const evs = typeof session.snapshotEvents === 'function' ? (session.snapshotEvents() ?? []) : [];
+        const sideEffects = inspectSubagentSideEffectSources({
+          sessionEvents: evs,
+          gateReceipts: store.gateReceipts(),
+          memberProgressCount: teamRt.memberExecutionProgress?.get(actor.agentId)?.size ?? 0,
+          circuitState: base.circuitStates?.get(actor.agentId) ?? null,
+          childId: actor.agentId,
+        });
+        if (sideEffects.canFallback && isRetryablePreToolMemberError({ errorCode: errCode, errorMessage: String(detail) })) {
+          rt.scheduler?.recordLlmOutcome?.({ ok: false, code: errCode, message: String(detail), retryable: true });
+          if (base.liveProcessMemberIds instanceof Set) base.liveProcessMemberIds.delete(actor.agentId);
+          store.setMemberStatus(
+            actor.agentId,
+            'failed',
+            truncate(`[PRE_TOOL_ERROR_FALLBACK] ${detail} — switching to executionFallback "${spawner.nextRoute}" (${spawner.nextEffort}).`, 600),
+            { kind: 'pre-tool-error-fallback', fallbackTo: spawner.nextRoute, noExecutionProgress: true },
+          );
+          rt.scheduler?.recordMemberFinished?.(actor.teamId, rec.taskSeq ?? 1);
+          store.appendWorkflowEvent({
+            type: 'member-execution-fallback',
+            trigger: 'pre-tool-turn-error',
+            taskSeq: rec.taskSeq ?? 1,
+            fromChildId: actor.agentId,
+            member: rec.name,
+            fromModel: rec.model,
+            fromEffort: rec.effort,
+            toModel: spawner.nextRoute,
+            toEffort: spawner.nextEffort,
+            errorCode: errCode,
+            errorMessage: truncate(String(detail), 300),
+            sideEffectSources: sideEffects.sources,
+          });
+          void Promise.resolve(spawner.spawnFallback({
+            trigger: 'pre-tool-turn-error',
+            previousChildId: actor.agentId,
+            previousError: String(detail),
+          })).catch(() => {
+            rt.onMemberTerminalStatus?.(actor.teamId, rec.taskSeq ?? 1, actor.agentId);
+          });
+          return;
+        }
+      }
       const cbState = ensureCircuitState(teamRt, actor.agentId, actor.role);
       const cbDecision = recordTurnEndInCircuit(cbState, { reasonKind: 'error', errorMessage: String(detail), errorCode: errCode }, teamRt.config?.circuitBreaker);
       rt.scheduler?.recordLlmOutcome?.({ ok: false, code: errCode, message: String(detail), retryable: false });
@@ -1491,6 +1809,7 @@ export function onSessionEvent(ctx, session, event) {
       }
       return;
     }
+    baseRuntime(rt).memberFallbackSpawners?.delete(actor.agentId);
     const cbState = ensureCircuitState(teamRt, actor.agentId, actor.role);
     recordTurnEndInCircuit(cbState, { reasonKind: 'completed' }, teamRt.config?.circuitBreaker);
     let finalText = '';
@@ -1508,8 +1827,13 @@ export function onSessionEvent(ctx, session, event) {
       settleGovernanceCheckpointPause(finalText, cbState.activationCompletedTools);
       return;
     }
-    const isBlocked = /^\s*STATUS:\s*blocked\b/im.test(finalText) || Boolean(actor.shellFailure ?? rec.shellFailure);
-    store.setMemberStatus(actor.agentId, isBlocked ? 'blocked' : 'done');
+    const shellErr = actor.shellFailure ?? rec.shellFailure ?? null;
+    const statusBlockedMatch = /^\s*STATUS:\s*blocked\b[:\s-]*(.*)$/im.exec(finalText);
+    const isBlocked = Boolean(statusBlockedMatch) || Boolean(shellErr);
+    const blockReason = isBlocked
+      ? truncate(String(shellErr || statusBlockedMatch?.[1]?.trim() || finalText.trim() || 'member reported STATUS: blocked'), 600)
+      : undefined;
+    store.setMemberStatus(actor.agentId, isBlocked ? 'blocked' : 'done', blockReason);
     if (isOrdinaryMember) {
       rt.scheduler?.recordMemberFinished?.(actor.teamId, rec.taskSeq ?? 1);
       rt.onMemberTerminalStatus?.(actor.teamId, rec.taskSeq ?? 1, actor.agentId);

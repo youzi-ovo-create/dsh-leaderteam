@@ -1,8 +1,9 @@
 import { assert, callsOf, lastToolResult, memberRecords } from '../lib.mjs';
-// The session runs a model other than roles.leader (agent default overridden): with the default
+// The session runs a model other than roles.leader (agent default overridden): with
 // team.leaderModelPolicy "enforce" every team tool refuses with a precise instruction, before any
 // gate, discussion or member work.
 export default {
+  config: { team: { leaderModelPolicy: 'enforce' } },
   files: { 'spec.md': 'spec\n' },
   extraPatches: ['test/fixtures/leader-model-mismatch.patch.yml'],
   respond(c) {

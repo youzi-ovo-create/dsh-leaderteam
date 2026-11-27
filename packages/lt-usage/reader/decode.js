@@ -53,7 +53,7 @@ export function readSessionFile(file) {
       error: null
     };
   } catch (err) {
-    entry = {
+    return {
       file,
       sig,
       rows: [],

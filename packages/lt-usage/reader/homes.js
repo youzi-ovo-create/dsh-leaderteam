@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -19,12 +20,14 @@ export function isHomeDir(dir) {
 export function registryFile() {
   return process.env.LT_USAGE_REGISTRY
     ? path.resolve(process.env.LT_USAGE_REGISTRY)
-    : REGISTRY_FILE;
+    : path.join(process.env.DSH_HOME || path.join(os.homedir(), '.dsh'), 'leaderteam', 'usage-homes.json');
 }
 
 export function readRegistry() {
   try {
-    const data = JSON.parse(fs.readFileSync(registryFile(), 'utf8'));
+    const current = registryFile();
+    const source = !process.env.LT_USAGE_REGISTRY && !fs.existsSync(current) ? REGISTRY_FILE : current;
+    const data = JSON.parse(fs.readFileSync(source, 'utf8'));
     return Array.isArray(data.homes)
       ? data.homes.filter((item) => typeof item === 'string')
       : [];
@@ -50,8 +53,11 @@ export function registerHome(dir) {
 }
 
 export function samePath(a, b) {
-  const ra = path.resolve(a);
-  const rb = path.resolve(b);
+  const canonical = dir => {
+    try { return fs.realpathSync.native(dir); } catch { return path.resolve(dir); }
+  };
+  const ra = canonical(a);
+  const rb = canonical(b);
   return process.platform === 'win32'
     ? ra.toLowerCase() === rb.toLowerCase()
     : ra === rb;
@@ -67,6 +73,7 @@ export function listKnownHomes(explicit) {
   };
   add(explicit);
   add(process.env.DSH_HOME);
+  if (!explicit && !process.env.DSH_HOME) add(path.join(os.homedir(), '.dsh'));
   if (process.platform === 'win32') {
     add('D:\\DSH-Official-Data\\home');
     add('D:\\DSH-Official-Data');

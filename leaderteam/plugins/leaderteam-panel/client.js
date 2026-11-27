@@ -317,7 +317,7 @@
     }
 
     function TabTitle() {
-      return h('span', { style: { fontWeight: 600, fontSize: '12px' } }, 'LeaderTeam');
+      return h('span', { style: { fontWeight: 600, fontSize: '12px' } }, 'Open Leader Team');
     }
 
     function ConsoleView(props) {
@@ -858,8 +858,8 @@
           h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px' } },
             h(OriginMark, { size: compact ? 18 : 22, ink: tok.fgPrimary, brand: tok.brand }),
             h('div', null,
-              h('div', { style: { fontSize: compact ? '14px' : '16px', fontWeight: 600, color: tok.fgPrimary } }, 'Leader Team'),
-              h('div', { style: { fontSize: '11px', color: tok.fgMuted } }, '河洛 · 上游模型 · 双模式 · 可拆卸模块 · 外部归档')
+              h('div', { style: { fontSize: compact ? '14px' : '16px', fontWeight: 600, color: tok.fgPrimary } }, 'Open Leader Team (OLT)'),
+              h('div', { style: { fontSize: '11px', color: tok.fgMuted } }, '河洛 · 上游模型 · 双模式 · 可拆卸模块 · 外部归档（兼容继承 Leader Team）')
             )
           ),
           h('div', { style: { display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: '4px' } },
@@ -1457,7 +1457,7 @@
             props => h(ConsoleView, props)
           )));
           own(ctx.slots.inject('sidebar.panellist', () => ctx.slots.register(
-            { name: 'sidebar.panellist', id: PANEL_ID, order: PANEL_ORDER, label: () => 'LeaderTeam' },
+            { name: 'sidebar.panellist', id: PANEL_ID, order: PANEL_ORDER, label: () => 'Open Leader Team' },
             props => h(PanelIcon, { size: props && typeof props.size === 'number' ? props.size : 18 })
           )));
         } catch {}
@@ -1474,11 +1474,11 @@
             own(tabs.register({
               id: PANEL_ID,
               kind: PANEL_ID,
-              title: () => 'LeaderTeam',
+              title: () => 'Open Leader Team',
               guide: [{
                 id: PANEL_ID,
                 order: PANEL_ORDER,
-                title: () => 'LeaderTeam 控制台',
+                title: () => 'Open Leader Team (OLT) 控制台',
                 description: () => '管理上游动态模型、可拆卸插件、工程计时与外部计划归档',
                 icon: PanelIcon,
               }],

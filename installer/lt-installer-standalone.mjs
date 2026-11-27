@@ -33,7 +33,7 @@ const LEGACY_PATCH_END = '# <<< leaderteam';
 export const TRACKS = Object.freeze({
   'open-source': {
     id: 'open-source',
-    label: '开源维护版 (Apache-2.0)',
+    label: 'Open Leader Team 开源版 (Apache-2.0)',
     repo: 'youzi-ovo-create/dsh-leaderteam',
     apiUrl: 'https://api.github.com/repos/youzi-ovo-create/dsh-leaderteam/releases?per_page=30',
   },
@@ -93,20 +93,40 @@ function compareSemver(a, b) {
 export function parseStandaloneReleaseTag(rawTag) {
   const tag = String(rawTag ?? '').trim();
   if (!tag) return null;
-  const pref = /^(windows|linux)-v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$/i.exec(tag);
+  const pref = /^(?:olt-)?(windows|linux)-v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$/i.exec(tag);
   if (pref) {
     const prefix = pref[1].toLowerCase();
     const version = pref[2];
     if (!parseSemver(version)) return null;
     return { tagName: tag, version, prefix, platformScope: prefix === 'windows' ? 'win32' : 'linux' };
   }
-  const leg = /^v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$/i.exec(tag);
+  const leg = /^(?:olt-)?v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$/i.exec(tag);
   if (leg && !tag.includes('/')) {
     const version = leg[1];
     if (!parseSemver(version)) return null;
     return { tagName: tag, version, prefix: null, platformScope: 'universal' };
   }
   return null;
+}
+
+function resolveStandaloneOpenSourceEpoch(rawRel, parsedTag) {
+  const tagName = String(rawRel?.tag_name ?? parsedTag?.tagName ?? '').trim();
+  if (/^olt-/i.test(tagName)) return 2;
+  const sv = parseSemver(parsedTag?.version);
+  if (parsedTag?.prefix && sv?.major === 1) return 2;
+  const assets = Array.isArray(rawRel?.assets) ? rawRel.assets : [];
+  if (assets.some(a => typeof a?.name === 'string' && /^open-leaderteam-/i.test(a.name))) return 2;
+  const metaText = `${rawRel?.name ?? ''} ${rawRel?.body ?? ''}`;
+  if (/open\s+leader\s*team|\bOLT\b/i.test(metaText) && sv?.major === 1) return 2;
+  if (sv?.major === 1) return 2;
+  return 1;
+}
+
+function compareStandaloneOpenSourceEntry(a, b) {
+  const ea = resolveStandaloneOpenSourceEpoch(a.raw, a.tag);
+  const eb = resolveStandaloneOpenSourceEpoch(b.raw, b.tag);
+  if (ea !== eb) return ea > eb ? 1 : -1;
+  return compareSemver(a.tag.version, b.tag.version);
 }
 
 export function selectStandaloneReleaseForPlatform(releases, { platform = process.platform, targetVersion = null } = {}) {
@@ -121,7 +141,6 @@ export function selectStandaloneReleaseForPlatform(releases, { platform = proces
     }
     if (
       parsedTarget.platformScope !== 'universal' &&
-      (normPlat === 'win32' || normPlat === 'linux') &&
       parsedTarget.platformScope !== normPlat
     ) {
       const err = new Error(
@@ -137,9 +156,7 @@ export function selectStandaloneReleaseForPlatform(releases, { platform = proces
     .map(r => ({ raw: r, tag: parseStandaloneReleaseTag(r.tag_name) }))
     .filter(x => {
       if (!x.tag) return false;
-      if (normPlat === 'win32') return x.tag.platformScope === 'win32' || x.tag.platformScope === 'universal';
-      if (normPlat === 'linux') return x.tag.platformScope === 'linux' || x.tag.platformScope === 'universal';
-      return x.tag.platformScope !== 'win32';
+      return x.tag.platformScope === normPlat || x.tag.platformScope === 'universal';
     });
 
   if (parsedTarget) {
@@ -149,13 +166,13 @@ export function selectStandaloneReleaseForPlatform(releases, { platform = proces
           ? x.tag.platformScope === parsedTarget.platformScope && x.tag.version === parsedTarget.version
           : x.tag.version === parsedTarget.version,
       )
-      .sort((a, b) => compareSemver(b.tag.version, a.tag.version));
+      .sort((a, b) => Number(b.tag.platformScope === normPlat) - Number(a.tag.platformScope === normPlat));
     return exact[0]?.raw ?? null;
   }
 
   const samePlat = valid.filter(x => x.tag.platformScope === normPlat);
   const pool = samePlat.length > 0 ? samePlat : valid.filter(x => x.tag.platformScope === 'universal');
-  pool.sort((a, b) => compareSemver(b.tag.version, a.tag.version));
+  pool.sort((a, b) => compareStandaloneOpenSourceEntry(b, a));
   return pool[0]?.raw ?? null;
 }
 
@@ -984,8 +1001,24 @@ export function ensureDesktopProfileInitialized(dshHome, fsImpl = fs) {
   return { initialized: createdPkg || createdPatch, createdPkg, createdPatch, profileDir };
 }
 
+// The standalone release asset must work even when no LeaderTeam code is installed.
+export function pnpmStoreEnv(dshHome, env = process.env, fsImpl = fs, platform = process.platform) {
+  if (platform !== 'win32' || !dshHome || !env.LOCALAPPDATA || env.npm_config_store_dir || env.NPM_CONFIG_STORE_DIR) return {};
+  const store = path.join(env.PNPM_HOME || path.join(env.LOCALAPPDATA, 'pnpm'), 'store');
+  try {
+    if (!fsImpl.lstatSync(store).isSymbolicLink()) return {};
+  } catch { return {}; }
+  try {
+    if (fsImpl.statSync(store).isDirectory()) return {};
+  } catch (err) {
+    if (err.code !== 'ENOENT') return {};
+  }
+  const home = path.join(dshHome, 'leaderteam', 'pnpm-home');
+  return { PNPM_HOME: home, npm_config_store_dir: path.join(home, 'store') };
+}
+
 function invokeStandalonePluginAdd(target, tgzToInstall, dshHome) {
-  const execEnv = { ...process.env, DSH_HOME: dshHome };
+  const execEnv = { ...process.env, DSH_HOME: dshHome, ...pnpmStoreEnv(dshHome) };
   if (target.kind === 'official-desktop' && target.clientExecutable && target.desktopHostCliJs) {
     return spawnSync(
       target.clientExecutable,
@@ -1069,6 +1102,9 @@ export async function downloadAndInstallStandalone({
 
   if (tgzToInstall) {
     const pkgMeta = inspectStandaloneTgz(tgzToInstall);
+    if (targetVersion && pkgMeta.version !== parseStandaloneReleaseTag(targetVersion).version) {
+      throw new Error(`PACKAGE_VERSION_MISMATCH: 安装包版本 ${pkgMeta.version} 与目标 ${targetVersion} 不符`);
+    }
     if (pkgMeta.enginesDsh && target.dshVersion && !satisfiesStandaloneRange(target.dshVersion, pkgMeta.enginesDsh)) {
       throw new Error(`HOST_INCOMPATIBLE: 当前 DSH 版本 (${target.dshVersion}) 不满足安装包要求 (${pkgMeta.enginesDsh})。`);
     }
@@ -1082,11 +1118,14 @@ export async function downloadAndInstallStandalone({
     const releases = await relRes.json();
     const rel = selectStandaloneReleaseForPlatform(releases, { platform, targetVersion });
     if (!rel) throw new Error('未找到与当前系统平台匹配的正式版 .tgz 安装包');
-    const tgzAsset = rel.assets.find(a => a.name.endsWith('.tgz'));
+    const parsedRelTag = parseStandaloneReleaseTag(rel.tag_name);
+    const tgzAsset = rel.assets.find(a => a.name === `dsh-leaderteam-${parsedRelTag.version}.tgz`)
+      ?? rel.assets.find(a => /^dsh-leaderteam-.*\.tgz$/i.test(a.name))
+      ?? rel.assets.find(a => a.name.endsWith('.tgz'));
     const sumsAsset = rel.assets.find(a => /^SHA256SUMS/i.test(a.name));
 
-    let expectedSha = null;
-    if (sumsAsset?.browser_download_url) {
+    let expectedSha = /^sha256:[a-f0-9]{64}$/i.test(tgzAsset.digest) ? tgzAsset.digest.slice(7).toLowerCase() : null;
+    if (!expectedSha && sumsAsset?.browser_download_url) {
       const sr = await fetchImpl(sumsAsset.browser_download_url);
       if (sr.ok) {
         const txt = await sr.text();
@@ -1098,23 +1137,24 @@ export async function downloadAndInstallStandalone({
         }
       }
     }
+    if (!expectedSha) throw new Error(`SHA256_UNAVAILABLE: 缺少安装包 ${tgzAsset.name} 的 SHA-256 校验值`);
     const pkgRes = await fetchImpl(tgzAsset.browser_download_url);
     if (!pkgRes.ok) throw new Error(`下载安装包失败 (HTTP ${pkgRes.status})`);
     const buf = Buffer.from(await pkgRes.arrayBuffer());
     const actualSha = crypto.createHash('sha256').update(buf).digest('hex');
-    if (expectedSha && actualSha !== expectedSha) {
+    if (actualSha !== expectedSha) {
       throw new Error('安装包 SHA-256 校验未通过，已中止安装');
     }
     const pkgMeta = inspectStandaloneTgz(buf);
+    if (pkgMeta.version !== parsedRelTag.version) throw new Error(`PACKAGE_VERSION_MISMATCH: 安装包版本 ${pkgMeta.version} 与标签 ${rel.tag_name} 不符`);
     if (pkgMeta.enginesDsh && target.dshVersion && !satisfiesStandaloneRange(target.dshVersion, pkgMeta.enginesDsh)) {
       throw new Error(`HOST_INCOMPATIBLE: 当前 DSH 版本 (${target.dshVersion}) 不满足安装包要求 (${pkgMeta.enginesDsh})。`);
     }
     const stageDir = path.join(snap.dshHome, 'leaderteam', 'installer-staging');
     fs.mkdirSync(stageDir, { recursive: true });
-    tgzToInstall = path.join(stageDir, tgzAsset.name);
+    tgzToInstall = path.join(stageDir, `dsh-leaderteam-${parsedRelTag.version}-${actualSha}.tgz`);
     fs.writeFileSync(tgzToInstall, buf);
-    const parsedRelTag = parseStandaloneReleaseTag(rel.tag_name);
-    versionInstalled = pkgMeta.version || parsedRelTag?.version || String(rel.tag_name || '').replace(/^v/i, '');
+    versionInstalled = pkgMeta.version;
   }
 
   let desktopProfileInit = null;
@@ -1354,7 +1394,7 @@ export function renderStandaloneHtml(token) {
     (d.bundledTarballs || []).forEach(b => {
       opts.push({ val: 'bundled:' + b.path, label: '使用随附离线安装包：' + b.fileName + ' (v' + b.version + ')' });
     });
-    opts.push({ val: 'track:open-source', label: '在线下载当前平台最新「开源维护版 (dsh-leaderteam · Apache-2.0)」' });
+    opts.push({ val: 'track:open-source', label: '在线下载当前平台最新「Open Leader Team 开源版 (dsh-leaderteam · Apache-2.0)」' });
     opts.push({ val: 'upload-tgz', label: '选择本地 .tgz 安装包文件上传安装…' });
     opts.push({ val: 'path-tgz', label: '手动输入本地 .tgz 安装包路径安装…' });
     srcSel.innerHTML = opts.map(o => '<option value="' + esc(o.val) + '">' + esc(o.label) + '</option>').join('');

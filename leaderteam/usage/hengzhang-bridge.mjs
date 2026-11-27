@@ -18,6 +18,7 @@ import { writeFileAtomic } from '../core/store.mjs';
 import {
   defaultPricing,
   pricingCatalog,
+  loadHome,
   listSessions,
   overviewFor,
   reportFor,
@@ -350,10 +351,12 @@ export class HengzhangUsageBridge {
     const pricing = this.getPricing();
     const storageRootForHome = this._storageRootForHome(resolvedHome);
     const hasSessionsDir = fs.existsSync(path.join(resolvedHome, 'sessions'));
+    const preloadedHome = hasSessionsDir ? loadHome(resolvedHome) : null;
     const overview = hasSessionsDir
       ? overviewFor(resolvedHome, pricing, {
         gatewayRecords: this.gatewayRecords,
         storageRoot: storageRootForHome,
+        preloadedHome,
       })
       : {
         totals: {
@@ -395,6 +398,7 @@ export class HengzhangUsageBridge {
         const repRes = reportFor(resolvedHome, sess.sessionId, pricing, {
           gatewayRecords: this.gatewayRecords,
           storageRoot: storageRootForHome,
+          preloadedHome,
         });
         for (const call of repRes?.report?.calls ?? []) {
           if (typeof call?.timeMs !== 'number' || call.timeMs < startOfTodayMs) continue;

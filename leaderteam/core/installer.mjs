@@ -26,6 +26,7 @@ import {
   evaluateHostCompatibility,
   getHostCompatibilityMatrix,
 } from './host-compat.mjs';
+import { pnpmStoreEnv } from '../../installer/lt-installer-standalone.mjs';
 import {
   UPDATE_TRACKS,
   checkForUpdates,
@@ -34,6 +35,7 @@ import {
   checkCandidatePackageCompatibility,
   computeFileSha256,
   assertTargetReleaseTagMatchesPlatform,
+  assertPackageVersion,
 } from './updater.mjs';
 import {
   QUICK_PROVIDER_PRESETS,
@@ -1017,6 +1019,7 @@ function ensurePnpmInEnv({ dshHome, env = process.env }) {
 }
 
 function invokeDshPluginAddSync(selectedTarget, installSpec, execEnv) {
+  execEnv = { ...execEnv, ...pnpmStoreEnv(execEnv.DSH_HOME, execEnv) };
   if (selectedTarget.kind === 'official-desktop' && selectedTarget.clientExecutable && selectedTarget.desktopHostCliJs) {
     return spawnSync(
       selectedTarget.clientExecutable,
@@ -1104,7 +1107,7 @@ export async function runOneClickInstallation({
   spawnSyncImpl = spawnSync,
   onProgress = null,
 } = {}) {
-  assertTargetReleaseTagMatchesPlatform(targetVersion, platform);
+  const requested = assertTargetReleaseTagMatchesPlatform(targetVersion, platform);
   const reportStep = (step, message) => {
     if (typeof onProgress === 'function') {
       try { onProgress({ step, message, at: new Date().toISOString() }); } catch {}
@@ -1229,6 +1232,7 @@ export async function runOneClickInstallation({
       downloadUrl: relCheck.latestRelease.asset.downloadUrl,
       sha256SumsUrl: relCheck.latestRelease.sha256SumsUrl,
       expectedSha256: relCheck.latestRelease.asset.sha256,
+      expectedVersion: relCheck.latestRelease.version,
       assetName: relCheck.latestRelease.asset.name,
       fetchImpl,
     });
@@ -1252,6 +1256,7 @@ export async function runOneClickInstallation({
     desktopProfileInit = ensureDesktopProfileInitialized(resolvedHome);
   }
 
+  assertPackageVersion(installedVersion, requested?.version);
   reportStep('install', `正在向 DSH (${selectedTarget.profile} profile) 安装 LeaderTeam v${installedVersion || ''}…`);
   if (typeof installerRunner === 'function') {
     await installerRunner({

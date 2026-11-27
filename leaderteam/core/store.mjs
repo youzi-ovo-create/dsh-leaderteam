@@ -145,6 +145,17 @@ export function readJsonl(file) {
   });
   return { records, skipped };
 }
+const renameWait = new Int32Array(new SharedArrayBuffer(4));
+function replaceStagedFile(tmp, file) {
+  for (let attempt = 0; ; attempt++) {
+    try { fs.renameSync(tmp, file); return; }
+    catch (err) {
+      if (process.platform !== 'win32' || !['EPERM', 'EACCES', 'EBUSY'].includes(err.code) || attempt >= 4) throw err;
+      Atomics.wait(renameWait, 0, 0, 5 * (2 ** attempt));
+    }
+  }
+}
+
 /** Write a whole file atomically (tmp + rename). */
 export function writeFileAtomic(file, text) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -158,7 +169,11 @@ export function writeFileAtomic(file, text) {
     throw e;
   }
   fs.closeSync(fd);
-  fs.renameSync(tmp, file);
+  try { replaceStagedFile(tmp, file); }
+  catch (err) {
+    try { fs.unlinkSync(tmp); } catch {}
+    throw err;
+  }
 }
 
 /**
@@ -188,7 +203,7 @@ export function writeFilesTransactional(writes) {
       staged.push({ file, tmp, existed, previousContent });
     }
     for (const item of staged) {
-      fs.renameSync(item.tmp, item.file);
+      replaceStagedFile(item.tmp, item.file);
       renamed.push(item);
     }
   } catch (err) {

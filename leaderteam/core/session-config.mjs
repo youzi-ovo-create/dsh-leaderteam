@@ -8,6 +8,7 @@ import path from 'node:path';
 import { LtError, FAMILIES } from './constants.mjs';
 import { validateConfig, pruneExecutionFallbacksMap } from './config.mjs';
 import { writeFileAtomic } from './store.mjs';
+import { realpathBestEffort } from './paths.mjs';
 
 const ROLE_KEYS = Object.freeze([
   'leader',
@@ -132,6 +133,12 @@ function encodeSessionSegment(sessionId) {
  */
 export function isProtectedLeaderTeamConfigPath(targetPath, { storageRoot = null, configPath = null } = {}) {
   if (typeof targetPath !== 'string' || !targetPath.trim()) return false;
+  const physical = value => value && realpathBestEffort(path.resolve(value));
+  return matchesManagedConfig(targetPath, storageRoot, configPath)
+    || matchesManagedConfig(physical(targetPath), physical(storageRoot), physical(configPath));
+}
+
+function matchesManagedConfig(targetPath, storageRoot, configPath) {
   const norm = path.resolve(targetPath).replace(/\\/g, '/').toLowerCase();
   if (configPath) {
     const exactCfg = path.resolve(configPath).replace(/\\/g, '/').toLowerCase();
@@ -664,9 +671,18 @@ export function flushPendingSessionConfig({
  * to configure LeaderTeam twice!
  */
 export function buildAutoAdoptedLocalOverrideFromDshModels(discoveredModels = []) {
-  const usable = (discoveredModels ?? []).filter(
-    m => m && typeof m.route === 'string' && m.route.includes('/') && m.registeredInDsh !== false,
-  );
+  const byRoute = new Map();
+  for (const model of discoveredModels ?? []) {
+    if (!model || typeof model.route !== 'string' || !model.route.includes('/') || model.registeredInDsh === false) continue;
+    const previous = byRoute.get(model.route);
+    if (previous) {
+      const efforts = [...new Set([previous.efforts, model.efforts].filter(Array.isArray).flat())];
+      byRoute.set(model.route, { ...model, ...previous, efforts });
+    } else {
+      byRoute.set(model.route, model);
+    }
+  }
+  const usable = [...byRoute.values()];
   if (usable.length === 0) return null;
 
   // Prefer reasoning-capable models for Leader / Arbiter / DiscussA, and fast chat/code models for Gate / DirectExec
@@ -684,7 +700,9 @@ export function buildAutoAdoptedLocalOverrideFromDshModels(discoveredModels = []
 
   const modelsMap = {};
   const pool = [];
-  for (const dm of usable.slice(0, 24)) {
+  const selected = usable.slice(0, 24);
+  if (!selected.includes(primary)) selected[selected.length - 1] = primary;
+  for (const dm of selected) {
     const effs = Array.isArray(dm.efforts) && dm.efforts.length > 0 ? [...dm.efforts] : ['none'];
     const defEff = dm.defaultEffort && effs.includes(dm.defaultEffort) ? dm.defaultEffort : effs[0];
     modelsMap[dm.route] = {
