@@ -1,16 +1,49 @@
-name: Unit Tests
+name: Unit Tests & Release Governance
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
+      - 'release/**'
+    tags:
+      - 'linux-v*'
+      - 'windows-v*'
+      - 'v*'
   pull_request:
-    branches: [main]
+    branches:
+      - main
+      - 'release/**'
   workflow_dispatch:
 
 jobs:
+  release-governance:
+    name: Release Governance, Links & Hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Verify docs links, acceptance script syntax, open-source hygiene, and tag contract
+        run: node scripts/ci/verify-release-governance.mjs
+
+      - name: Validate shipped default configuration
+        run: node -e "import('./leaderteam/core/config.mjs').then(m => { const c = m.loadConfig('./config/leaderteam.config.json'); console.log('config ok, mode =', c.governance.mode, 'maxMembers =', c.team.maxMembersPerTeam); })"
+
+      - name: Verify npm pack dry-run
+        run: npm pack --dry-run > /dev/null
+
   unit-tests-linux:
     name: Linux Unit Tests (Node ${{ matrix.node }})
     runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' && !endsWith(github.base_ref, '-win') && !endsWith(github.base_ref, '-windows')) ||
+      (github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/windows-v') && !endsWith(github.ref, '-win') && !endsWith(github.ref, '-windows'))
     strategy:
       fail-fast: false
       matrix:
@@ -34,7 +67,14 @@ jobs:
         working-directory: Leader Team/leaderteam-v2.2-dev
         run: node -e "import('./leaderteam/core/config.mjs').then(m => { const c = m.loadConfig('./config/leaderteam.config.json'); console.log('config ok, mode =', c.governance.mode, 'maxMembers =', c.team.maxMembersPerTeam); })"
 
-      - name: Run pure unit test suite (zero paid models, zero Desktop, zero skipped)
+      - name: Install lt-web test toolchain (esbuild for UI contract tests)
+        working-directory: Leader Team/leaderteam-v2.2-dev
+        run: |
+          if [ -f packages/lt-web/package-lock.json ]; then
+            npm --prefix packages/lt-web ci --no-audit --no-fund
+          fi
+
+      - name: Run pure unit test suite (zero paid models, zero Desktop)
         working-directory: Leader Team/leaderteam-v2.2-dev
         run: node --test test/unit/*.test.mjs
 
@@ -47,6 +87,10 @@ jobs:
   unit-tests-windows:
     name: Windows Unit Tests (Node ${{ matrix.node }})
     runs-on: windows-latest
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' && !endsWith(github.base_ref, '-linux')) ||
+      (github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/linux-v') && !endsWith(github.ref, '-linux'))
     strategy:
       fail-fast: false
       matrix:
@@ -68,6 +112,19 @@ jobs:
         shell: pwsh
         run: node -e "import('./leaderteam/core/config.mjs').then(m => { const c = m.loadConfig('./config/leaderteam.config.json'); console.log('config ok, mode =', c.governance.mode, 'maxMembers =', c.team.maxMembersPerTeam); })"
 
+      - name: Install lt-web test toolchain (esbuild for UI contract tests)
+        shell: pwsh
+        run: |
+          if (Test-Path packages/lt-web/package-lock.json) {
+            npm --prefix packages/lt-web ci --no-audit --no-fund
+          }
+
       - name: Run pure unit test suite (zero paid models, zero Desktop)
         shell: pwsh
         run: node --test "test/unit/*.test.mjs"
+
+      - name: Verify Windows CLI execution (lt-doctor & lt-bugreport)
+        shell: pwsh
+        run: |
+          node bin/lt-doctor.mjs --json | Out-Null
+          node bin/lt-bugreport.mjs --json | Out-Null

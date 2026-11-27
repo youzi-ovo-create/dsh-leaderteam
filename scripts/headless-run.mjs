@@ -13,7 +13,40 @@ import { renderMagpieModelRows, rewriteModelsBlock } from '../leaderteam/core/mo
 import { fetchEndpointModelsCatalog, enrichConfigModelsFromCatalog, canonicalRouteFor } from '../leaderteam/core/upstream-models.mjs';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const fwd = p => p.replace(/\\/g, '/');
-const args = Object.fromEntries(process.argv.slice(2).reduce((acc, a, i, all) => (a.startsWith('--') ? [...acc, [a.slice(2), all[i + 1]]] : acc), []));
+export function parseHeadlessCliArgs(rawArgv = process.argv.slice(2)) {
+  const out = {};
+  for (let i = 0; i < rawArgv.length; i++) {
+    const a = rawArgv[i];
+    if (!a.startsWith('--')) continue;
+    const eq = a.indexOf('=');
+    if (eq > 2) {
+      out[a.slice(2, eq)] = a.slice(eq + 1);
+      continue;
+    }
+    const key = a.slice(2);
+    if (i + 1 < rawArgv.length) {
+      out[key] = rawArgv[++i];
+    } else {
+      out[key] = true;
+    }
+  }
+  return out;
+}
+
+function isMainCliModule(metaUrl, argv1 = process.argv[1]) {
+  if (!argv1) return false;
+  const selfPath = fileURLToPath(metaUrl);
+  const resolvedArgv = path.resolve(argv1);
+  if (resolvedArgv === selfPath) return true;
+  try {
+    return fs.realpathSync(resolvedArgv) === fs.realpathSync(selfPath);
+  } catch {
+    return false;
+  }
+}
+
+if (isMainCliModule(import.meta.url)) {
+const args = parseHeadlessCliArgs(process.argv.slice(2));
 if (!args.workspace || !(args['task-file'] || args.task)) { console.error('usage: --workspace <dir> (--task-file <file> | --task "<text>") [--session <id>]'); process.exit(2); }
 const ws = path.resolve(args.workspace);
 if (!fs.existsSync(ws)) { console.error(`workspace not found: ${ws}`); process.exit(2); }
@@ -130,3 +163,4 @@ child.on('close', (code, signal) => {
   if (final?.text) console.log(`\n${final.text}`);
   process.exitCode = effectiveCode;
 });
+}

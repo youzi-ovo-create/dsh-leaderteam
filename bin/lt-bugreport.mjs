@@ -5,8 +5,12 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import zlib from 'node:zlib';
 import { fileURLToPath } from 'node:url';
-import { safeId } from '../leaderteam/core/store.mjs';
+import { encodeTeamStoreId } from '../leaderteam/core/store.mjs';
+import { decodeSessionModeSegment } from '../leaderteam/core/session-mode.mjs';
+import { deepMergePlain } from '../leaderteam/core/config.mjs';
+import { isInside } from '../leaderteam/core/paths.mjs';
 import { checkDshHostCompatibility } from './lt-doctor.mjs';
 
 const THIS_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -41,20 +45,26 @@ export function redactDiagnosticText(input, options = {}) {
 
   // 1. URLs (strip custom internal endpoints, userinfo, query tokens)
   text = text.replace(/\bhttps?:\/\/[^\s"'`<>|)\],;]+/gi, '<REDACTED_URL>');
+  text = text.replace(/\b([a-z][a-z0-9+.-]*:\/\/[^/\s:@"'\\]+:)(?!\[REDACTED)((?:(?!\\+["'])[^@/?#\s"'])+)@/gi, '$1[REDACTED]@');
 
-  // 2. Bearer / Basic auth headers & inline key=value secrets
-  text = text.replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{4,}/gi, '$1 [REDACTED_TOKEN]');
+  // 2. Bearer / Basic auth headers, JSON-serialized secrets (including escaped quotes), CLI flags, & inline key=value secrets
+  text = text.replace(/\b(Bearer|Basic)\s+(?!\[REDACTED)[A-Za-z0-9._~+/=-]{4,}/gi, '$1 [REDACTED_TOKEN]');
   text = text.replace(
-    /((?:api[_-]?key|token|secret|password|passwd|pwd|authorization|credential|private[_-]?key|access[_-]?key)\s*[:=]\s*["']?)([^\s"';&|,)\]}]+)/gi,
+    /((?:\\*["'])?(?:api[_-]?key|token|secret|password|passwd|pwd|authorization|credential|private[_-]?key|access[_-]?key)(?:\\*["'])?\s*[:=]\s*(?:\\*["'])?(?:(?:Bearer|Basic)\s+)?)(?!\[REDACTED|\{)((?:(?!\\+["'])[^\s"';&|,)\]}[])+)/gi,
+    '$1[REDACTED]',
+  );
+  text = text.replace(
+    /(--?(?:api[_-]?key|token|secret|password|passwd|pwd|authorization|credential|private[_-]?key|access[_-]?key)\s+(?:\\*["'])?)(?!\[REDACTED)((?:(?!\\+["'])[^\s"';&|,)])+)/gi,
     '$1[REDACTED]',
   );
 
-  // 3. Provider & API key prefixes (sk-..., ak-..., ghp_..., github_pat_..., xoxb-..., AIza...)
+  // 3. Provider & API key prefixes (sk-..., ak-..., ghp_..., github_pat_..., xoxb-..., AIza..., JWTs)
   text = text.replace(/\b(?:sk|ak|pk|rk)-[A-Za-z0-9_-]{8,}\b/g, '[REDACTED_KEY]');
   text = text.replace(/\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{12,}\b/g, '[REDACTED_KEY]');
   text = text.replace(/\bgithub_pat_[A-Za-z0-9_]{16,}\b/g, '[REDACTED_KEY]');
   text = text.replace(/\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g, '[REDACTED_KEY]');
   text = text.replace(/\bAIza[0-9A-Za-z_-]{20,}\b/g, '[REDACTED_KEY]');
+  text = text.replace(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g, '[REDACTED_TOKEN]');
 
   // 4. Quoted Windows / UNC / POSIX paths (preserving surrounding quotes, capturing spaces inside paths)
   text = text.replace(/(["'`])(?:[A-Za-z]:(?:\\\\|\\|\/)Users(?:\\\\|\\|\/)|\/(?:home|Users|root)\/|\/mnt\/[a-zA-Z]\/Users\/)[^"'`\r\n]*\1/gi, '$1<USER_HOME>/<REDACTED>$1');
@@ -87,7 +97,7 @@ export function redactDiagnosticText(input, options = {}) {
     '<LOCAL_PATH>/<REDACTED>',
   );
   text = text.replace(
-    new RegExp(String.raw`(?:^|(?<=[\s"'` + '`' + String.raw`(=:]))\/(?:opt|srv|var|tmp|mnt|media|data)\/(?:[^\r\n"'` + '`' + String.raw`<>|),;:]*?\/)*[^\s"'` + '`' + String.raw`<>|),;:\r\n]+` + SPACED_PATH_CONT, 'gu'),
+    new RegExp(String.raw`(?:^|(?<=[\s"'` + '`' + String.raw`(=:]))\/(?:opt|srv|var|tmp|etc|run|mnt|media|data)\/(?:[^\r\n"'` + '`' + String.raw`<>|),;:]*?\/)*[^\s"'` + '`' + String.raw`<>|),;:\r\n]+` + SPACED_PATH_CONT, 'gu'),
     '<LOCAL_PATH>/<REDACTED>',
   );
   text = text.replace(/\bfile:\/\/[^\r\n"'`<>|),;]+/gi, '<LOCAL_PATH>/<REDACTED>');
@@ -267,7 +277,7 @@ function sanitizeMemberStatus(rawStatus) {
 function selectTeamDirectory(storageRoot, explicitTeamId, fsImpl = fs) {
   const teamsRoot = path.join(storageRoot, 'teams');
   if (explicitTeamId) {
-    const cleanId = safeId(explicitTeamId);
+    const cleanId = encodeTeamStoreId(explicitTeamId, storageRoot);
     const dir = path.join(teamsRoot, cleanId);
     try {
       if (fsImpl.existsSync(dir) && fsImpl.statSync(dir).isDirectory()) return dir;
@@ -342,13 +352,205 @@ function addBucket(target, delta) {
   target.totalTokens += delta.totalTokens;
 }
 
-function readGlobalGuardCounts(storageRoot, targetTeamName, fsImpl = fs) {
+function encodeDshSegment(raw) {
+  const s = String(raw ?? '');
+  if (s.length === 0) return '~';
+  if (s === '.') return '~002E';
+  if (s === '..') return '~002E~002E';
+  let out = '';
+  for (let i = 0; i < s.length; i++) {
+    const code = s.charCodeAt(i);
+    const ch = String.fromCharCode(code);
+    out += ch !== '~' && /^[A-Za-z0-9._-]$/.test(ch) ? ch : '~' + code.toString(16).toUpperCase().padStart(4, '0');
+  }
+  return out;
+}
+
+const MAX_NATIVE_SESSION_FILE_BYTES = 64 * 1024 * 1024;
+const MAX_NATIVE_SESSION_OUTPUT_BYTES = 256 * 1024 * 1024;
+const NATIVE_SESSION_FILENAMES = Object.freeze(['session.v4.jsonl.zstd', 'session.v4.jsonl']);
+
+function decodeZstdSessionBuffer(buf) {
+  if (!buf || buf.length === 0) return '';
+  const rawBuf = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
+  const starts = [];
+  for (let i = 0; i + 3 < rawBuf.length; i++) {
+    if (rawBuf[i] === 0x28 && rawBuf[i + 1] === 0xb5 && rawBuf[i + 2] === 0x2f && rawBuf[i + 3] === 0xfd) {
+      starts.push(i);
+    }
+  }
+  if (starts.length <= 1) {
+    try {
+      return zlib.zstdDecompressSync(rawBuf, { maxOutputLength: MAX_NATIVE_SESSION_OUTPUT_BYTES }).toString('utf8');
+    } catch {
+      return '';
+    }
+  }
+  const parts = [];
+  let totalDecoded = 0;
+  let n = 0;
+  while (n < starts.length && totalDecoded < MAX_NATIVE_SESSION_OUTPUT_BYTES) {
+    let found = false;
+    for (let end = n + 1; end <= starts.length; end++) {
+      try {
+        const chunk = zlib.zstdDecompressSync(rawBuf.subarray(starts[n], starts[end] ?? rawBuf.length), {
+          maxOutputLength: MAX_NATIVE_SESSION_OUTPUT_BYTES - totalDecoded,
+        });
+        parts.push(chunk);
+        totalDecoded += chunk.length;
+        n = end;
+        found = true;
+        break;
+      } catch {}
+    }
+    if (!found) break;
+  }
+  return parts.length > 0 ? Buffer.concat(parts).toString('utf8') : '';
+}
+
+function isSafeContainedSessionFile(file, root, fsImpl) {
+  const absRoot = path.resolve(root);
+  const absFile = path.resolve(file);
+  if (!isInside(absFile, absRoot)) return false;
+  try {
+    const lst = typeof fsImpl.lstatSync === 'function' ? fsImpl.lstatSync(absFile) : fsImpl.statSync(absFile);
+    if ((typeof lst.isSymbolicLink === 'function' && lst.isSymbolicLink()) || !lst.isFile()) return false;
+    if (!Number.isFinite(lst.size) || lst.size < 0 || lst.size > MAX_NATIVE_SESSION_FILE_BYTES) return false;
+    if (typeof fsImpl.realpathSync === 'function') {
+      const realRoot = fsImpl.realpathSync(absRoot);
+      const realFile = fsImpl.realpathSync(absFile);
+      if (!isInside(realFile, realRoot)) return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function findNativeSessionZstdFile(sessionsRoots, sessionId, fsImpl, fallbackSegment = null) {
+  const rawId = String(sessionId ?? '');
+  if (!rawId) return null;
+  const isSafeRawSeg = /^[A-Za-z0-9._-]+$/.test(rawId) && rawId !== '.' && rawId !== '..' && !rawId.includes('..');
+  const isSafeFallbackSeg = typeof fallbackSegment === 'string'
+    && /^[A-Za-z0-9._~-]+$/.test(fallbackSegment)
+    && fallbackSegment !== '.'
+    && fallbackSegment !== '..'
+    && !fallbackSegment.includes('..');
+  const segs = [...new Set([
+    ...(isSafeRawSeg ? [rawId] : []),
+    encodeDshSegment(rawId),
+    ...(isSafeFallbackSeg ? [fallbackSegment] : []),
+  ])];
+  for (const root of sessionsRoots) {
+    for (const seg of segs) {
+      for (const fileName of NATIVE_SESSION_FILENAMES) {
+        const flat = path.join(root, seg, fileName);
+        if (isSafeContainedSessionFile(flat, root, fsImpl)) return flat;
+      }
+    }
+    let buckets;
+    try {
+      buckets = fsImpl.readdirSync(root, { withFileTypes: true }).filter(d => d.isDirectory() && !(typeof d.isSymbolicLink === 'function' && d.isSymbolicLink()));
+    } catch {
+      continue;
+    }
+    for (const b of buckets) {
+      if (!/^[A-Za-z0-9.~_-]+$/.test(b.name) || b.name === '.' || b.name === '..') continue;
+      for (const seg of segs) {
+        for (const fileName of NATIVE_SESSION_FILENAMES) {
+          const nested = path.join(root, b.name, seg, fileName);
+          if (isSafeContainedSessionFile(nested, root, fsImpl)) return nested;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Fold physical 4-bucket token totals from native DSH `session.v4.jsonl.zstd` / `session.v4.jsonl` logs (`leader`, `member`, `directExec`),
+ * deduplicated by `message.id` / `compactionId`. Emits numeric counts ONLY — zero message text, model URLs, or paths.
+ */
+function foldNativeSessionUsage({ dshHome, storageRoot, sessionRoleMap, targetTeamName = null, usageByRole, usageTotal, fsImpl }) {
+  if (!sessionRoleMap || sessionRoleMap.size === 0) return;
+  const candidateHomes = [
+    dshHome ? path.resolve(dshHome) : null,
+    storageRoot ? path.dirname(path.resolve(storageRoot)) : null,
+    storageRoot ? path.resolve(storageRoot) : null,
+  ].filter(Boolean);
+  const sessionsRoots = [...new Set(candidateHomes.map(h => path.join(h, 'sessions')))];
+  if (sessionsRoots.length === 0) return;
+
+  for (const [sessionId, role] of sessionRoleMap.entries()) {
+    const file = findNativeSessionZstdFile(
+      sessionsRoots,
+      sessionId,
+      fsImpl,
+      role === 'leader' ? targetTeamName : null,
+    );
+    if (!file) continue;
+    let text;
+    try {
+      const lst = typeof fsImpl.lstatSync === 'function' ? fsImpl.lstatSync(file) : fsImpl.statSync(file);
+      if ((typeof lst.isSymbolicLink === 'function' && lst.isSymbolicLink()) || !lst.isFile() || lst.size > MAX_NATIVE_SESSION_FILE_BYTES) {
+        continue;
+      }
+      if (file.endsWith('.zstd')) {
+        text = decodeZstdSessionBuffer(fsImpl.readFileSync(file));
+      } else {
+        const rawJsonl = fsImpl.readFileSync(file);
+        if (rawJsonl.length > MAX_NATIVE_SESSION_OUTPUT_BYTES) continue;
+        text = Buffer.isBuffer(rawJsonl) ? rawJsonl.toString('utf8') : String(rawJsonl);
+      }
+    } catch {
+      continue;
+    }
+    if (!text) continue;
+    const seen = new Map();
+    const sessionDeltas = [];
+    let lineIdx = 0;
+    for (const line of text.split(/\r?\n/)) {
+      lineIdx += 1;
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      let row;
+      try { row = JSON.parse(trimmed); } catch { continue; }
+      if (!row || typeof row !== 'object' || row.surfaceOp === 'seed') continue;
+      const u = row.data?.usage;
+      if (!u || typeof u !== 'object') continue;
+      const key = row.data?.message?.id
+        ? `msg:${row.data.message.id}`
+        : (row.data?.compactionId ? `comp:${row.data.compactionId}` : `${row.type}:${row.seq ?? row.time ?? lineIdx}`);
+      const delta = extract4BucketUsage(row.data);
+      if (seen.has(key)) {
+        const prevIdx = seen.get(key);
+        if (sessionDeltas[prevIdx].totalTokens === 0 && delta.totalTokens > 0) {
+          sessionDeltas[prevIdx] = delta;
+        }
+        continue;
+      }
+      seen.set(key, sessionDeltas.length);
+      sessionDeltas.push(delta);
+    }
+    const safeRole = sanitizeRoleKey(role);
+    for (const delta of sessionDeltas) {
+      usageByRole[safeRole] ??= emptyBucket();
+      addBucket(usageByRole[safeRole], delta);
+      addBucket(usageTotal, delta);
+    }
+  }
+}
+
+function readGlobalGuardCounts(storageRoot, targetTeamNames, fsImpl = fs) {
+  const allowedSet = targetTeamNames instanceof Set
+    ? targetTeamNames
+    : new Set(targetTeamNames ? [targetTeamNames] : []);
   let globalRequestWindowEvents = 0;
   const globalRwTimestamps = new Set();
   if (storageRoot) {
     const rwAudit = readJsonlTolerant(path.join(storageRoot, 'request-window-audit.jsonl'), fsImpl);
     for (const r of rwAudit.records) {
-      if (targetTeamName && r.teamId && r.teamId !== targetTeamName) continue;
+      if (allowedSet.size > 0 && r.teamId && !allowedSet.has(r.teamId)) continue;
       globalRequestWindowEvents += 1;
       if (r.atMs !== undefined && r.atMs !== null) globalRwTimestamps.add(String(r.atMs));
       else if (typeof r.at === 'string') globalRwTimestamps.add(r.at);
@@ -369,7 +571,12 @@ function readGlobalGuardCounts(storageRoot, targetTeamName, fsImpl = fs) {
 function aggregateTeamMetrics(teamDir, fsImpl = fs, options = {}) {
   const storageRoot = options.storageRoot ?? (teamDir ? path.dirname(path.dirname(teamDir)) : null);
   const targetTeamName = teamDir ? path.basename(teamDir) : null;
-  const { globalRequestWindowEvents, globalRwTimestamps, globalLowBatteryTriggerCount } = readGlobalGuardCounts(storageRoot, targetTeamName, fsImpl);
+  const preMeta = teamDir ? readJsonOptional(path.join(teamDir, 'team.json'), fsImpl) : null;
+  const preSessionId = (typeof preMeta?.sessionId === 'string' && preMeta.sessionId.trim())
+    ? preMeta.sessionId.trim()
+    : (targetTeamName ? decodeSessionModeSegment(targetTeamName) : null);
+  const targetNamesSet = new Set([targetTeamName, preSessionId].filter(Boolean));
+  const { globalRequestWindowEvents, globalRwTimestamps, globalLowBatteryTriggerCount } = readGlobalGuardCounts(storageRoot, targetNamesSet, fsImpl);
 
   if (!teamDir) {
     return {
@@ -400,6 +607,7 @@ function aggregateTeamMetrics(teamDir, fsImpl = fs, options = {}) {
 
   // 1. Fold members.jsonl -> counts by status ONLY (never emit member names, errors, or checkpoints)
   const memberStates = new Map();
+  const memberRoles = new Map();
   let anonIdx = 0;
   const membersData = readJsonlTolerant(path.join(teamDir, 'members.jsonl'), fsImpl);
   for (const r of membersData.records) {
@@ -407,6 +615,9 @@ function aggregateTeamMetrics(teamDir, fsImpl = fs, options = {}) {
     if (r.type === 'member' || (!r.type && id)) {
       const key = id ?? `m_${++anonIdx}`;
       memberStates.set(key, sanitizeMemberStatus(r.status ?? 'starting'));
+      if (id) {
+        memberRoles.set(id, r.actorRole === 'direct_exec' ? 'directExec' : 'member');
+      }
     } else if (r.type === 'member-status' && id) {
       memberStates.set(id, sanitizeMemberStatus(r.status));
     }
@@ -428,7 +639,7 @@ function aggregateTeamMetrics(teamDir, fsImpl = fs, options = {}) {
     gate.byRule[decision][code] = (gate.byRule[decision][code] ?? 0) + 1;
   }
 
-  // 3. Aggregate usage.jsonl -> 4-bucket physical token totals by role ONLY
+  // 3. Aggregate usage.jsonl + native session.v4.jsonl.zstd -> 4-bucket physical token totals by role ONLY
   const usageData = readJsonlTolerant(path.join(teamDir, 'usage.jsonl'), fsImpl);
   const usageByRole = {};
   const usageTotal = emptyBucket();
@@ -439,6 +650,32 @@ function aggregateTeamMetrics(teamDir, fsImpl = fs, options = {}) {
     addBucket(usageByRole[role], delta);
     addBucket(usageTotal, delta);
   }
+
+  const teamMetaForId = readJsonOptional(path.join(teamDir, 'team.json'), fsImpl);
+  const gateTeamId = gateData.records.find(r => typeof r?.teamId === 'string' && r.teamId.trim())?.teamId?.trim() ?? null;
+  const decodedMetaTeamId = (typeof teamMetaForId?.teamId === 'string' && teamMetaForId.teamId.trim() && !/~h[0-9a-f]{32}$/.test(teamMetaForId.teamId.trim()))
+    ? decodeSessionModeSegment(teamMetaForId.teamId.trim())
+    : null;
+  const leaderSessionId = (typeof teamMetaForId?.sessionId === 'string' && teamMetaForId.sessionId.trim())
+    ? teamMetaForId.sessionId.trim()
+    : (gateTeamId
+      ?? decodedMetaTeamId
+      ?? (targetTeamName ? decodeSessionModeSegment(targetTeamName) : null)
+      ?? ((typeof teamMetaForId?.teamId === 'string' && teamMetaForId.teamId.trim()) ? teamMetaForId.teamId.trim() : null));
+  const sessionRoleMap = new Map();
+  if (leaderSessionId) sessionRoleMap.set(leaderSessionId, 'leader');
+  for (const [mId, mRole] of memberRoles.entries()) {
+    sessionRoleMap.set(mId, mRole);
+  }
+  foldNativeSessionUsage({
+    dshHome: options.dshHome ?? null,
+    storageRoot,
+    sessionRoleMap,
+    targetTeamName,
+    usageByRole,
+    usageTotal,
+    fsImpl,
+  });
 
   // 4. Aggregate governance.jsonl (+ workflow.jsonl if present) -> strike/conference/request-window/low-battery counts ONLY
   const govData = readJsonlTolerant(path.join(teamDir, 'governance.jsonl'), fsImpl);
@@ -616,7 +853,14 @@ export function generateRedactedBugReport(options = {}) {
     for (const cFile of candidateConfigs) {
       const parsed = readJsonOptional(cFile, fsImpl);
       if (parsed) {
-        rawConfig = parsed;
+        let merged = parsed;
+        if (path.basename(cFile) === 'leaderteam.config.json') {
+          const localOverride = readJsonOptional(path.join(path.dirname(cFile), 'leaderteam.local.json'), fsImpl);
+          if (localOverride && !Array.isArray(localOverride)) {
+            merged = deepMergePlain(parsed, localOverride);
+          }
+        }
+        rawConfig = merged;
         break;
       }
     }
@@ -644,8 +888,13 @@ export function generateRedactedBugReport(options = {}) {
     dshClassification,
   };
 
+  const sessionsDshHome = options.dshHome
+    ? path.resolve(options.dshHome)
+    : (env.DSH_HOME
+      ? path.resolve(env.DSH_HOME)
+      : (options.storageRoot ? path.dirname(path.resolve(options.storageRoot)) : path.resolve(dshHome)));
   const config = sanitizeConfigSummary(rawConfig);
-  const metrics = aggregateTeamMetrics(teamDir, fsImpl, { storageRoot });
+  const metrics = aggregateTeamMetrics(teamDir, fsImpl, { storageRoot, dshHome: sessionsDshHome });
 
   const redactOpts = {
     hostname: options.hostname,

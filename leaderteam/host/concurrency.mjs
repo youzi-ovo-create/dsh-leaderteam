@@ -31,7 +31,7 @@ import {
 import { assessRequestWindow } from '../core/request-window.mjs';
 import { readQuotaStateFile, routeQuota5hWindow } from '../core/quota.mjs';
 import { routeProvider } from '../core/config.mjs';
-import { TeamStore } from '../core/store.mjs';
+import { TeamStore, readJsonl } from '../core/store.mjs';
 import { frontierState, frontierNeedsPlanning } from '../core/frontier.mjs';
 import { hasAdmissibleFrontierWork } from './activation.mjs';
 import { readSystemPowerSample } from './power-adapter.mjs';
@@ -296,8 +296,7 @@ export function evaluateTeamRequestWindow(rt = runtime(), teamId = null, nowMs =
     if (fs.existsSync(teamsDir)) {
       for (const tid of fs.readdirSync(teamsDir)) {
         try {
-          const st = storeForRoot(tid);
-          for (const u of st.usageRecords()) {
+          for (const u of readJsonl(path.join(teamsDir, tid, 'usage.jsonl')).records) {
             if (!matchesProvider(u?.route ?? null, u?.provider ?? null, u?.hostProvider ?? null)) continue;
             const t = typeof u?.at === 'string' ? Date.parse(u.at) : (typeof u?.atMs === 'number' ? u.atMs : NaN);
             if (!Number.isFinite(t)) continue;
@@ -681,7 +680,11 @@ export function formatLeaderConcurrencyContext(ctx, teamId) {
       const confirmedLabel = rw.confirmedSource === 'provider-confirmed'
         ? `${rw.confirmedRemainingPct !== null ? `${rw.confirmedRemainingPct}%` : 'confirmed'} (provider-confirmed)`
         : 'unknown';
-      lines.push(`- 5h request window: local_estimated=${rw.local_estimated_requests_5h} (local-estimate), provider_confirmed=${confirmedLabel}, tier=${rw.tier} (governance reviews never skipped)`);
+      if (rw.tier === 'normal' && rw.confirmedSource !== 'provider-confirmed') {
+        lines.push(`- 5h request window: tier=normal (governance reviews never skipped)`);
+      } else {
+        lines.push(`- 5h request window: local_estimated=${rw.local_estimated_requests_5h} (local-estimate), provider_confirmed=${confirmedLabel}, tier=${rw.tier} (governance reviews never skipped)`);
+      }
     }
     if (isTeamAwaitingUserAfterPowerPause(baseRt, teamId)) {
       lines.push(`- Battery-aware wind-down ACTIVE (${baseRt.powerMonitorState?.latched ? `${baseRt.powerMonitorState.lastBatteryPct ?? '<=20'}% on battery` : 'awaiting explicit user message to resume after low-battery pause'}): stop new non-essential dispatches, let active members reach safe checkpoints, persist progress & resume entry.`);

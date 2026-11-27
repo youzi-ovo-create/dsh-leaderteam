@@ -1,17 +1,21 @@
 // DSH plugin row "leaderteam-core" (profile root): config, safety gate, team roles.
+import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadConfig } from './core/config.mjs';
+import { writeFileAtomic } from './core/store.mjs';
 import { resolveOrBootstrapConfigPath, buildSoloProviderSettingsTemplates } from './core/solo-key.mjs';
-import { isPluginActive, runtimeForTeam, runtime, bindRuntimeConfigFile, refreshUpstreamCatalog, effectiveRuntimeConfig } from './host/runtime.mjs';
+import { buildAutoAdoptedLocalOverrideFromDshModels, readSessionConfigRecord, hasActiveSessionOverride } from './core/session-config.mjs';
+import { isPluginActive, runtimeForTeam, runtime, bindRuntimeConfigFile, syncRuntimeConfig, refreshUpstreamCatalog, effectiveRuntimeConfig, syncSessionLeaderSelectionFromHost, flushPendingSessionConfigAtSafeBoundary, rebindAllIdleSessionsOnGlobalUserSave, isTeamExecutionStarted, rebindUnstartedTeamGovernance } from './host/runtime.mjs';
 import { syncUpstreamModelsToDshSettings, resolveModelTarget } from './core/upstream-models.mjs';
-import { onAgentCreated, onAgentPresetSelected, onAgentDisposed, onAgentStatus, onAgentError, onSessionEvent, onToolResult } from './host/roles.mjs';
+import { onAgentCreated, onAgentPresetSelected, onAgentDisposed, onAgentStatus, onAgentError, onSessionEvent, onToolResult, shouldApplyDefaultLeaderModel } from './host/roles.mjs';
 import { bindHostImports } from './host/host-imports.mjs';
 import { disposePlanning } from './host/planning.mjs';
 import { frontierNeedsPlanning } from './core/frontier.mjs';
 import { isAutonomousGovernance } from './core/governance-protocol.mjs';
 import { isReadGrantOnlyMessage } from './core/gate-policy.mjs';
+import { resetShellCircuitBreakerForTeam } from './core/shell-circuit-breaker.mjs';
 import { formatLeaderGovernanceContext, resolveHumanEscalationOnUserTurn, retryDeferredSupervisions } from './host/governance.mjs';
 import { teamStore } from './host/runtime.mjs';
 import { currentTaskSeq, userMessageTexts } from './host/roles.mjs';
@@ -58,7 +62,12 @@ export function apply(ctx, config) {
   rt.plugins = { scheduler: null, consensus: null, timerArchive: null, panel: null };
   rt.surface = config?.surface === 'headless' ? 'headless' : 'desktop';
   if (!rt.config.storage.root && !home) throw new Error('leaderteam-core: cannot locate DSH_HOME for team storage');
-  rt.storageRoot = rt.config.storage.root ?? path.join(home, 'leaderteam');
+  const configuredStorageRoot = typeof rt.config.storage.root === 'string' && rt.config.storage.root.trim()
+    ? rt.config.storage.root.trim()
+    : null;
+  rt.storageRoot = configuredStorageRoot
+    ? path.resolve(home || process.cwd(), configuredStorageRoot)
+    : path.resolve(home, 'leaderteam');
   rt.llm = ctx.llm;
   rt.logger = ctx.logger;
   rt.hostAgents = ctx.agents ?? null;
@@ -73,23 +82,23 @@ export function apply(ctx, config) {
   if (!rt.cordisCompositionMode && rt.config.plugins?.timerArchive !== false) {
     hostTimerArchive.ensurePlanArchive(rt, null);
   }
-  rt.formatLeaderContext = teamId => {
-    const sections = [];
+  rt.formatLeaderGovernanceSlot = teamId => {
     const teamRt = runtimeForTeam(teamId);
-    if (isAutonomousGovernance(teamRt.config)) {
-      const g = formatLeaderGovernanceContext(teamStore(teamId), currentTaskSeq(ctx, teamId));
-      if (g) sections.push(g);
-    }
-    if (isPluginActive(teamRt, 'scheduler')) {
-      const c = hostConcurrency.formatLeaderConcurrencyContext(ctx, teamId);
-      if (c) sections.push(c);
-    }
-    if (isPluginActive(teamRt, 'timerArchive')) {
-      const t = hostTimerArchive.formatLeaderTimerContext(ctx, teamId, null, teamRt);
-      if (t) sections.push(t);
-    }
-    return sections.join('\n\n');
+    return isAutonomousGovernance(teamRt.config) ? formatLeaderGovernanceContext(teamStore(teamId), currentTaskSeq(ctx, teamId)) : '';
   };
+  rt.formatLeaderConcurrencySlot = teamId => {
+    const teamRt = runtimeForTeam(teamId);
+    return isPluginActive(teamRt, 'scheduler') ? hostConcurrency.formatLeaderConcurrencyContext(ctx, teamId) : '';
+  };
+  rt.formatLeaderTimerSlot = teamId => {
+    const teamRt = runtimeForTeam(teamId);
+    return isPluginActive(teamRt, 'timerArchive') ? hostTimerArchive.formatLeaderTimerContext(ctx, teamId, null, teamRt) : '';
+  };
+  rt.formatLeaderContext = teamId => [
+    rt.formatLeaderGovernanceSlot(teamId),
+    rt.formatLeaderConcurrencySlot(teamId),
+    rt.formatLeaderTimerSlot(teamId),
+  ].filter(Boolean).join('\n\n');
   rt.onLeaderSessionReady = (hookCtx, teamId, cwd) => {
     if ((!rt.cordisCompositionMode || rt.plugins.timerArchive) && rt.config.plugins?.timerArchive !== false) {
       hostTimerArchive.ensureTeamTimerState(hookCtx, teamId, cwd, runtimeForTeam(teamId));
@@ -100,10 +109,33 @@ export function apply(ctx, config) {
     if ((!rt.cordisCompositionMode || rt.plugins.timerArchive) && rt.config.plugins?.timerArchive !== false) {
       hostTimerArchive.syncArchivedMemberStatuses(teamId, taskSeq, runtimeForTeam(teamId));
     }
+    try { flushPendingSessionConfigAtSafeBoundary(ctx, rt, teamId); } catch {}
   };
   rt.onLeaderUserMessage = (hookCtx, teamId) => {
+    syncRuntimeConfig(rt);
+    const preActor = rt.actors.get(teamId);
+    if (rt.surface === 'desktop' && !isTeamExecutionStarted(teamStore(teamId)) && !hasActiveSessionOverride(readSessionConfigRecord(rt.storageRoot, teamId))) {
+      const reb = rebindUnstartedTeamGovernance(rt, teamId);
+      if (reb.rebound && reb.changed && preActor?.agent?.model?.select) {
+        try {
+          const curSel = preActor.agent.model.current?.();
+          const heldPrevDefault = reb.prevLeaderTarget
+            && curSel
+            && curSel.provider === reb.prevLeaderTarget.provider
+            && curSel.model === reb.prevLeaderTarget.model;
+          if (!curSel || heldPrevDefault) {
+            const nextCfg = runtimeForTeam(teamId).config;
+            preActor.agent.model.select(resolveModelTarget(nextCfg, nextCfg.roles.leader.route, nextCfg.roles.leader.effort));
+          }
+        } catch {}
+      }
+    }
+    if (preActor?.agent) {
+      try { syncSessionLeaderSelectionFromHost(hookCtx, rt, preActor.agent, { atUserTurnStart: true }); } catch {}
+    }
     const teamRt = runtimeForTeam(teamId), actor = rt.actors.get(teamId);
     const latestMsg = userMessageTexts(hookCtx, teamId).at(-1) ?? '';
+    if (!isReadGrantOnlyMessage(latestMsg)) resetShellCircuitBreakerForTeam(rt, teamId);
     if (latestMsg && !isReadGrantOnlyMessage(latestMsg)) {
       hostConcurrency?.clearPowerPauseForTeamOnUserMessage?.(rt, teamId);
     }
@@ -148,6 +180,7 @@ export function apply(ctx, config) {
     if ((!rt.cordisCompositionMode || rt.plugins.scheduler) && rt.config.plugins?.scheduler !== false) {
       try { hostConcurrency.onLeaderTurnCompleted(hookCtx, teamId); } catch {}
     }
+    try { flushPendingSessionConfigAtSafeBoundary(hookCtx, rt, teamId); } catch {}
   };
   rt.onLeaderIdle = (hookCtx, teamId) => {
     if (runtimeForTeam(teamId).config.team.rollingPlanning && frontierNeedsPlanning(teamStore(teamId), currentTaskSeq(hookCtx, teamId))) return false;
@@ -159,7 +192,11 @@ export function apply(ctx, config) {
   rt.reserveMemberActivation = (teamId, member) => isPluginActive(runtimeForTeam(teamId), 'scheduler') ? hostConcurrency.reserveTeamDispatch(ctx, teamId, { id: member.childId, name: member.name, taskSeq: member.taskSeq, profile: member.profile }) : null;
   rt.activationCapacity = teamId => isPluginActive(runtimeForTeam(teamId), 'scheduler') ? hostConcurrency.evaluateTeamConcurrency(ctx, teamId) : null;
   rt.activationLimit = teamId => isPluginActive(runtimeForTeam(teamId), 'scheduler') ? hostConcurrency.evaluateTeamConcurrency(ctx, teamId).controls.user_max_concurrent : runtimeForTeam(teamId).config.team.maxActiveMembers;
-  installFinalGate(pkg.leaderteam.supportedCoreVersions);
+  installFinalGate({
+    supportedVersions: pkg.leaderteam.supportedCoreVersions,
+    supportedRange: pkg.leaderteam.supportedCoreRange,
+    policy: rt.config?.gate?.hostCompatibilityPolicy ?? pkg.leaderteam?.compatibilityPolicy ?? 'adaptive',
+  });
   rt.gate = new Gate(ctx);
   hostSurface.installToolSurface(agent => agent?.session ? rt.gate.actorFor(agent) : null);
   hostCapabilities.registerCapabilityTools(ctx);
@@ -179,7 +216,7 @@ export function apply(ctx, config) {
   if (!rt.cordisCompositionMode && rt.config.plugins?.scheduler !== false) {
     ctx.effect(() => hostConcurrency.startConcurrencyWatchers(ctx), { label: 'leaderteam-core concurrency' });
   }
-  ctx.effect(() => () => { disposePlanning(rt); rt.gate = new ClosedGate(); rt.startupReady = null; rt.hostAgents = null; rt.liveProcessMemberIds = null; }, { label: 'leaderteam-core gate' });
+  ctx.effect(() => () => { disposePlanning(rt); rt.gate = new ClosedGate(ctx); rt.startupReady = null; rt.hostAgents = null; rt.liveProcessMemberIds = null; }, { label: 'leaderteam-core gate' });
   const ready = Object.freeze({ coreVersion: pkg.version, modular: rt.cordisCompositionMode });
   rt.startupReady = ready;
   ctx.provide('leaderteamReady', ready);
@@ -202,7 +239,7 @@ export function apply(ctx, config) {
     if (syncRes?.synced) {
       for (const actor of rt.actors.values()) {
         if (actor.role !== 'leader' || !actor.agent) continue;
-        if (actor.agent.model?.recordedSelection?.() === null && !actor.agent.options?.model) {
+        if (shouldApplyDefaultLeaderModel(rt, actor.agent)) {
           try {
             const teamCfg = runtimeForTeam(actor.teamId).config;
             const target = resolveModelTarget(teamCfg, teamCfg.roles.leader.route, teamCfg.roles.leader.effort);
@@ -213,18 +250,63 @@ export function apply(ctx, config) {
     }
     return syncRes;
   };
+  const maybeAutoAdoptHostModels = cat => {
+    if (!cat?.models?.length || rt.planningDisposed || !rt.configPath) return false;
+    if (resolvedCfg.mode !== 'solo-deepseek-default') return false;
+    const localFile = path.basename(rt.configPath) === 'leaderteam.config.json'
+      ? path.join(path.dirname(rt.configPath), 'leaderteam.local.json')
+      : null;
+    if (!localFile || fs.existsSync(localFile)) return false;
+    // Only auto-adopt when the user actually configured non-placeholder models in DSH Settings and has no DeepSeek env key
+    if (process.env.DEEPSEEK_API_KEY) return false;
+    const realHostModels = cat.models.filter(
+      m => m.registeredInDsh && m.route && !m.route.startsWith('deepseek-official/'),
+    );
+    if (realHostModels.length === 0) return false;
+    const adopted = buildAutoAdoptedLocalOverrideFromDshModels(realHostModels);
+    if (!adopted) return false;
+    try {
+      writeFileAtomic(localFile, `${JSON.stringify(adopted, null, 2)}\n`);
+      syncRuntimeConfig(rt);
+      rebindAllIdleSessionsOnGlobalUserSave(rt, { principal: { kind: 'user', source: 'onboarding' } });
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  rt.initialSettingsSyncPromise = null;
+  rt.upstreamCatalog = null;
+  let activeSettingsCtx = ctx;
+  let microtaskStarted = false;
   if (typeof ctx.inject === 'function') {
     ctx.inject(['settings'], settingsCtx => {
-      rt.initialSettingsSyncPromise = syncConfiguredModelsToHostSettings(settingsCtx).catch(() => null);
+      activeSettingsCtx = settingsCtx;
+      let chain = syncConfiguredModelsToHostSettings(settingsCtx).catch(() => null);
+      if (microtaskStarted) {
+        chain = chain
+          .then(() => refreshUpstreamCatalog(settingsCtx, rt, { force: true, probeEndpoints: true }))
+          .then(cat => {
+            if (!cat || rt.planningDisposed) return null;
+            maybeAutoAdoptHostModels(cat);
+            return syncConfiguredModelsToHostSettings(settingsCtx);
+          })
+          .catch(() => null);
+      } else if (rt.upstreamCatalog) {
+        chain = chain.then(() => syncConfiguredModelsToHostSettings(settingsCtx).catch(() => null));
+      }
+      rt.initialSettingsSyncPromise = chain;
     });
   }
   // Asynchronously sync Solo-Key / configured providers first, then probe upstream `/v1/models` to enrich `contextWindow` / `maxTokens`.
   queueMicrotask(() => {
-    Promise.resolve(rt.initialSettingsSyncPromise ?? syncConfiguredModelsToHostSettings(ctx))
-      .then(() => refreshUpstreamCatalog(ctx, rt, { force: true, probeEndpoints: true }))
+    microtaskStarted = true;
+    Promise.resolve(rt.initialSettingsSyncPromise ?? syncConfiguredModelsToHostSettings(activeSettingsCtx))
+      .then(() => refreshUpstreamCatalog(activeSettingsCtx, rt, { force: true, probeEndpoints: true }))
       .then(cat => {
         if (!cat || rt.planningDisposed) return;
-        return syncConfiguredModelsToHostSettings(ctx);
+        maybeAutoAdoptHostModels(cat);
+        return syncConfiguredModelsToHostSettings(activeSettingsCtx);
       })
       .catch(() => {});
   });

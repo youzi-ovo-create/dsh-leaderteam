@@ -1,0 +1,411 @@
+/* =====================================================================
+   LT Design Tokens · heluoxu-tokens.css (Heluo Layer 1 + LT Layer 2)
+   Layer 1 (Heluo Product Design Language) primitives  -> --hl-*
+   Layer 2 (LT Common UI) semantic tokens per theme   -> --lt-*
+   Themes:  :root[data-lt-theme="white" | "dark" | "heluoxu" | "custom"]
+   Density: :root[data-lt-density="comfortable" | "compact"]
+   Display: :root[data-lt-display="serif" | "sans"]
+   ===================================================================== */
+
+/* ---------- Layer 1 · Heluo primitives (theme-independent) ---------- */
+:root {
+  /* Type families — zero network dependency, system stacks only */
+  --hl-font-serif: "Noto Serif SC", "Source Han Serif SC", "Source Han Serif", "Songti SC", "STSong", "SimSun", serif;
+  --hl-font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "HarmonyOS Sans SC", "Microsoft YaHei", "Noto Sans SC", "Noto Sans CJK SC", system-ui, sans-serif;
+  --hl-font-mono: "JetBrains Mono", "SF Mono", "Cascadia Code", "Menlo", "Consolas", "Noto Sans Mono CJK SC", monospace;
+
+  /* Type scale (px). Body size switches with density below. */
+  --hl-fs-overline: 11px;
+  --hl-fs-caption: 11.5px;
+  --hl-fs-meta: 12px;
+  --hl-fs-small: 13px;
+  --hl-fs-body: 14px;
+  --hl-fs-subhead: 16px;
+  --hl-fs-title: 20px;
+  --hl-fs-display-s: 26px;
+  --hl-fs-display: 34px;
+  --hl-lh-ui: 1.45;
+  --hl-lh-prose: 1.75;
+  --hl-lh-code: 1.6;
+  --hl-tracking-overline: 0.14em;
+  --hl-tracking-display: 0.02em;
+
+  /* 4px spatial rhythm */
+  --hl-sp-0: 2px;
+  --hl-sp-1: 4px;
+  --hl-sp-2: 6px;
+  --hl-sp-3: 8px;
+  --hl-sp-4: 12px;
+  --hl-sp-5: 16px;
+  --hl-sp-6: 20px;
+  --hl-sp-7: 24px;
+  --hl-sp-8: 32px;
+  --hl-sp-9: 40px;
+  --hl-sp-10: 56px;
+
+  /* Hairline system */
+  --hl-hairline: 1px;
+  --hl-axis: 1.5px;          /* brand axis / progress line weight */
+
+  /* Motion — calm, explanatory only */
+  --hl-dur-micro: 80ms;      /* hover, press */
+  --hl-dur-state: 140ms;     /* toggles, badges */
+  --hl-dur-panel: 200ms;     /* pane collapse, accordion */
+  --hl-dur-overlay: 260ms;   /* drawer, dialog, palette */
+  --hl-dur-breath: 2400ms;   /* running "breathing axis" */
+  --hl-ease-standard: cubic-bezier(0.2, 0, 0, 1);
+  --hl-ease-enter: cubic-bezier(0, 0, 0.2, 1);
+  --hl-ease-exit: cubic-bezier(0.4, 0, 1, 1);
+
+  /* Brand constants (identical across themes, used by marks only) */
+  --hl-brand-ink: #1A1916;
+  --hl-brand-paper: #F5F3EE;
+  --hl-brand-copper: #9C5B2E;
+  --hl-brand-qingdai: #2A657C;
+  --hl-brand-seal: #92544E;
+}
+
+/* ---------- Density ---------- */
+:root,
+:root[data-lt-density="comfortable"],
+:root[data-lt-density="standard"] {
+  --lt-fs-body: var(--hl-fs-body);
+  --lt-fs-dense: var(--hl-fs-small);
+  --lt-ctl-h: 32px;
+  --lt-ctl-h-sm: 26px;
+  --lt-row-h: 40px;
+  --lt-pad-pane: 16px;
+  --lt-pad-card: 16px;
+  --lt-gap: 12px;
+  --lt-gap-tight: 8px;
+}
+:root[data-lt-density="compact"] {
+  --lt-fs-body: var(--hl-fs-small);
+  --lt-fs-dense: var(--hl-fs-meta);
+  --lt-ctl-h: 28px;
+  --lt-ctl-h-sm: 22px;
+  --lt-row-h: 32px;
+  --lt-pad-pane: 12px;
+  --lt-pad-card: 12px;
+  --lt-gap: 8px;
+  --lt-gap-tight: 6px;
+}
+
+/* ---------- Display font switch ---------- */
+:root,
+:root[data-lt-display="serif"] { --lt-font-display: var(--hl-font-serif); }
+:root[data-lt-display="sans"],
+:root[data-lt-heading="sans"] { --lt-font-display: var(--hl-font-sans); }
+
+/* ---------- Shell geometry (theme-independent) ---------- */
+:root {
+  --lt-rail-w: 60px;
+  --lt-status-h: 26px;
+  --lt-header-h: 48px;
+  --lt-context-w: 280px;       /* left context pane default */
+  --lt-context-min: 220px;
+  --lt-context-max: 420px;
+  --lt-inspector-w: 344px;     /* right inspector default */
+  --lt-inspector-min: 300px;
+  --lt-inspector-max: 520px;
+  --lt-reading-w: 800px;       /* conversation reading column */
+  --lt-z-pane: 10;
+  --lt-z-sticky: 20;
+  --lt-z-drawer: 60;
+  --lt-z-dialog: 70;
+  --lt-z-palette: 80;
+  --lt-z-toast: 90;
+}
+
+/* =====================================================================
+   THEME 1 · WHITE (default) — 日光工程白
+   ===================================================================== */
+:root,
+:root[data-lt-theme="white"] {
+  color-scheme: light;
+  --lt-bg-canvas: #F2F3F5;
+  --lt-bg-subtle: #F8F9FA;
+  --lt-bg-surface: #FFFFFF;
+  --lt-bg-elevated: #FFFFFF;
+  --lt-bg-input: #FFFFFF;
+  --lt-bg-inset: #F3F5F7;
+  --lt-bg-hover: rgba(21, 25, 30, 0.045);
+  --lt-bg-pressed: rgba(21, 25, 30, 0.08);
+  --lt-bg-selected: rgba(42, 101, 124, 0.09);
+
+  --lt-fg-primary: #15191E;
+  --lt-fg-secondary: #47505A;
+  --lt-fg-muted: #67707B;
+  --lt-fg-disabled: #A3AAB2;
+  --lt-fg-on-ink: #FFFFFF;
+
+  --lt-border-subtle: rgba(21, 25, 30, 0.085);
+  --lt-border-strong: rgba(21, 25, 30, 0.16);
+  --lt-border-control: #B4BBC3;
+  --lt-border-control-hover: #8B939D;
+
+  --lt-accent: #2A657C;
+  --lt-accent-strong: #1E4E61;
+  --lt-accent-subtle: rgba(42, 101, 124, 0.10);
+  --lt-on-accent: #FFFFFF;
+  --lt-focus: rgba(42, 101, 124, 0.45);
+
+  --lt-info: #2A657C;
+  --lt-info-bg: #E9F2F5;
+  --lt-success: #2B6F57;
+  --lt-success-bg: #E7F3ED;
+  --lt-warning: #8F620E;
+  --lt-warning-bg: #FBF2DF;
+  --lt-danger: #B2372C;
+  --lt-danger-bg: #FBECEA;
+  --lt-seal: #A63D2F;
+  --lt-brand: #9C5B2E;
+
+  --lt-code-fg: #1F2A33;
+  --lt-code-key: #2A657C;
+  --lt-code-str: #2B6F57;
+  --lt-code-num: #9C5B2E;
+  --lt-code-com: #7A838D;
+  --lt-diff-add-bg: #E7F3ED;
+  --lt-diff-del-bg: #FBECEA;
+
+  --lt-chart-1: #2A657C;  /* 青黛 */
+  --lt-chart-2: #9C5B2E;  /* 焦铜 */
+  --lt-chart-3: #2B6F57;  /* 松石 */
+  --lt-chart-4: #B08A3E;  /* 琥珀 */
+  --lt-chart-5: #6A5B8E;  /* 黛紫 */
+  --lt-chart-6: #6E8A99;  /* 灰青 */
+  --lt-chart-7: #B6735A;  /* 赭 */
+  --lt-chart-8: #8A9A5B;  /* 苔 */
+  --lt-chart-grid: rgba(21, 25, 30, 0.07);
+  --lt-chart-unknown: rgba(103, 112, 123, 0.45);
+
+  --lt-radius-xs: 3px;
+  --lt-radius-sm: 4px;
+  --lt-radius-md: 6px;
+  --lt-radius-lg: 10px;
+  --lt-radius-btn: 6px;
+  --lt-shadow-overlay: 0 12px 40px rgba(15, 18, 22, 0.12), 0 2px 6px rgba(15, 18, 22, 0.06);
+  --lt-shadow-pop: 0 6px 20px rgba(15, 18, 22, 0.10);
+  --lt-scrim: rgba(15, 18, 22, 0.28);
+}
+
+/* =====================================================================
+   THEME 2 · DARK — 深碳石板
+   ===================================================================== */
+:root[data-lt-theme="dark"] {
+  color-scheme: dark;
+  --lt-bg-canvas: #0D0F12;
+  --lt-bg-subtle: #121519;
+  --lt-bg-surface: #16191E;
+  --lt-bg-elevated: #1D2127;
+  --lt-bg-input: #111418;
+  --lt-bg-inset: #101317;
+  --lt-bg-hover: rgba(230, 234, 239, 0.05);
+  --lt-bg-pressed: rgba(230, 234, 239, 0.09);
+  --lt-bg-selected: rgba(111, 177, 201, 0.13);
+
+  --lt-fg-primary: #E5E8EC;
+  --lt-fg-secondary: #AAB2BC;
+  --lt-fg-muted: #8A939E;
+  --lt-fg-disabled: #565E68;
+  --lt-fg-on-ink: #0D0F12;
+
+  --lt-border-subtle: rgba(230, 234, 239, 0.08);
+  --lt-border-strong: rgba(230, 234, 239, 0.15);
+  --lt-border-control: #434B56;
+  --lt-border-control-hover: #616B78;
+
+  --lt-accent: #6FB1C9;
+  --lt-accent-strong: #96C7D9;
+  --lt-accent-subtle: rgba(111, 177, 201, 0.14);
+  --lt-on-accent: #081317;
+  --lt-focus: rgba(111, 177, 201, 0.5);
+
+  --lt-info: #6FB1C9;
+  --lt-info-bg: rgba(111, 177, 201, 0.13);
+  --lt-success: #62B892;
+  --lt-success-bg: rgba(98, 184, 146, 0.13);
+  --lt-warning: #DDAB55;
+  --lt-warning-bg: rgba(221, 171, 85, 0.13);
+  --lt-danger: #EE8577;
+  --lt-danger-bg: rgba(238, 133, 119, 0.13);
+  --lt-seal: #E28C79;
+  --lt-brand: #D29A68;
+
+  --lt-code-fg: #D8DDE3;
+  --lt-code-key: #8CC3D7;
+  --lt-code-str: #8ACBA9;
+  --lt-code-num: #E0AE80;
+  --lt-code-com: #7C8692;
+  --lt-diff-add-bg: rgba(98, 184, 146, 0.12);
+  --lt-diff-del-bg: rgba(238, 133, 119, 0.12);
+
+  --lt-chart-1: #6FB1C9;
+  --lt-chart-2: #D29A68;
+  --lt-chart-3: #62B892;
+  --lt-chart-4: #DDAB55;
+  --lt-chart-5: #A595D1;
+  --lt-chart-6: #8FA9B7;
+  --lt-chart-7: #D9927A;
+  --lt-chart-8: #ADBE7D;
+  --lt-chart-grid: rgba(230, 234, 239, 0.07);
+  --lt-chart-unknown: rgba(138, 147, 158, 0.45);
+
+  --lt-radius-xs: 3px;
+  --lt-radius-sm: 4px;
+  --lt-radius-md: 6px;
+  --lt-radius-lg: 10px;
+  --lt-radius-btn: 6px;
+  --lt-shadow-overlay: 0 16px 48px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(230, 234, 239, 0.06);
+  --lt-shadow-pop: 0 8px 24px rgba(0, 0, 0, 0.45), 0 0 0 1px rgba(230, 234, 239, 0.06);
+  --lt-scrim: rgba(0, 0, 0, 0.5);
+}
+
+/* =====================================================================
+   THEME 3 · HELUOXU — 河洛序 · 宣纸焦铜
+   ===================================================================== */
+:root[data-lt-theme="heluoxu"] {
+  color-scheme: light;
+  --lt-bg-canvas: #ECE8DF;
+  --lt-bg-subtle: #F2EFE8;
+  --lt-bg-surface: #F8F6F1;
+  --lt-bg-elevated: #FFFDF9;
+  --lt-bg-input: #FFFDF9;
+  --lt-bg-inset: #EFEBE3;
+  --lt-bg-hover: rgba(26, 25, 22, 0.045);
+  --lt-bg-pressed: rgba(26, 25, 22, 0.08);
+  --lt-bg-selected: rgba(156, 91, 46, 0.10);
+
+  --lt-fg-primary: #1A1916;
+  --lt-fg-secondary: #504D46;
+  --lt-fg-muted: #6A665E;
+  --lt-fg-disabled: #A6A297;
+  --lt-fg-on-ink: #F8F6F1;
+
+  --lt-border-subtle: rgba(26, 25, 22, 0.10);
+  --lt-border-strong: rgba(26, 25, 22, 0.20);
+  --lt-border-control: #ABA597;
+  --lt-border-control-hover: #857F72;
+
+  --lt-accent: #9C5B2E;
+  --lt-accent-strong: #7E4520;
+  --lt-accent-subtle: rgba(156, 91, 46, 0.11);
+  --lt-on-accent: #FFFDF9;
+  --lt-focus: rgba(156, 91, 46, 0.42);
+
+  --lt-info: #2A657C;
+  --lt-info-bg: #E6EEF0;
+  --lt-success: #36705A;
+  --lt-success-bg: #E5EFE8;
+  --lt-warning: #8A6113;
+  --lt-warning-bg: #F5EBD6;
+  --lt-danger: #A3263F;
+  --lt-danger-bg: #F6E6E8;
+  --lt-seal: #92544E;
+  --lt-brand: #9C5B2E;
+
+  --lt-code-fg: #2A2722;
+  --lt-code-key: #2A657C;
+  --lt-code-str: #36705A;
+  --lt-code-num: #9C5B2E;
+  --lt-code-com: #857F72;
+  --lt-diff-add-bg: #E5EFE8;
+  --lt-diff-del-bg: #F6E6E8;
+
+  --lt-chart-1: #9C5B2E;
+  --lt-chart-2: #2A657C;
+  --lt-chart-3: #36705A;
+  --lt-chart-4: #B08A3E;
+  --lt-chart-5: #6E5A82;
+  --lt-chart-6: #7F8E8C;
+  --lt-chart-7: #92544E;
+  --lt-chart-8: #8A8B55;
+  --lt-chart-grid: rgba(26, 25, 22, 0.07);
+  --lt-chart-unknown: rgba(106, 102, 94, 0.45);
+
+  --lt-radius-xs: 2px;
+  --lt-radius-sm: 3px;
+  --lt-radius-md: 5px;
+  --lt-radius-lg: 10px;
+  --lt-radius-btn: 999px;
+  --lt-shadow-overlay: 0 14px 40px rgba(40, 32, 20, 0.12), 0 2px 6px rgba(40, 32, 20, 0.06);
+  --lt-shadow-pop: 0 6px 20px rgba(40, 32, 20, 0.10);
+  --lt-scrim: rgba(30, 26, 20, 0.26);
+}
+
+/* =====================================================================
+   THEME 4 · CUSTOM — seed-derived. Runtime (theme.ts / bootLtTheme)
+   derives all --lt-* tokens with WCAG 2.x contrast guard-rails.
+   CSS color-mix() below is the fallback before JS runs.
+   ===================================================================== */
+:root[data-lt-theme="custom"] {
+  --lt-bg-canvas: var(--seed-canvas, var(--user-bg-canvas, #F1F2EF));
+  --lt-bg-surface: var(--seed-surface, var(--user-bg-surface, #FFFFFF));
+  --lt-fg-primary: var(--seed-ink, var(--user-fg-primary, #17191C));
+  --lt-accent: var(--seed-accent, var(--user-accent, #3D6B5A));
+  --lt-danger: var(--seed-danger, var(--user-danger, #B2372C));
+
+  --lt-bg-subtle: color-mix(in srgb, var(--lt-bg-surface) 55%, var(--lt-bg-canvas));
+  --lt-bg-elevated: var(--lt-bg-surface);
+  --lt-bg-input: var(--lt-bg-surface);
+  --lt-bg-inset: color-mix(in srgb, var(--lt-bg-canvas) 92%, var(--lt-fg-primary));
+  --lt-bg-hover: color-mix(in srgb, var(--lt-fg-primary) 5%, transparent);
+  --lt-bg-pressed: color-mix(in srgb, var(--lt-fg-primary) 9%, transparent);
+  --lt-bg-selected: color-mix(in srgb, var(--lt-accent) 11%, transparent);
+  --lt-fg-secondary: color-mix(in srgb, var(--lt-fg-primary) 76%, var(--lt-bg-surface));
+  --lt-fg-muted: color-mix(in srgb, var(--lt-fg-primary) 62%, var(--lt-bg-surface));
+  --lt-fg-disabled: color-mix(in srgb, var(--lt-fg-primary) 34%, var(--lt-bg-surface));
+  --lt-fg-on-ink: var(--lt-bg-surface);
+  --lt-border-subtle: color-mix(in srgb, var(--lt-fg-primary) 9%, transparent);
+  --lt-border-strong: color-mix(in srgb, var(--lt-fg-primary) 17%, transparent);
+  --lt-border-control: color-mix(in srgb, var(--lt-fg-primary) 30%, var(--lt-bg-surface));
+  --lt-border-control-hover: color-mix(in srgb, var(--lt-fg-primary) 46%, var(--lt-bg-surface));
+  --lt-accent-strong: color-mix(in srgb, var(--lt-accent) 80%, var(--lt-fg-primary));
+  --lt-accent-subtle: color-mix(in srgb, var(--lt-accent) 12%, transparent);
+  --lt-on-accent: #FFFFFF;
+  --lt-focus: color-mix(in srgb, var(--lt-accent) 45%, transparent);
+  --lt-info: var(--lt-accent);
+  --lt-info-bg: color-mix(in srgb, var(--lt-accent) 10%, var(--lt-bg-surface));
+  --lt-success: #2B6F57;
+  --lt-success-bg: color-mix(in srgb, #2B6F57 11%, var(--lt-bg-surface));
+  --lt-warning: #8F620E;
+  --lt-warning-bg: color-mix(in srgb, #8F620E 11%, var(--lt-bg-surface));
+  --lt-danger-bg: color-mix(in srgb, var(--lt-danger) 10%, var(--lt-bg-surface));
+  --lt-seal: var(--lt-danger);
+  --lt-brand: var(--lt-accent);
+  --lt-code-fg: var(--lt-fg-primary);
+  --lt-code-key: var(--lt-accent);
+  --lt-code-str: var(--lt-success);
+  --lt-code-num: var(--lt-warning);
+  --lt-code-com: var(--lt-fg-muted);
+  --lt-diff-add-bg: var(--lt-success-bg);
+  --lt-diff-del-bg: var(--lt-danger-bg);
+  --lt-chart-1: var(--lt-accent);
+  --lt-chart-2: #9C5B2E;
+  --lt-chart-3: #2B6F57;
+  --lt-chart-4: #B08A3E;
+  --lt-chart-5: #6A5B8E;
+  --lt-chart-6: #6E8A99;
+  --lt-chart-7: #B6735A;
+  --lt-chart-8: #8A9A5B;
+  --lt-chart-grid: color-mix(in srgb, var(--lt-fg-primary) 7%, transparent);
+  --lt-chart-unknown: color-mix(in srgb, var(--lt-fg-muted) 45%, transparent);
+  --lt-radius-xs: var(--seed-radius-xs, 3px);
+  --lt-radius-sm: var(--seed-radius-sm, 4px);
+  --lt-radius-md: var(--seed-radius-md, 6px);
+  --lt-radius-lg: var(--seed-radius-lg, 10px);
+  --lt-radius-btn: var(--seed-radius-btn, 6px);
+  --lt-shadow-overlay: 0 12px 40px rgba(0, 0, 0, 0.14);
+  --lt-shadow-pop: 0 6px 20px rgba(0, 0, 0, 0.10);
+  --lt-scrim: rgba(0, 0, 0, 0.3);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --hl-dur-micro: 0ms;
+    --hl-dur-state: 0ms;
+    --hl-dur-panel: 0ms;
+    --hl-dur-overlay: 0ms;
+  }
+}

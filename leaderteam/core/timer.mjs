@@ -58,6 +58,7 @@ function createTaskTimerEntry(taskSeq, nowMs) {
     deliveredAtMs: null,
     planAttempts: 0,
     unapprovedPlanAttempts: 0,
+    settledPlanIds: [],
   };
 }
 
@@ -140,6 +141,9 @@ export function normalizeTimerState(raw, fallback = {}) {
         deliveredAtMs: typeof v.deliveredAtMs === 'number' ? Math.trunc(v.deliveredAtMs) : null,
         planAttempts: Number.isInteger(v.planAttempts) && v.planAttempts >= 0 ? v.planAttempts : 0,
         unapprovedPlanAttempts: Number.isInteger(v.unapprovedPlanAttempts) && v.unapprovedPlanAttempts >= 0 ? v.unapprovedPlanAttempts : 0,
+        settledPlanIds: Array.isArray(v.settledPlanIds)
+          ? [...new Set(v.settledPlanIds.filter(id => typeof id === 'string' && id.length > 0))]
+          : [],
       };
     }
   }

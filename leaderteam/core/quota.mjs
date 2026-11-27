@@ -85,7 +85,7 @@ export function routeQuota(state, route, modelCfg, quotaCfg, now) {
   return { ...base, status, bestRemainingPct: best, bestAccount, nextResetAt, reason: status === 'ok' ? '' : `best account has ${best}% left${reserveNote}` };
 }
 
-const FIVE_HOUR_WINDOW_NAME_RE = /^(?:5\s*(?:h|hr|hrs|hours?)|300\s*(?:m|min|mins|minutes?))$/i;
+const FIVE_HOUR_WINDOW_NAME_RE = /(?<![\d.])(?:5\s*(?:h|hr|hrs|hours?)|300\s*(?:m|min|mins|minutes?))(?![A-Za-z0-9_])/i;
 
 /**
  * Quota status strictly for the 5-hour request window of `route` (never conflating 7-day / weekly / monthly windows).

@@ -1,0 +1,31 @@
+{
+  "component": "magpie",
+  "upstreamRepository": "https://github.com/yetone/magpie",
+  "releasesRepository": "https://github.com/yetone/magpie-releases",
+  "releaseMetadataUrl": "https://usemagpie.ai/api/latest",
+  "license": "MIT",
+  "copyright": "Copyright (c) 2026 yetone",
+  "pinnedVersion": "0.1.4731",
+  "testedMinVersion": "0.1.4731",
+  "testedMaxVersion": "0.1.4797",
+  "ed25519PublicKeyBase64": "3XuYQEohIRDF+zxGQry1iXGZ1cfKYFX3vsST6GSSbYQ=",
+  "buildVariant": "magpie-cli (CGO_ENABLED=0 -tags \"nogui packedassets conptypair\", zero LGPL GTK/WebKit dynamic dependencies)",
+  "platformAssets": {
+    "linux-x64": "magpie-cli-linux-amd64",
+    "linux-arm64": "magpie-cli-linux-arm64",
+    "darwin-arm64": "magpie-cli-darwin-arm64",
+    "darwin-x64": "magpie-cli-darwin-amd64",
+    "win32-x64": "magpie-cli-windows-amd64.exe",
+    "win32-arm64": "magpie-cli-windows-arm64.exe"
+  },
+  "knownSha256": {
+    "0.1.4731": {
+      "magpie-cli-linux-amd64": "b0d3af5eb3e12864699780ae14629e952b0838f3ece0ded7a2022c7478fac833"
+    }
+  },
+  "requiredEndpoints": {
+    "gateway": ["/", "/v1/models", "/v1/magpie/usage/requests", "/v1/magpie/accounts"],
+    "webAdmin": ["/api/settings", "/api/providers"]
+  },
+  "patches": []
+}

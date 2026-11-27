@@ -1,0 +1,176 @@
+{
+  "contract": "lt.public.v1",
+  "contractVersion": "1.0.0",
+  "capabilities": {
+    "backendLine": "v2.4-compat-mock",
+    "backendVersion": "2.4.0-mock",
+    "hostKind": "standalone",
+    "frontendSwitch": {
+      "available": false,
+      "currentSurface": "lt-native",
+      "dshFrontendUrl": null,
+      "ltFrontendUrl": "./",
+      "sharesRuntimeAndSessions": false
+    },
+    "features": {
+      "liveSessionRpc": false,
+      "magpieGateway": true,
+      "magpieManagedLifecycle": true,
+      "magpieProviderAdmin": true,
+      "magpieOAuthPassthrough": true,
+      "directProviders": true,
+      "externalGateways": true,
+      "modelPoolWrite": true,
+      "roleConfigWrite": true,
+      "roleFallbacks": false,
+      "teamObservability": true,
+      "rollingFrontier": false,
+      "governanceConferences": false,
+      "schedulerTelemetry": false,
+      "planArchive": false,
+      "usageAnalytics": true,
+      "usageOfflineImport": true,
+      "themePersistence": true
+    },
+    "supportedRoles": [
+      { "roleId": "coordinator", "label": "协调器 (Coordinator)", "description": "模拟新一代通用协调角色", "supportsFallbacks": false, "maxFallbacks": 0, "required": true },
+      { "roleId": "worker", "label": "执行器 (Worker)", "description": "模拟通用任务执行角色", "supportsFallbacks": false, "maxFallbacks": 0, "required": true }
+    ]
+  },
+  "gateway": {
+    "mode": "external",
+    "state": "running",
+    "gatewayUrl": "http://127.0.0.1:3425",
+    "webAdminUrl": null,
+    "managementAuthenticated": false,
+    "autoRecover": false,
+    "recoveryCount": 0,
+    "version": {
+      "current": "0.1.4797",
+      "pinned": "0.1.4731",
+      "testedRange": "0.1.4731 - 0.1.4797",
+      "compatible": true,
+      "rollbackAvailable": false,
+      "previousVersion": null,
+      "license": "MIT"
+    },
+    "health": {
+      "ok": true,
+      "latencyMs": 2,
+      "checkedAt": "2026-11-25T14:35:00.000Z",
+      "pid": null,
+      "modelCount": 1
+    },
+    "lastError": null
+  },
+  "providers": [
+    {
+      "providerId": "magpie:openai",
+      "sourceKind": "magpie",
+      "vendorId": "openai",
+      "displayName": "OpenAI (External Magpie)",
+      "protocol": "openai-responses",
+      "endpointUrl": "http://127.0.0.1:3425/v1",
+      "status": "ready",
+      "keyRotation": "single",
+      "sessionAffinity": true,
+      "credentials": [
+        { "credentialId": "oauth:codex:team", "kind": "oauth", "label": "Codex Subscription", "maskedPreview": "oauth:team", "enabled": true, "primary": true, "weight": 1, "accountPlan": "Team" }
+      ],
+      "discoveredModelCount": 1,
+      "enabledModelCount": 1
+    }
+  ],
+  "models": [
+    {
+      "entryId": "magpie:magpie:openai:gpt-5.2",
+      "routeId": "openai/gpt-5.2",
+      "upstreamModelId": "gpt-5.2",
+      "providerId": "magpie:openai",
+      "providerDisplayName": "OpenAI (External Magpie)",
+      "credentialScope": "oauth:codex:team",
+      "sourceKind": "magpie",
+      "displayName": "GPT-5.2",
+      "family": "gpt",
+      "capabilities": { "vision": true, "pdf": true, "toolCall": true, "reasoning": true },
+      "efforts": { "supported": ["low", "medium", "high"], "defaultEffort": "high" },
+      "limits": { "contextWindow": 400000, "maxOutputTokens": 128000 },
+      "tier": "flagship",
+      "inModelPool": true,
+      "inExecutionPool": true,
+      "disabled": false
+    }
+  ],
+  "runtime": {
+    "modelPool": {
+      "configuredRoutes": ["openai/gpt-5.2"],
+      "executionPool": ["openai/gpt-5.2"],
+      "disabledRoutes": []
+    },
+    "roleAssignments": {
+      "coordinator": { "route": "openai/gpt-5.2", "effort": "high", "fallback": [] },
+      "worker": { "route": "openai/gpt-5.2", "effort": "medium", "fallback": [] }
+    },
+    "syncState": {
+      "dshSettingsSynced": false,
+      "patchSynced": false,
+      "governanceHash": null
+    },
+    "scheduler": {
+      "maxActiveMembers": 4,
+      "effectiveCap": null,
+      "activeExecutionMembers": 0,
+      "pressureBand": "unknown"
+    },
+    "power": {
+      "enabled": false,
+      "onBattery": null,
+      "batteryPct": null,
+      "latched": false
+    },
+    "requestWindows": [],
+    "teams": []
+  },
+  "usageRecords": [
+    {
+      "logicalRequestId": "req-v24-unmetered",
+      "timestampMs": 1764081000000,
+      "status": "unknown",
+      "requestedRoute": "openai/gpt-5.2",
+      "actualProvider": "openai",
+      "actualModel": "gpt-5.2",
+      "sourceKind": "magpie",
+      "physicalAttemptCount": 1,
+      "latencyMs": 920,
+      "ttftMs": null,
+      "metered": false,
+      "tokens": {
+        "uncachedInputTokens": null,
+        "cacheReadTokens": null,
+        "cacheWriteTokens": null,
+        "outputTokens": null,
+        "reasoningTokens": null,
+        "totalTokens": null
+      },
+      "cost": {
+        "known": false,
+        "currency": null,
+        "actualCny": null,
+        "peakCny": null,
+        "offPeakCny": null,
+        "actualUsd": null,
+        "priceSource": "unknown"
+      },
+      "attribution": {
+        "sessionId": null,
+        "teamId": null,
+        "taskSeq": null,
+        "stageId": null,
+        "group": "unknown",
+        "role": "coordinator",
+        "actorName": null,
+        "degraded": false
+      }
+    }
+  ]
+}

@@ -2,10 +2,12 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { runtime, baseRuntime, teamStore, runtimeForTeam, isPluginActive, activePluginsMap, effectiveRuntimeConfig, recordSessionModelRequest, resolveCanonicalRouteFromHostSelection } from './runtime.mjs';
+import { runtime, baseRuntime, teamStore, runtimeForTeam, isPluginActive, activePluginsMap, effectiveRuntimeConfig, recordSessionModelRequest, resolveCanonicalRouteFromHostSelection, syncSessionLeaderSelectionFromHost, flushPendingSessionConfigAtSafeBoundary } from './runtime.mjs';
 import { TeamStore } from '../core/store.mjs';
-import { leaderSection, memberSection, directExecSection } from '../core/prompts.mjs';
-import { resolvePath, pathKey } from '../core/paths.mjs';
+import { leaderSection, memberSection, directExecSection, singleModeSection } from '../core/prompts.mjs';
+import { readSessionModeHistory } from '../core/session-mode.mjs';
+import { getSessionExecutionMode } from './mode-controller.mjs';
+import { resolvePath, pathKey, realpathBestEffort } from '../core/paths.mjs';
 import { truncate } from '../core/redact.mjs';
 import { CAPABILITY_TOOLS } from '../core/tool-policy.mjs';
 import { DIRECT_EXEC_ALLOWED_TOOLS, LEADER_AUTONOMOUS_TOOLS } from '../core/constants.mjs';
@@ -19,6 +21,7 @@ import { frontierState, frontierView, frontierNeedsPlanning, frontierHasDispatch
 import { formatFrontierContext } from './planning.mjs';
 import { hasAdmissibleFrontierWork, hasAdmissibleNonShellFrontierWork, hasUnfinishedNonShellPlanWork, resolveSendMessageTargetId } from './activation.mjs';
 import { createAgentCircuitState, recordToolOutcomeInCircuit, recordTurnEndInCircuit } from '../core/circuit-breaker.mjs';
+import { isHostShellInitFailureResult, recordShellToolResultForTeam } from '../core/shell-circuit-breaker.mjs';
 import { runCircuitInvestigation } from './investigator.mjs';
 import { isAutonomousGovernance, replayGovernanceState } from '../core/governance-protocol.mjs';
 import {
@@ -35,11 +38,60 @@ const LEGACY_TOOLS = {
   shell: ['read', 'read_image', 'glob', 'grep', 'todo_write', 'write', 'edit', 'pwsh', 'bash', 'job_list', 'job_output', 'job_kill'],
 };
 const leaderPromptDisposers = new WeakMap();
+const subagentPromptDisposers = new WeakMap();
 
-export function leaderAllowedTools(rt = runtime()) {
-  const cfg = rt.config;
+export const SINGLE_MODE_FORBIDDEN_TOOLS = Object.freeze([
+  'send_message',
+  'interrupt_agent',
+  'list_agents',
+  'subagent',
+  'fork_agent',
+]);
+
+export const TEAM_MODE_LEADER_FORBIDDEN_TOOLS = Object.freeze([
+  'write',
+  'edit',
+  'bash',
+  'pwsh',
+  'job_list',
+  'job_output',
+  'job_kill',
+]);
+
+export function singleModeDirectTools(platform = process.platform) {
+  return [
+    'read',
+    'read_image',
+    'glob',
+    'grep',
+    'todo_write',
+    'write',
+    'edit',
+    ...(platform === 'win32' ? ['pwsh'] : ['bash']),
+    'job_list',
+    'job_output',
+    'job_kill',
+  ];
+}
+
+export const SINGLE_MODE_DIRECT_TOOLS = Object.freeze(singleModeDirectTools(process.platform));
+
+export function leaderAllowedTools(rt = runtime(), executionMode = 'team', platform = process.platform, cwd = null) {
+  const cfg = rt?.config;
   if (!cfg) return [];
-  const disabledTools = new Set();
+  if (executionMode === 'single') {
+    const forbidden = new Set(SINGLE_MODE_FORBIDDEN_TOOLS);
+    const baseRt = baseRuntime(rt);
+    const wsShellFailed = typeof cwd === 'string' && cwd.length > 0
+      ? Boolean(baseRt?.workspaceShellFailures?.has(pathKey(cwd, platform)))
+      : false;
+    const shellSet = wsShellFailed ? new Set(cfg.gate?.shellTools ?? ['bash', 'pwsh']) : null;
+    const extras = (cfg.toolPolicy?.additionalTools ?? []).filter(
+      t => typeof t === 'string' && !t.startsWith('team_') && !forbidden.has(t) && (!shellSet || !shellSet.has(t)),
+    );
+    return [...new Set([...singleModeDirectTools(platform), ...extras])].filter(t => !shellSet || !shellSet.has(t));
+  }
+  const disabledTools = new Set(TEAM_MODE_LEADER_FORBIDDEN_TOOLS);
   if (!isPluginActive(rt, 'scheduler')) disabledTools.add('team_concurrency');
   if (!isPluginActive(rt, 'consensus')) {
     disabledTools.add('team_discuss');
@@ -96,19 +148,209 @@ export function resolveActor(ctx, agent) {
       }
     }
   } else if (isLeaderRoot(ctx, agent)) {
-    teamStore(agent.id).ensure({ workspace: cwd, surface: rt.surface });
-    cfg = runtimeForTeam(agent.id).config;
-    const tools = leaderAllowedTools(runtimeForTeam(agent.id));
-    actor = { role: 'leader', teamId: agent.id, agentId: agent.id, name: 'leader', profile: 'leader', allowedTools: tools, loadedTools: tools, skills: [], writeScope: [], refs: [], cwd };
+    const mode = getSessionExecutionMode(rt, agent.id);
+    if (mode === 'team') {
+      teamStore(agent.id).ensure({ workspace: cwd, surface: rt.surface });
+    }
+    const teamRt = runtimeForTeam(agent.id);
+    cfg = teamRt.config;
+    const tools = leaderAllowedTools(teamRt, mode, process.platform, cwd);
+    actor = {
+      role: 'leader',
+      executionMode: mode,
+      teamId: agent.id,
+      agentId: agent.id,
+      name: 'leader',
+      profile: 'leader',
+      allowedTools: tools,
+      loadedTools: tools,
+      skills: [],
+      writeScope: [],
+      refs: [],
+      cwd,
+    };
   }
   if (actor) { actor.agent = agent; rt.actors.set(agent.id, actor); }
   return actor;
 }
-function isLeaderRoot(ctx, agent) {
+export function isLeaderRoot(ctx, agent) {
+  if (!agent) return false;
   const rt = runtime();
   if (rt.surface === 'headless') return process.env.LEADERTEAM_HEADLESS_LEADER === '1';
-  const presets = ctx.get('agentPresets');
-  return presets?.presetForSession?.(agent.session) === rt.config.profiles.leader.preset;
+  const leaderPreset = rt.config?.profiles?.leader?.preset ?? 'leaderteam';
+  const presets = ctx?.get?.('agentPresets');
+  const resolved = presets?.presetForSession?.(agent.session);
+  return typeof resolved === 'string' && resolved === leaderPreset;
+}
+
+function disposeHandleList(map, agent) {
+  for (const dispose of map.get(agent) ?? []) {
+    if (typeof dispose === 'function') {
+      try { dispose(); } catch {}
+    } else if (dispose && typeof dispose.dispose === 'function') {
+      try { dispose.dispose(); } catch {}
+    }
+  }
+  map.delete(agent);
+}
+
+function disposeLeaderPromptHandles(agent) {
+  disposeHandleList(leaderPromptDisposers, agent);
+}
+
+function resolveAgentSystemPrompt(agent) {
+  let prompt = null;
+  if (agent?.ctx) {
+    if (typeof agent.ctx.get === 'function') {
+      try { prompt = agent.ctx.get('systemPrompt') ?? null; } catch {}
+    }
+    if (!prompt) {
+      try { prompt = agent.ctx.systemPrompt ?? null; } catch {}
+    }
+  }
+  return prompt && typeof prompt.section === 'function' ? prompt : null;
+}
+
+function shadowDisallowedHostToolSections(prompt, allowedTools) {
+  if (!prompt || typeof prompt.section !== 'function') return [];
+  const allowed = new Set(allowedTools ?? []);
+  const disposers = [];
+  if (!allowed.has('bash')) {
+    disposers.push(prompt.section({
+      name: 'tool:bash',
+      order: typeof prompt.getSectionOrder === 'function' ? (prompt.getSectionOrder('TOOL_BASH') ?? 1000) : 1000,
+      interpolate: false,
+      text: '',
+    }));
+  }
+  if (!allowed.has('pwsh')) {
+    disposers.push(prompt.section({
+      name: 'tool:pwsh',
+      order: typeof prompt.getSectionOrder === 'function' ? (prompt.getSectionOrder('TOOL_PWSH') ?? 1010) : 1010,
+      interpolate: false,
+      text: '',
+    }));
+  }
+  if (!allowed.has('job_list') && !allowed.has('job_output') && !allowed.has('job_kill')) {
+    disposers.push(prompt.section({
+      name: 'tool:jobs',
+      order: typeof prompt.getSectionOrder === 'function' ? (prompt.getSectionOrder('TOOL_JOBS') ?? 1600) : 1600,
+      interpolate: false,
+      text: '',
+    }));
+  }
+  return disposers;
+}
+
+export function applyLeaderPromptSections(ctx, rt, actor, agent, mode = 'team') {
+  disposeLeaderPromptHandles(agent);
+  const prompt = resolveAgentSystemPrompt(agent);
+  if (!prompt) {
+    actor.promptAppliedMode = mode;
+    return;
+  }
+  const teamRt = runtimeForTeam(actor.teamId);
+  const cfg = teamRt.config ?? rt.config;
+  const disposers = [];
+  if (mode === 'single') {
+    disposers.push(prompt.section({
+      name: 'leaderteam:role',
+      order: 9000,
+      interpolate: false,
+      text: singleModeSection(cfg, process.platform),
+    }));
+    const shellFailure = actor.shellFailure ?? (actor.cwd ? baseRuntime(rt)?.workspaceShellFailures?.get(pathKey(actor.cwd)) : null);
+    if (shellFailure) {
+      disposers.push(prompt.section({
+        name: 'leaderteam:shell-unavailable',
+        order: 9010,
+        interpolate: false,
+        text: `The OS sandbox failed before a command started: ${shellFailure}\nShell tools are unavailable for this workspace in Single Mode. Stop shell command retries, use direct file tools (read/glob/grep/write/edit) where sufficient, or explain the OS sandbox obstacle clearly to the user without modifying sandbox permissions or bypassing safety controls.`,
+      }));
+    }
+  } else {
+    disposers.push(prompt.section({
+      name: 'leaderteam:role',
+      order: 9000,
+      interpolate: false,
+      text: leaderSection(cfg, activePluginsMap(teamRt)),
+    }));
+    if (typeof prompt.context === 'function') {
+      disposers.push(prompt.context({
+        name: 'leaderteam:current-plan',
+        order: 125,
+        interpolate: false,
+        text: () => {
+          const curRt = runtimeForTeam(actor.teamId);
+          const curCfg = curRt.config ?? cfg;
+          const seq = currentTaskSeq(ctx, actor.teamId);
+          const store = teamStore(actor.teamId);
+          if (curCfg.team.rollingPlanning) return formatFrontierContext(store, seq, curCfg);
+          const logicalTeamId = store.rawTeamId ?? store.teamId;
+          const plan = readCurrentPlan(curRt.storageRoot, logicalTeamId, seq);
+          return `Current full task plan: ${currentPlanFile(curRt.storageRoot, logicalTeamId, seq)}. ${plan ? 'Read this file after context compaction; it is the source of plan review.' : 'Write the full plan using team_note(scope="current_plan", path="plan.md").'}`;
+        },
+      }));
+      const baseRt = baseRuntime(rt);
+      if (typeof baseRt.formatLeaderGovernanceSlot === 'function' || typeof baseRt.formatLeaderConcurrencySlot === 'function' || typeof baseRt.formatLeaderTimerSlot === 'function') {
+        disposers.push(prompt.context({ name: 'leaderteam:governance', order: 127, interpolate: false, text: () => baseRt.formatLeaderGovernanceSlot?.(actor.teamId) ?? '' }));
+        disposers.push(prompt.context({ name: 'leaderteam:concurrency', order: 130, interpolate: false, text: () => baseRt.formatLeaderConcurrencySlot?.(actor.teamId) ?? '' }));
+        disposers.push(prompt.context({ name: 'leaderteam:timer', order: 131, interpolate: false, text: () => baseRt.formatLeaderTimerSlot?.(actor.teamId) ?? '' }));
+      } else {
+        disposers.push(prompt.context({
+          name: 'leaderteam:concurrency',
+          order: 130,
+          interpolate: false,
+          text: () => baseRt.formatLeaderContext?.(actor.teamId) ?? '',
+        }));
+      }
+    }
+  }
+  disposers.push(...shadowDisallowedHostToolSections(prompt, actor.allowedTools));
+  leaderPromptDisposers.set(agent, disposers);
+  actor.promptAppliedMode = mode;
+}
+
+export function syncLeaderAgentMode(ctx, rt = runtime(), sessionId) {
+  const baseRt = baseRuntime(rt);
+  if (!sessionId) return { synced: false, mode: 'team' };
+  const mode = getSessionExecutionMode(baseRt, sessionId);
+  let actor = baseRt.actors.get(sessionId);
+  const liveAgent = (actor?.role === 'leader' ? actor.agent : null) ?? baseRt.hostAgents?.get?.(sessionId) ?? null;
+  if ((!actor || (liveAgent && actor.agent !== liveAgent)) && liveAgent && isLeaderRoot(ctx, liveAgent)) {
+    actor = resolveActor(ctx, liveAgent);
+  }
+  if (!actor || actor.role !== 'leader') return { synced: false, mode };
+  if (mode === 'team' && baseRt.storageRoot) {
+    teamStore(sessionId).ensure({ workspace: actor.cwd, surface: baseRt.surface });
+    reconcileStaleMembers(runtimeForTeam(sessionId), teamStore(sessionId));
+    try { baseRt.onLeaderSessionReady?.(ctx, sessionId, actor.cwd); } catch {}
+  } else if (baseRt.storageRoot && TeamStore.exists(baseRt.storageRoot, sessionId)) {
+    reconcileStaleMembers(baseRt, teamStore(sessionId));
+  }
+  const teamRt = runtimeForTeam(sessionId);
+  const cwd = typeof actor.agent?.session?.header?.cwd === 'string' ? actor.agent.session.header.cwd : actor.cwd;
+  const tools = leaderAllowedTools(teamRt, mode, process.platform, cwd);
+  actor.executionMode = mode;
+  actor.allowedTools = tools;
+  actor.loadedTools = tools;
+  if (actor.agent) {
+    applyLeaderPromptSections(ctx, teamRt, actor, actor.agent, mode);
+  }
+  return { synced: true, mode, allowedTools: tools };
+}
+
+export function shouldApplyDefaultLeaderModel(rt, agent) {
+  if (typeof agent?.model?.select !== 'function') return false;
+  if (agent.model?.recordedSelection?.() !== null) return false;
+  const opts = agent.options;
+  if (rt?.surface !== 'headless') {
+    const desc = opts && typeof opts === 'object'
+      ? Object.getOwnPropertyDescriptor(opts, 'model')
+      : undefined;
+    return typeof desc?.get === 'function' || !opts?.model;
+  }
+  return !opts?.model;
 }
 
 export function onAgentCreated(ctx, { agent }) {
@@ -116,51 +358,61 @@ export function onAgentCreated(ctx, { agent }) {
   if (!actor) return;
   const rt = runtimeForTeam(actor.teamId), cfg = rt.config;
   if (actor.role === 'leader') {
-    if (leaderPromptDisposers.has(agent)) return;
-    teamStore(actor.teamId).ensure({ workspace: actor.cwd, surface: rt.surface });
-    reconcileStaleMembers(rt, teamStore(actor.teamId));
-    try { rt.onLeaderSessionReady?.(ctx, actor.teamId, actor.cwd); } catch {}
+    const mode = actor.executionMode ?? getSessionExecutionMode(rt, actor.teamId);
+    const cwd = typeof agent?.session?.header?.cwd === 'string' ? agent.session.header.cwd : actor.cwd;
+    const tools = leaderAllowedTools(rt, mode, process.platform, cwd);
+    actor.executionMode = mode;
+    actor.allowedTools = tools;
+    actor.loadedTools = tools;
+    if (leaderPromptDisposers.has(agent) && actor.promptAppliedMode === mode) return;
+    if (mode === 'team') {
+      teamStore(actor.teamId).ensure({ workspace: actor.cwd, surface: rt.surface });
+      reconcileStaleMembers(rt, teamStore(actor.teamId));
+      try { rt.onLeaderSessionReady?.(ctx, actor.teamId, actor.cwd); } catch {}
+    } else if (rt.storageRoot && TeamStore.exists(rt.storageRoot, actor.teamId)) {
+      reconcileStaleMembers(rt, teamStore(actor.teamId));
+    }
     // Apply the configured default only before this session has any durable or CLI-specified selection.
-    // Resuming a session or passing an explicit `--model` in headless preserves its actual model/effort.
-    if (agent.model?.recordedSelection?.() === null && !agent.options?.model) {
+    // On Desktop / `dsh --profile web` (`rt.surface !== 'headless'`), `sessionController.create` supplies a
+    // getter `get model()` returning DSH's host default (`deepseek-reasoner` on `deepseek-official`), whereas
+    // `dsh headless` supplies plain `{ provider, model }` values when overridden (`it17-leader-model`).
+    if (shouldApplyDefaultLeaderModel(rt, agent)) {
       try {
         const target = resolveModelTarget(cfg, cfg.roles.leader.route, cfg.roles.leader.effort);
         agent.model.select(target);
       } catch {}
     }
-    const prompt = agent.ctx.systemPrompt;
-    const disposers = [];
-    disposers.push(prompt.section({ name: 'leaderteam:role', order: 9000, interpolate: false, text: leaderSection(cfg, activePluginsMap(rt)) }));
-    disposers.push(prompt.context?.({ name: 'leaderteam:current-plan', order: 125, interpolate: false,
-      text: () => {
-        const seq = currentTaskSeq(ctx, actor.teamId);
-        if (cfg.team.rollingPlanning) return formatFrontierContext(teamStore(actor.teamId), seq, cfg);
-        const plan = readCurrentPlan(rt.storageRoot, actor.teamId, seq);
-        return `Current full task plan: ${currentPlanFile(rt.storageRoot, actor.teamId, seq)}. ${plan ? 'Read this file after context compaction; it is the source of plan review.' : 'Write the full plan using team_note(scope="current_plan", path="plan.md").'}`;
-      } }));
-    disposers.push(prompt.context?.({
-      name: 'leaderteam:concurrency',
-      order: 130,
-      interpolate: false,
-      text: () => rt.formatLeaderContext?.(actor.teamId) ?? '',
-    }));
-    leaderPromptDisposers.set(agent, disposers);
-    if (cfg.team.rollingPlanning && isPluginActive(rt, 'consensus')) {
+    applyLeaderPromptSections(ctx, rt, actor, agent, mode);
+    if (mode === 'team' && cfg.team.rollingPlanning && isPluginActive(rt, 'consensus')) {
       rt.recoverExecutionReviews?.(actor, currentTaskSeq(ctx, actor.teamId));
     }
   } else if (actor.role === 'member') {
     if (rt.liveProcessMemberIds instanceof Set) rt.liveProcessMemberIds.add(agent.id);
+    disposeHandleList(subagentPromptDisposers, agent);
     const m = { name: actor.name, profile: actor.profile, model: '', effort: '', allowedTools: actor.allowedTools, loadedTools: actor.loadedTools, skills: actor.skills, writeScope: actor.writeScope, refs: actor.refs, task: actor.task, acceptance: actor.acceptance, userTask: actor.userTask };
     const rec = teamStore(actor.teamId).getMember(agent.id);
     if (rec) { m.model = rec.model; m.effort = rec.effort; }
-    agent.ctx.systemPrompt.section({ name: 'leaderteam:role', order: 9000, interpolate: false, text: memberSection(m, cfg.paths.protectedDirs) });
-    if (actor.shellFailure) appendShellFailureInstruction(agent, actor.shellFailure);
+    const prompt = resolveAgentSystemPrompt(agent);
+    const disposers = [];
+    if (prompt) {
+      disposers.push(prompt.section({ name: 'leaderteam:role', order: 9000, interpolate: false, text: memberSection(m, cfg.paths.protectedDirs) }));
+      disposers.push(...shadowDisallowedHostToolSections(prompt, actor.shellFailure ? actor.loadedTools : actor.allowedTools));
+      if (actor.shellFailure) disposers.push(appendShellFailureInstruction(agent, actor.shellFailure, prompt));
+      subagentPromptDisposers.set(agent, disposers);
+    }
   } else if (actor.role === 'direct_exec') {
     if (rt.liveProcessMemberIds instanceof Set) rt.liveProcessMemberIds.add(agent.id);
+    disposeHandleList(subagentPromptDisposers, agent);
     const rec = teamStore(actor.teamId).getMember(agent.id);
     const m = { name: actor.name, profile: actor.profile, model: rec?.model ?? actor.model, effort: rec?.effort ?? actor.effort, allowedTools: actor.allowedTools, loadedTools: actor.loadedTools, writeScope: actor.writeScope, task: actor.task, acceptance: actor.acceptance, userTask: actor.userTask };
-    agent.ctx.systemPrompt.section({ name: 'leaderteam:role', order: 9000, interpolate: false, text: directExecSection(m, cfg.paths.protectedDirs) });
-    if (actor.shellFailure) appendShellFailureInstruction(agent, actor.shellFailure);
+    const prompt = resolveAgentSystemPrompt(agent);
+    const disposers = [];
+    if (prompt) {
+      disposers.push(prompt.section({ name: 'leaderteam:role', order: 9000, interpolate: false, text: directExecSection(m, cfg.paths.protectedDirs) }));
+      disposers.push(...shadowDisallowedHostToolSections(prompt, actor.shellFailure ? actor.loadedTools : actor.allowedTools));
+      if (actor.shellFailure) disposers.push(appendShellFailureInstruction(agent, actor.shellFailure, prompt));
+      subagentPromptDisposers.set(agent, disposers);
+    }
   }
   // The final registry-view filter covers inherited AND preset-local tools.
   // tools.restrict() intentionally exempts local registrations, so it cannot enforce this contract.
@@ -175,10 +427,10 @@ function syncDesktopLeaderRole(ctx, agent) {
   if (rt.surface !== 'desktop' || agent.session?.header?.origin === 'subagent') return;
   if (isLeaderRoot(ctx, agent)) {
     if (!leaderPromptDisposers.has(agent)) onAgentCreated(ctx, { agent });
+    else syncLeaderAgentMode(ctx, rt, agent.id);
     return;
   }
-  for (const dispose of leaderPromptDisposers.get(agent) ?? []) if (typeof dispose === 'function') dispose();
-  leaderPromptDisposers.delete(agent);
+  disposeLeaderPromptHandles(agent);
   const actor = rt.actors.get(agent.id);
   if (actor?.agent === agent && actor.role === 'leader') rt.actors.delete(agent.id);
 }
@@ -207,6 +459,7 @@ export function onAgentDisposed({ agent }) {
     }
     rt.memberErrors?.delete(agent.id);
   }
+  if (agent) disposeHandleList(subagentPromptDisposers, agent);
   if (actor?.agent === agent) { rt.actors.delete(agent.id); rt.reads.delete(agent.id); rt.readProgress?.delete(agent.id); baseRuntime(rt).circuitStates?.delete(agent.id); baseRuntime(rt).pendingMemberContinuations?.delete(agent.id); }
 }
 
@@ -308,6 +561,51 @@ function buildMemberTruncationContinuationPrompt(rec, completedInTurn, cumulativ
     '- Finish your remaining acceptance checks and report `STATUS: done` (or `STATUS: blocked` only for a genuine external obstacle).',
   ].join('\n');
 }
+function maybeRecoverSingleLeaderMaxTokens(rt, actor, agent) {
+  try {
+    if (getSessionExecutionMode(rt, actor.teamId) !== 'single') return;
+    if (typeof agent?.followup !== 'function') return;
+    if ((agent.inbox?.nextTurn?.length ?? 0) > 0 || (agent.inbox?.nextStep?.length ?? 0) > 0) return;
+    if (typeof agent.session?.snapshotEvents !== 'function') return;
+    const evs = agent.session.snapshotEvents();
+    if (!Array.isArray(evs) || evs.length === 0) return;
+    let lastTurnEndIdx = -1;
+    for (let i = evs.length - 1; i >= 0; i--) {
+      if (evs[i]?.type === 'turn/end') { lastTurnEndIdx = i; break; }
+    }
+    if (lastTurnEndIdx < 0) return;
+    const endReason = evs[lastTurnEndIdx]?.data?.reason?.kind;
+    if (endReason !== 'max-tokens') return;
+    let finalText = null;
+    for (let i = lastTurnEndIdx - 1; i >= 0; i--) {
+      const ev = evs[i];
+      if (ev?.type === 'turn/start') break;
+      if (finalText === null && ev?.type === 'assistant/message') {
+        finalText = eventContentBlocks(ev).filter(b => b?.type === 'text').map(b => b.text).join('\n');
+      }
+    }
+    if (finalText && /允许读取|allow read/i.test(finalText)) return;
+    const cbState = ensureCircuitState(rt, actor.agentId, 'leader');
+    const sessionTurnTools = extractSessionTurnCompletedTools(evs, lastTurnEndIdx);
+    if (cbState.turnCompletedTools.length === 0 && sessionTurnTools.length > 0) {
+      cbState.turnCompletedTools.push(...sessionTurnTools);
+    }
+    const cbDecision = recordTurnEndInCircuit(cbState, { reasonKind: 'max-tokens' }, rt.config?.circuitBreaker);
+    const hardZeroProgressCap = rt.config?.circuitBreaker?.zeroProgressTruncationHard ?? 10;
+    if (cbDecision.trigger === 'hard' || cbDecision.zeroProgressTruncations >= hardZeroProgressCap) return;
+    const completedTools = [...new Set([...cbDecision.completedInTurn, ...sessionTurnTools])];
+    const summary = completedTools.length > 0
+      ? completedTools.join(', ')
+      : '(none completed in the truncated turn — issue the next concrete tool call or remaining response directly)';
+    agent.followup(buildContinuationMessage(
+      rt,
+      `[LeaderTeam output recovery — Single Mode] The last model response hit its single-turn output-token limit (\`max-tokens\`). Context and workspace files are preserved.\nAlready succeeded in the truncated turn (DO NOT repeat these calls): ${summary}.\nResume directly from the interruption point without repeating completed operations or earlier prose.`,
+    ));
+  } catch (err) {
+    rt.logger?.warn?.(`leaderteam: single-mode output recovery failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
 export function onAgentStatus(ctx, { agent, status } = {}) {
   let rt = runtime();
   if (!rt.config || !rt.storageRoot || !agent) return;
@@ -316,7 +614,22 @@ export function onAgentStatus(ctx, { agent, status } = {}) {
   const actor = (rt.actors.get(agent.id)?.agent === agent ? rt.actors.get(agent.id) : null) ?? resolveActor(ctx, agent);
   rt = runtimeForTeam(actor?.teamId);
   if (actor?.role === 'leader') {
+    if (status === 'running') {
+      const syncSel = syncSessionLeaderSelectionFromHost(ctx, baseRuntime(rt), agent, { atUserTurnStart: true });
+      rt = runtimeForTeam(actor.teamId);
+      const liveMode = getSessionExecutionMode(rt, actor.teamId);
+      if (syncSel?.appliedImmediately || actor.executionMode !== liveMode || actor.promptAppliedMode !== liveMode) {
+        syncLeaderAgentMode(ctx, rt, actor.teamId);
+      }
+      return;
+    }
     if (status === 'idle') {
+      flushPendingSessionConfigAtSafeBoundary(ctx, baseRuntime(rt), actor.teamId);
+      rt = runtimeForTeam(actor.teamId);
+      if (getSessionExecutionMode(rt, actor.teamId) === 'single') {
+        maybeRecoverSingleLeaderMaxTokens(rt, actor, agent);
+        return;
+      }
       const notified = rt.onLeaderIdle?.(ctx, actor.teamId);
       if (!notified) maybeAutoContinueLeader(ctx, rt, actor, agent);
     }
@@ -359,7 +672,40 @@ export function onAgentStatus(ctx, { agent, status } = {}) {
   }
 }
 
-const ACTIVE_MEMBER_STATES = new Set(['starting', 'started', 'running']);
+export const ACTIVE_MEMBER_STATES = new Set(['starting', 'started', 'running']);
+
+export function isProcessPidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  if (pid === process.pid) return true;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err?.code === 'EPERM';
+  }
+}
+
+export function isMemberStaleForRuntime(rt, store, m) {
+  if (!m || !ACTIVE_MEMBER_STATES.has(m.status) || !store) return false;
+  const hasValidOwnerPid = Number.isInteger(m.ownerPid) && m.ownerPid > 0;
+  if (hasValidOwnerPid && m.ownerPid !== process.pid) {
+    return !isProcessPidAlive(m.ownerPid);
+  }
+  if (!rt || !(rt.liveProcessMemberIds instanceof Set) || typeof rt.hostAgents?.get !== 'function') {
+    return false;
+  }
+  if (rt.liveProcessMemberIds.has(m.childId)) return false;
+  if (rt.hostAgents.get(m.childId) !== undefined) return false;
+
+  const baseRt = baseRuntime(rt);
+  const rawId = typeof store.rawTeamId === 'string' && store.rawTeamId ? store.rawTeamId : null;
+  const encId = typeof store.teamId === 'string' && store.teamId ? store.teamId : null;
+  const hasMountedLeader = Boolean(
+    (rawId && (baseRt?.actors?.has?.(rawId) || rt.actors?.has?.(rawId) || rt.hostAgents.get(rawId) !== undefined))
+    || (encId && (baseRt?.actors?.has?.(encId) || rt.actors?.has?.(encId) || rt.hostAgents.get(encId) !== undefined)),
+  );
+  return hasMountedLeader;
+}
 
 export function reconcileStaleMembers(rt, store) {
   if (!rt || !(rt.liveProcessMemberIds instanceof Set) || typeof rt.hostAgents?.get !== 'function' || !store) return;
@@ -370,6 +716,7 @@ export function reconcileStaleMembers(rt, store) {
       rt.liveProcessMemberIds.add(m.childId);
       continue;
     }
+    if (!isMemberStaleForRuntime(rt, store, m)) continue;
     try {
       store.setMemberStatus(m.childId, 'cancelled', 'interrupted by previous host exit');
     } catch {}
@@ -414,6 +761,7 @@ function effectiveWorkspaceShellFailure(rt, store, cwd) {
 
 async function maybeAutoContinueLeader(ctx, rt, actor, agent) {
   try {
+    if (getSessionExecutionMode(rt, actor.teamId) === 'single') return;
     if (rt.stopReviewPending?.has(actor.teamId)) return;
     if (typeof agent.followup !== 'function') return;
     if ((agent.inbox?.nextTurn?.length ?? 0) > 0 || (agent.inbox?.nextStep?.length ?? 0) > 0) return;
@@ -442,7 +790,7 @@ async function maybeAutoContinueLeader(ctx, rt, actor, agent) {
       }
       if (ev?.type === 'tool/result') {
         const txt = eventContentBlocks(ev).filter(b => b?.type === 'text').map(b => b.text).join('\n');
-        if (/consensus cannot run:|plan agreement limit \d+ reached|discussion limit \d+ reached|workspace OS sandbox initialization failed/i.test(txt)) {
+        if (/consensus cannot run:|plan agreement limit \d+ reached|discussion limit \d+ reached|workspace OS sandbox initialization failed|\[HOST_SHELL_CHANNEL_UNAVAILABLE\]/i.test(txt)) {
           hitHardTerminalBlocker = true;
         }
       }
@@ -856,13 +1204,19 @@ function resolveSessionAttemptSource(session, event, fallbackSel) {
 export function onSessionEvent(ctx, session, event) {
   const rt = runtime();
   if (!rt.config || !rt.storageRoot || !session || !event) return;
-  if (event.type === 'assistant/message' || event.type === 'assistant/attempt') {
+  if ((event.type === 'assistant/message' || event.type === 'assistant/attempt' || event.type === 'compaction/summary') && event.surfaceOp !== 'seed') {
     const leader = [...rt.actors.values()].find(a => a.role === 'leader' && (a.agent?.session === session || a.teamId === session.id));
     if (leader) {
       const sel = leader.agent?.model?.current?.() ?? null;
-      const src = resolveSessionAttemptSource(session, event, sel);
-      const hostProvider = src?.provider ?? sel?.provider ?? null;
-      const hostModel = src?.model ?? sel?.model ?? null;
+      const src = event.type === 'compaction/summary'
+        ? {
+            provider: event.data?.provider ?? event.data?.message?.source?.provider ?? null,
+            model: event.data?.model ?? event.data?.message?.source?.model ?? null,
+          }
+        : resolveSessionAttemptSource(session, event, sel);
+      const hasExplicitModel = typeof src?.model === 'string' && src.model.trim().length > 0;
+      const hostProvider = hasExplicitModel ? (src?.provider ?? null) : (src?.provider ?? sel?.provider ?? null);
+      const hostModel = hasExplicitModel ? src.model : (sel?.model ?? null);
       const teamCfg = runtimeForTeam(leader.teamId).config ?? rt.config;
       const route = resolveCanonicalRouteFromHostSelection(
         teamCfg,
@@ -886,7 +1240,12 @@ export function onSessionEvent(ctx, session, event) {
         : null);
     if (subActor) {
       const rec = teamStore(subActor.teamId).getMember(subActor.agentId);
-      const src = resolveSessionAttemptSource(session, event, subActor.agent?.model?.current?.() ?? null);
+      const src = event.type === 'compaction/summary'
+        ? {
+            provider: event.data?.provider ?? event.data?.message?.source?.provider ?? null,
+            model: event.data?.model ?? event.data?.message?.source?.model ?? null,
+          }
+        : resolveSessionAttemptSource(session, event, subActor.agent?.model?.current?.() ?? null);
       const teamCfg = runtimeForTeam(subActor.teamId).config ?? rt.config;
       const route = resolveCanonicalRouteFromHostSelection(
         teamCfg,
@@ -907,13 +1266,20 @@ export function onSessionEvent(ctx, session, event) {
   }
   if (event.type === 'user/message' && event.data?.source?.kind === 'user') {
     const leader = [...rt.actors.values()].find(a => a.role === 'leader' && (a.agent?.session === session || a.teamId === session.id));
-    if (leader) rt.onLeaderUserMessage?.(ctx, leader.teamId);
+    if (leader && getSessionExecutionMode(rt, leader.teamId) === 'team') {
+      rt.onLeaderUserMessage?.(ctx, leader.teamId);
+    }
     return;
   }
   if (event.type !== 'turn/end') return;
   const leaderActor = [...rt.actors.values()].find(a => a.role === 'leader' && (a.agent?.session === session || a.teamId === session.id));
   if (leaderActor) {
-    rt.onLeaderTurnEnd?.(ctx, leaderActor.teamId);
+    if (getSessionExecutionMode(rt, leaderActor.teamId) === 'team') {
+      rt.onLeaderTurnEnd?.(ctx, leaderActor.teamId);
+    } else if (event.data?.reason?.kind === 'completed') {
+      const cbState = baseRuntime(rt).circuitStates?.get?.(leaderActor.agentId);
+      if (cbState) recordTurnEndInCircuit(cbState, { reasonKind: 'completed' }, runtimeForTeam(leaderActor.teamId).config?.circuitBreaker);
+    }
     return;
   }
   const actor = [...rt.actors.values()].find(a => (a.role === 'member' || a.role === 'direct_exec') && a.agent?.session === session)
@@ -1176,49 +1542,88 @@ export function onToolResult(exec, result) {
     return;
   }
   const errorText = (result?.content ?? []).filter(b => b.type === 'text').map(b => b.text).join('\n');
+  const shellTools = rt.config?.gate?.shellTools;
+  const isShellInitFailure = Boolean(caller?.teamId && exec?.name && isHostShellInitFailureResult(exec.name, result, shellTools));
+  if (isShellInitFailure) {
+    recordShellToolResultForTeam(rt, caller.teamId, exec.name, result, {
+      shellTools,
+      callId: exec.callId ?? null,
+      actorRole: caller.role,
+    });
+  }
+  const isSingleModeLeader = Boolean(caller?.role === 'leader' && getSessionExecutionMode(rt, caller.teamId) === 'single');
   if (caller && caller.teamId && rt.storageRoot && exec?.name) {
     try {
-      const store = teamStore(caller.teamId);
       const cbState = ensureCircuitState(rt, exec.agent.id, caller.role);
-      const ok = !result?.isError && !result?.error;
+      const ok = !result?.isError && !result?.error && !isShellInitFailure;
       const gateRuleMatch = /\((rule:[^)]+|model|gate-error)\)/.exec(errorText);
       if (gateRuleMatch?.[1] === 'rule:conference-checkpoint-pause') {
         return;
       }
-      const hasActiveMembers = caller.role === 'leader'
-        ? [...store.members().values()].some(m => ACTIVE_MEMBER_STATES.has(m.status))
-        : false;
-      const cbDecision = recordToolOutcomeInCircuit(cbState, {
-        tool: exec.name,
-        targetSummary: summarizeToolTarget(exec.name, exec.arguments),
-        ok,
-        errorSignature: ok ? '' : truncate(errorText.replace(/\s+/g, ' ').trim(), 120),
-        rule: gateRuleMatch?.[1] ?? '',
-        hasActiveMembers,
-      }, rt.config?.circuitBreaker);
-      if (cbDecision.trigger === 'soft' || cbDecision.trigger === 'hard') {
-        const hostCtx = baseRuntime(rt).gate?.ctx ?? null;
-        const tSeq = caller.role === 'member' ? (caller.taskSeq ?? 1) : (hostCtx ? currentTaskSeq(hostCtx, caller.teamId) : 1);
-        void runCircuitInvestigation({
-          ctx: hostCtx,
-          rt,
-          store,
-          actor: caller,
-          agent: exec.agent,
-          circuitState: cbState,
-          decision: cbDecision,
-          taskSeq: tSeq,
-        });
+      if (isSingleModeLeader) {
+        recordToolOutcomeInCircuit(cbState, {
+          tool: exec.name,
+          targetSummary: summarizeToolTarget(exec.name, exec.arguments),
+          ok,
+          errorSignature: ok ? '' : truncate(errorText.replace(/\s+/g, ' ').trim(), 120),
+          rule: gateRuleMatch?.[1] ?? '',
+          hasActiveMembers: false,
+        }, rt.config?.circuitBreaker);
+      } else {
+        const store = teamStore(caller.teamId);
+        const hasActiveMembers = caller.role === 'leader'
+          ? [...store.members().values()].some(m => ACTIVE_MEMBER_STATES.has(m.status))
+          : false;
+        const cbDecision = recordToolOutcomeInCircuit(cbState, {
+          tool: exec.name,
+          targetSummary: summarizeToolTarget(exec.name, exec.arguments),
+          ok,
+          errorSignature: ok ? '' : truncate(errorText.replace(/\s+/g, ' ').trim(), 120),
+          rule: gateRuleMatch?.[1] ?? '',
+          hasActiveMembers,
+        }, rt.config?.circuitBreaker);
+        if (cbDecision.trigger === 'soft' || cbDecision.trigger === 'hard') {
+          const hostCtx = baseRuntime(rt).gate?.ctx ?? null;
+          const tSeq = caller.role === 'member' ? (caller.taskSeq ?? 1) : (hostCtx ? currentTaskSeq(hostCtx, caller.teamId) : 1);
+          void runCircuitInvestigation({
+            ctx: hostCtx,
+            rt,
+            store,
+            actor: caller,
+            agent: exec.agent,
+            circuitState: cbState,
+            decision: cbDecision,
+            taskSeq: tSeq,
+          });
+        }
       }
     } catch {}
   }
   const isOsSandboxStartupFailure = /SetNamedSecurityInfoW failed.*grantWrite\(/s.test(errorText)
     || /\bbwrap:\s*(?:Creating new namespace failed|setting up uid map|No permissions to creating new namespace|loopback:\s*Failed)/i.test(errorText);
+  if (isSingleModeLeader && result?.isError && rt.config?.gate?.shellTools?.includes(exec.name) && isOsSandboxStartupFailure) {
+    const baseRt = baseRuntime(rt);
+    caller.shellFailure = errorText.slice(0, 1200);
+    if (caller.cwd) {
+      baseRt.workspaceShellFailures ??= new Map();
+      baseRt.workspaceShellFailures.set(pathKey(caller.cwd), caller.shellFailure);
+    }
+    const tools = leaderAllowedTools(rt, 'single', process.platform, caller.cwd);
+    caller.allowedTools = tools;
+    caller.loadedTools = tools;
+    if (exec.agent) {
+      applyLeaderPromptSections(baseRt.gate?.ctx ?? null, rt, caller, exec.agent, 'single');
+    }
+    return;
+  }
   if ((caller?.role === 'member' || caller?.role === 'direct_exec') && result?.isError && rt.config?.gate?.shellTools?.includes(exec.name) && isOsSandboxStartupFailure) {
+    const baseRt = baseRuntime(rt);
     caller.shellFailure = errorText.slice(0, 1200);
     caller.loadedTools = (caller.loadedTools ?? caller.allowedTools).filter(n => !rt.config.gate.shellTools.includes(n));
-    rt.workspaceShellFailures ??= new Map();
-    rt.workspaceShellFailures.set(pathKey(caller.cwd), caller.shellFailure);
+    if (caller.cwd) {
+      baseRt.workspaceShellFailures ??= new Map();
+      baseRt.workspaceShellFailures.set(pathKey(caller.cwd), caller.shellFailure);
+    }
     teamStore(caller.teamId).setMemberTools(caller.agentId, caller.loadedTools, caller.shellFailure);
     appendShellFailureInstruction(exec.agent, caller.shellFailure);
     return;
@@ -1235,17 +1640,27 @@ export function onToolResult(exec, result) {
   if (exec.name === 'read_image') {
     const requested = resolvePath(exec.arguments?.file_path ?? exec.arguments?.path, actor.cwd, process.platform);
     if (requested === null) return;
+    const realRequested = realpathBestEffort(requested, process.platform);
     let set = rt.reads.get(exec.agent.id);
     if (!set) { set = new Set(); rt.reads.set(exec.agent.id, set); }
     set.add(pathKey(requested, process.platform));
+    set.add(pathKey(realRequested, process.platform));
     return;
   }
   const meta = readWindowMeta(result.meta);
   if (!meta) return;
   const p = resolvePath(meta.path, actor.cwd, process.platform);
   const requested = resolvePath(exec.arguments?.file_path ?? exec.arguments?.path, actor.cwd, process.platform);
-  if (p === null || requested === null || pathKey(p, process.platform) !== pathKey(requested, process.platform)) return;
-  const key = pathKey(p, process.platform);
+  if (p === null || requested === null) return;
+  const realP = realpathBestEffort(p, process.platform);
+  const realRequested = realpathBestEffort(requested, process.platform);
+  if (
+    pathKey(p, process.platform) !== pathKey(requested, process.platform)
+    && pathKey(realP, process.platform) !== pathKey(realRequested, process.platform)
+  ) {
+    return;
+  }
+  const key = pathKey(realP, process.platform);
   const intervals = mergeIntervals(rt.readProgress?.get(exec.agent.id)?.get(key) ?? [], meta.lines.map(({ number }) => [number, number]));
   if (!isFileCovered(intervals, meta.totalLines)) {
     rt.readProgress ??= new Map();
@@ -1257,10 +1672,14 @@ export function onToolResult(exec, result) {
   let set = rt.reads.get(exec.agent.id);
   if (!set) { set = new Set(); rt.reads.set(exec.agent.id, set); }
   set.add(key);
+  set.add(pathKey(p, process.platform));
+  set.add(pathKey(requested, process.platform));
+  set.add(pathKey(realRequested, process.platform));
   rt.readProgress?.get(exec.agent.id)?.delete(key);
 }
-function appendShellFailureInstruction(agent, reason) {
-  agent.ctx.systemPrompt.section({ name: 'leaderteam:shell-unavailable', order: 9010, interpolate: false, text: `The OS sandbox failed before a command started: ${reason}\nShell tools are now unavailable for this member. Stop command retries and report STATUS: blocked to the leader. Do not change permissions or bypass the sandbox. A repaired workspace requires a new member.` });
+function appendShellFailureInstruction(agent, reason, prompt = resolveAgentSystemPrompt(agent)) {
+  if (!prompt) return null;
+  return prompt.section({ name: 'leaderteam:shell-unavailable', order: 9010, interpolate: false, text: `The OS sandbox failed before a command started: ${reason}\nShell tools are now unavailable for this member. Stop command retries and report STATUS: blocked to the leader. Do not change permissions or bypass the sandbox. A repaired workspace requires a new member.` });
 }
 /** The user's instructions to the team leader: first and last two user messages, bounded. */
 /** Every message the user typed in the leader session, oldest first. Agent notifications and tool output are excluded. */
@@ -1311,17 +1730,72 @@ function approvedDeliveryTimes(teamId) {
  *  - a bare "continue" resumes the task in hand while that task has no approved delivery. Once a delivery was approved
  *    before the message, "continue" means new work and starts a task like any other message. When the message time or
  *    the agreement log is unavailable, the conservative reading (new task) applies. */
+function singleToTeamBoundaries(teamId) {
+  const rt = runtime();
+  if (!rt?.storageRoot || !teamId) return [];
+  try {
+    return readSessionModeHistory(rt.storageRoot, teamId)
+      .filter(r => r && r.fromMode === 'single' && r.toMode === 'team')
+      .map(r => ({
+        atMs: typeof r.at === 'string' ? Date.parse(r.at) : NaN,
+        taskSeqHint: Number.isInteger(r.taskSeqHint) ? r.taskSeqHint : null,
+      }));
+  } catch {
+    return [];
+  }
+}
+
 export function currentTaskSeq(ctx, teamId) {
   const msgs = userMessages(ctx, teamId);
+  if (msgs.length === 0) return 1;
   let seq = 1, delivered;
-  for (let i = 1; i < msgs.length; i++) {
+  const modeBoundaries = singleToTeamBoundaries(teamId);
+  const isNonTaskControlMsg = text => isReadGrantOnlyMessage(text) || (!isBareContinueMessage(text) && isControlOnlyUserMessage(text));
+  const firstTaskIdx = msgs.findIndex(m => !isNonTaskControlMsg(m.text));
+  const firstTaskMsgTime = firstTaskIdx >= 0 ? msgs[firstTaskIdx].time : msgs[0]?.time;
+  let lastTaskStartMs = Number.isFinite(firstTaskMsgTime) ? firstTaskMsgTime : msgs[0]?.time;
+  let consumedBoundaryIdx = -1;
+  if (Number.isFinite(firstTaskMsgTime)) {
+    for (let bIdx = 0; bIdx < modeBoundaries.length; bIdx++) {
+      const b = modeBoundaries[bIdx];
+      if (Number.isFinite(b.atMs) && b.atMs <= firstTaskMsgTime) {
+        consumedBoundaryIdx = bIdx;
+      }
+    }
+  }
+  const loopStart = firstTaskIdx >= 0 ? firstTaskIdx + 1 : 1;
+  for (let i = loopStart; i < msgs.length; i++) {
     const m = msgs[i];
-    if (isReadGrantOnlyMessage(m.text) || (!isBareContinueMessage(m.text) && isControlOnlyUserMessage(m.text))) continue;
-    if (isBareContinueMessage(m.text) && Number.isFinite(m.time)) {
+    if (isNonTaskControlMsg(m.text)) continue;
+    const crossedBoundaryIdx = modeBoundaries.findIndex((b, idx) => {
+      if (idx <= consumedBoundaryIdx) return false;
+      if (Number.isFinite(b.atMs) && Number.isFinite(m.time) && Number.isFinite(lastTaskStartMs)) {
+        return b.atMs <= m.time && b.atMs >= lastTaskStartMs;
+      }
+      if (!Number.isFinite(b.atMs) || !Number.isFinite(m.time) || !Number.isFinite(lastTaskStartMs)) {
+        if (b.taskSeqHint !== null && b.taskSeqHint === seq && (!Number.isFinite(b.atMs) || !Number.isFinite(m.time) || b.atMs <= m.time)) {
+          return true;
+        }
+      }
+      return false;
+    });
+    if (crossedBoundaryIdx === -1 && isBareContinueMessage(m.text) && Number.isFinite(m.time)) {
       if (delivered === undefined) delivered = approvedDeliveryTimes(teamId);
       if (delivered !== null && !(delivered.get(seq) ?? []).some(t => t <= m.time)) continue;
     }
+    if (crossedBoundaryIdx !== -1) {
+      consumedBoundaryIdx = Math.max(consumedBoundaryIdx, crossedBoundaryIdx);
+      if (Number.isFinite(m.time)) {
+        for (let bIdx = consumedBoundaryIdx + 1; bIdx < modeBoundaries.length; bIdx++) {
+          const b = modeBoundaries[bIdx];
+          if (Number.isFinite(b.atMs) && b.atMs <= m.time) {
+            consumedBoundaryIdx = bIdx;
+          }
+        }
+      }
+    }
     seq++;
+    if (Number.isFinite(m.time)) lastTaskStartMs = m.time;
   }
   return seq;
 }

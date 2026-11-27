@@ -4,14 +4,10 @@
 # their tools from lt-member-* presets and the leader-only tools are masked for them at creation.
 - id: tool-executor-native
   disabled: true
-- id: tool-fs
-  config: {write: false, edit: false}
 - id: tool-bash
-  disabled: true
+  disabled: !!js process.platform === 'win32'
 - id: tool-pwsh
-  disabled: true
-- id: tool-jobs
-  disabled: true
+  disabled: !!js process.platform !== 'win32'
 - id: tool-goal
   disabled: true
 - id: tool-skill

@@ -179,6 +179,7 @@ export function locateHostAnchor(options = {}) {
 
 export function bindHostImports() {
   const existing = globalThis[KEY];
+  const normalizedPrefix = foldUrl(pluginURL);
   if (existing && existing.pluginRoot === pluginRoot && !process.env.LT_DSH_MODULE_ROOT && !process.env.DSH_MODULE_ROOT) {
     return existing;
   }
@@ -188,21 +189,30 @@ export function bindHostImports() {
   }
   const { moduleRoot, anchor } = found;
   if (existing) {
-    if (existing.moduleRoot !== moduleRoot || existing.pluginRoot !== pluginRoot) {
+    if (existing.moduleRoot !== moduleRoot) {
       throw new Error('Conflicting LeaderTeam host binding.');
+    }
+    // Support in-process Cordis HMR upgrades across pnpm store paths targeting the exact same DSH host
+    if (existing.allowedPrefixes instanceof Set) {
+      existing.allowedPrefixes.add(normalizedPrefix);
     }
     return existing;
   }
-  const normalizedPrefix = foldUrl(pluginURL);
+  const allowedPrefixes = new Set([normalizedPrefix]);
   const hook = registerHooks({
     resolve(specifier, context, nextResolve) {
-      if (PEERS.has(specifier) && context.parentURL && foldUrl(context.parentURL).startsWith(normalizedPrefix)) {
-        return nextResolve(specifier, { ...context, parentURL: anchor });
+      if (PEERS.has(specifier) && context.parentURL) {
+        const parentFolded = foldUrl(context.parentURL);
+        for (const prefix of allowedPrefixes) {
+          if (parentFolded.startsWith(prefix)) {
+            return nextResolve(specifier, { ...context, parentURL: anchor });
+          }
+        }
       }
       return nextResolve(specifier, context);
     },
   });
-  const binding = Object.freeze({ moduleRoot, pluginRoot, anchor, hook });
+  const binding = Object.freeze({ moduleRoot, pluginRoot, anchor, hook, allowedPrefixes });
   globalThis[KEY] = binding;
   return binding;
 }

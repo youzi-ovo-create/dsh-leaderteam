@@ -26,7 +26,7 @@ export function classify(payload) {
   if (sys.includes('You are the final safety gate')) return { ...base, kind: 'gate', who: 'gate', request: structured };
   if (sys.includes('independent arbiter')) return { ...base, kind: 'arbiter', who: 'arbiter', request: structured };
   if (sys.includes('consensus panel') && sys.includes('independent reviewers')) { return { ...base, kind: 'discuss', who: structured?.you_are ?? '?', request: structured }; }
-  if (text.includes('# LeaderTeam: you are the team leader')) return { ...base, kind: 'leader', who: 'leader' };
+  if (text.includes('# LeaderTeam: you are the team leader') || text.includes('# LeaderTeam Single Mode:')) return { ...base, kind: 'leader', who: 'leader' };
   const d = text.match(/# LeaderTeam: Direct Execution Model \(\\"([a-z0-9-]+)\\"\)/);
   if (d) return { ...base, kind: 'direct_exec', who: d[1] };
   const m = text.match(/# LeaderTeam: you are team member \\"([a-z0-9-]+)\\"/);

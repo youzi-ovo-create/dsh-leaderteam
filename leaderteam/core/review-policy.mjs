@@ -33,7 +33,7 @@ export function normalizeReview(opinion, { previousItems = [] } = {}) {
     }
   }
   // Explicit rejection remains terminal; an ordinary new issue cannot veto an otherwise resolved revision.
-  const stance = ['revise','reject'].includes(opinion.stance) && previousItems.length > 0 && blocking.length === 0 ? 'approve' : opinion.stance;
+  const stance = opinion.stance === 'revise' && previousItems.length > 0 && blocking.length === 0 ? 'approve' : opinion.stance;
   return { ...opinion, stance, changeItems: blocking, conditions: [...new Set(conditions)], resolutions,
     requiredChanges: stance === 'revise' ? blocking.map(i => i.problem) : [] };
 }

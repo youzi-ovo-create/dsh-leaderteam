@@ -2,6 +2,46 @@
 
 本项目的所有重要版本变更均记录于此文件，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [2.2.3] - 2026-11-27 (`linux-v2.2.3` / `windows-v2.2.3`)
+
+会话内 `Single / Team` 双模协同、河洛（Heluo）原生控制台 v2、Magpie 网关与衡账（`lt-usage`）融合、历代设计原则（`DP-01`..`DP-06`）防退化护栏、DSH 模型选择器全链路同步修复，以及 Windows / Linux 跨平台独立发行版（`Apache-2.0`）：
+
+### Added
+- **会话内 `Single / Team` 双模无缝切换与河洛原生工作台（`lt.public.v1` `1.1.0`）**：支持在同一 `leaderteam` 会话内于安全边界一键切换轻量单兵直连模式（`single`）与多角色分权自治团队模式（`team`），内置完整 React 源码（`packages/lt-web`）与构建产物、Magpie 托管/外置网关生命周期管理及衡账（`packages/lt-usage`）多维成本归因。
+- **零命令行图形安装器、三步新手引导、双轨隔离自动升级与会话级模型隔离（Issues #1–#4）**：
+  - 自适应宿主结构契约兼容矩阵（覆盖官方 DeepSeek Harness `0.2.2-alpha.2` ~ `0.2.3-alpha.2`）；
+  - 图形化一键安装器（`Install-LeaderTeam.cmd` / `install-leaderteam.sh` / `lt-installer-standalone.mjs`），支持 Windows 注册表 `Uninstall`、环境变量、运行中进程及 `C:..Z:` 全盘自定义安装目录（如 `D:\Apps\DeepSeek-Harness`）自动识别与旧补丁无损清理；
+  - 控制台内置 SHA-256 校验热升级与一键快照回滚；
+  - 会话级独立模型覆盖（`session-config.mjs`）、默认 `leaderModelPolicy: "follow"` 自动跟随 DSH 模型/推理档位切换、空闲会话保存即生效及 User/Agent 严格权限隔离（`403 AGENT_CONFIG_MUTATION_FORBIDDEN`）。
+- **跨平台独立发行标签治理（`windows-vX.Y.Z` / `linux-vX.Y.Z`）**：新增《[跨平台独立发行与长期工程治理规范](docs/13-跨平台独立发行与长期工程规范.md)》，升级 `updater.mjs` 与全系安装器按当前运行平台严格筛选 GitHub Releases（同平台前缀优先、无同平台前缀时向后兼容 `vX.Y.Z`、硬性拦截跨平台标签 `PLATFORM_RELEASE_TAG_MISMATCH`），支持 Linux 技术先行与 Windows 独立适配发版而不互相串台。
+- **历代设计原则反退化台账与回归测试（`DP-01`..`DP-06`）**：新增《[历代设计原则与反退化台账](docs/12-历代设计原则与反退化台账.md)》与专项回归套件，固化渐进式规划、免审批自主直派、两级障碍判定、静默前缀 KV 缓存保护、`team_conference` 按需参数注入、隐私脱敏宿主运行事实及 `@deepseek-ai/dsh-tool-web` 原生联网安全边界。
+- **Windows 宿主终端 `0xC0000142` 确定性熔断器（`shell-circuit-breaker.mjs`）**：针对 Windows 非交互窗口站/桌面堆耗尽导致的 `pwsh`/`bash` 进程初始化失败（`0xC0000142` / `3221225794` / `-1073741502` / `STATUS_DLL_INIT_FAILED`），单会话累计 2 次即触发 `0ms` 确定性阻断并引导保留静态工作或单次汇报阻塞，杜绝无效重试空转。
+
+### Fixed
+- **修复「面板保存与 Doctor 全绿，但 DSH 客户端选不到模型」P0 体验缺陷**：
+  - 打通独立模式（`ctx === null`）与宿主内置模式双路径模型落盘：保存配置或完成新手引导时同步更新实时 `ctx.credentials`、`$DSH_HOME/.credentials.yaml`（`version: 1` `refs:` 实时监听凭据库）、`$DSH_HOME/.env` 以及 `$DSH_HOME/profiles/<desktop|web>/cordis.patch.yml` 中的 `llm-pi-ai` 与 `agent-default-model`（仅在宿主无可用默认模型或显式切换时更新 `agentDefaultModel`）；
+  - 新增 `openai-compatible` 自定义网关预设并避让保留内置适配器 ID（`deepseek-official`、`deepseek-account`），修复 `openai` 等内置目录供应商填写自定义 `baseURL` 被忽略或触发 `PiAiCatalogError`（`modelOverrides` 冲突 / 自定义模型缺少 `api: "openai-completions"` / 非推理模型误发 `{ off: "none" }`）的问题；
+  - 新手引导连通性预检与自定义网关接入支持自动探测真实 `/v1/models` 列表并替换占位模型路由。
+- **官方 DSH `0.2.2-rc.1` Windows 桌面端真机细节对齐**：
+  - 零状态首次安装自举：在从未打开过 GUI 的全新 `$DSH_HOME` 上执行 `--profile desktop` 安装前，自动幂等初始化 `profiles/desktop/package.json` 与 `cordis.patch.yml`，消除退出码 `1` 初始化报错；
+  - 完整支持官方 Windows Desktop `dsh-app://app/` 自定义协议：`leaderteam-panel/client.js` 与 `lt-web` 在 `dsh-app:` 下采用窗口内直跳 `/lt/` 与 `/`（不触发 `target="_blank"` 拦截，杜绝误导运行独立 `npx lt-ui` 脑裂）；
+  - Windows 系统级 Magpie 自动寻址优先匹配无头 `magpie-cli.exe`（避开同目录 Tauri GUI 壳 `magpie.exe`），并在跨进程同步切换模式时保留未核销的 `managed-pid.json` 交由异步健康探针安全回收，杜绝孤儿端口占用。
+- **合入 V2.2.1 治理与回退修复**：领队末位兜底严格按 `(provider, upstreamModel)` 成对匹配、策略拒绝（Policy Refusal）停止后台异步重发、区分安全门策略回执、修正中途重试 5h 窗口归因、双审回执绑定交付材料快照及回放恢复。
+- **Windows NTFS Junction / 符号链接参考文件追踪与 Magpie 进程树回收修复**：修复阶段 `references` 含 NTFS Junction 目录链接时的安全门放行与已读状态核销（`realpathBestEffort`），增强 Windows 退出时子进程树清理兜底。
+- **修复 Node.js 22 CI 单元测试事件循环提前退出取消问题**：移除 `leaderteam/host/governance.mjs` 中 `awaitExecutionModelsCheckpointPause` 与 `awaitTeamGovernanceJobs` 在主动 `await` 期间误设 `.unref()` 的定时器（后者改由 `try/finally` 确定性清理），使 Linux & Windows 在 Node.js 22 与 24 双环境下全量测试稳定通过。
+
+## [2.2.2] - 2026-11-27 (`linux-v2.2.2` / `windows-v2.2.2`)
+
+V2.2 产品化纯团队治理维护正式版（`inSessionDualMode: false`，`lt.public.v1` `1.0.1`，纯 Node.js ESM，`Apache-2.0`）：
+
+### Added
+- **河洛原生工作台（`/lt/`）、图形化一键安装器与自动升级回滚（Issues `#1`–`#3`）**：集成自适应宿主结构契约兼容矩阵（`>=0.2.2-alpha.2 <1.0.0`）、零命令行图形化安装器（`bin/lt-installer.mjs`、`installer/lt-installer-standalone.mjs`、`Install-LeaderTeam.cmd`、`install-leaderteam.sh`）、首次三步引导、SHA-256 校验热升级与快照回滚，以及根级 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+- **会话级独立配置、手动切换模型自动跟随与 User/Agent 权限分离（Issue `#4`）**：默认 `leaderModelPolicy: "follow"`，空闲会话修改即生效，API 与安全门双重阻断模型篡改配置。
+- **跨平台独立发行标签治理（`linux-v2.2.2` / `windows-v2.2.2`）与 Windows 专属真机适配**：更新器与安装器严格按运行平台筛选 Release 并拦截跨平台标签；Windows 版集成自定义路径全盘/注册表探测、零状态桌面端初始化、`dsh-app://app/` 支持、`0xC0000142` Shell 通道熔断、NTFS Junction 归并与 `magpie-cli.exe` 优先寻址。
+
+### Fixed
+- **正交恢复 V1.9 渐进式局部就绪规划 + V2.1 自主直接派发（`DP-01`..`DP-06`）**，合并 V2.2.1 治理/回退/双审绑定修复，并修复 Node.js 22 CI 定时器 `.unref()` 导致的测试取消问题。
+
 ## [2.2.1] - 2026-11-26
 
 跨平台稳定性、调度器抑制、治理回执一致性与推理档位同步维护版（纯 Node.js ESM，Apache-2.0）：

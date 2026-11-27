@@ -1,11 +1,15 @@
 // Full current plan is core state, independent of optional timer/archive plugins.
 import fs from 'node:fs';
 import path from 'node:path';
-import { safeId, writeFileAtomic } from './store.mjs';
+import { LtError } from './constants.mjs';
+import { encodeTeamStoreId, writeFileAtomic } from './store.mjs';
 import { realpathBestEffort, isInside } from './paths.mjs';
 
 export function currentPlanRoot(storageRoot, teamId) {
-  return path.join(storageRoot, 'teams', safeId(teamId), 'plans');
+  if (typeof teamId !== 'string' || teamId === '.' || teamId === '..' || /(?:^|[\\/])\.\.(?:[\\/]|$)/.test(teamId)) {
+    throw new LtError('BAD_ID', `unsafe id: ${teamId}`);
+  }
+  return path.join(storageRoot, 'teams', encodeTeamStoreId(teamId, storageRoot), 'plans');
 }
 export function currentPlanFile(storageRoot, teamId, taskSeq) {
   if (!Number.isInteger(taskSeq) || taskSeq < 1) throw new Error('invalid current plan task sequence');

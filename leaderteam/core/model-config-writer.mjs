@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { LtError, FAMILIES, MODEL_ROUTE_RE, EFFORT_ID_RE, DSH_EFFORTS } from './constants.mjs';
-import { validateConfig, deepMergePlain, routeModel } from './config.mjs';
+import { validateConfig, deepMergePlain, mergeConfigLayers, pruneExecutionFallbacksMap, routeModel } from './config.mjs';
 import { writeFileAtomic, writeFilesTransactional, appendJsonl } from './store.mjs';
 import { hashJson } from './canonical.mjs';
 
@@ -324,7 +324,10 @@ export function inspectDesktopSync(effectiveCfg, options = {}) {
 
   const activeSet = new Set([
     ...effectiveCfg.team.executionPool,
-    ...ROLE_KEYS.map(k => effectiveCfg.roles[k]?.route).filter(Boolean),
+    ...ROLE_KEYS.flatMap(k => [
+      effectiveCfg.roles[k]?.route,
+      ...(effectiveCfg.roles[k]?.fallback ?? []).map(f => f?.route),
+    ]).filter(Boolean),
   ]);
   const defaultProvider = effectiveCfg.magpie?.provider ?? 'magpie';
 
@@ -534,7 +537,24 @@ export function applyModelConfigChanges(changes = {}, options = {}) {
     leaderModelPolicy: false,
   };
 
-  // 1. Optional clearLocal operations (local target only)
+  let localClearedInBaseMode = false;
+
+  // 1. Optional clearLocal / clearLocalOverrides / clearLocalRolesAndPool operations
+  if (changes.clearLocalOverrides === true || changes.clearLocalRolesAndPool === true) {
+    if (changes.clearLocalOverrides === true) {
+      delete nextLocal.models;
+    }
+    delete nextLocal.roles;
+    if (isPlainObj(nextLocal.team)) {
+      delete nextLocal.team.executionPool;
+      delete nextLocal.team.leaderModelPolicy;
+    }
+    pruneEmptyObjects(nextLocal);
+    if (target === 'base' && hasExistingLocal) {
+      localClearedInBaseMode = true;
+    }
+  }
+
   if (changes.clearLocal) {
     if (target !== 'local') {
       throw new LtError('BAD_CONFIG', 'clearLocal options require target="local" (--local)');
@@ -572,13 +592,27 @@ export function applyModelConfigChanges(changes = {}, options = {}) {
   const requestedAutoRoutes = new Set([
     ...(changes.poolSet ?? []),
     ...(changes.poolEnable ?? []),
-    ...(changes.setRoles ?? []).map(r => r?.route).filter(Boolean),
+    ...(changes.setRoles ?? []).flatMap(r => [
+      r?.route,
+      ...(Array.isArray(r?.fallback) ? r.fallback.map(f => f?.route) : []),
+    ]).filter(Boolean),
   ]);
   const explicitUpsertRoutes = new Set((changes.upsertModels ?? []).map(x => x?.route?.trim()).filter(Boolean));
   const autoUpserts = [];
   for (const r of requestedAutoRoutes) {
     if (explicitUpsertRoutes.has(r)) continue;
-    if (Object.hasOwn(nextBase.models ?? {}, r) || Object.hasOwn(nextLocal.models ?? {}, r)) continue;
+    if (target === 'base') {
+      if (Object.hasOwn(nextBase.models ?? {}, r)) continue;
+      if (isPlainObj(nextLocal.models?.[r])) {
+        const localSpec = structuredClone(nextLocal.models[r]);
+        delete localSpec.enableInPool;
+        delete localSpec.disableInPool;
+        autoUpserts.push({ route: r, ...localSpec });
+        continue;
+      }
+    } else {
+      if (Object.hasOwn(nextBase.models ?? {}, r) || Object.hasOwn(nextLocal.models ?? {}, r)) continue;
+    }
     const dm = discoveredMap.get(r);
     if (dm) {
       autoUpserts.push({
@@ -589,12 +623,14 @@ export function applyModelConfigChanges(changes = {}, options = {}) {
         label: dm.label,
         efforts: dm.efforts,
         defaultEffort: dm.defaultEffort,
+        ...(isPlainObj(dm.reasoningEfforts) ? { reasoningEfforts: { ...dm.reasoningEfforts } } : {}),
         strengths: dm.strengths,
         ...(typeof dm.vision === 'boolean' ? { vision: dm.vision } : {}),
         ...(Number.isInteger(dm.contextWindow) && dm.contextWindow > 0 ? { contextWindow: dm.contextWindow } : {}),
         ...(Number.isInteger(dm.maxTokens ?? dm.defaultMaxTokens) && (dm.maxTokens ?? dm.defaultMaxTokens) > 0
           ? { maxTokens: dm.maxTokens ?? dm.defaultMaxTokens }
           : {}),
+        ...(Array.isArray(dm.quotaWindows) && dm.quotaWindows.length > 0 ? { quotaWindows: [...dm.quotaWindows] } : {}),
       });
     }
   }
@@ -707,14 +743,24 @@ export function applyModelConfigChanges(changes = {}, options = {}) {
     const route = String(rawRoute ?? '').trim();
     if (!route) throw new LtError('BAD_CONFIG', 'removeModels entry must be a non-empty string');
     if (target === 'local') {
-      if (Object.hasOwn(nextBase.models ?? {}, route)) {
-        throw new LtError('BAD_CONFIG', `cannot remove base catalog model "${route}" via --local (local overrides merge onto base); omit --local to delete from catalog or use --pool-disable to disable it for members`);
-      }
-      if (!isPlainObj(nextLocal.models) || !Object.hasOwn(nextLocal.models, route)) {
+      const inBase = Object.hasOwn(nextBase.models ?? {}, route);
+      const inLocal = isPlainObj(nextLocal.models) && Object.hasOwn(nextLocal.models, route);
+      if (!inBase && !inLocal) {
         throw new LtError('BAD_CONFIG', `model "${route}" does not exist in leaderteam.local.json`);
       }
-      delete nextLocal.models[route];
-      if (changes.prunePool && Array.isArray(nextLocal.team?.executionPool)) {
+      if (inLocal) {
+        delete nextLocal.models[route];
+      }
+      if (inBase) {
+        nextLocal.team ??= {};
+        const prevDisabled = Array.isArray(nextLocal.team.disabledModels)
+          ? [...nextLocal.team.disabledModels]
+          : [...(nextBase.team?.disabledModels ?? [])];
+        if (!prevDisabled.includes(route)) prevDisabled.push(route);
+        nextLocal.team.disabledModels = prevDisabled;
+        poolAutoDisable.push(route);
+        warnings.push(`base catalog model "${route}" has been disabled and removed from the local execution pool in leaderteam.local.json`);
+      } else if (changes.prunePool && Array.isArray(nextLocal.team?.executionPool)) {
         nextLocal.team.executionPool = nextLocal.team.executionPool.filter(r => r !== route);
         touched.pool = true;
       }
@@ -807,17 +853,56 @@ export function applyModelConfigChanges(changes = {}, options = {}) {
     } else {
       effort = prior.effort;
     }
+    const targetModelSpec = mergedModelsNow[route];
+    if (
+      !item.requireExplicitEffort &&
+      (options.autoAlignRoleEfforts || (item.route && item.route !== prior.route)) &&
+      Array.isArray(targetModelSpec?.efforts) &&
+      targetModelSpec.efforts.length > 0 &&
+      !targetModelSpec.efforts.includes(effort)
+    ) {
+      effort = targetModelSpec.defaultEffort && targetModelSpec.efforts.includes(targetModelSpec.defaultEffort)
+        ? targetModelSpec.defaultEffort
+        : targetModelSpec.efforts[0];
+    }
+
+    const leaderMaxTokens = (item.clearMaxTokens || item.maxTokens === null)
+      ? undefined
+      : (item.maxTokens ?? prior.maxTokens);
+    const nonLeaderMaxTokens = (item.clearMaxTokens || item.maxTokens === null)
+      ? DEFAULT_ROLE_LIMITS[role]?.maxTokens
+      : (item.maxTokens ?? prior.maxTokens ?? DEFAULT_ROLE_LIMITS[role]?.maxTokens);
 
     const nextRole = role === 'leader'
-      ? { route, effort }
+      ? {
+        route,
+        effort,
+        ...(leaderMaxTokens !== undefined ? { maxTokens: leaderMaxTokens } : {}),
+      }
       : {
         ...prior,
         route,
         effort,
-        maxTokens: item.maxTokens ?? prior.maxTokens ?? DEFAULT_ROLE_LIMITS[role].maxTokens,
+        ...(nonLeaderMaxTokens !== undefined ? { maxTokens: nonLeaderMaxTokens } : {}),
         timeoutMs: item.timeoutMs ?? prior.timeoutMs ?? DEFAULT_ROLE_LIMITS[role].timeoutMs,
         retries: item.retries ?? prior.retries ?? DEFAULT_ROLE_LIMITS[role].retries,
+        ...(Array.isArray(item.fallback) ? { fallback: item.fallback.map(f => {
+          const fbCopy = { ...f };
+          const fbSpec = mergedModelsNow[fbCopy.route];
+          if (
+            options.autoAlignRoleEfforts &&
+            Array.isArray(fbSpec?.efforts) &&
+            fbSpec.efforts.length > 0 &&
+            !fbSpec.efforts.includes(fbCopy.effort)
+          ) {
+            fbCopy.effort = fbSpec.defaultEffort && fbSpec.efforts.includes(fbSpec.defaultEffort)
+              ? fbSpec.defaultEffort
+              : fbSpec.efforts[0];
+          }
+          return fbCopy;
+        }) } : {}),
       };
+    if (role !== 'leader' && nonLeaderMaxTokens === undefined) delete nextRole.maxTokens;
     if (role !== 'leader' && Array.isArray(nextRole.fallback)) nextRole.fallback = nextRole.fallback.filter(f => f.route !== route);
 
     if (target === 'base') {
@@ -863,12 +948,66 @@ export function applyModelConfigChanges(changes = {}, options = {}) {
     dest.requestWindow = { ...(dest.requestWindow ?? {}), ...changes.setRequestWindow };
   }
 
+  // Auto-unblock disabledFamilies when a user explicitly enables or assigns a model of that family
+  if ((changes.poolDisableFamilies?.length ?? 0) === 0) {
+    const previewMerged = deepMergePlain(nextBase, nextLocal);
+    const activeRoutes = new Set([
+      ...(previewMerged.team?.executionPool ?? []),
+      ...Object.values(previewMerged.roles ?? {}).flatMap(r => [r?.route, ...(r?.fallback ?? []).map(f => f?.route)]).filter(Boolean),
+    ]);
+    const activeFams = new Set([...activeRoutes].map(r => previewMerged.models?.[r]?.family).filter(Boolean));
+    const curDisabledFams = previewMerged.team?.disabledFamilies ?? [];
+    if (Array.isArray(curDisabledFams) && curDisabledFams.some(f => activeFams.has(f))) {
+      const filteredFams = curDisabledFams.filter(f => !activeFams.has(f));
+      if (target === 'base') {
+        nextBase.team ??= {};
+        nextBase.team.disabledFamilies = filteredFams;
+      } else {
+        nextLocal.team ??= {};
+        nextLocal.team.disabledFamilies = filteredFams;
+      }
+    }
+  }
+
+  // 5c. Auto-prune stale `team.executionFallbacks` routes when `executionPool`, families, or models change
+  if (touched.pool || touched.removedModels.size > 0 || (changes.poolDisableFamilies?.length ?? 0) > 0) {
+    if (target === 'base' && isPlainObj(nextBase.team?.executionFallbacks)) {
+      const { next, pruned } = pruneExecutionFallbacksMap(
+        nextBase.team.executionFallbacks,
+        nextBase.team.executionPool,
+        nextBase.models,
+        nextBase.team.disabledModels,
+        nextBase.team.disabledFamilies,
+      );
+      if (pruned.length > 0) {
+        if (next) nextBase.team.executionFallbacks = next;
+        else delete nextBase.team.executionFallbacks;
+        warnings.push(`pruned ${pruned.length} stale team.executionFallbacks route(s) after executionPool update (${pruned.slice(0, 4).join('; ')}${pruned.length > 4 ? '; ...' : ''})`);
+      }
+    }
+    if (hasExistingLocal && isPlainObj(nextLocal.team?.executionFallbacks)) {
+      const preview = mergeConfigLayers(nextBase, nextLocal);
+      const { next, pruned } = pruneExecutionFallbacksMap(
+        nextLocal.team.executionFallbacks,
+        preview.team?.executionPool,
+        preview.models,
+        preview.team?.disabledModels,
+        preview.team?.disabledFamilies,
+      );
+      if (pruned.length > 0) {
+        if (next) nextLocal.team.executionFallbacks = next;
+        else delete nextLocal.team.executionFallbacks;
+        warnings.push(`pruned ${pruned.length} stale local team.executionFallbacks route(s) after executionPool update`);
+      }
+    }
+  }
+
   pruneEmptyObjects(nextLocal);
 
   // 6. Strict validation of BOTH standalone base and merged (base + local) before any disk write
   const validatedBase = validateConfig(nextBase);
   const hasEffectiveLocal = hasExistingLocal || Object.keys(nextLocal).length > 0;
-  const mergedRaw = hasEffectiveLocal ? deepMergePlain(nextBase, nextLocal) : nextBase;
+  const mergedRaw = hasEffectiveLocal ? mergeConfigLayers(nextBase, nextLocal) : nextBase;
   const effective = validateConfig(mergedRaw);
 
   // 7. Detect local overrides shadowing base edits
@@ -905,7 +1044,18 @@ export function applyModelConfigChanges(changes = {}, options = {}) {
   const targetFile = target === 'base' ? configFile : localFile;
   const serializedTarget = JSON.stringify(target === 'base' ? nextBase : nextLocal, null, 2) + '\n';
   const prevTargetText = fs.existsSync(targetFile) ? fs.readFileSync(targetFile, 'utf8') : null;
-  const targetChanged = prevTargetText === null || prevTargetText.replace(/\r\n/g, '\n') !== serializedTarget.replace(/\r\n/g, '\n');
+  const targetChanged = (target === 'local' && !hasExistingLocal && Object.keys(nextLocal).length === 0)
+    ? false
+    : (prevTargetText === null || prevTargetText.replace(/\r\n/g, '\n') !== serializedTarget.replace(/\r\n/g, '\n'));
+
+  const prevLocalText = localClearedInBaseMode && fs.existsSync(localFile) ? fs.readFileSync(localFile, 'utf8') : null;
+  const serializedLocalInBaseMode = localClearedInBaseMode ? (JSON.stringify(nextLocal, null, 2) + '\n') : null;
+  const sidecarLocalChanged = Boolean(
+    localClearedInBaseMode &&
+    prevLocalText !== null &&
+    serializedLocalInBaseMode !== null &&
+    prevLocalText.replace(/\r\n/g, '\n') !== serializedLocalInBaseMode.replace(/\r\n/g, '\n'),
+  );
 
   const patchWrites = [];
   if (target === 'base' && options.syncPatches !== false) {
@@ -921,7 +1071,7 @@ export function applyModelConfigChanges(changes = {}, options = {}) {
     }
   }
 
-  const changed = targetChanged || patchWrites.length > 0;
+  const changed = targetChanged || sidecarLocalChanged || patchWrites.length > 0;
   const beforeGovernance = governanceSettings(target === 'base' ? baseRaw : localRaw);
   const afterGovernance = governanceSettings(target === 'base' ? nextBase : nextLocal);
   const governanceChanged = hashJson(beforeGovernance) !== hashJson(afterGovernance);
@@ -931,7 +1081,10 @@ export function applyModelConfigChanges(changes = {}, options = {}) {
   let auditId = null;
   if (!dryRun && changed) {
     if (options.backupDir) {
-      backupPath = backupFiles([targetFile, ...patchWrites.map(w => w.file)], path.resolve(options.backupDir));
+      backupPath = backupFiles(
+        [targetFile, ...(sidecarLocalChanged ? [localFile] : []), ...patchWrites.map(w => w.file)],
+        path.resolve(options.backupDir),
+      );
     }
     if (governanceChanged) {
       auditId = randomUUID();
@@ -944,6 +1097,7 @@ export function applyModelConfigChanges(changes = {}, options = {}) {
     }
     const plannedWrites = [
       ...(targetChanged ? [{ file: targetFile, content: serializedTarget }] : []),
+      ...(sidecarLocalChanged ? [{ file: localFile, content: serializedLocalInBaseMode }] : []),
       ...patchWrites,
     ];
     writeFilesTransactional(plannedWrites);

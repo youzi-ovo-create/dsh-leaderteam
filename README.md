@@ -1,8 +1,8 @@
 # LeaderTeam for DeepSeek Harness (V2.2)
 
-![Version](https://img.shields.io/badge/version-2.2.1-blue)
+![Version](https://img.shields.io/badge/version-2.2.3-blue)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows-success)
-![DSH Host](https://img.shields.io/badge/DeepSeek%20Harness-0.2.2--rc.1%20%7C%200.2.2--rc.5-5b6ee1)
+![DSH Host](https://img.shields.io/badge/DeepSeek%20Harness-%3E%3D0.2.2--alpha.2%20%3C1.0.0-5b6ee1)
 ![Node.js](https://img.shields.io/badge/node-%3E%3D22.15-339933)
 ![License](https://img.shields.io/badge/license-Apache--2.0-orange)
 
@@ -14,30 +14,45 @@ LeaderTeam 是运行在 **DeepSeek Harness（Linux & Windows）** 上的长周�
 - **零模型调用的确定性宿主安全门**：挂载于宿主工具执行管道最后一环，工作区内的合规文件读写与常规命令按确定性规则直接放行（0 次额外审查模型调用），越界读写与 Shell 逃逸硬阻断，跨界操作才调用独立安全门模型复核；宿主版本未验真时严格 **Fail-Closed**。
 - **四桶物理 Token 对账与无人值守护栏**：按 `Input / Cache Read / Cache Write / Output` 四桶逐笔落盘真实用量账本（以各上游接口实际返回的计量字段为准，严格区分未上报 `null` 与真实 `0`），内置 Linux `cgroup v2/v1` 容器内存感知、**不跳过审查的 5 小时请求窗口三级节流**，以及笔记本低电量检查点优雅收尾。
 
+### 版本与发行通道一览
+
+| 发行线 | 最新正式版 | 覆盖平台 | 主要能力与下载入口 |
+|---|---|---|---|
+| **开源最新双模版 (`V2.2.3`)** | [`linux-v2.2.3`](https://github.com/youzi-ovo-create/dsh-leaderteam/releases/tag/linux-v2.2.3) · [`windows-v2.2.3`](https://github.com/youzi-ovo-create/dsh-leaderteam/releases/tag/windows-v2.2.3) | Linux x64 / Windows x64 (`Apache-2.0`) | 会话内 **Single / Team 双模切换** + 河洛原生工作台 `/lt/` + 一键安装器/自动更新器 + 会话级模型跟随 |
+| **开源纯团队维护版 (`V2.2.2`)** | [`linux-v2.2.2`](https://github.com/youzi-ovo-create/dsh-leaderteam/releases/tag/linux-v2.2.2) · [`windows-v2.2.2`](https://github.com/youzi-ovo-create/dsh-leaderteam/releases/tag/windows-v2.2.2) | Linux x64 / Windows x64 (`Apache-2.0`) | 纯正 Team 分权自治治理（`inSessionDualMode: false`）+ 河洛工作台 + 一键安装/更新与 `DP-01..DP-06` 防退化 |
+| **闭源免费公开发行线 (`V2.3+`)** | [`dsh-leaderteam-releases`](https://github.com/youzi-ovo-create/dsh-leaderteam-releases/releases) | Linux (`linux-v2.5.1` / `linux-v2.5.0` / `linux-v2.4.0`) · 双平台 (`v2.3.0`) | 预编译 Rust 原生模型映射核心 + 内置轻量 API Key 网关 + 三源衡账对账（免费公开发行二进制） |
+
 ---
 
 ## 第一屏：3 分钟安装与单 Key 即刻启动（Quick Start）
 
-### 1. 标准插件包安装（`dsh.bundle`）
+### 1. 零命令行图形化一键安装（推荐新手）与标准命令行安装
 
-- **运行环境要求**：
-  - **Node.js `>= 22.15`**（若需从源码构建 `extensions/dsh-context` 推荐 `22.19+` 或 `24.x`）；
-  - 已端到端实机验真的 **DeepSeek Harness `0.2.2-rc.1` 或 `0.2.2-rc.5`**（未实机放行的中间版本如 `rc.2–rc.4` 或未知新版本默认保持 Fail-Closed 拒绝加载，可通过 `lt-doctor --check-host` 离线预检）；
-  - 实机验证平台为 **Linux（x86_64 / WSL2）与 Windows**（底层 POSIX 路径兼容类 Unix 环境，macOS 暂未纳入官方真机验收矩阵）；Linux 下执行 `dsh plugin add` 需确保 `PATH` 中包含 `node` 与 `pnpm`（可通过 `corepack enable pnpm` 启用）。
+- **运行环境与宿主兼容范围**（完整列表见《[DSH 宿主版本兼容性列表](docs/10-DSH宿主兼容性列表.md)》）：
+  - **Node.js `>= 22.15`**（Windows 官方桌面端用户双击 `Install-LeaderTeam.cmd` 时可自动复用桌面端内置运行时，无需单独安装 Node.js）；
+  - **DeepSeek Harness `>=0.2.2-alpha.2 <1.0.0`**：已实机核验覆盖 **`0.2.2-alpha.2` ~ `0.2.2-rc.5`** 及最新 **`0.2.3-alpha.1` ~ `0.2.3-alpha.2`**，并内置**自适应结构契约校验**，后续官方桌面端或 CLI 常规更新只要未破坏安全门管道契约即可免升级直跑（安装前可通过图形安装器或 `node bin/lt-doctor.mjs --compatibility-matrix` 预检）；
+  - **控制台内置新手引导与一键升级**：首次打开控制台自动弹出三步引导（免命令行粘贴 API Key、选择团队模式、创建首个任务），并在「设置 → 版本更新与兼容」中支持自动检查更新、SHA-256 校验一键升级与失败自动回滚（开源版与闭源免费版严格独立检查，详见《[一键安装、新手引导与自动更新指南](docs/11-一键安装新手引导与自动更新指南.md)》）。
 
-> **安装源说明**：当前稳定版通过 [GitHub Releases](https://github.com/youzi-ovo-create/dsh-leaderteam/releases/tag/v2.2.1) 分发离线 `.tgz` 插件包（公共 npm registry 尚未上架，请直接安装 `.tgz` 包或本地克隆目录）：
+- **方式 A：图形化一键安装器（全程无需命令行）**：
+  - Windows：解压后双击 **`Install-LeaderTeam.cmd`**；
+  - Linux / WSL2：执行 **`./install-leaderteam.sh`**（或 `node bin/lt-installer.mjs --gui`），在自动打开的浏览器向导中点击安装并直接启动客户端。
+
+- **方式 B：标准 `dsh plugin` 命令行安装**：
+
+> **安装源与跨平台独立 Release 标签说明**：当前稳定版通过 [GitHub Releases](https://github.com/youzi-ovo-create/dsh-leaderteam/releases) 按平台独立分发离线 `.tgz` 插件包——Linux 发行标签为 **`linux-vX.Y.Z`**（如 `linux-v2.2.3`），Windows 发行标签为 **`windows-vX.Y.Z`**（如 `windows-v2.2.3`）；内置安装器与自动更新器会自动按当前系统匹配对应平台 Release（详见《[跨平台独立发行与长期工程治理规范](docs/13-跨平台独立发行与长期工程规范.md)》）：
 
 ```bash
-# 1. 从 GitHub Release 下载 v2.2.1 标准插件包
-curl -fLO https://github.com/youzi-ovo-create/dsh-leaderteam/releases/download/v2.2.1/dsh-leaderteam-2.2.1.tgz
+# 1A. Linux / WSL2：从 linux-v2.2.3 Release 下载并校验安装到 web profile
+curl -fLO https://github.com/youzi-ovo-create/dsh-leaderteam/releases/download/linux-v2.2.3/dsh-leaderteam-2.2.3.tgz
+curl -fLO https://github.com/youzi-ovo-create/dsh-leaderteam/releases/download/linux-v2.2.3/SHA256SUMS.txt
+grep "dsh-leaderteam-2.2.3.tgz" SHA256SUMS.txt | sha256sum -c -
+dsh plugin --profile web add ./dsh-leaderteam-2.2.3.tgz
 
-# 2A. Linux / Web CLI Profile 安装
-dsh plugin --profile web add ./dsh-leaderteam-2.2.1.tgz
-
-# 2B. 官方 Windows Desktop Profile 安装
-# （若此前用 V2.1 install-desktop.ps1 注入过旧补丁，先在克隆仓内运行一次清理，会自动备份原文件：
-#   node bin/lt-doctor.mjs --clean-legacy-patch ）
-dsh plugin --profile desktop add ./dsh-leaderteam-2.2.1.tgz
+# 1B. 官方 Windows Desktop：从 windows-v2.2.3 Release 下载并安装到 desktop profile
+# （推荐直接双击随附的 Install-LeaderTeam.cmd 图形向导自动识别默认/自定义安装目录；若用命令行安装：）
+curl.exe -fLO https://github.com/youzi-ovo-create/dsh-leaderteam/releases/download/windows-v2.2.3/dsh-leaderteam-2.2.3.tgz
+curl.exe -fLO https://github.com/youzi-ovo-create/dsh-leaderteam/releases/download/windows-v2.2.3/SHA256SUMS.txt
+dsh plugin --profile desktop add ./dsh-leaderteam-2.2.3.tgz
 ```
 
 > 若已 `git clone` 本仓库，也可在仓库根目录直接执行 `dsh plugin --profile web add .`；Windows 旧版脚本备份恢复流程见《[官方 Desktop 部署与恢复](docs/官方Desktop部署与恢复.md)》。
@@ -77,7 +92,7 @@ dsh plugin --profile desktop add ./dsh-leaderteam-2.2.1.tgz
 
 ### 阶梯 1：`¥0` 纯离线单元测试验证（零模型调用、不依赖客户端）
 
-克隆仓库后直接验证安全门硬规则、四阶段自治状态机、Linux `cgroup v2/v1` 并发调度、5h 窗口节流与电量状态机（共 296 项跨平台单测）：
+克隆仓库后直接验证安全门硬规则、四阶段自治状态机、Linux `cgroup v2/v1` 并发调度、5h 窗口节流与电量状态机（共 406 项跨平台单测，Node.js 22 / 24 双版本 CI 全绿）：
 
 ```bash
 node --test "test/unit/*.test.mjs"
@@ -120,5 +135,5 @@ node bin/lt-bugreport.mjs --out lt-bugreport.md
   - [V1.1–V2.2：基于五项真实工程实测的架构演进与发展潜力分析](docs/benchmarks/LeaderTeam_V1.1至V2.2_架构演进与发展潜力分析.md)
   - [V2.1 双项复杂工程实跑测评报告（自举编译器 & 存量生态账本插件，含耗时/成本客观劣势披露）](docs/benchmarks/LeaderTeam_V2.1_双项工程实跑测评报告.md)
 - **核心设计与接口契约**：[架构总览与设计决定](docs/00-总览.md) · [配置与接口参考](docs/01-配置与接口.md) · [按需工具与技能](docs/07-按需工具与技能.md) · [可视化与用量账本](docs/08-可视化与用量.md)
-- **日常操作与客户端维护**：[使用指南](docs/使用指南.md) · [官方 Desktop 部署与恢复](docs/官方Desktop部署与恢复.md) · [官方客户端更新复验](docs/官方Desktop更新复验.md) · [CHANGELOG.md](CHANGELOG.md)
-- **开源许可**：本项目采用 [Apache License 2.0](LICENSE) 许可发布，第三方组件声明见 [leaderteam/NOTICE](leaderteam/NOTICE)。
+- **日常操作与客户端维护**：[一键安装、新手引导与自动更新指南](docs/11-一键安装新手引导与自动更新指南.md) · [历代设计原则与反退化台账](docs/12-历代设计原则与反退化台账.md) · [跨平台独立发行与长期工程治理规范](docs/13-跨平台独立发行与长期工程规范.md) · [Windows 真机九项验收与独立复测指南](docs/14-Windows真机验收与独立复测指南.md) · [使用指南](docs/使用指南.md) · [官方 Desktop 部署与恢复](docs/官方Desktop部署与恢复.md) · [CHANGELOG.md](CHANGELOG.md)
+- **开源许可**：本项目采用 [Apache License 2.0](LICENSE) 许可发布，第三方组件声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) 与 [leaderteam/NOTICE](leaderteam/NOTICE)。

@@ -50,7 +50,8 @@ export default {
     assert.deepEqual(writes.map(r => r.member).sort(), ['impl-a', 'impl-b']);
     assert.ok(writes.every(r => r.decision === 'allow' && r.by === 'model'));
     const cfgFile = JSON.parse(fs.readFileSync(path.join(t.workDir, 'leaderteam.config.json'), 'utf8'));
-    assert.deepEqual(l[0].tools, [...cfgFile.profiles.leader.tools].sort(), 'leader sees exactly its profile (global working_directory masked)');
+    const expectedHeadlessLeaderTools = cfgFile.profiles.leader.tools.filter(n => n !== 'web_search' && n !== 'web_fetch').sort();
+    assert.deepEqual(l[0].tools, expectedHeadlessLeaderTools, 'leader sees exactly its profile (global working_directory masked; tool-web disabled in headless)');
     for (const m of [a[0], b[0]]) assert.deepEqual(m.tools, [...cfgFile.profiles.code.tools].sort(), 'member sees exactly its profile');
     const members = memberRecords(t).filter(r => r.type === 'member');
     assert.deepEqual(members.map(m => m.name).sort(), ['impl-a', 'impl-b']);

@@ -45,6 +45,7 @@ export const EXPECTED_SCENARIOS = [
   'it32-timer-archive-accountable-review',
   'it33-modular-plugins-and-upstream-models',
   'it34-adversarial-rationality',
+  'it46-dual-mode-single-team',
 ];
 export const EXPECTED_PROVIDER_MERGE_CHECKS = 23;
 /** The verifier's own files: hashed at start and end so a result names the exact tool that produced it. */

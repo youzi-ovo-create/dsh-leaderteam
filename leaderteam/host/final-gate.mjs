@@ -23,20 +23,30 @@ import {
   replayGovernanceState,
   checkGovernanceExecutionGate,
 } from '../core/governance-protocol.mjs';
+import { checkShellCircuitBreakerForTeam, recordShellToolResultForTeam } from '../core/shell-circuit-breaker.mjs';
 import { frontierState } from '../core/frontier.mjs';
 import { boundJson, sanitizeArguments } from '../core/redact.mjs';
 import { GATE_DENIED_CODE, GATE_DENIED_NAME } from '../core/constants.mjs';
-import { pathKey } from '../core/paths.mjs';
+import { pathKey, resolvePath, realpathBestEffort } from '../core/paths.mjs';
+import { isProtectedLeaderTeamConfigPath } from '../core/session-config.mjs';
 import { readQuotaStateFile } from '../core/quota.mjs';
 import { quotaGate } from '../core/models.mjs';
 import { replay, nextAction } from '../core/agreement.mjs';
 import { callRoleJson } from './llm.mjs';
 import { roleRouteChain } from '../core/role-routes.mjs';
 import { runtime, teamStore, recordUsage, syncRuntimeConfig, runtimeForTeam, isPluginActive, refreshUpstreamCatalog, effectiveRuntimeConfig } from './runtime.mjs';
-import { resolveActor, leaderAllowedTools, userTaskText, userMessageTexts, currentTaskSeq, reconcileStaleMembers } from './roles.mjs';
+import { resolveActor, isLeaderRoot, leaderAllowedTools, userTaskText, userMessageTexts, currentTaskSeq, reconcileStaleMembers } from './roles.mjs';
+import { getSessionExecutionMode } from './mode-controller.mjs';
 import { resumeAdmission, withMemberActivation, activationConfig, resolveSendMessageTargetId } from './activation.mjs';
+import {
+  VERIFIED_CORE_VERSIONS,
+  SUPPORTED_DSH_ENGINE_RANGE,
+  CANONICAL_PIPELINE_SNIPPETS,
+  evaluateHostCompatibility,
+} from '../core/host-compat.mjs';
 
 const INSTALLED = Symbol.for('leaderteam.finalGate.installed.v1');
+const ORIGINAL_DISPATCH = Symbol.for('leaderteam.finalGate.originalDispatch.v1');
 const RECOVERABLE_PROTOCOL_NUDGES = new Set([
   'rule:tool-not-loaded',
   'rule:refs-unread',
@@ -61,30 +71,72 @@ function countSubstantiveMemberDenials(memberReceipts) {
   return count;
 }
 
-const REQUIRED_SOURCE = [
-  'this.resolveExecution(exec.name, exec.agent, exec.parent !== void 0, exec.toolSet)',
-  'await tool.execute(exec.arguments, exec)',
-];
+const REQUIRED_SOURCE = CANONICAL_PIPELINE_SNIPPETS;
 
-/** Throws when the host pipeline is not the exact shape this patch was verified against. */
-export function assertCompatiblePipeline(proto, version, supported) {
-  if (!supported.includes(version)) throw new Error(`leaderteam: @deepseek-ai/dsh-tools ${version} is not a verified core version (${supported.join(', ')}); refusing to start without the safety gate`);
-  if (typeof proto.dispatchToolBody !== 'function' || typeof proto.resolveExecution !== 'function') throw new Error('leaderteam: ToolExecutionPipeline lacks dispatchToolBody/resolveExecution; refusing to start');
-  const src = Function.prototype.toString.call(proto.dispatchToolBody);
-  for (const s of REQUIRED_SOURCE) if (!src.includes(s)) throw new Error(`leaderteam: dispatchToolBody no longer contains "${s}"; refusing to start`);
+/**
+ * Throws when the host pipeline breaks safety-gate contract invariants or is disallowed by policy.
+ * When `options` is omitted and `supported` is a plain array of versions, defaults to `'strict-verified'`
+ * so explicit allowlist callers retain deterministic pin semantics; runtime startup passes `{ policy: 'adaptive' }`.
+ */
+export function assertCompatiblePipeline(proto, version, supported, options = null) {
+  const isConfigObj = supported !== null && typeof supported === 'object' && !Array.isArray(supported);
+  const cfg = isConfigObj ? supported : (options ?? {});
+  const supportedVersions = isConfigObj
+    ? (cfg.supportedVersions ?? VERIFIED_CORE_VERSIONS)
+    : (Array.isArray(supported) ? supported : VERIFIED_CORE_VERSIONS);
+  const policy = cfg.policy ?? (isConfigObj || options ? 'adaptive' : 'strict-verified');
+  const supportedRange = cfg.supportedRange ?? SUPPORTED_DSH_ENGINE_RANGE;
+
+  if (!proto || typeof proto.dispatchToolBody !== 'function' || typeof proto.resolveExecution !== 'function') {
+    throw new Error('leaderteam: ToolExecutionPipeline lacks dispatchToolBody/resolveExecution; refusing to start');
+  }
+  const unpatchedFn = typeof proto[ORIGINAL_DISPATCH] === 'function' ? proto[ORIGINAL_DISPATCH] : proto.dispatchToolBody;
+  const src = Function.prototype.toString.call(unpatchedFn);
+  const evaluation = evaluateHostCompatibility({
+    toolsVersion: version,
+    pipelineSource: src,
+    supportedVersions,
+    supportedRange,
+    policy,
+  });
+
+  if (evaluation.classification === 'INCOMPATIBLE_PIPELINE') {
+    for (const s of REQUIRED_SOURCE) {
+      if (!src.includes(s)) {
+        throw new Error(`leaderteam: dispatchToolBody no longer contains "${s}"; refusing to start`);
+      }
+    }
+    throw new Error(`leaderteam: ${evaluation.summary}`);
+  }
+  if (!evaluation.productionAllowed) {
+    throw new Error(
+      `leaderteam: @deepseek-ai/dsh-tools ${version} is not a verified core version (${supportedVersions.join(', ')}); refusing to start without the safety gate`,
+    );
+  }
+  return evaluation;
 }
 
-export function installFinalGate(supportedVersions) {
+export function installFinalGate(supportedVersionsOrOptions) {
   const proto = ToolExecutionPipeline.prototype;
-  if (proto[INSTALLED]) return;
-  assertCompatiblePipeline(proto, toolsPackage.version, supportedVersions);
-  const original = proto.dispatchToolBody;
+  const opts = Array.isArray(supportedVersionsOrOptions)
+    ? { supportedVersions: supportedVersionsOrOptions, supportedRange: SUPPORTED_DSH_ENGINE_RANGE, policy: 'adaptive' }
+    : (supportedVersionsOrOptions ?? { supportedVersions: VERIFIED_CORE_VERSIONS, supportedRange: SUPPORTED_DSH_ENGINE_RANGE, policy: 'adaptive' });
+  const evaluation = assertCompatiblePipeline(proto, toolsPackage.version, opts);
+  const original = typeof proto[ORIGINAL_DISPATCH] === 'function' ? proto[ORIGINAL_DISPATCH] : proto.dispatchToolBody;
+  if (!proto[ORIGINAL_DISPATCH]) {
+    Object.defineProperty(proto, ORIGINAL_DISPATCH, { value: original });
+  }
+  runtime().hostCompatibility = Object.freeze({
+    ...evaluation,
+    checkedAt: new Date().toISOString(),
+  });
   proto.dispatchToolBody = async function leaderteamFinalGate(exec) {
     const gate = runtime().gate;
     const agent = exec.agent;
     if (gate === null) return original.call(this, exec);
     const actor = gate.actorFor(agent);
     if (actor === null) return original.call(this, exec); // not governed (outside any LeaderTeam team)
+    const reviewedMode = actor.executionMode;
     const name = exec.name, parent = exec.parent, toolSet = exec.toolSet;
     let args;
     try { args = frozenJsonCopy(exec.arguments ?? {}); } catch { return denied(name, { by: 'rule:arguments-not-json', reason: 'tool arguments are not plain JSON' }); }
@@ -95,7 +147,8 @@ export function installFinalGate(supportedVersions) {
     catch (e) { verdict = { decision: 'deny', by: 'gate-error', reason: `safety gate failed: ${e instanceof Error ? e.message : String(e)}` }; }
     if (exec.signal?.aborted) return abortedBeforeDispatch();
     if (verdict.decision !== 'allow') return denied(name, verdict);
-    if (runtime().gate !== gate || exec.agent !== agent || exec.parent !== parent || exec.toolSet !== toolSet || gate.actorFor(agent) !== actor || (typeof agent?.session?.header?.cwd === 'string' && agent.session.header.cwd !== actor.cwd)) {
+    const postActor = gate.actorFor(agent);
+    if (runtime().gate !== gate || exec.agent !== agent || exec.parent !== parent || exec.toolSet !== toolSet || postActor !== actor || postActor.executionMode !== reviewedMode || (typeof agent?.session?.header?.cwd === 'string' && agent.session.header.cwd !== actor.cwd)) {
       return denied(name, { by: 'binding', reason: 'the operation changed while it was under review' });
     }
     if (typeof gate.checkHardRules === 'function') {
@@ -125,15 +178,65 @@ export function installFinalGate(supportedVersions) {
         exec.arguments = frozenJsonCopy({ ...args, agent: targetMember.hostAgentName });
       }
     }
-    const isShell = Boolean(runtimeForTeam(actor.teamId).config?.gate?.shellTools?.includes(name));
-    if (isShell) runtime().scheduler?.beginShellCall?.();
+    const shellTools = runtimeForTeam(actor.teamId).config?.gate?.shellTools;
+    const isShell = Boolean(shellTools?.includes(name));
+    const sessionKey = actor.teamId ?? agent?.id ?? null;
+    const baseRtForFlight = runtime();
+    if (sessionKey) {
+      baseRtForFlight.inFlightToolDispatchesByTeam ??= new Map();
+      baseRtForFlight.inFlightToolDispatchesByTeam.set(
+        sessionKey,
+        (baseRtForFlight.inFlightToolDispatchesByTeam.get(sessionKey) ?? 0) + 1,
+      );
+    }
+    if (isShell) {
+      const baseRt = runtime();
+      baseRt.scheduler?.beginShellCall?.();
+      if (sessionKey) {
+        baseRt.inFlightShellCallsBySession ??= new Map();
+        baseRt.inFlightShellCallsBySession.set(sessionKey, (baseRt.inFlightShellCallsBySession.get(sessionKey) ?? 0) + 1);
+      }
+    }
     try {
-      return await original.call(this, exec);
+      const res = await original.call(this, exec);
+      if (isShell && actor.teamId) {
+        recordShellToolResultForTeam(baseRtForFlight, actor.teamId, name, res, {
+          shellTools,
+          callId: exec.callId ?? null,
+          actorRole: actor.role,
+        });
+      }
+      return res;
+    } catch (err) {
+      if (isShell && actor.teamId) {
+        recordShellToolResultForTeam(baseRtForFlight, actor.teamId, name, err, {
+          shellTools,
+          callId: exec.callId ?? null,
+          actorRole: actor.role,
+        });
+      }
+      throw err;
     } finally {
-      if (isShell) runtime().scheduler?.endShellCall?.();
+      if (sessionKey && baseRtForFlight.inFlightToolDispatchesByTeam) {
+        const nextToolCnt = (baseRtForFlight.inFlightToolDispatchesByTeam.get(sessionKey) ?? 1) - 1;
+        if (nextToolCnt <= 0) baseRtForFlight.inFlightToolDispatchesByTeam.delete(sessionKey);
+        else baseRtForFlight.inFlightToolDispatchesByTeam.set(sessionKey, nextToolCnt);
+      }
+      if (isShell) {
+        const baseRt = runtime();
+        baseRt.scheduler?.endShellCall?.();
+        if (sessionKey && baseRt.inFlightShellCallsBySession) {
+          const next = (baseRt.inFlightShellCallsBySession.get(sessionKey) ?? 1) - 1;
+          if (next <= 0) baseRt.inFlightShellCallsBySession.delete(sessionKey);
+          else baseRt.inFlightShellCallsBySession.set(sessionKey, next);
+        }
+      }
     }
   };
-  Object.defineProperty(proto, INSTALLED, { value: true });
+  if (!proto[INSTALLED]) {
+    Object.defineProperty(proto, INSTALLED, { value: true });
+  }
+  return evaluation;
 }
 
 function denied(name, verdict) {
@@ -151,9 +254,47 @@ export class Gate {
     syncRuntimeConfig();
     const rt = runtimeForTeam(actor.teamId);
     const cfg = rt.config;
-    const unreadRefs = actor.role === 'member' ? (actor.refs ?? []).filter(r => !(rt.reads.get(agent.id)?.has(pathKey(r)))) : [];
+    const shellBroken = checkShellCircuitBreakerForTeam(rt, actor.teamId, name, cfg?.gate?.shellTools);
+    if (shellBroken) return { rule: shellBroken.rule, reason: shellBroken.reason };
+    const readSet = rt.reads.get(agent.id);
+    const unreadRefs = actor.role === 'member'
+      ? (actor.refs ?? []).filter(r => !(readSet?.has(pathKey(r)) || readSet?.has(pathKey(realpathBestEffort(r)))))
+      : [];
     const cwd = typeof agent?.session?.header?.cwd === 'string' ? agent.session.header.cwd : actor.cwd;
-    const userTexts = actor.role === 'leader' ? () => userMessageTexts(this.ctx, actor.teamId) : undefined; // read grants; evaluated only when a leader read leaves the standing roots
+    const baseRt = runtime();
+    // Enforce Agent-vs-User separation at filesystem boundary: agents may NEVER mutate LeaderTeam global or session config files.
+    if (cfg.gate?.mutatingTools?.includes(name)) {
+      const argKeys = [...new Set([...(cfg.gate?.pathArgs?.[name] ?? []), 'file_path', 'path'])];
+      for (const k of argKeys) {
+        const rawTarget = args?.[k];
+        if (typeof rawTarget === 'string' && rawTarget.trim()) {
+          const resolved = resolvePath(rawTarget, cwd) ?? rawTarget;
+          if (isProtectedLeaderTeamConfigPath(resolved, { storageRoot: baseRt.storageRoot, configPath: baseRt.configPath })) {
+            return {
+              rule: 'protected-lt-config',
+              reason: 'Agent processes are forbidden from modifying LeaderTeam global or session configuration files; only user-initiated actions are permitted.',
+            };
+          }
+        }
+      }
+    }
+    if (cfg.gate?.shellTools?.includes(name) && typeof args?.command === 'string') {
+      const cmdLower = args.command.toLowerCase();
+      if (
+        cmdLower.includes('leaderteam.config.json') ||
+        cmdLower.includes('leaderteam.local.json') ||
+        cmdLower.includes('session-config.json') ||
+        (cmdLower.includes('governance.json') && cmdLower.includes('teams'))
+      ) {
+        if (/(?:>|tee\b|sed\s+-i|mv\b|cp\b|rm\b|python|node\s+-e|writefile)/i.test(args.command)) {
+          return {
+            rule: 'protected-lt-config',
+            reason: 'Shell commands initiated by an agent may not modify LeaderTeam configuration or governance files.',
+          };
+        }
+      }
+    }
+    const userTexts = (actor.role === 'leader' || name === 'web_search' || name === 'web_fetch') ? () => userMessageTexts(this.ctx, actor.teamId) : undefined; // read grants & user network-prohibition checks
     const rawSessionId = typeof agent?.session?.id === 'string' ? agent.session.id : (typeof agent?.session?.header?.id === 'string' ? agent.session.header.id : '');
     const ownSpillSessionSegment = rawSessionId ? `session-${createHash('sha256').update(rawSessionId).digest('hex').slice(0, 12)}` : undefined;
     const hit = evaluateHardRules({ tool: name, args, actor: { ...actor, unreadRefs }, cwd, platform: process.platform, userTexts, spillTmpRoot: os.tmpdir(), ownSpillSessionSegment }, cfg);
@@ -170,13 +311,16 @@ export class Gate {
     return undefined;
   }
   actorFor(agent) {
-    if (agent === undefined) return null;
+    if (agent === undefined || agent === null) return null;
     const rt = runtime();
     syncRuntimeConfig(rt);
     const known = rt.actors.get(agent.id);
     if (known && known.agent === agent) {
       if (known.role === 'leader') {
-        const tools = leaderAllowedTools(runtimeForTeam(known.teamId));
+        const mode = getSessionExecutionMode(rt, known.teamId);
+        const cwd = typeof agent?.session?.header?.cwd === 'string' ? agent.session.header.cwd : known.cwd;
+        const tools = leaderAllowedTools(runtimeForTeam(known.teamId), mode, process.platform, cwd);
+        known.executionMode = mode;
         known.allowedTools = tools;
         known.loadedTools = tools;
       }
@@ -190,10 +334,24 @@ export class Gate {
     syncRuntimeConfig();
     const rt = runtimeForTeam(actor.teamId);
     const cfg = rt.config;
+    const initialExecutionMode = actor.role === 'leader'
+      ? (actor.executionMode ?? getSessionExecutionMode(rt, actor.teamId))
+      : undefined;
     try { rt.onTeamActivity?.(this.ctx, actor.teamId, actor.cwd); } catch {}
     const taskSeq = currentTaskSeq(this.ctx, actor.teamId);
     const argsPreview = boundJson(sanitizeArguments(args ?? {}), 400, 200).text;
-    const base = { teamId: actor.teamId, taskSeq, agentId: agent.id, role: actor.role, member: actor.name ?? null, tool: name, callId, argsSha256: hashJson(args ?? {}), argsPreview };
+    const base = {
+      teamId: actor.teamId,
+      taskSeq,
+      agentId: agent.id,
+      role: actor.role,
+      ...(actor.role === 'leader' ? { executionMode: initialExecutionMode } : {}),
+      member: actor.name ?? null,
+      tool: name,
+      callId,
+      argsSha256: hashJson(args ?? {}),
+      argsPreview,
+    };
     let reviewArgs = args;
     let effectiveActor = actor;
     if (isAutonomousGovernance(cfg) && base.teamId && (actor.role === 'member' || actor.role === 'direct_exec')) {
@@ -218,7 +376,7 @@ export class Gate {
     }
     const hit = this.checkHardRules({ name, args, agent, actor: effectiveActor });
     if (hit) return this.record(base, { decision: 'deny', by: `rule:${hit.rule}`, reason: hit.reason });
-    if (isAutonomousGovernance(cfg) && base.teamId) {
+    if (isAutonomousGovernance(cfg) && base.teamId && !(effectiveActor.role === 'leader' && effectiveActor.executionMode === 'single')) {
       const store = teamStore(base.teamId);
       const govState = replayGovernanceState(store.governanceEvents(), taskSeq);
       const stageObj = (effectiveActor.role === 'leader' && name === 'team_dispatch' && args?.stage_id)
@@ -302,7 +460,7 @@ export class Gate {
     }
     const usePatternCache = cfg.gate.enablePatternCache !== false && (actor.role === 'direct_exec' || cfg.gate.sandboxDirectAllow !== false);
     const patternCacheKey = usePatternCache
-      ? `${base.teamId ?? 'local'}:${taskSeq}:${actor.role}:${actor.stageHash ?? actor.name ?? agent.id}:${computeGatePatternKey(name, reviewArgs, base.boundaryReason ?? '')}`
+      ? `${base.teamId ?? 'local'}:${taskSeq}:${actor.role}${actor.role === 'leader' ? `:${initialExecutionMode ?? 'team'}` : ''}:${actor.stageHash ?? actor.name ?? agent.id}:${computeGatePatternKey(name, reviewArgs, base.boundaryReason ?? '')}`
       : null;
     if (patternCacheKey) {
       rt.gatePatternCache ??= new Map();
@@ -325,7 +483,14 @@ export class Gate {
       }
       const taskReceipts = receipts.filter(x => (x.taskSeq ?? 1) === taskSeq);
       if (cfg.gate.dedupeDeniedCalls) {
-        const prevDeny = taskReceipts.find(x => x.agentId === agent.id && x.tool === name && x.argsSha256 === base.argsSha256 && x.decision === 'deny' && (x.by === 'model' || x.by === 'rule:provider-policy-refusal'));
+        const prevDeny = taskReceipts.find(
+          x => x.agentId === agent.id
+            && x.tool === name
+            && x.argsSha256 === base.argsSha256
+            && x.decision === 'deny'
+            && (x.by === 'model' || x.by === 'rule:provider-policy-refusal')
+            && (actor.role !== 'leader' || (x.executionMode ?? 'team') === (initialExecutionMode ?? 'team')),
+        );
         if (prevDeny) return this.record(base, { decision: 'deny', by: 'rule:duplicate-denied-call', reason: `identical operation was already denied by safety review: ${prevDeny.reason}` });
       }
       // Safety review unavailable N times in a row for this agent: stop calling until the cooldown has passed, so an
@@ -425,6 +590,9 @@ export class Gate {
       if (typeof agent?.session?.header?.cwd === 'string' && agent.session.header.cwd !== actor.cwd) {
         return this.record(base, { decision: 'deny', by: 'binding', reason: 'the operation changed while it was under review', ...ran, attempts: r.attempts, latencyMs: r.latencyMs });
       }
+      if (actor.role === 'leader' && actor.teamId && getSessionExecutionMode(rt, actor.teamId) !== initialExecutionMode) {
+        return this.record(base, { decision: 'deny', by: 'binding', reason: 'the operation changed while it was under review', ...ran, attempts: r.attempts, latencyMs: r.latencyMs });
+      }
       const postHit = this.checkHardRules({ name, args, agent, actor });
       if (postHit) {
         return this.record(base, { decision: 'deny', by: `rule:${postHit.rule}`, reason: postHit.reason, ...ran, attempts: r.attempts, latencyMs: r.latencyMs });
@@ -452,12 +620,33 @@ export class Gate {
     return verdict;
   }
 }
-/** After the core plugin is disposed: team agents may not run controlled tools; others pass through. */
+/** After the core plugin is disposed: fail closed (hide all tools and deny all executions) for every LT-governed session. */
 export class ClosedGate {
-  actorFor(agent) { return agent && runtime().actors.has(agent.id) ? runtime().actors.get(agent.id) : null; }
-  async decide({ name, actor }) {
-    const cfg = runtime().config;
-    if (cfg && classifyTool(name, cfg, actor) === 'uncontrolled') return { decision: 'allow', by: 'uncontrolled' };
+  constructor(ctx = null) { this.ctx = ctx; }
+  actorFor(agent) {
+    if (!agent) return null;
+    const rt = runtime();
+    const leaderPreset = rt.config?.profiles?.leader?.preset ?? 'leaderteam';
+    let leaderMatch = false;
+    try { leaderMatch = Boolean(isLeaderRoot(this.ctx, agent)); } catch { leaderMatch = false; }
+    if (
+      rt.actors.has(agent.id)
+      || leaderMatch
+      || agent.session?.header?.agentPreset === leaderPreset
+      || agent.session?.header?.origin === 'subagent'
+      || rt.config?.gate?.scope === 'all'
+    ) {
+      return {
+        role: 'closed',
+        agentId: agent.id,
+        teamId: agent.id,
+        allowedTools: [],
+        loadedTools: [],
+      };
+    }
+    return null;
+  }
+  async decide() {
     return { decision: 'deny', by: 'gate-closed', reason: 'the LeaderTeam core plugin is not running' };
   }
 }

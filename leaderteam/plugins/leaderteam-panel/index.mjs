@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { runtime, registerRuntimePlugin } from '../../host/runtime.mjs';
 import { detectLegacyProfilePatchConflicts } from '../../core/legacy-patch-guard.mjs';
 import { registerPanelRoutes } from './panel-api.mjs';
+import { registerPublicContractRoutes, registerLtNativeFrontendStaticRoute } from './public-api.mjs';
 import pkg from '../../package.json' with { type: 'json' };
 
 export const name = 'leaderteam-panel';
@@ -56,6 +57,11 @@ export function apply(ctx) {
   assertNoLegacyDesktopPatchOverride(ctx, rt);
   ctx.effect(() => registerRuntimePlugin('panel', { version: pkg.version }, rt), { label: 'leaderteam-panel registration' });
   ctx.inject(['connection'], c => {
-    registerPanelRoutes(c, c.get('connection'), ctx, rt);
+    const conn = c.get('connection');
+    registerPanelRoutes(c, conn, ctx, rt);
+    registerPublicContractRoutes(c, conn, ctx, rt);
+  });
+  ctx.inject(['webServer', 'connection'], c => {
+    registerLtNativeFrontendStaticRoute(c, c.get('webServer'), c.get('connection'));
   });
 }

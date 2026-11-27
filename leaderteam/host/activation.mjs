@@ -11,8 +11,9 @@ export const ACTIVE_MEMBER_STATUSES = new Set(['starting', 'started', 'running']
 
 export function activationConfig(rt, store, cfg) {
   const base = baseRuntime(rt);
+  const logicalTeamId = store.rawTeamId ?? store.teamId;
   const coherent = base.schedulerStorageRef === base.storageRoot && base.schedulerConfigRef === base.config && cfg.team.maxActiveMembers === base.config.team.maxActiveMembers;
-  const limit = rt.activationLimit?.(store.teamId) ?? (coherent ? rt.scheduler?.currentUserMaxForTeam?.(store.teamId)?.max : undefined);
+  const limit = rt.activationLimit?.(logicalTeamId) ?? (coherent ? rt.scheduler?.currentUserMaxForTeam?.(logicalTeamId)?.max : undefined);
   return Number.isInteger(limit) ? { ...cfg, team: { ...cfg.team, maxActiveMembers: limit } } : cfg;
 }
 
@@ -64,7 +65,8 @@ export function resumeAdmission(store, cfg, targetId, taskSeq) {
   const member = store.getMember(targetId);
   if (!member || member.actorRole === 'direct_exec') {
     const byName = [...store.members().values()].findLast(m => m.actorRole !== 'direct_exec' && m.name === targetId);
-    const hint = byName?.childId ? ` (pass agent_id="${byName.childId}" instead of member name "${targetId}")` : '';
+    const preferredAgent = byName?.hostAgentName ?? byName?.childId;
+    const hint = preferredAgent ? ` (pass agent="${preferredAgent}" instead of "${targetId}")` : '';
     throw new Error(`send_message target is not a member of this team${hint}`);
   }
   const autonomous = isAutonomousGovernance(cfg);
@@ -153,9 +155,10 @@ export function hasUnfinishedNonShellPlanWork(store, cfg, taskSeq) {
 }
 
 export async function withMemberActivation(rt, store, cfg, targetId, taskSeq, invoke) {
+  const logicalTeamId = store.rawTeamId ?? store.teamId;
   const { member, planId } = resumeAdmission(store, activationConfig(rt, store, cfg), targetId, taskSeq);
   if (ACTIVE_MEMBER_STATUSES.has(member.status)) return invoke(); // a message to a running member adds no slot
-  const reservation = rt.reserveMemberActivation?.(store.teamId, { ...member, taskSeq });
+  const reservation = rt.reserveMemberActivation?.(logicalTeamId, { ...member, taskSeq });
   if (reservation && !reservation.allowed) throw new Error(reservation.reason);
   // No await between checking and reserving: dispatches and other resumes see this slot and write range immediately.
   const actor = rt.actors.get(targetId);
@@ -180,7 +183,7 @@ export async function withMemberActivation(rt, store, cfg, targetId, taskSeq, in
     rt.readProgress?.delete(targetId);
     const result = await invoke();
     if (result?.isError) { rollback(); reservation?.cancel(); }
-    else reservation?.commit(rt.activationCapacity?.(store.teamId));
+    else reservation?.commit(rt.activationCapacity?.(logicalTeamId));
     return result;
   } catch (error) { rollback(); reservation?.cancel(); throw error; }
 }

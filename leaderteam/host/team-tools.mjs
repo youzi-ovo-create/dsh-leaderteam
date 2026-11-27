@@ -6,13 +6,14 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { defineTool } from '@deepseek-ai/dsh-tools';
-import { requireReady, teamStore, runtime, baseRuntime, recordUsage, runtimeForTeam, isPluginActive, activePluginsMap, refreshUpstreamCatalog, effectiveRuntimeConfig } from './runtime.mjs';
+import { requireReady, teamStore, runtime, baseRuntime, recordUsage, runtimeForTeam, isPluginActive, activePluginsMap, refreshUpstreamCatalog, effectiveRuntimeConfig, syncSessionLeaderSelectionFromHost } from './runtime.mjs';
 import { resolveActor, userTaskText, currentTaskSeq, reconcileStaleMembers } from './roles.mjs';
 import { callRoleJson } from './llm.mjs';
 import { roleRouteChain, degradedNote } from '../core/role-routes.mjs';
 import { readQuotaStateFile } from '../core/quota.mjs';
 import { executionModelRows, quotaGate, checkLeaderModel } from '../core/models.mjs';
-import { resolvePath, isInside, normalizeGlob, hasGlobWildcard, relativeInside, realpathBestEffort, pathKey, anyGlobOverlaps } from '../core/paths.mjs';
+import { resolvePath, isInside, normalizeGlob, relativeInside, realpathBestEffort, pathKey } from '../core/paths.mjs';
+import { findProtectedWriteScopeOverlap } from '../core/gate-policy.mjs';
 import { MEMBER_NAME_RE, AGREEMENT_KINDS, PLAN_CATEGORIES, PLAN_LIFECYCLE_STATES, DIRECT_EXEC_ALLOWED_TOOLS } from '../core/constants.mjs';
 import { resolveModelTarget } from '../core/upstream-models.mjs';
 import { hashJson } from '../core/canonical.mjs';
@@ -157,7 +158,7 @@ function fallbackConcurrencySnapshot(cfg, store, rt, teamId) {
   };
 }
 
-async function leaderOf(ctx, exec) {
+async function leaderOf(ctx, exec, { allowBlockedStopReport = false } = {}) {
   let rt = requireReady();
   const base = baseRuntime(rt);
   if (base.initialSettingsSyncPromise) {
@@ -170,9 +171,13 @@ async function leaderOf(ctx, exec) {
   if (!actor || actor.role !== 'leader') throw new Error('team tools are only available in a LeaderTeam leader session');
   if (!actor.cwd) throw new Error('the leader session has no working directory');
   rt = runtimeForTeam(actor.teamId);
+  if ((rt.config?.team?.leaderModelPolicy ?? 'follow') === 'follow') {
+    syncSessionLeaderSelectionFromHost(ctx, base, agent, { allowHostPrologue: true });
+    rt = runtimeForTeam(actor.teamId);
+  }
   const leaderModel = checkLeaderModel(rt.config, currentSelection(agent));
   const cfg = rt.config;
-  if (leaderModel.blocked) throw new Error(`LeaderTeam leader model check failed: ${leaderModel.message}`);
+  if (leaderModel.blocked && !allowBlockedStopReport) throw new Error(`LeaderTeam leader model check failed: ${leaderModel.message}`);
   try { touchTeamTimer(ctx, actor.teamId, actor.cwd, rt); } catch {}
   return { rt, cfg, actor, store: teamStore(actor.teamId), leaderModel };
 }
@@ -728,10 +733,8 @@ export function registerTeamTools(ctx) {
       if (profile.mutating) {
         writeScope = (args.write_scope ?? []).map(normalizeGlob);
         if (writeScope.length === 0) throw new Error(`profile "${args.profile}" writes files: write_scope must list at least one workspace-relative glob`);
-        const protectedEntries = (cfg.paths.protectedDirs ?? []).map(normalizeGlob).filter(Boolean);
         for (const g of writeScope) {
-          if (hasGlobWildcard(g.split('/')[0])) continue;
-          const hit = protectedEntries.find(d => anyGlobOverlaps([g], [d, `${d}/**`], platform));
+          const hit = findProtectedWriteScopeOverlap(g, cfg.paths.protectedDirs ?? [], platform);
           if (hit) {
             throw new Error(`write_scope glob "${g}" targets protected path "${hit}" (members cannot modify protectedDirs ${JSON.stringify(cfg.paths.protectedDirs)}; update ${cfg.paths.projectRefsDir}/* directly from leader via team_note, and restrict member write_scope to non-protected workspace paths)`);
           }
@@ -926,10 +929,8 @@ export function registerTeamTools(ctx) {
 
       const writeScope = (args.write_scope ?? []).map(normalizeGlob).filter(Boolean);
       if (writeScope.length > 0) {
-        const protectedEntries = (cfg.paths.protectedDirs ?? []).map(normalizeGlob).filter(Boolean);
         for (const g of writeScope) {
-          if (hasGlobWildcard(g.split('/')[0])) continue;
-          const hit = protectedEntries.find(d => anyGlobOverlaps([g], [d, `${d}/**`], platform));
+          const hit = findProtectedWriteScopeOverlap(g, cfg.paths.protectedDirs ?? [], platform);
           if (hit) {
             throw new Error(`write_scope glob "${g}" targets protected path "${hit}" (direct_exec cannot modify protectedDirs ${JSON.stringify(cfg.paths.protectedDirs)})`);
           }
@@ -1699,7 +1700,8 @@ export function registerTeamTools(ctx) {
     },
     output: jsonCompact,
     async execute(_args, exec) {
-      const { rt, cfg, actor, store, leaderModel } = await leaderOf(ctx, exec);
+      const isDiagnosticBlockedStop = Boolean(_args && (_args.stop_state === 'blocked' || _args.stop_state === 'waiting_user'));
+      const { rt, cfg, actor, store, leaderModel } = await leaderOf(ctx, exec, { allowBlockedStopReport: isDiagnosticBlockedStop });
       reconcileStaleMembers(rt, store);
       const taskSeq = currentTaskSeq(ctx, actor.teamId);
       const events = exec.agent.session?.snapshotEvents?.() ?? [];
@@ -1747,6 +1749,7 @@ export function registerTeamTools(ctx) {
               : 'Stop declaration recorded. If no useful planning or permitted dispatch remains, finish this turn NOW with one short status sentence and ZERO further tool calls; host completion/review notices will wake you automatically.',
           },
           active_members: activeMembers.map(m => ({ name: m.name, child_id: m.child_id, status: m.status })),
+          ...(leaderModel.blocked ? { leader_model_blocked: true, leader_model: leaderModelView(leaderModel) } : {}),
           ...(planning?.pending_execution_reviews.length ? { pending_execution_reviews: planning.pending_execution_reviews } : {}),
         };
       }

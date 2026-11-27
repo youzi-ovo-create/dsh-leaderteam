@@ -37,6 +37,78 @@ const BARE_CONTINUE = /^(?:请)?(?:继续|继续吧|继续做|继续执行|接�
 export function isBareContinueMessage(text) {
   return BARE_CONTINUE.test(String(text ?? '').trim());
 }
+
+const NETWORK_FORBIDDEN_RE = /(?:禁止|不得|不要|不准|不允许|切勿)(?:使用)?(?:联网|访问网络|网络访问|外网|上网|web_search|web_fetch)|(?:必须|全程|完全)(?:离线|断网)|纯离线|(?:do\s+not|don't|must\s+not|never|forbid(?:den)?\s+to)\s+(?:use\s+)?(?:the\s+)?(?:internet|network|web(?:\s+search|\s+fetch|\s+access)?)|offline[\s-]+only|no\s+(?:internet|network|external\s+network|web\s+access)\s+allowed/i;
+const NETWORK_RESTORED_RE = /(?:允许|恢复|可以)(?:使用)?(?:联网|访问网络|外网|上网|web_search|web_fetch)|allow\s+(?:internet|network|web(?:\s+access)?)/i;
+export const DIRECT_EXEC_EPISTEMIC_NOTE = ' [policy boundary only: direct_exec lacks permission for external paths/network; does NOT indicate host capability absence]';
+
+/** True when the user's messages explicitly prohibit network/web access (unless re-enabled in a later message). Pure. */
+export function isNetworkForbiddenByUser(texts) {
+  let forbidden = false;
+  for (const text of Array.isArray(texts) ? texts : []) {
+    const s = String(text ?? '');
+    if (NETWORK_FORBIDDEN_RE.test(s)) forbidden = true;
+    else if (forbidden && NETWORK_RESTORED_RE.test(s)) forbidden = false;
+  }
+  return forbidden;
+}
+
+/** Deterministic SSRF / local-file guard for `web_fetch` URLs. Allows only public http(s) targets. Pure. */
+export function inspectWebFetchUrlSafety(rawUrl) {
+  if (typeof rawUrl !== 'string' || !rawUrl.trim()) {
+    return { safe: false, reason: 'web_fetch requires a non-empty http(s) URL' };
+  }
+  let u;
+  try { u = new URL(rawUrl.trim()); } catch {
+    return { safe: false, reason: `web_fetch URL is invalid: ${truncate(rawUrl, 120)}` };
+  }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') {
+    return { safe: false, reason: `web_fetch only permits http/https URLs (got "${u.protocol}")` };
+  }
+  if (u.username || u.password) {
+    return { safe: false, reason: 'web_fetch forbids embedded URL credentials' };
+  }
+  const host = u.hostname.replace(/^\[|\]$/g, '').replace(/\.+$/, '').toLowerCase();
+  if (!host) return { safe: false, reason: 'web_fetch URL has an empty host' };
+  if (host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local') || host.endsWith('.internal')) {
+    return { safe: false, reason: `web_fetch forbids local/internal host "${host}"` };
+  }
+  // IPv6 loopback, unspecified, ULA (fc00::/7), link-local (fe80::/10), and IPv4-mapped loopback/private
+  if (host.includes(':')) {
+    if (
+      host === '::'
+      || host === '::1'
+      || /^f[cd][0-9a-f]{0,2}:/.test(host)
+      || /^fe[89ab][0-9a-f]:/.test(host)
+      || host.startsWith('::ffff:')
+    ) {
+      return { safe: false, reason: `web_fetch forbids loopback/private IPv6 address "${host}"` };
+    }
+    return { safe: true, url: u.href };
+  }
+  // IPv4 dotted-quad check (plus integer/octal single-token numeric IPs)
+  if (/^\d+$/.test(host) || /^0x[0-9a-f]+$/i.test(host)) {
+    return { safe: false, reason: `web_fetch forbids non-standard numeric IP host "${host}"` };
+  }
+  const ipv4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+  if (ipv4) {
+    const octets = ipv4.slice(1).map(Number);
+    if (octets.some(n => n > 255)) return { safe: false, reason: `web_fetch invalid IPv4 address "${host}"` };
+    const [a, b] = octets;
+    if (
+      a === 0
+      || a === 10
+      || a === 127
+      || (a === 169 && b === 254)
+      || (a === 172 && b >= 16 && b <= 31)
+      || (a === 192 && b === 168)
+      || (a === 100 && b >= 64 && b <= 127)
+    ) {
+      return { safe: false, reason: `web_fetch forbids loopback/private/link-local IPv4 address "${host}"` };
+    }
+  }
+  return { safe: true, url: u.href };
+}
 export function parseReadGrants(texts, platform = process.platform, homeDir = null) {
   const out = [];
   const effectiveHome = homeDir ?? (platform !== 'win32' ? (process.env.HOME || os.homedir()) : null);
@@ -118,8 +190,226 @@ const POSIX_ANY_ABS_ARG_RE = /(?:^|[\s"'=(;,>])(\/(?!dev\/(?:null|stdin|stdout|s
 const PARENT_ESCAPE_TOKEN_RE = /(?:^|[\s"'=(;,])(\.\.(?:[\\/][^\s"';|,<>]*)?)(?=$|[\s"');|,])/;
 const SAFE_DEV_SINKS = new Set(['/dev/null', '/dev/stdout', '/dev/stderr', '/dev/stdin', 'nul']);
 const DETACHED_DAEMON_CMDS = new Set(['nohup', 'disown', 'setsid', 'daemonize', 'start-stop-daemon']);
-const SUBSHELL_WRAPPER_CMDS = new Set(['bash', 'sh', 'zsh', 'dash', 'ksh']);
+const SUBSHELL_WRAPPER_CMDS = new Set(['bash', 'sh', 'zsh', 'dash', 'ksh', 'csh', 'tcsh', 'fish', 'pwsh', 'powershell', 'cmd', 'wsl']);
+const AWK_CMDS = new Set(['awk', 'gawk', 'mawk', 'nawk']);
+const SHELL_OR_SCRIPT_INTERPRETER_CMDS = new Set([
+  ...SUBSHELL_WRAPPER_CMDS,
+  ...AWK_CMDS,
+  'node', 'nodejs', 'deno', 'bun', 'perl', 'ruby', 'php', 'lua', 'rscript', 'osascript',
+  'xargs', 'eval', 'exec', 'source', '.',
+]);
 const TRANSPARENT_CMD_PREFIXES = new Set(['command', 'builtin', 'env', 'nice', 'time', 'stdbuf', 'timeout']);
+const POSIX_COMPOUND_KEYWORDS = new Set(['{', '}', '!', 'if', 'then', 'else', 'elif', 'fi', 'while', 'until', 'do', 'done']);
+const AWK_UNCONFINED_PROGRAM_RE = /\bsystem\s*\(|\bgetline\b|(?<!\|)\|(?!\|)|>>?|@\s*(?:include|load)\b/;
+const PURE_RECURSIVE_CODE_EXT_GLOB_RE = /^\*\*\/\*\.(?:[mc]?[jt]sx?|py|go|rs|java|kt|swift|c|cc|cpp|cxx|h|hh|hpp|cs|rb|php|lua|scala|zig|css|scss|less|sass|html|vue|svelte|sql|proto|graphql)$/i;
+
+function isAwkCmd(cmdBase) {
+  const lower = String(cmdBase ?? '').toLowerCase().replace(/\.exe$/, '');
+  return AWK_CMDS.has(lower);
+}
+
+function inspectAwkInvocation(cmdArgs) {
+  const programs = [];
+  const scriptFileToks = [];
+  const loadExtToks = [];
+  const inputFileToks = [];
+  let hasExplicitProgram = false;
+  let hasInPlace = false;
+  let hasNonInplaceInclude = false;
+  let inplaceSuffix = '';
+  let afterDD = false;
+
+  for (let a = 0; a < cmdArgs.length; a++) {
+    const tok = cmdArgs[a];
+    const v = tok.value;
+    if (!afterDD && v === '--') { afterDD = true; continue; }
+    if (!afterDD && v.startsWith('-') && v.length > 1) {
+      if (v === '-F' || v === '--field-separator' || v === '-W') { a++; continue; }
+      if (v.startsWith('-F') || v.startsWith('--field-separator=') || v.startsWith('-W')) continue;
+      if (v === '-v' || v === '--assign') {
+        const assignVal = cmdArgs[++a]?.value ?? '';
+        if (assignVal.startsWith('INPLACE_SUFFIX=')) inplaceSuffix = assignVal.slice('INPLACE_SUFFIX='.length);
+        continue;
+      }
+      if (v.startsWith('--assign=')) {
+        const assignVal = v.slice('--assign='.length);
+        if (assignVal.startsWith('INPLACE_SUFFIX=')) inplaceSuffix = assignVal.slice('INPLACE_SUFFIX='.length);
+        continue;
+      }
+      if (v.startsWith('-v') && v.length > 2 && !v.startsWith('--')) {
+        const assignVal = v.slice(2);
+        if (assignVal.startsWith('INPLACE_SUFFIX=')) inplaceSuffix = assignVal.slice('INPLACE_SUFFIX='.length);
+        continue;
+      }
+      if (v === '-f' || v === '--file' || v === '-E' || v === '--exec') {
+        hasExplicitProgram = true;
+        if (cmdArgs[a + 1]) scriptFileToks.push(cmdArgs[a + 1]);
+        a++;
+        continue;
+      }
+      if (v.startsWith('--file=') || v.startsWith('--exec=')) {
+        hasExplicitProgram = true;
+        scriptFileToks.push({ ...tok, value: v.slice(v.indexOf('=') + 1) });
+        continue;
+      }
+      if ((v.startsWith('-f') || v.startsWith('-E')) && v.length > 2 && !v.startsWith('--')) {
+        hasExplicitProgram = true;
+        scriptFileToks.push({ ...tok, value: v.slice(2) });
+        continue;
+      }
+      if (v === '-e' || v === '--source') {
+        hasExplicitProgram = true;
+        if (cmdArgs[a + 1]) programs.push(cmdArgs[a + 1].value);
+        a++;
+        continue;
+      }
+      if (v.startsWith('--source=')) {
+        hasExplicitProgram = true;
+        programs.push(v.slice('--source='.length));
+        continue;
+      }
+      if (v.startsWith('-e') && v.length > 2 && !v.startsWith('--')) {
+        hasExplicitProgram = true;
+        programs.push(v.slice(2));
+        continue;
+      }
+      if (v === '-i' || v === '--include') {
+        const inc = cmdArgs[++a]?.value ?? '';
+        if (inc === 'inplace' || inc === 'inplace.awk') hasInPlace = true;
+        else hasNonInplaceInclude = true;
+        continue;
+      }
+      if (v.startsWith('--include=')) {
+        const inc = v.slice('--include='.length);
+        if (inc === 'inplace' || inc === 'inplace.awk') hasInPlace = true;
+        else hasNonInplaceInclude = true;
+        continue;
+      }
+      if (v.startsWith('-i') && v.length > 2 && !v.startsWith('--')) {
+        const inc = v.slice(2);
+        if (inc === 'inplace' || inc === 'inplace.awk') hasInPlace = true;
+        else hasNonInplaceInclude = true;
+        continue;
+      }
+      if (v === '-l' || v === '--load') {
+        if (cmdArgs[a + 1]) loadExtToks.push(cmdArgs[a + 1]);
+        a++;
+        continue;
+      }
+      if (v.startsWith('--load=') || (v.startsWith('-l') && v.length > 2 && !v.startsWith('--'))) {
+        loadExtToks.push(tok);
+        continue;
+      }
+      continue;
+    }
+
+    if (!hasExplicitProgram && programs.length === 0) {
+      programs.push(v);
+      continue;
+    }
+    if (!afterDD && /^[A-Za-z_][A-Za-z0-9_]*=/.test(v)) {
+      if (v.startsWith('INPLACE_SUFFIX=')) inplaceSuffix = v.slice('INPLACE_SUFFIX='.length);
+      continue;
+    }
+    inputFileToks.push(tok);
+  }
+
+  const hasDangerousProgram = programs.some(p => AWK_UNCONFINED_PROGRAM_RE.test(p));
+  const hasExternalCodeLoad = scriptFileToks.length > 0 || loadExtToks.length > 0 || hasNonInplaceInclude;
+  return {
+    programs,
+    scriptFileToks,
+    loadExtToks,
+    inputFileToks,
+    hasInPlace,
+    inplaceSuffix,
+    hasDangerousProgram,
+    hasExternalCodeLoad,
+  };
+}
+
+function isShellOrScriptInterpreter(cmdBase) {
+  const lower = String(cmdBase ?? '').toLowerCase().replace(/\.exe$/, '');
+  return SHELL_OR_SCRIPT_INTERPRETER_CMDS.has(lower) || /^python(?:\d+(?:\.\d+)*)?$/i.test(lower);
+}
+
+function isSubshellEvalCmd(cmdBase) {
+  const lower = String(cmdBase ?? '').toLowerCase().replace(/\.exe$/, '');
+  return SUBSHELL_WRAPPER_CMDS.has(lower) || lower === 'eval';
+}
+
+/**
+ * Return the first configured `protectedDirs` entry overlapped by a normalized `write_scope` glob
+ * (including glob-prefixed entries like `.git*`, `.gi?/**`, or `*.md` overlapping `AGENTS.md`).
+ */
+export function findProtectedWriteScopeOverlap(rawOrNormGlob, rawProtectedDirs, platform = process.platform) {
+  const norm = normalizeGlob(rawOrNormGlob, platform);
+  const protectedEntries = (rawProtectedDirs ?? []).map(d => normalizeGlob(d, platform)).filter(Boolean);
+  const exemptDotDirOnly = PURE_RECURSIVE_CODE_EXT_GLOB_RE.test(norm);
+  for (const d of protectedEntries) {
+    const firstProtectedSeg = d.split('/')[0];
+    if (exemptDotDirOnly) {
+      if (firstProtectedSeg.startsWith('.') && !d.includes('.', 1)) continue;
+      if (!d.includes('/') && /\.[A-Za-z0-9]{1,8}$/.test(d)) {
+        if (matchesAnyGlob(d, [norm], platform)) return d;
+        continue;
+      }
+    }
+    if (anyGlobOverlaps([norm], [d, `${d}/**`], platform)) {
+      return d;
+    }
+  }
+  return null;
+}
+
+function unescapeBasicShellEscapes(str) {
+  return String(str ?? '').replace(/\\([nrt\\'"0]|x[0-9a-fA-F]{1,2})/g, (_m, seq) => {
+    if (seq === 'n') return '\n';
+    if (seq === 'r') return '\r';
+    if (seq === 't') return '\t';
+    if (seq === '0') return '\0';
+    if (seq.startsWith('x')) return String.fromCharCode(Number.parseInt(seq.slice(1), 16));
+    return seq;
+  });
+}
+
+function extractEchoOrPrintfLiteral(cmdBase, cmdArgs) {
+  const lower = String(cmdBase ?? '').toLowerCase();
+  if (lower === 'echo') {
+    let idx = 0;
+    let interpretEsc = false;
+    while (idx < cmdArgs.length && /^-[neE]+$/.test(cmdArgs[idx].value)) {
+      if (cmdArgs[idx].value.includes('e')) interpretEsc = true;
+      if (cmdArgs[idx].value.includes('E')) interpretEsc = false;
+      idx++;
+    }
+    const raw = cmdArgs.slice(idx).map(t => t.value).join(' ');
+    return interpretEsc ? unescapeBasicShellEscapes(raw) : raw;
+  }
+  if (lower === 'printf') {
+    let idx = 0;
+    if (cmdArgs[idx]?.value === '-v') idx += 2;
+    if (cmdArgs[idx]?.value === '--') idx++;
+    if (idx >= cmdArgs.length) return null;
+    const fmt = unescapeBasicShellEscapes(cmdArgs[idx].value);
+    const args = cmdArgs.slice(idx + 1).map(t => t.value);
+    if (args.length === 0) return fmt;
+    let argCursor = 0;
+    let out = '';
+    const maxLoops = Math.max(1, args.length);
+    for (let pass = 0; pass < maxLoops && (pass === 0 || argCursor < args.length); pass++) {
+      const before = argCursor;
+      out += fmt.replace(/%([%sb])/g, (_m, spec) => {
+        if (spec === '%') return '%';
+        const val = args[argCursor++] ?? '';
+        return spec === 'b' ? unescapeBasicShellEscapes(val) : val;
+      });
+      if (argCursor === before) break;
+    }
+    return out;
+  }
+  return null;
+}
 
 function extractBalancedParen(src, openParenIdx) {
   // `src[openParenIdx]` must be '('
@@ -268,6 +558,28 @@ function classifyTildeAt(command, tildeIdx, len) {
     return false;
   }
   return true;
+}
+
+function hasUnquotedBraceExpansion(unquotedShape) {
+  if (!unquotedShape || !unquotedShape.includes('{') || !unquotedShape.includes('}')) return false;
+  const stack = [];
+  for (let k = 0; k < unquotedShape.length; k++) {
+    const ch = unquotedShape[k];
+    if (ch === '{') {
+      stack.push({ start: k, hasComma: false, hasDotDot: false });
+    } else if (stack.length > 0) {
+      const top = stack[stack.length - 1];
+      if (ch === ',') {
+        top.hasComma = true;
+      } else if (ch === '.' && unquotedShape[k + 1] === '.') {
+        top.hasDotDot = true;
+      } else if (ch === '}') {
+        stack.pop();
+        if ((top.hasComma || top.hasDotDot) && k > top.start + 1) return true;
+      }
+    }
+  }
+  return false;
 }
 
 /**
@@ -455,6 +767,7 @@ export function scanPosixShell(command, { treatBacktickAsSubstitution = true } =
     const wordStart = i;
     let value = '';
     let rawSlice = '';
+    let unquotedShape = '';
     let hasSubstitution = false;
     let hasDynamicParam = false;
     let hasAnsiCQuote = false;
@@ -471,6 +784,7 @@ export function scanPosixShell(command, { treatBacktickAsSubstitution = true } =
         if (i + 1 < len) {
           value += command[i + 1];
           rawSlice += command.slice(i, i + 2);
+          unquotedShape += 'Q';
           i += 2;
         } else {
           i++;
@@ -483,12 +797,14 @@ export function scanPosixShell(command, { treatBacktickAsSubstitution = true } =
         const ansi = decodeBashAnsiCQuote(command, i + 2);
         value += ansi.decoded;
         rawSlice += ansi.raw;
+        unquotedShape += 'Q';
         i = ansi.nextIdx;
         continue;
       }
       if (wc === "'") {
         quotedAny = true;
         rawSlice += "'";
+        unquotedShape += 'Q';
         i++;
         while (i < len && command[i] !== "'") {
           value += command[i];
@@ -501,6 +817,7 @@ export function scanPosixShell(command, { treatBacktickAsSubstitution = true } =
       if (wc === '"') {
         quotedAny = true;
         rawSlice += '"';
+        unquotedShape += 'Q';
         i++;
         while (i < len && command[i] !== '"') {
           if (command[i] === '\\' && i + 1 < len) {
@@ -551,6 +868,7 @@ export function scanPosixShell(command, { treatBacktickAsSubstitution = true } =
         substitutions.push({ kind: 'cmd_sub', inner: sub.inner });
         value += `$(${sub.inner})`;
         rawSlice += `$(${sub.inner})`;
+        unquotedShape += 'Q';
         i = sub.nextIdx;
         continue;
       }
@@ -562,6 +880,7 @@ export function scanPosixShell(command, { treatBacktickAsSubstitution = true } =
         }
         value += `\${${br.inner}}`;
         rawSlice += `\${${br.inner}}`;
+        unquotedShape += 'Q';
         i = br.nextIdx;
         continue;
       }
@@ -571,11 +890,13 @@ export function scanPosixShell(command, { treatBacktickAsSubstitution = true } =
         substitutions.push({ kind: 'backtick', inner: sub.inner });
         value += `\`${sub.inner}\``;
         rawSlice += `\`${sub.inner}\``;
+        unquotedShape += 'Q';
         i = sub.nextIdx;
         continue;
       }
       value += wc;
       rawSlice += wc;
+      unquotedShape += wc;
       i++;
     }
 
@@ -585,6 +906,7 @@ export function scanPosixShell(command, { treatBacktickAsSubstitution = true } =
       continue;
     }
 
+    const hasBraceExpansion = hasUnquotedBraceExpansion(unquotedShape);
     const hasExternalEnv = /\$(?:HOME|USERPROFILE|TMPDIR|TEMP|TMP|OLDPWD|XDG_[A-Z_]+)\b|\$\{(?:HOME|USERPROFILE|TMPDIR|TEMP|TMP|OLDPWD|XDG_[A-Z_]+)(?:[^A-Za-z0-9_].*)?\}|\$\{PWD[^A-Za-z0-9_}][^}]*\}/.test(rawSlice);
     tokens.push({
       type: 'word',
@@ -593,6 +915,7 @@ export function scanPosixShell(command, { treatBacktickAsSubstitution = true } =
       quoted: quotedAny,
       hasAnsiCQuote,
       hasDynamicParam,
+      hasBraceExpansion,
       hasSubstitution,
       hasTildePrefix,
       hasExternalEnv,
@@ -621,11 +944,28 @@ function isSafeNullSink(val) {
   return SAFE_DEV_SINKS.has(String(val ?? '').trim().toLowerCase());
 }
 
-function stripLeadingEnvAssignmentsAndPrefixes(words) {
+function stripLeadingEnvAssignmentsAndPrefixes(rawWords) {
+  let words = rawWords;
   let idx = 0;
+  let splitCount = 0;
   const envChdirTokens = [];
+  const envSplitStrings = [];
+  let hasEnvSplitString = false;
+  let openedBraceGroup = false;
+  let closedBraceGroup = false;
+  let openedCompoundBlock = false;
+  let closedCompoundBlock = false;
+
   while (idx < words.length) {
     const w = words[idx].value;
+    if (!words[idx].quoted && POSIX_COMPOUND_KEYWORDS.has(w)) {
+      if (w === '{') openedBraceGroup = true;
+      else if (w === '}') closedBraceGroup = true;
+      else if (w === 'if' || w === 'while' || w === 'until') openedCompoundBlock = true;
+      else if (w === 'fi' || w === 'done') closedCompoundBlock = true;
+      idx++;
+      continue;
+    }
     if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(w) && !words[idx].quoted) {
       idx++;
       continue;
@@ -634,6 +974,7 @@ function stripLeadingEnvAssignmentsAndPrefixes(words) {
     if (TRANSPARENT_CMD_PREFIXES.has(base)) {
       idx++;
       if (base === 'env') {
+        let injectedSplitWords = null;
         while (idx < words.length && words[idx].value.startsWith('-')) {
           const flag = words[idx].value;
           if (flag === '--') { idx++; break; }
@@ -652,11 +993,59 @@ function stripLeadingEnvAssignmentsAndPrefixes(words) {
             idx++;
             continue;
           }
-          if (flag === '-u' || flag === '--unset' || flag === '-S' || flag === '--split-string' || flag === '-P') {
+          if (flag === '-S' || flag === '--split-string' || /^-[i0v]+S$/.test(flag)) {
+            hasEnvSplitString = true;
+            const splitTok = words[idx + 1];
+            idx += 2;
+            if (splitTok) {
+              envSplitStrings.push(splitTok);
+              if (splitCount < 4) {
+                splitCount++;
+                const parsedSplit = scanPosixShell(splitTok.value);
+                injectedSplitWords = parsedSplit.tokens.filter(t => t.type === 'word');
+              }
+            }
+            if (injectedSplitWords) break;
+            continue;
+          }
+          if (flag.startsWith('--split-string=')) {
+            hasEnvSplitString = true;
+            const splitVal = flag.slice('--split-string='.length);
+            const splitTok = { ...words[idx], value: splitVal };
+            envSplitStrings.push(splitTok);
+            idx++;
+            if (splitCount < 4) {
+              splitCount++;
+              const parsedSplit = scanPosixShell(splitVal);
+              injectedSplitWords = parsedSplit.tokens.filter(t => t.type === 'word');
+              break;
+            }
+            continue;
+          }
+          const mSplitShort = /^-[i0v]*S(.+)$/.exec(flag);
+          if (mSplitShort) {
+            hasEnvSplitString = true;
+            const splitVal = mSplitShort[1];
+            const splitTok = { ...words[idx], value: splitVal };
+            envSplitStrings.push(splitTok);
+            idx++;
+            if (splitCount < 4) {
+              splitCount++;
+              const parsedSplit = scanPosixShell(splitVal);
+              injectedSplitWords = parsedSplit.tokens.filter(t => t.type === 'word');
+              break;
+            }
+            continue;
+          }
+          if (flag === '-u' || flag === '--unset' || flag === '-P' || flag === '--default-path') {
             idx += 2;
             continue;
           }
           idx++;
+        }
+        if (injectedSplitWords && injectedSplitWords.length > 0) {
+          words = [...injectedSplitWords, ...words.slice(idx)];
+          idx = 0;
         }
       } else if (base === 'nice') {
         while (idx < words.length && words[idx].value.startsWith('-')) {
@@ -703,7 +1092,23 @@ function stripLeadingEnvAssignmentsAndPrefixes(words) {
     }
     break;
   }
-  return { words: words.slice(idx), envChdirTokens };
+
+  let endIdx = words.length;
+  while (endIdx > idx && !words[endIdx - 1].quoted && words[endIdx - 1].value === '}') {
+    closedBraceGroup = true;
+    endIdx--;
+  }
+
+  return {
+    words: words.slice(idx, endIdx),
+    envChdirTokens,
+    envSplitStrings,
+    hasEnvSplitString,
+    openedBraceGroup,
+    closedBraceGroup,
+    openedCompoundBlock,
+    closedCompoundBlock,
+  };
 }
 
 /**
@@ -729,6 +1134,8 @@ function inspectPosixShellEscapes(command, ctx, depth = 0) {
     effectiveWorkdir,
     protectedDirs = [],
     realProtectedDirs = [],
+    protectedEntries = [],
+    writeScope = [],
     globals = [],
     realGlobals = [],
     platform,
@@ -746,14 +1153,17 @@ function inspectPosixShellEscapes(command, ctx, depth = 0) {
     reason,
   });
 
-  const checkTargetBoundary = (wordTok, curWd, actionLabel, { checkProtected = true } = {}) => {
+  const checkTargetBoundary = (wordTok, curWd, actionLabel, { checkProtected = true, checkWriteScope = false } = {}) => {
     if (!wordTok) return null;
-    if (isSafeNullSink(wordTok.value)) return null;
+    if (isSafeNullSink(wordTok.value) || String(wordTok.value).trim().toLowerCase() === '$null') return null;
     if (wordTok.hasTildePrefix || wordTok.hasExternalEnv) {
       return makeRule('path-outside-workspace', `shell ${actionLabel} targets external home/temp path: ${wordTok.raw ?? wordTok.value}`);
     }
     if (wordTok.hasSubstitution) {
       return makeRule('shell-dynamic-target', `shell ${actionLabel} uses dynamic command substitution as target path`);
+    }
+    if (wordTok.hasBraceExpansion) {
+      return makeRule('shell-dynamic-target', `shell ${actionLabel} uses unquoted brace expansion as target path: ${wordTok.raw ?? wordTok.value}`);
     }
     const { resolved: target, forceOutside } = resolveShellPathForPlatform(wordTok.value, curWd, workspace, platform, tool);
     if (forceOutside || !target) {
@@ -766,23 +1176,85 @@ function inspectPosixShellEscapes(command, ctx, depth = 0) {
     if (!isInside(target, workspace, effPlat) || !isInside(realTarget, realWorkspace, effPlat)) {
       return makeRule('path-outside-workspace', `shell ${actionLabel} targets path outside the workspace ${workspace}: ${wordTok.value}`);
     }
-    if (checkProtected && (protectedDirs.some(d => d && isInside(target, d, effPlat)) || realProtectedDirs.some(d => d && isInside(realTarget, d, effPlat)))) {
-      return makeRule('path-protected', `shell ${actionLabel} cannot modify protected path: ${wordTok.value}`);
+    if (checkProtected) {
+      if (protectedDirs.some(d => d && isInside(target, d, effPlat)) || realProtectedDirs.some(d => d && isInside(realTarget, d, effPlat))) {
+        return makeRule('path-protected', `shell ${actionLabel} cannot modify protected path: ${wordTok.value}`);
+      }
+      if (hasGlobWildcard(wordTok.value) && protectedEntries.length > 0) {
+        const relCand = relativeInside(workspace, target, effPlat);
+        if (relCand) {
+          try {
+            const normCand = normalizeGlob(relCand, effPlat);
+            if (protectedEntries.some(d => anyGlobOverlaps([normCand], [d, `${d}/**`], effPlat))) {
+              return makeRule('path-protected', `shell ${actionLabel} wildcard "${wordTok.value}" overlaps protected path`);
+            }
+          } catch {}
+        }
+      }
+    }
+    if (checkWriteScope && Array.isArray(writeScope) && writeScope.length > 0) {
+      const rel = relativeInside(workspace, target, effPlat);
+      const realRel = relativeInside(realWorkspace, realTarget, effPlat);
+      if (hasGlobWildcard(wordTok.value)) {
+        const parentDir = api(effPlat).dirname(target);
+        const parentRel = isInside(parentDir, workspace, effPlat) ? relativeInside(workspace, parentDir, effPlat) : null;
+        const probePath = parentRel ? `${parentRel}/__redir_wildcard_probe__` : '__redir_wildcard_probe__';
+        if (hasGlobWildcard(parentRel ?? '') || !matchesAnyGlob(probePath, writeScope, effPlat)) {
+          return {
+            rule: isDirectExec ? 'direct-exec-sandbox-lock' : 'path-outside-write-scope',
+            reason: `${wordTok.value} is outside the granted write scope [${writeScope.join(', ')}]`,
+          };
+        }
+      } else if (!matchesAnyGlob(rel, writeScope, effPlat) || !matchesAnyGlob(realRel, writeScope, effPlat)) {
+        return {
+          rule: isDirectExec ? 'direct-exec-sandbox-lock' : 'path-outside-write-scope',
+          reason: `${rel} is outside the granted write scope [${writeScope.join(', ')}]`,
+        };
+      }
     }
     return null;
   };
 
   let curWorkdir = effectiveWorkdir;
   let hadInWorkspaceCd = false;
+  let prevWasPipe = false;
+  let prevPipeLiteral = null;
+  let lastCmdLiteral = null;
+  const subshellPipeStack = [];
+  const bracePipeStack = [];
+  const compoundPipeStack = [];
+
+  const isGroupPiped = () => (
+    subshellPipeStack.some(s => s.piped)
+    || bracePipeStack.some(s => s.piped)
+    || compoundPipeStack.some(s => s.piped)
+  );
+  const getGroupPipeLiteral = () => {
+    for (let s = subshellPipeStack.length - 1; s >= 0; s--) {
+      if (subshellPipeStack[s].piped && subshellPipeStack[s].literal) return subshellPipeStack[s].literal;
+    }
+    for (let s = bracePipeStack.length - 1; s >= 0; s--) {
+      if (bracePipeStack[s].piped && bracePipeStack[s].literal) return bracePipeStack[s].literal;
+    }
+    for (let s = compoundPipeStack.length - 1; s >= 0; s--) {
+      if (compoundPipeStack[s].piped && compoundPipeStack[s].literal) return compoundPipeStack[s].literal;
+    }
+    return null;
+  };
 
   // Walk segments separated by `;`, `&&`, `||`, `|`, `&`, `(`, `)`
   let idx = 0;
   while (idx < tokens.length) {
     const cmdWords = [];
     const segmentHeredocs = [];
+    const segmentHerestrings = [];
+    let segTermOp = null;
+    let segTermParen = null;
     while (idx < tokens.length) {
       const tok = tokens[idx];
       if (tok.type === 'op' || tok.type === 'paren') {
+        segTermOp = tok.type === 'op' ? tok.op : null;
+        segTermParen = tok.type === 'paren' ? tok.op : null;
         idx++;
         break;
       }
@@ -799,13 +1271,16 @@ function inspectPosixShellEscapes(command, ctx, depth = 0) {
           idx++;
           continue;
         }
-        const redirErr = checkTargetBoundary(nextTok, curWorkdir, `redirection (${tok.op})`);
+        const redirErr = checkTargetBoundary(nextTok, curWorkdir, `redirection (${tok.op})`, { checkProtected: true, checkWriteScope: true });
         if (redirErr) return redirErr;
         idx += 2;
         continue;
       }
       if (tok.type === 'in_redir') {
         const nextTok = tokens[idx + 1];
+        if (tok.op === '<<<' && nextTok && nextTok.type === 'word') {
+          segmentHerestrings.push(nextTok);
+        }
         if (nextTok && nextTok.type === 'word') idx += 2;
         else idx++;
         continue;
@@ -821,7 +1296,17 @@ function inspectPosixShellEscapes(command, ctx, depth = 0) {
       idx++;
     }
 
-    const { words: stripped, envChdirTokens } = stripLeadingEnvAssignmentsAndPrefixes(cmdWords);
+    const strippedInfo = stripLeadingEnvAssignmentsAndPrefixes(cmdWords);
+    const {
+      words: stripped,
+      envChdirTokens,
+      envSplitStrings,
+      openedBraceGroup,
+      closedBraceGroup,
+      openedCompoundBlock,
+      closedCompoundBlock,
+    } = strippedInfo;
+
     for (const chdirTok of envChdirTokens) {
       const envCdErr = checkTargetBoundary(chdirTok, curWorkdir, 'env -C', { checkProtected: false });
       if (envCdErr) return envCdErr;
@@ -831,22 +1316,124 @@ function inspectPosixShellEscapes(command, ctx, depth = 0) {
         hadInWorkspaceCd = true;
       }
     }
-    if (stripped.length === 0) continue;
+    for (const splitTok of envSplitStrings) {
+      if (splitTok?.value) {
+        const splitHit = inspectPosixShellEscapes(splitTok.value, { ...ctx, effectiveWorkdir: curWorkdir }, depth + 1);
+        if (splitHit) return splitHit;
+      }
+    }
+
+    if (openedBraceGroup) {
+      bracePipeStack.push({ piped: prevWasPipe || isGroupPiped(), literal: prevWasPipe ? prevPipeLiteral : getGroupPipeLiteral() });
+    }
+    if (openedCompoundBlock) {
+      compoundPipeStack.push({ piped: prevWasPipe || isGroupPiped(), literal: prevWasPipe ? prevPipeLiteral : getGroupPipeLiteral() });
+    }
+
+    const incomingPipe = prevWasPipe || isGroupPiped();
+    const incomingPipeLiteral = prevPipeLiteral ?? getGroupPipeLiteral();
+
+    if (stripped.length === 0) {
+      if (closedBraceGroup && bracePipeStack.length > 0) bracePipeStack.pop();
+      if (closedCompoundBlock && compoundPipeStack.length > 0) compoundPipeStack.pop();
+      if (segTermParen === '(') {
+        subshellPipeStack.push({ piped: prevWasPipe || isGroupPiped(), literal: prevWasPipe ? prevPipeLiteral : getGroupPipeLiteral() });
+      } else if (segTermParen === ')') {
+        if (subshellPipeStack.length > 0) subshellPipeStack.pop();
+        prevWasPipe = false;
+        prevPipeLiteral = null;
+      } else if (segTermOp === '|') {
+        prevWasPipe = true;
+        prevPipeLiteral = lastCmdLiteral;
+      } else {
+        prevWasPipe = false;
+        prevPipeLiteral = null;
+        lastCmdLiteral = null;
+      }
+      continue;
+    }
 
     const rawCmdName = stripped[0].value;
     const cmdBase = rawCmdName.includes('/') ? rawCmdName.slice(rawCmdName.lastIndexOf('/') + 1) : rawCmdName;
     const cmdArgs = stripped.slice(1);
+    const thisCmdLiteral = extractEchoOrPrintfLiteral(cmdBase, cmdArgs);
+
+    if (closedBraceGroup && bracePipeStack.length > 0) bracePipeStack.pop();
+    if (closedCompoundBlock && compoundPipeStack.length > 0) compoundPipeStack.pop();
+    if (segTermParen === '(') {
+      subshellPipeStack.push({ piped: false, literal: null });
+      prevWasPipe = false;
+      prevPipeLiteral = null;
+      lastCmdLiteral = thisCmdLiteral;
+    } else if (segTermParen === ')') {
+      if (subshellPipeStack.length > 0) subshellPipeStack.pop();
+      prevWasPipe = false;
+      prevPipeLiteral = null;
+      lastCmdLiteral = thisCmdLiteral;
+    } else if (segTermOp === '|') {
+      prevWasPipe = true;
+      prevPipeLiteral = thisCmdLiteral;
+      lastCmdLiteral = thisCmdLiteral;
+    } else {
+      prevWasPipe = false;
+      prevPipeLiteral = null;
+      lastCmdLiteral = null;
+    }
 
     // (e) Detached background daemon tools (`nohup`, `disown`, `setsid`, ...)
     if (DETACHED_DAEMON_CMDS.has(cmdBase)) {
       return makeRule('shell-detached-daemon', `shell command "${cmdBase}" spawns detached background daemon outside lifecycle tracking`);
     }
 
-    // Recursive inspection of `bash -c "..."` / `sh -c "..."` AND `bash << 'EOF' ... EOF`
-    if (SUBSHELL_WRAPPER_CMDS.has(cmdBase)) {
+    // Recursive inspection of `*awk` `system("...")` and redirection `> "..."` targets
+    if (isAwkCmd(cmdBase)) {
+      const awkInfo = inspectAwkInvocation(cmdArgs);
+      for (const prog of awkInfo.programs) {
+        const sysRe = /\bsystem\s*\(\s*(["'])((?:\\.|(?!\1).)*)\1\s*\)/g;
+        let sm;
+        while ((sm = sysRe.exec(prog)) !== null) {
+          const innerCmd = unescapeBasicShellEscapes(sm[2]);
+          const sysHit = inspectPosixShellEscapes(innerCmd, { ...ctx, effectiveWorkdir: curWorkdir }, depth + 1);
+          if (sysHit) return sysHit;
+        }
+        const redirRe = /(?:>>?)\s*(["'])((?:\\.|(?!\1).)*)\1/g;
+        let rm;
+        while ((rm = redirRe.exec(prog)) !== null) {
+          const outPath = unescapeBasicShellEscapes(rm[2]);
+          const awkOutErr = checkTargetBoundary({ type: 'word', value: outPath, raw: outPath }, curWorkdir, 'awk redirection', { checkProtected: true, checkWriteScope: true });
+          if (awkOutErr) return awkOutErr;
+        }
+      }
+      if (incomingPipe && incomingPipeLiteral && awkInfo.hasDangerousProgram) {
+        const pipeHit = inspectPosixShellEscapes(incomingPipeLiteral, { ...ctx, effectiveWorkdir: curWorkdir }, depth + 1);
+        if (pipeHit) return pipeHit;
+      }
+    }
+
+    // `dd of=<target>` boundary inspection
+    if (cmdBase.toLowerCase() === 'dd') {
+      for (let a = 0; a < cmdArgs.length; a++) {
+        const v = cmdArgs[a].value;
+        let outTok = null;
+        if (v.startsWith('of=')) outTok = { ...cmdArgs[a], value: v.slice(3) };
+        else if (v.startsWith('--output=')) outTok = { ...cmdArgs[a], value: v.slice('--output='.length) };
+        else if (v === '--output' || v === '-o') outTok = cmdArgs[++a] ?? null;
+        if (outTok && outTok.value) {
+          const ddErr = checkTargetBoundary(outTok, curWorkdir, 'dd output');
+          if (ddErr) return ddErr;
+        }
+      }
+    }
+
+    // Recursive inspection of `bash -c "..."`, `eval "..."`, `bash << 'EOF'`, `bash <<< "..."`, and `echo/printf "..." | bash`
+    if (isSubshellEvalCmd(cmdBase)) {
+      if (cmdBase.toLowerCase() === 'eval' && cmdArgs.length > 0) {
+        const evalHit = inspectPosixShellEscapes(cmdArgs.map(t => t.value).join(' '), { ...ctx, effectiveWorkdir: curWorkdir }, depth + 1);
+        if (evalHit) return evalHit;
+      }
       for (let a = 0; a < cmdArgs.length; a++) {
         const flag = cmdArgs[a].value;
-        if (flag === '-c' || (/^-[A-Za-z]+$/.test(flag) && flag.includes('c'))) {
+        if (flag === '-c' || flag === '-Command' || flag === '/c' || (/^-[A-Za-z]+$/.test(flag) && flag.includes('c'))) {
           const scriptTok = cmdArgs[a + 1];
           if (scriptTok) {
             const subHit = inspectPosixShellEscapes(scriptTok.value, { ...ctx, effectiveWorkdir: curWorkdir }, depth + 1);
@@ -861,6 +1448,21 @@ function inspectPosixShellEscapes(command, ctx, depth = 0) {
           if (hdHit) return hdHit;
         }
       }
+      for (const hs of segmentHerestrings) {
+        if (hs.value) {
+          const hsHit = inspectPosixShellEscapes(hs.value, { ...ctx, effectiveWorkdir: curWorkdir }, depth + 1);
+          if (hsHit) return hsHit;
+        }
+      }
+      if (incomingPipe && incomingPipeLiteral) {
+        const pipeHit = inspectPosixShellEscapes(incomingPipeLiteral, { ...ctx, effectiveWorkdir: curWorkdir }, depth + 1);
+        if (pipeHit) return pipeHit;
+      }
+    }
+
+    if ((cmdBase === 'source' || cmdBase === '.') && cmdArgs[0]) {
+      const srcFileErr = checkTargetBoundary(cmdArgs[0], curWorkdir, cmdBase, { checkProtected: false });
+      if (srcFileErr) return srcFileErr;
     }
 
     // (a) `cd <outside>` / `pushd <outside>`
@@ -921,6 +1523,10 @@ function inspectPosixShellEscapes(command, ctx, depth = 0) {
         }
         if (!afterDoubleDash && v.startsWith('--target-directory=')) {
           targetDirTok = { ...cmdArgs[a], value: v.slice('--target-directory='.length) };
+          continue;
+        }
+        if (!afterDoubleDash && v.startsWith('-t') && v.length > 2 && !v.startsWith('--')) {
+          targetDirTok = { ...cmdArgs[a], value: v.slice(2) };
           continue;
         }
         if (!afterDoubleDash && v.startsWith('-') && v.length > 1) {
@@ -986,18 +1592,22 @@ function inspectPosixShellEscapes(command, ctx, depth = 0) {
       if (st.hasTildePrefix || st.hasExternalEnv) {
         return makeRule('shell-substitution-outside-workspace', `shell substitution references external environment path: ${st.raw ?? st.value}`);
       }
-      const val = st.value;
-      if (isSafeNullSink(val)) continue;
-      if (/(?:^|[\\/])\.\.(?:$|[\\/])/.test(val)) {
-        const { resolved: cand, forceOutside } = resolveShellPathForPlatform(val, curWorkdir, workspace, platform, tool);
-        if (forceOutside || !cand || !isInside(cand, workspace, effPlat) || !isInside(realOf(cand), realWorkspace, effPlat)) {
-          return makeRule('shell-substitution-outside-workspace', `shell substitution parent traversal "${val}" escapes workspace`);
+      for (const val of extractCandidatePathStrings(st.value)) {
+        if (isSafeNullSink(val)) continue;
+        if (val === '~' || (val.startsWith('~') && !val.startsWith('~+'))) {
+          return makeRule('shell-substitution-outside-workspace', `shell substitution references external environment path: ${val}`);
         }
-      }
-      if (/^\/(?:etc|usr|var|tmp|opt|home|root|Users|Library|System|Volumes|proc|sys|dev(?!\/(?:null|stdin|stdout|stderr)\b)|mnt|media|srv|run)(?:\/|$)/.test(val)) {
-        const { resolved: cand, forceOutside } = resolveShellPathForPlatform(val, curWorkdir, workspace, platform, tool);
-        if (forceOutside || !cand || !isInside(cand, workspace, effPlat) || !isInside(realOf(cand), realWorkspace, effPlat)) {
-          return makeRule('shell-substitution-outside-workspace', `shell substitution escapes workspace via external path ${val}`);
+        if (/(?:^|[\\/])\.\.(?:$|[\\/])/.test(val)) {
+          const { resolved: cand, forceOutside } = resolveShellPathForPlatform(val, curWorkdir, workspace, platform, tool);
+          if (forceOutside || !cand || !isInside(cand, workspace, effPlat) || !isInside(realOf(cand), realWorkspace, effPlat)) {
+            return makeRule('shell-substitution-outside-workspace', `shell substitution parent traversal "${val}" escapes workspace`);
+          }
+        }
+        if (/^\/(?:etc|usr|var|tmp|opt|home|root|Users|Library|System|Volumes|proc|sys|dev(?!\/(?:null|stdin|stdout|stderr)\b)|mnt|media|srv|run)(?:\/|$)/.test(val)) {
+          const { resolved: cand, forceOutside } = resolveShellPathForPlatform(val, curWorkdir, workspace, platform, tool);
+          if (forceOutside || !cand || !isInside(cand, workspace, effPlat) || !isInside(realOf(cand), realWorkspace, effPlat)) {
+            return makeRule('shell-substitution-outside-workspace', `shell substitution escapes workspace via external path ${val}`);
+          }
         }
       }
     }
@@ -1008,7 +1618,7 @@ function inspectPosixShellEscapes(command, ctx, depth = 0) {
 
 const SAFE_POSIX_CMD_BIN_RE = /^\/(?:usr\/local\/bin|usr\/bin|bin|opt\/[A-Za-z0-9._-]+\/bin)\/[A-Za-z0-9._+-]+$/;
 const POSIX_SYSTEM_ROOT_PREFIX_RE = /^\/(?:etc|usr|var|tmp|opt|home|root|Users|Library|System|Volumes|proc|sys|dev(?!\/(?:null|stdin|stdout|stderr)\b)|mnt|media|srv|run|sbin|lib|lib64|boot|snap|nix)(?:\/|$)/;
-const NON_NODE_INLINE_INTERPRETER_RE = /\b(?:python3?|perl|ruby|php|lua|deno|bun)\b[^;|&]*?\s(?:-[A-Za-z]*[ceErp]\b|--(?:eval|print)(?:=|\b))|\bfind\b[^;|&]*?\s-(?:exec|execdir|ok|delete)\b/;
+const NON_NODE_INLINE_INTERPRETER_RE = /\b(?:python3?|perl|ruby|php|lua|deno|bun)\b[^;|&]*?\s(?:-[A-Za-z]*[ceErp]\b|--(?:eval|print)(?:=|\b))|\bfind\b[^;|&]*?\s-(?:exec|execdir|ok|delete)\b|\b(?:gawk|mawk|nawk|awk)\b[^;|&]*?(?:\bsystem\s*\(|\bgetline\b|@[ \t]*(?:include|load)\b|\s-(?:f|l)\b|\s--(?:file|load)(?:=|\b))/;
 const ALLOWED_NODE_EVAL_FLAGS = new Set(['--input-type=module', '--input-type=commonjs', '--no-warnings']);
 const NODE_EVAL_FORBIDDEN_RE = /\b(?:process|globalThis|global|require|module|exports|eval|Function|Reflect|Proxy|constructor|__proto__|prototype|Buffer|atob|btoa|fromCharCode|fromCodePoint|fetch|WebSocket|Worker|SharedArrayBuffer|Atomics|Deno|Bun|child_process|fs|path|os|net|http|https|tls|dgram|dns|vm|worker_threads|v8|inspector)\b|import\s*\(|import\.meta|\b(?:node|file|data|http|https):/;
 
@@ -1090,7 +1700,8 @@ function hasUnconfinedInlineInterpreter(args, workspace, realWorkspace, platform
       if (tk.type === 'word') segWords.push(tk);
       tIdx++;
     }
-    const { words: strippedSeg, envChdirTokens } = stripLeadingEnvAssignmentsAndPrefixes(segWords);
+    const { words: strippedSeg, envChdirTokens, hasEnvSplitString } = stripLeadingEnvAssignmentsAndPrefixes(segWords);
+    if (hasEnvSplitString) return true;
     for (const chdirTok of envChdirTokens) {
       const { resolved: nextEnvWd } = resolveShellPathForPlatform(chdirTok.value, curWd, workspace, platform, tool);
       if (nextEnvWd) curWd = nextEnvWd;
@@ -1099,6 +1710,10 @@ function hasUnconfinedInlineInterpreter(args, workspace, realWorkspace, platform
 
     const rawExe = strippedSeg[0].value.replace(/\\/g, '/');
     const baseExe = (rawExe.includes('/') ? rawExe.slice(rawExe.lastIndexOf('/') + 1) : rawExe).toLowerCase().replace(/\.exe$/, '');
+    if (isAwkCmd(baseExe)) {
+      const awkInfo = inspectAwkInvocation(strippedSeg.slice(1));
+      if (awkInfo.hasDangerousProgram || awkInfo.hasExternalCodeLoad) return true;
+    }
     if (baseExe === 'node' || baseExe === 'nodejs') {
       const argsOnly = strippedSeg.slice(1).map(t => t.value);
       const hasPreloadOrRepl = argsOnly.some(a => (
@@ -1141,71 +1756,134 @@ function hasUnconfinedInlineInterpreter(args, workspace, realWorkspace, platform
   return false;
 }
 
+const OPTION_ASSIGN_LHS_RE = /^(?:--?[A-Za-z0-9_.:-]+|[A-Za-z_][A-Za-z0-9_.:-]*)$/;
+const OPTION_ASSIGN_PREFIX_RE = /^(?:--?[A-Za-z0-9_.:-]+|[A-Za-z_][A-Za-z0-9_.:-]*)=/;
+
 function extractCandidatePathStrings(val) {
   if (typeof val !== 'string' || !val) return [];
   const out = [val];
+  const pushUnique = s => {
+    if (s && !out.includes(s)) out.push(s);
+  };
+  if (val.startsWith('@') && val.length > 1) {
+    const afterAt = val.slice(1);
+    if (afterAt.startsWith('/') || afterAt.startsWith('~') || afterAt === '..' || /(?:^|[\\/])\.\.(?:$|[\\/])/.test(afterAt) || /^[A-Za-z]:[\\/]/.test(afterAt)) {
+      pushUnique(afterAt);
+    }
+  }
   const eqIdx = val.indexOf('=');
-  if (eqIdx > 0 && /^--?[A-Za-z0-9_-]+$|^[A-Za-z_][A-Za-z0-9_]*$/.test(val.slice(0, eqIdx))) {
+  if (eqIdx > 0 && OPTION_ASSIGN_LHS_RE.test(val.slice(0, eqIdx))) {
     const rhs = val.slice(eqIdx + 1);
-    if (rhs) out.push(rhs);
+    if (rhs) {
+      pushUnique(rhs);
+      if (rhs.startsWith('@') && rhs.length > 1) pushUnique(rhs.slice(1));
+      if (rhs.includes(',')) {
+        for (const part of rhs.split(',')) {
+          if (!part) continue;
+          const subEq = part.indexOf('=');
+          if (subEq > 0 && /^[A-Za-z0-9_.:-]+$/.test(part.slice(0, subEq))) {
+            pushUnique(part.slice(subEq + 1));
+          } else if (part.startsWith('/') || part.startsWith('~') || part === '..' || /(?:^|[\\/])\.\.(?:$|[\\/])/.test(part) || /^[A-Za-z]:[\\/]/.test(part)) {
+            pushUnique(part);
+          }
+        }
+      }
+    }
+    return out;
+  }
+  if (val.startsWith('-') && val.includes(',')) {
+    for (const part of val.split(',')) {
+      if (!part) continue;
+      const subEq = part.indexOf('=');
+      if (subEq > 0 && /^--?[A-Za-z0-9_.:-]+$|^[A-Za-z0-9_.:-]+$/.test(part.slice(0, subEq))) {
+        pushUnique(part.slice(subEq + 1));
+      } else if (part.startsWith('/') || part.startsWith('~') || part === '..' || /(?:^|[\\/])\.\.(?:$|[\\/])/.test(part) || /^[A-Za-z]:[\\/]/.test(part)) {
+        pushUnique(part);
+      }
+    }
+  }
+  if (val.startsWith('-') && !val.startsWith('--') && val.length > 2) {
+    if (/^-[A-Za-z]/.test(val)) {
+      const rest = val.slice(2);
+      if (
+        rest.includes('/')
+        || rest.includes('\\')
+        || rest === '~'
+        || rest.startsWith('~')
+        || rest === '..'
+        || /(?:^|[\\/])\.\.(?:$|[\\/])/.test(rest)
+        || /^[A-Za-z]:[\\/]/.test(rest)
+      ) {
+        pushUnique(rest);
+      }
+    }
+    const clustered = /^-[A-Za-z]{2,}(\/.*|\.\.(?:[\\/].*)?|~(?:[\\/].*)?|[A-Za-z]:[\\/].*)$/.exec(val);
+    if (clustered) {
+      pushUnique(clustered[1]);
+    }
   }
   return out;
 }
 
-function inspectShellSandboxConfinement(args, workspace, realWorkspace, config, platform, realOf, tool = 'pwsh', fsImpl = null) {
-  if (!args || typeof args !== 'object') return { confined: false, reason: 'missing shell arguments' };
+function inspectShellSandboxConfinement(args, workspace, realWorkspace, config, platform, realOf, tool = 'pwsh', fsImpl = null, actor = null) {
+  if (!args || typeof args !== 'object') return { confined: false, hardDenyInDirectExec: true, reason: 'missing shell arguments' };
   if (args.sandbox_permissions !== undefined || args.escalate === true) {
-    return { confined: false, reason: `shell requests sandbox_permissions="${args.sandbox_permissions ?? 'escalated'}"` };
+    return { confined: false, hardDenyInDirectExec: true, reason: `shell requests sandbox_permissions="${args.sandbox_permissions ?? 'escalated'}"` };
   }
   let effectiveWorkdir = workspace;
   const rawWorkdir = args.workdir ?? args.cwd;
   if (rawWorkdir !== undefined) {
     if (typeof rawWorkdir !== 'string' || !rawWorkdir.trim()) {
-      return { confined: false, reason: 'invalid shell workdir' };
+      return { confined: false, hardDenyInDirectExec: true, reason: 'invalid shell workdir' };
     }
     const resolvedWd = resolvePath(rawWorkdir, workspace, platform);
     if (resolvedWd === null || !isInside(resolvedWd, workspace, platform) || !isInside(realOf(resolvedWd), realWorkspace, platform)) {
-      return { confined: false, reason: `shell workdir leaves workspace: ${rawWorkdir}` };
+      return { confined: false, hardDenyInDirectExec: true, reason: `shell workdir leaves workspace: ${rawWorkdir}` };
     }
     effectiveWorkdir = resolvedWd;
   }
 
   const command = typeof args.command === 'string' ? args.command : '';
-  if (!command.trim()) return { confined: false, reason: 'empty shell command' };
+  if (!command.trim()) return { confined: false, hardDenyInDirectExec: true, reason: 'empty shell command' };
 
   const treatBacktick = tool === 'bash' || platform !== 'win32';
   const scanned = scanPosixShell(command, { treatBacktickAsSubstitution: treatBacktick });
   const decodedSummary = scanned.tokens.filter(t => t.type === 'word').map(t => t.value).join(' ');
 
   if (UNC_PATH_RE.test(command) || UNC_PATH_RE.test(decodedSummary)) {
-    return { confined: false, reason: 'shell command references UNC network path' };
+    return { confined: false, hardDenyInDirectExec: true, reason: 'shell command references UNC network path' };
   }
   if (SHELL_EXTERNAL_ENV_RE.test(command)) {
-    return { confined: false, reason: 'shell command references external host/user/temp environment directory' };
+    return { confined: false, hardDenyInDirectExec: true, reason: 'shell command references external host/user/temp environment directory' };
   }
   if (SHELL_NETWORK_OR_REMOTE_RE.test(command) || SHELL_NETWORK_OR_REMOTE_RE.test(decodedSummary)) {
-    return { confined: false, reason: 'shell command performs network, remote, or package-registry operation' };
+    return { confined: false, hardDenyInDirectExec: true, reason: 'shell command performs network, remote, or package-registry operation' };
   }
   if (SHELL_SYSTEM_OR_OBFUSCATED_RE.test(command) || SHELL_SYSTEM_OR_OBFUSCATED_RE.test(decodedSummary)) {
-    return { confined: false, reason: 'shell command touches host process/system/registry state or dynamic eval' };
+    return { confined: false, hardDenyInDirectExec: true, reason: 'shell command touches host process/system/registry state or dynamic eval' };
   }
   if (SHELL_DESTRUCTIVE_OR_PROTECTED_RE.test(command) || SHELL_DESTRUCTIVE_OR_PROTECTED_RE.test(decodedSummary)) {
-    return { confined: false, reason: 'shell command performs file deletion, protected-dir access, or git history mutation' };
+    return { confined: false, hardDenyInDirectExec: true, reason: 'shell command performs file deletion, protected-dir access, or git history mutation' };
   }
 
   if (scanned.substitutions.length > 0) {
-    return { confined: false, reason: 'shell command uses command or process substitution requiring safety gate review' };
+    const hasProcSub = scanned.substitutions.some(s => s.kind === 'proc_sub');
+    return {
+      confined: false,
+      hardDenyInDirectExec: hasProcSub,
+      reason: 'shell command uses command or process substitution requiring safety gate review',
+    };
   }
   if (scanned.tokens.some(t => t.type === 'bg')) {
-    return { confined: false, reason: 'shell command spawns background process via "&"' };
+    return { confined: false, hardDenyInDirectExec: true, reason: 'shell command spawns background process via "&"' };
   }
   for (const tok of scanned.tokens) {
     if (tok.type !== 'word') continue;
-    if (tok.hasTildePrefix || tok.hasExternalEnv || tok.hasDynamicParam || tok.hasAnsiCQuote) {
-      return { confined: false, reason: `shell command uses tilde/dynamic/ANSI-C expansion requiring review: ${tok.raw ?? tok.value}` };
+    if (tok.hasTildePrefix || tok.hasExternalEnv || tok.hasDynamicParam || tok.hasAnsiCQuote || tok.hasBraceExpansion) {
+      return { confined: false, hardDenyInDirectExec: true, reason: `shell command uses tilde/dynamic/brace/ANSI-C expansion requiring review: ${tok.raw ?? tok.value}` };
     }
     if (tok.value === 'ln' || tok.value.endsWith('/ln')) {
-      return { confined: false, reason: 'shell link creation requires safety gate review' };
+      return { confined: false, hardDenyInDirectExec: true, reason: 'shell link creation requires safety gate review' };
     }
   }
 
@@ -1213,6 +1891,12 @@ function inspectShellSandboxConfinement(args, workspace, realWorkspace, config, 
   const realGlobals = globals.map(realOf);
   const protectedDirs = (config?.paths?.protectedDirs ?? []).map(d => resolvePath(d, workspace, platform)).filter(Boolean);
   const realProtectedDirs = protectedDirs.map(realOf);
+  const protectedEntries = (config?.paths?.protectedDirs ?? []).map(d => {
+    try { return normalizeGlob(d, platform); } catch { return null; }
+  }).filter(Boolean);
+  const actorWriteScope = (actor && (actor.role === 'member' || actor.role === 'direct_exec') && Array.isArray(actor.writeScope))
+    ? actor.writeScope
+    : [];
 
   const posixEscape = inspectPosixShellEscapes(command, {
     workspace,
@@ -1220,6 +1904,8 @@ function inspectShellSandboxConfinement(args, workspace, realWorkspace, config, 
     effectiveWorkdir,
     protectedDirs,
     realProtectedDirs,
+    protectedEntries,
+    writeScope: actorWriteScope,
     globals,
     realGlobals,
     platform,
@@ -1228,7 +1914,7 @@ function inspectShellSandboxConfinement(args, workspace, realWorkspace, config, 
     isDirectExec: false,
   });
   if (posixEscape) {
-    return { confined: false, reason: posixEscape.reason };
+    return { confined: false, hardDenyInDirectExec: true, reason: posixEscape.reason };
   }
 
   const checkWin32Drive = platform === 'win32' || tool === 'pwsh';
@@ -1239,23 +1925,53 @@ function inspectShellSandboxConfinement(args, workspace, realWorkspace, config, 
       const candidate = resolvePath(wm[1], effectiveWorkdir, 'win32');
       const wsWin = resolvePath(workspace, undefined, 'win32');
       if (!candidate || !wsWin || !isInside(candidate, wsWin, 'win32')) {
-        return { confined: false, reason: `shell command references external path ${wm[1]}` };
+        return { confined: false, hardDenyInDirectExec: true, reason: `shell command references external path ${wm[1]}` };
       }
     }
   }
   const effPlat = (platform === 'win32' && tool !== 'bash') ? 'win32' : (platform === 'win32' ? 'win32' : platform);
   const posixCheckPlat = platform !== 'win32' ? platform : 'linux';
 
+  const checkProtectedPathOrWildcard = (candStr, baseWd) => {
+    if (!candStr || candStr.startsWith('-') || OPTION_ASSIGN_PREFIX_RE.test(candStr) || /^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(candStr)) {
+      return null;
+    }
+    const { resolved, forceOutside } = resolveShellPathForPlatform(candStr, baseWd, workspace, platform, tool);
+    if (forceOutside || !resolved || !isInside(resolved, workspace, effPlat)) return null;
+    const realCand = realOf(resolved);
+    if (protectedDirs.some(d => d && isInside(resolved, d, effPlat)) || realProtectedDirs.some(d => d && isInside(realCand, d, effPlat))) {
+      return { confined: false, hardDenyInDirectExec: true, reason: `shell command accesses protected path: ${candStr}` };
+    }
+    if (hasGlobWildcard(candStr) && protectedEntries.length > 0) {
+      const relCand = relativeInside(workspace, resolved, effPlat);
+      if (relCand) {
+        try {
+          const normCand = normalizeGlob(relCand, effPlat);
+          if (protectedEntries.some(d => anyGlobOverlaps([normCand], [d, `${d}/**`], effPlat))) {
+            return { confined: false, hardDenyInDirectExec: true, reason: `shell command wildcard "${candStr}" overlaps protected path` };
+          }
+        } catch {}
+      }
+    }
+    return null;
+  };
+
   const checkWordTokenAtWd = (wTok, baseWd, isCmdExecutable, strippedCmdVal) => {
     for (const candStr of extractCandidatePathStrings(wTok.value)) {
       if (isSafeNullSink(candStr)) continue;
+
+      if (candStr === '~' || (candStr.startsWith('~') && !candStr.startsWith('~+'))) {
+        return { confined: false, hardDenyInDirectExec: true, reason: `shell command references external home/tilde path ${candStr}` };
+      }
 
       if (checkWin32Drive && /^[A-Za-z]:[\\/]/.test(candStr)) {
         const candidate = resolvePath(candStr, baseWd, 'win32');
         const wsWin = resolvePath(workspace, undefined, 'win32');
         if (!candidate || !wsWin || !isInside(candidate, wsWin, 'win32')) {
-          return { confined: false, reason: `shell command references external path ${candStr}` };
+          return { confined: false, hardDenyInDirectExec: true, reason: `shell command references external path ${candStr}` };
         }
+        const protWin = checkProtectedPathOrWildcard(candStr, baseWd);
+        if (protWin) return protWin;
         continue;
       }
 
@@ -1263,8 +1979,10 @@ function inspectShellSandboxConfinement(args, workspace, realWorkspace, config, 
       if (/(?:^|[\\/])\.\.(?:$|[\\/])/.test(candStr)) {
         const { resolved: resolvedRel, forceOutside } = resolveShellPathForPlatform(candStr, baseWd, workspace, platform, tool);
         if (forceOutside || !resolvedRel || !isInside(resolvedRel, workspace, effPlat) || !isInside(realOf(resolvedRel), realWorkspace, effPlat)) {
-          return { confined: false, reason: `shell command parent traversal "${candStr}" escapes workspace` };
+          return { confined: false, hardDenyInDirectExec: true, reason: `shell command parent traversal "${candStr}" escapes workspace` };
         }
+        const protRel = checkProtectedPathOrWildcard(candStr, baseWd);
+        if (protRel) return protRel;
         continue;
       }
 
@@ -1284,21 +2002,29 @@ function inspectShellSandboxConfinement(args, workspace, realWorkspace, config, 
           const wsCheck = resolvePath(workspace, undefined, checkPlat);
           const candCheck = forceOutside ? null : (candidate ?? resolvePath(candStr, baseWd, checkPlat));
           if (!candCheck || !wsCheck || !isInside(candCheck, wsCheck, checkPlat)) {
-            // On POSIX, ignore synthetic URL routes / CLI option values (e.g. `--base=/app`, `"/api/v1/users"`)
+            // On POSIX, ignore synthetic URL routes / long CLI option values (e.g. `--base=/app`, `"/api/v1/users"`)
             // ONLY when neither the path nor its top-level mount/directory actually exists on disk!
-            if (!isSystemRootPrefix && platform !== 'win32' && (wTok.value.startsWith('-') || wTok.quoted)) {
+            if (!isSystemRootPrefix && platform !== 'win32' && (wTok.value.startsWith('--') || wTok.quoted || /^-[A-Za-z]{2,}\//.test(wTok.value))) {
               const topSeg = '/' + candStr.slice(1).split('/')[0];
               const targetOrTopExists = inputFsExists(candCheck ?? candStr, fsImpl, realOf)
                 || inputFsExists(topSeg, fsImpl, realOf);
               if (!targetOrTopExists) continue;
             }
-            return { confined: false, reason: `shell command references external path ${candStr}` };
+            return { confined: false, hardDenyInDirectExec: true, reason: `shell command references external path ${candStr}` };
           }
           if (platform !== 'win32' && !isInside(realOf(candCheck), realWorkspace, platform)) {
-            return { confined: false, reason: `shell command path resolves via symlink outside workspace: ${candStr}` };
+            return { confined: false, hardDenyInDirectExec: true, reason: `shell command path resolves via symlink outside workspace: ${candStr}` };
           }
+          const protAbs = checkProtectedPathOrWildcard(candStr, baseWd);
+          if (protAbs) return protAbs;
         }
         continue;
+      }
+
+      // Check custom protectedDirs & shell wildcards overlapping protectedDirs (e.g. `.gi?/hooks/...`, `.github/...`)
+      if (!isCmdExecutable) {
+        const protHit = checkProtectedPathOrWildcard(candStr, baseWd);
+        if (protHit) return protHit;
       }
 
       // Relative path inside workspace (including non-ASCII / Chinese filenames & symlinks!):
@@ -1306,7 +2032,7 @@ function inspectShellSandboxConfinement(args, workspace, realWorkspace, config, 
       if (
         platform !== 'win32'
         && !candStr.startsWith('-')
-        && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(candStr)
+        && !OPTION_ASSIGN_PREFIX_RE.test(candStr)
         && !/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(candStr)
         && (candStr.includes('/') || candStr !== strippedCmdVal || !SAFE_POSIX_BARE_CMD_RE.test(candStr))
       ) {
@@ -1314,7 +2040,7 @@ function inspectShellSandboxConfinement(args, workspace, realWorkspace, config, 
         if (relCand && isInside(relCand, workspace, platform)) {
           const realRelCand = realOf(relCand);
           if (!isInside(realRelCand, realWorkspace, platform)) {
-            return { confined: false, reason: `shell command accesses symlink resolving outside workspace: ${candStr}` };
+            return { confined: false, hardDenyInDirectExec: true, reason: `shell command accesses symlink resolving outside workspace: ${candStr}` };
           }
         }
       }
@@ -1322,21 +2048,540 @@ function inspectShellSandboxConfinement(args, workspace, realWorkspace, config, 
     return null;
   };
 
+  const isExistingDir = absPath => {
+    if (!absPath || !fsImpl || typeof fsImpl.statSync !== 'function') return false;
+    try { return fsImpl.statSync(absPath).isDirectory(); } catch { return false; }
+  };
+
+  const isDestProvablyInsideWriteScope = (destTok, baseWd, isDirectoryDest = false) => {
+    if (!destTok || typeof destTok.value !== 'string') return false;
+    const rawVal = destTok.value;
+    if (isSafeNullSink(rawVal) || rawVal.trim().toLowerCase() === '$null') return true;
+    if (destTok.hasSubstitution || destTok.hasDynamicParam || destTok.hasBraceExpansion || destTok.hasTildePrefix || destTok.hasExternalEnv) return false;
+    const { resolved, forceOutside } = resolveShellPathForPlatform(rawVal, baseWd, workspace, platform, tool);
+    if (forceOutside || !resolved || !isInside(resolved, workspace, effPlat)) return false;
+    const realResolved = realOf(resolved);
+    if (!isInside(realResolved, realWorkspace, effPlat)) return false;
+    const rel = relativeInside(workspace, resolved, effPlat);
+    const realRel = relativeInside(realWorkspace, realResolved, effPlat);
+    if (rel === null || realRel === null) return false;
+    if (hasGlobWildcard(rawVal)) {
+      const parentDir = api(effPlat).dirname(resolved);
+      const parentRel = isInside(parentDir, workspace, effPlat) ? relativeInside(workspace, parentDir, effPlat) : null;
+      if (parentRel === null || hasGlobWildcard(parentRel)) return false;
+      const probe = parentRel ? `${parentRel}/__wildcard_dest_probe__` : '__wildcard_dest_probe__';
+      return matchesAnyGlob(probe, actorWriteScope, effPlat);
+    }
+    if (isDirectoryDest || rawVal.endsWith('/') || rawVal.endsWith('\\') || isExistingDir(resolved)) {
+      const probe = rel ? `${rel}/__dir_dest_probe__` : '__dir_dest_probe__';
+      const realProbe = realRel ? `${realRel}/__dir_dest_probe__` : '__dir_dest_probe__';
+      return matchesAnyGlob(probe, actorWriteScope, effPlat) && matchesAnyGlob(realProbe, actorWriteScope, effPlat);
+    }
+    return matchesAnyGlob(rel, actorWriteScope, effPlat) && matchesAnyGlob(realRel, actorWriteScope, effPlat);
+  };
+
+  const checkMutatingCommandWriteScope = (cBase, strippedSeg, cmdExecWd) => {
+    if (actorWriteScope.length === 0) return null;
+    const lowerCmd = cBase.toLowerCase().replace(/\.exe$/, '');
+    const cmdArgs = strippedSeg.slice(1);
+
+    if (lowerCmd === 'tee') {
+      let afterDD = false;
+      for (const argTok of cmdArgs) {
+        if (!afterDD && argTok.value === '--') { afterDD = true; continue; }
+        if (!afterDD && argTok.value.startsWith('-') && argTok.value.length > 1) continue;
+        if (argTok.value === '-') continue;
+        if (!isDestProvablyInsideWriteScope(argTok, cmdExecWd, false)) {
+          return { confined: false, hardDenyInDirectExec: true, reason: `tee destination "${argTok.value}" is outside granted write_scope` };
+        }
+      }
+      return null;
+    }
+
+    if (lowerCmd === 'cp' || lowerCmd === 'mv' || lowerCmd === 'install') {
+      let targetDirTok = null;
+      let isInstallDir = false;
+      let afterDD = false;
+      const positional = [];
+      for (let a = 0; a < cmdArgs.length; a++) {
+        const v = cmdArgs[a].value;
+        if (!afterDD && v === '--') { afterDD = true; continue; }
+        if (!afterDD && (v === '-t' || v === '--target-directory')) { targetDirTok = cmdArgs[++a] ?? null; continue; }
+        if (!afterDD && v.startsWith('--target-directory=')) { targetDirTok = { ...cmdArgs[a], value: v.slice('--target-directory='.length) }; continue; }
+        if (!afterDD && v.startsWith('-t') && v.length > 2 && !v.startsWith('--')) { targetDirTok = { ...cmdArgs[a], value: v.slice(2) }; continue; }
+        if (!afterDD && lowerCmd === 'install' && (v === '-d' || v === '--directory' || (/^-[A-Za-z]+$/.test(v) && v.includes('d')))) { isInstallDir = true; continue; }
+        if (!afterDD && (v === '-S' || v === '--suffix' || (lowerCmd === 'install' && (v === '-m' || v === '--mode' || v === '-o' || v === '--owner' || v === '-g' || v === '--group' || v === '-B')))) { a++; continue; }
+        if (!afterDD && v.startsWith('-') && v.length > 1) continue;
+        positional.push(cmdArgs[a]);
+      }
+      if (isInstallDir) {
+        if (positional.length === 0) return { confined: false, hardDenyInDirectExec: true, reason: 'install -d requires explicit destination inside write_scope' };
+        for (const pTok of positional) {
+          if (!isDestProvablyInsideWriteScope(pTok, cmdExecWd, false)) {
+            return { confined: false, hardDenyInDirectExec: true, reason: `install destination "${pTok.value}" is outside granted write_scope` };
+          }
+        }
+        return null;
+      }
+      if (targetDirTok) {
+        if (!isDestProvablyInsideWriteScope(targetDirTok, cmdExecWd, true)) {
+          return { confined: false, hardDenyInDirectExec: true, reason: `${lowerCmd} target directory "${targetDirTok.value}" is outside granted write_scope` };
+        }
+        return null;
+      }
+      if (positional.length < 2) {
+        return { confined: false, hardDenyInDirectExec: true, reason: `${lowerCmd} destination cannot be verified against write_scope` };
+      }
+      const destTok = positional[positional.length - 1];
+      if (!isDestProvablyInsideWriteScope(destTok, cmdExecWd, positional.length > 2)) {
+        return { confined: false, hardDenyInDirectExec: true, reason: `${lowerCmd} destination "${destTok.value}" is outside granted write_scope` };
+      }
+      return null;
+    }
+
+    if (lowerCmd === 'sed' || lowerCmd === 'gsed') {
+      let hasInPlace = false;
+      let hasExplicitScript = false;
+      let inPlaceSuffix = '';
+      let afterDD = false;
+      const positional = [];
+      for (let a = 0; a < cmdArgs.length; a++) {
+        const v = cmdArgs[a].value;
+        if (!afterDD && v === '--') { afterDD = true; continue; }
+        if (!afterDD && (v === '-e' || v === '--expression' || v === '-f' || v === '--file')) { hasExplicitScript = true; a++; continue; }
+        if (!afterDD && (v.startsWith('--expression=') || v.startsWith('--file=') || (/^-[ef].+/.test(v)))) { hasExplicitScript = true; continue; }
+        const mCluster = !afterDD ? /^-[nErsuz]*i(.*)$/.exec(v) : null;
+        if (!afterDD && (v === '--in-place' || v.startsWith('--in-place=') || mCluster)) {
+          hasInPlace = true;
+          if (v === '-i' && cmdArgs[a + 1]?.value === '') {
+            a++;
+          } else if (v.startsWith('--in-place=')) {
+            inPlaceSuffix = v.slice('--in-place='.length);
+          } else if (mCluster && mCluster[1] && !/^[nErsuz]+$/.test(mCluster[1])) {
+            inPlaceSuffix = mCluster[1];
+          }
+          continue;
+        }
+        if (!afterDD && v.startsWith('-') && v.length > 1) continue;
+        positional.push(cmdArgs[a]);
+      }
+      if (hasInPlace) {
+        const targetFiles = hasExplicitScript ? positional : positional.slice(1);
+        if (targetFiles.length === 0) {
+          return { confined: false, hardDenyInDirectExec: true, reason: 'sed -i requires explicit target file inside write_scope' };
+        }
+        for (const fTok of targetFiles) {
+          if (!isDestProvablyInsideWriteScope(fTok, cmdExecWd, false)) {
+            return { confined: false, hardDenyInDirectExec: true, reason: `sed -i target "${fTok.value}" is outside granted write_scope` };
+          }
+          if (inPlaceSuffix && !isDestProvablyInsideWriteScope({ ...fTok, value: `${fTok.value}${inPlaceSuffix}` }, cmdExecWd, false)) {
+            return { confined: false, hardDenyInDirectExec: true, reason: `sed -i backup "${fTok.value}${inPlaceSuffix}" is outside granted write_scope` };
+          }
+        }
+      }
+      return null;
+    }
+
+    if (isAwkCmd(lowerCmd)) {
+      const awkInfo = inspectAwkInvocation(cmdArgs);
+      if (awkInfo.hasInPlace) {
+        if (awkInfo.inputFileToks.length === 0) {
+          return { confined: false, hardDenyInDirectExec: true, reason: `${lowerCmd} -i inplace requires explicit target file inside write_scope` };
+        }
+        for (const fTok of awkInfo.inputFileToks) {
+          if (!isDestProvablyInsideWriteScope(fTok, cmdExecWd, false)) {
+            return { confined: false, hardDenyInDirectExec: true, reason: `${lowerCmd} -i inplace target "${fTok.value}" is outside granted write_scope` };
+          }
+          if (awkInfo.inplaceSuffix && !isDestProvablyInsideWriteScope({ ...fTok, value: `${fTok.value}${awkInfo.inplaceSuffix}` }, cmdExecWd, false)) {
+            return { confined: false, hardDenyInDirectExec: true, reason: `${lowerCmd} -i inplace backup "${fTok.value}${awkInfo.inplaceSuffix}" is outside granted write_scope` };
+          }
+        }
+      }
+      return null;
+    }
+
+    if (lowerCmd === 'dd') {
+      for (let a = 0; a < cmdArgs.length; a++) {
+        const v = cmdArgs[a].value;
+        let outTok = null;
+        if (v.startsWith('of=')) {
+          outTok = { ...cmdArgs[a], value: v.slice(3) };
+        } else if (v.startsWith('--output=')) {
+          outTok = { ...cmdArgs[a], value: v.slice('--output='.length) };
+        } else if (v === '--output' || v === '-o') {
+          outTok = cmdArgs[++a] ?? null;
+        }
+        if (outTok !== null && (!outTok.value || !isDestProvablyInsideWriteScope(outTok, cmdExecWd, false))) {
+          return { confined: false, hardDenyInDirectExec: true, reason: `dd output "${outTok?.value ?? ''}" is outside granted write_scope` };
+        }
+      }
+      return null;
+    }
+
+    if (lowerCmd === 'rsync') {
+      const RSYNC_ARG_FLAGS = new Set([
+        '-f', '-T', '-S', '-B', '-M', '--exclude', '--include', '--exclude-from', '--include-from',
+        '--files-from', '--filter', '--chmod', '--chown', '--usermap', '--groupmap', '--port',
+        '--sockopts', '--out-format', '--log-file-format', '--password-file', '--bwlimit',
+        '--max-size', '--min-size', '--compare-dest', '--copy-dest', '--link-dest',
+        '--compress-level', '--skip-compress', '--suffix', '--iconv', '--timeout',
+        '--contimeout', '--address', '--protocol', '--checksum-seed', '--block-size', '--max-alloc',
+      ]);
+      const extraWriteToks = [];
+      const positional = [];
+      let afterDD = false;
+      for (let a = 0; a < cmdArgs.length; a++) {
+        const v = cmdArgs[a].value;
+        if (!afterDD && v === '--') { afterDD = true; continue; }
+        if (!afterDD && (v === '-e' || v === '--rsh' || v.startsWith('--rsh=') || (v.startsWith('-e') && v.length > 2 && !v.startsWith('--')))) {
+          return { confined: false, hardDenyInDirectExec: true, reason: 'rsync remote shell option requires safety gate review' };
+        }
+        if (!afterDD && (v === '--log-file' || v === '--temp-dir' || v === '--backup-dir')) {
+          extraWriteToks.push({ tok: cmdArgs[++a] ?? null, isDir: v !== '--log-file' });
+          continue;
+        }
+        if (!afterDD && (v.startsWith('--log-file=') || v.startsWith('--temp-dir=') || v.startsWith('--backup-dir='))) {
+          const eq = v.indexOf('=');
+          extraWriteToks.push({ tok: { ...cmdArgs[a], value: v.slice(eq + 1) }, isDir: !v.startsWith('--log-file=') });
+          continue;
+        }
+        if (!afterDD && v === '-T') {
+          extraWriteToks.push({ tok: cmdArgs[++a] ?? null, isDir: true });
+          continue;
+        }
+        if (!afterDD && v.startsWith('-T') && v.length > 2 && !v.startsWith('--')) {
+          extraWriteToks.push({ tok: { ...cmdArgs[a], value: v.slice(2) }, isDir: true });
+          continue;
+        }
+        if (!afterDD && RSYNC_ARG_FLAGS.has(v)) { a++; continue; }
+        if (!afterDD && v.startsWith('-') && v.length > 1) continue;
+        if (/^[A-Za-z0-9._@-]+:/.test(v) && !/^[A-Za-z]:[\\/]/.test(v)) {
+          return { confined: false, hardDenyInDirectExec: true, reason: 'rsync remote host specification requires safety gate review' };
+        }
+        positional.push(cmdArgs[a]);
+      }
+      for (const ew of extraWriteToks) {
+        if (!ew.tok || !isDestProvablyInsideWriteScope(ew.tok, cmdExecWd, ew.isDir)) {
+          return { confined: false, hardDenyInDirectExec: true, reason: `rsync auxiliary output "${ew.tok?.value ?? ''}" is outside granted write_scope` };
+        }
+      }
+      if (positional.length < 2) {
+        return { confined: false, hardDenyInDirectExec: true, reason: 'rsync destination cannot be verified against write_scope' };
+      }
+      const destTok = positional[positional.length - 1];
+      if (!isDestProvablyInsideWriteScope(destTok, cmdExecWd, positional.length > 2)) {
+        return { confined: false, hardDenyInDirectExec: true, reason: `rsync destination "${destTok.value}" is outside granted write_scope` };
+      }
+      return null;
+    }
+
+    if (lowerCmd === 'touch') {
+      let afterDD = false;
+      const positional = [];
+      for (let a = 0; a < cmdArgs.length; a++) {
+        const v = cmdArgs[a].value;
+        if (!afterDD && v === '--') { afterDD = true; continue; }
+        if (!afterDD && (v === '-d' || v === '--date' || v === '-r' || v === '--reference' || v === '-t' || v === '--time' || /^-[acfmh]*[drt]$/.test(v))) {
+          a++;
+          continue;
+        }
+        if (!afterDD && v.startsWith('-') && v.length > 1) continue;
+        positional.push(cmdArgs[a]);
+      }
+      if (positional.length === 0) {
+        return { confined: false, hardDenyInDirectExec: true, reason: 'touch requires explicit target file inside write_scope' };
+      }
+      for (const fTok of positional) {
+        if (!isDestProvablyInsideWriteScope(fTok, cmdExecWd, false)) {
+          return { confined: false, hardDenyInDirectExec: true, reason: `touch destination "${fTok.value}" is outside granted write_scope` };
+        }
+      }
+      return null;
+    }
+
+    if (lowerCmd === 'mkdir') {
+      let afterDD = false;
+      const positional = [];
+      for (let a = 0; a < cmdArgs.length; a++) {
+        const v = cmdArgs[a].value;
+        if (!afterDD && v === '--') { afterDD = true; continue; }
+        if (!afterDD && (v === '-m' || v === '--mode' || /^-[pvZ]*m$/.test(v))) {
+          a++;
+          continue;
+        }
+        if (!afterDD && v.startsWith('-') && v.length > 1) continue;
+        positional.push(cmdArgs[a]);
+      }
+      if (positional.length === 0) {
+        return { confined: false, hardDenyInDirectExec: true, reason: 'mkdir requires explicit target directory inside write_scope' };
+      }
+      for (const dTok of positional) {
+        if (!isDestProvablyInsideWriteScope(dTok, cmdExecWd, true)) {
+          return { confined: false, hardDenyInDirectExec: true, reason: `mkdir destination "${dTok.value}" is outside granted write_scope` };
+        }
+      }
+      return null;
+    }
+
+    if (lowerCmd === 'truncate') {
+      let afterDD = false;
+      const positional = [];
+      for (let a = 0; a < cmdArgs.length; a++) {
+        const v = cmdArgs[a].value;
+        if (!afterDD && v === '--') { afterDD = true; continue; }
+        if (!afterDD && (v === '-s' || v === '--size' || v === '-r' || v === '--reference' || /^-[co]*[sr]$/.test(v))) {
+          a++;
+          continue;
+        }
+        if (!afterDD && v.startsWith('-') && v.length > 1) continue;
+        positional.push(cmdArgs[a]);
+      }
+      if (positional.length === 0) {
+        return { confined: false, hardDenyInDirectExec: true, reason: 'truncate requires explicit target file inside write_scope' };
+      }
+      for (const fTok of positional) {
+        if (!isDestProvablyInsideWriteScope(fTok, cmdExecWd, false)) {
+          return { confined: false, hardDenyInDirectExec: true, reason: `truncate destination "${fTok.value}" is outside granted write_scope` };
+        }
+      }
+      return null;
+    }
+
+    if (lowerCmd === 'tar') {
+      let isExtract = false;
+      let isCreateOrAppend = false;
+      let toStdout = false;
+      let archiveTok = null;
+      const dirToks = [];
+      let afterDD = false;
+      for (let a = 0; a < cmdArgs.length; a++) {
+        const v = cmdArgs[a].value;
+        if (!afterDD && v === '--') { afterDD = true; continue; }
+        if (a === 0 && !afterDD && !v.startsWith('-') && /^[A-Za-z0-9]+$/.test(v)) {
+          if (v.includes('x')) isExtract = true;
+          if (v.includes('c') || v.includes('r') || v.includes('u')) isCreateOrAppend = true;
+          if (v.includes('O')) toStdout = true;
+          for (const ch of v) {
+            if (ch === 'f') archiveTok = cmdArgs[++a] ?? null;
+            else if (ch === 'C') dirToks.push(cmdArgs[++a] ?? { value: '' });
+          }
+          continue;
+        }
+        if (!afterDD && (v === '--extract' || v === '--get')) { isExtract = true; continue; }
+        if (!afterDD && (v === '--create' || v === '--append' || v === '--update')) { isCreateOrAppend = true; continue; }
+        if (!afterDD && v === '--to-stdout') { toStdout = true; continue; }
+        if (!afterDD && (v === '-C' || v === '--directory')) { dirToks.push(cmdArgs[++a] ?? { value: '' }); continue; }
+        if (!afterDD && v.startsWith('--directory=')) { dirToks.push({ ...cmdArgs[a], value: v.slice('--directory='.length) }); continue; }
+        if (!afterDD && (v === '-f' || v === '--file')) { archiveTok = cmdArgs[++a] ?? null; continue; }
+        if (!afterDD && v.startsWith('--file=')) { archiveTok = { ...cmdArgs[a], value: v.slice('--file='.length) }; continue; }
+        if (!afterDD && v.startsWith('-') && !v.startsWith('--') && v.length > 1) {
+          for (let k = 1; k < v.length; k++) {
+            const ch = v[k];
+            if (ch === 'x') isExtract = true;
+            else if (ch === 'c' || ch === 'r' || ch === 'u') isCreateOrAppend = true;
+            else if (ch === 'O') toStdout = true;
+            else if (ch === 'f') {
+              archiveTok = k + 1 < v.length ? { ...cmdArgs[a], value: v.slice(k + 1) } : (cmdArgs[++a] ?? null);
+              break;
+            } else if (ch === 'C') {
+              dirToks.push(k + 1 < v.length ? { ...cmdArgs[a], value: v.slice(k + 1) } : (cmdArgs[++a] ?? { value: '' }));
+              break;
+            }
+          }
+          continue;
+        }
+      }
+      if (isExtract && !toStdout) {
+        if (dirToks.length === 0) {
+          if (!isDestProvablyInsideWriteScope({ value: '.' }, cmdExecWd, true)) {
+            return { confined: false, hardDenyInDirectExec: true, reason: 'tar extraction into working directory is outside granted write_scope' };
+          }
+        } else {
+          let curTarWd = cmdExecWd;
+          for (const dTok of dirToks) {
+            if (!dTok.value || !isDestProvablyInsideWriteScope(dTok, curTarWd, true)) {
+              return { confined: false, hardDenyInDirectExec: true, reason: `tar extraction directory "${dTok.value}" is outside granted write_scope` };
+            }
+            const { resolved: nextTarWd } = resolveShellPathForPlatform(dTok.value, curTarWd, workspace, platform, tool);
+            if (nextTarWd) curTarWd = nextTarWd;
+          }
+        }
+      }
+      if (isCreateOrAppend && archiveTok && archiveTok.value !== '-') {
+        if (!isDestProvablyInsideWriteScope(archiveTok, cmdExecWd, false)) {
+          return { confined: false, hardDenyInDirectExec: true, reason: `tar output archive "${archiveTok.value}" is outside granted write_scope` };
+        }
+      }
+      return null;
+    }
+
+    if (lowerCmd === 'unzip') {
+      let readOnlyOrStdout = false;
+      let sawArchiveArg = false;
+      let destDirTok = null;
+      let afterDD = false;
+      for (let a = 0; a < cmdArgs.length; a++) {
+        const v = cmdArgs[a].value;
+        if (!afterDD && v === '--') { afterDD = true; continue; }
+        if (!afterDD && v === '-d') {
+          destDirTok = cmdArgs[++a] ?? { value: '' };
+          continue;
+        }
+        if (!afterDD && v.startsWith('-d') && v.length > 2 && !v.startsWith('--')) {
+          destDirTok = { ...cmdArgs[a], value: v.slice(2) };
+          continue;
+        }
+        if (!afterDD && !sawArchiveArg && v.startsWith('-') && v.length > 1) {
+          if (v.startsWith('-Z') || /[ltpc]/.test(v.slice(1))) readOnlyOrStdout = true;
+          continue;
+        }
+        if (!v.startsWith('-') || afterDD) sawArchiveArg = true;
+      }
+      if (!readOnlyOrStdout) {
+        const targetDir = destDirTok ?? { value: '.' };
+        if (!targetDir.value || !isDestProvablyInsideWriteScope(targetDir, cmdExecWd, true)) {
+          return { confined: false, hardDenyInDirectExec: true, reason: `unzip extraction directory "${targetDir.value}" is outside granted write_scope` };
+        }
+      }
+      return null;
+    }
+
+    if (lowerCmd === 'patch') {
+      let outTok = null;
+      let dirTok = null;
+      let afterDD = false;
+      const positional = [];
+      for (let a = 0; a < cmdArgs.length; a++) {
+        const v = cmdArgs[a].value;
+        if (!afterDD && v === '--') { afterDD = true; continue; }
+        if (!afterDD && (v === '-o' || v === '--output')) { outTok = cmdArgs[++a] ?? null; continue; }
+        if (!afterDD && v.startsWith('--output=')) { outTok = { ...cmdArgs[a], value: v.slice('--output='.length) }; continue; }
+        if (!afterDD && v.startsWith('-o') && v.length > 2 && !v.startsWith('--')) { outTok = { ...cmdArgs[a], value: v.slice(2) }; continue; }
+        if (!afterDD && (v === '-d' || v === '--directory')) { dirTok = cmdArgs[++a] ?? null; continue; }
+        if (!afterDD && v.startsWith('--directory=')) { dirTok = { ...cmdArgs[a], value: v.slice('--directory='.length) }; continue; }
+        if (!afterDD && v.startsWith('-d') && v.length > 2 && !v.startsWith('--')) { dirTok = { ...cmdArgs[a], value: v.slice(2) }; continue; }
+        if (!afterDD && (v === '-i' || v === '--input' || v === '-p' || v === '--strip' || v === '-F' || v === '--fuzz' || v === '-r' || v === '--reject-file' || v === '-B' || v === '-Y' || v === '-z')) { a++; continue; }
+        if (!afterDD && v.startsWith('-') && v.length > 1) continue;
+        positional.push(cmdArgs[a]);
+      }
+      let patchWd = cmdExecWd;
+      if (dirTok) {
+        const { resolved: nextPatchWd, forceOutside } = resolveShellPathForPlatform(dirTok.value, cmdExecWd, workspace, platform, tool);
+        if (forceOutside || !nextPatchWd || !isInside(nextPatchWd, workspace, effPlat)) {
+          return { confined: false, hardDenyInDirectExec: true, reason: `patch directory "${dirTok.value}" leaves workspace` };
+        }
+        patchWd = nextPatchWd;
+      }
+      const targetTok = outTok ?? positional[0] ?? null;
+      if (!targetTok || !isDestProvablyInsideWriteScope(targetTok, patchWd, false)) {
+        return { confined: false, hardDenyInDirectExec: true, reason: 'patch destination is not provably confined to granted write_scope' };
+      }
+      return null;
+    }
+
+    return null;
+  };
+
   // Walk parsed command segments so quoted paths with spaces, mid-token `..`, `cd ..` within workspace,
   // and Unicode/ASCII symlinks inside workspace are evaluated accurately in execution order.
   let curWd = effectiveWorkdir;
+  let prevOp = null;
+  const subshellPipeStack = [];
+  const bracePipeStack = [];
+  const compoundPipeStack = [];
+  const isGroupPiped = () => (
+    subshellPipeStack.includes(true)
+    || bracePipeStack.includes(true)
+    || compoundPipeStack.includes(true)
+  );
   let tIdx = 0;
   while (tIdx < scanned.tokens.length) {
     const segWords = [];
     const segHeredocs = [];
+    const segHerestrings = [];
+    const segInputRedirs = [];
+    const segRedirTargets = [];
+    let segTermOp = null;
+    let segTermParen = null;
     while (tIdx < scanned.tokens.length) {
       const tk = scanned.tokens[tIdx];
-      if (tk.type === 'op' || tk.type === 'paren' || tk.type === 'bg') { tIdx++; break; }
+      if (tk.type === 'op' || tk.type === 'paren' || tk.type === 'bg') {
+        segTermOp = tk.type === 'op' ? tk.op : null;
+        segTermParen = tk.type === 'paren' ? tk.op : null;
+        tIdx++;
+        break;
+      }
       if (tk.type === 'heredoc') { segHeredocs.push(tk); tIdx++; continue; }
+      if (tk.type === 'in_redir') {
+        const nextTk = scanned.tokens[tIdx + 1];
+        if (tk.op === '<<<') {
+          if (nextTk && nextTk.type === 'word') {
+            segHerestrings.push(nextTk);
+            tIdx += 2;
+          } else {
+            tIdx++;
+          }
+          continue;
+        }
+        if (nextTk && nextTk.type === 'word') {
+          segInputRedirs.push(nextTk);
+          tIdx += 2;
+        } else {
+          tIdx++;
+        }
+        continue;
+      }
+      if (tk.type === 'redir') {
+        const nextTk = scanned.tokens[tIdx + 1];
+        if (nextTk && nextTk.type === 'word') {
+          segRedirTargets.push(nextTk);
+          tIdx += 2;
+        } else {
+          tIdx++;
+        }
+        continue;
+      }
       if (tk.type === 'word') segWords.push(tk);
       tIdx++;
     }
-    const { words: strippedSeg, envChdirTokens } = stripLeadingEnvAssignmentsAndPrefixes(segWords);
+
+    const {
+      words: strippedSeg,
+      envChdirTokens,
+      hasEnvSplitString,
+      openedBraceGroup,
+      closedBraceGroup,
+      openedCompoundBlock,
+      closedCompoundBlock,
+    } = stripLeadingEnvAssignmentsAndPrefixes(segWords);
+
+    if (hasEnvSplitString) {
+      return {
+        confined: false,
+        hardDenyInDirectExec: true,
+        reason: 'env -S / --split-string dynamic command splitting requires safety gate review',
+      };
+    }
+
+    if (openedBraceGroup) bracePipeStack.push(prevOp === '|' || isGroupPiped());
+    if (openedCompoundBlock) compoundPipeStack.push(prevOp === '|' || isGroupPiped());
+    const incomingPiped = prevOp === '|' || isGroupPiped();
+
+    if (closedBraceGroup && bracePipeStack.length > 0) bracePipeStack.pop();
+    if (closedCompoundBlock && compoundPipeStack.length > 0) compoundPipeStack.pop();
+    if (strippedSeg.length === 0 && segTermParen === '(') {
+      subshellPipeStack.push(prevOp === '|' || isGroupPiped());
+      prevOp = null;
+    } else if (segTermParen === '(') {
+      subshellPipeStack.push(false);
+      prevOp = null;
+    } else if (segTermParen === ')') {
+      if (subshellPipeStack.length > 0) subshellPipeStack.pop();
+      prevOp = null;
+    } else {
+      prevOp = segTermOp;
+    }
+
     const envChdirSet = new Set(envChdirTokens);
     for (const chdirTok of envChdirTokens) {
       const envHit = checkWordTokenAtWd(chdirTok, curWd, false, strippedSeg[0]?.value ?? '');
@@ -1347,10 +2592,36 @@ function inspectShellSandboxConfinement(args, workspace, realWorkspace, config, 
 
     let cBase = '';
     if (strippedSeg.length > 0) {
-      const cName = strippedSeg[0].value;
+      const cName = strippedSeg[0].value.replace(/\\/g, '/');
       cBase = cName.includes('/') ? cName.slice(cName.lastIndexOf('/') + 1) : cName;
-      if (SUBSHELL_WRAPPER_CMDS.has(cBase) && segHeredocs.length > 0) {
-        return { confined: false, reason: `shell sub-interpreter "${cBase}" with heredoc requires safety gate review` };
+      const lowerBase = cBase.toLowerCase().replace(/\.exe$/, '');
+      if (lowerBase === 'eval' || lowerBase === 'source' || lowerBase === '.' || lowerBase === 'exec' || lowerBase === 'xargs') {
+        return { confined: false, hardDenyInDirectExec: true, reason: `shell dynamic command "${cBase}" requires safety gate review` };
+      }
+      if (isAwkCmd(cBase)) {
+        const awkInfo = inspectAwkInvocation(strippedSeg.slice(1));
+        if (awkInfo.hasDangerousProgram || awkInfo.hasExternalCodeLoad) {
+          return {
+            confined: false,
+            hardDenyInDirectExec: true,
+            reason: `awk command "${cBase}" uses system/pipe/redirection/getline or script loading requiring safety gate review`,
+          };
+        }
+      }
+      if (isShellOrScriptInterpreter(cBase)) {
+        const readsStdinOrPipe = incomingPiped
+          || segHeredocs.length > 0
+          || segHerestrings.length > 0
+          || segInputRedirs.length > 0
+          || strippedSeg.length === 1
+          || strippedSeg.slice(1).some(t => t.value === '-');
+        if (readsStdinOrPipe) {
+          return {
+            confined: false,
+            hardDenyInDirectExec: true,
+            reason: `shell interpreter "${cBase}" reading dynamic pipe/stdin/herestring requires safety gate review`,
+          };
+        }
       }
     }
 
@@ -1361,6 +2632,15 @@ function inspectShellSandboxConfinement(args, workspace, realWorkspace, config, 
       const isCmdExecutable = strippedSeg.length > 0 && wTok === strippedSeg[0];
       const wordHit = checkWordTokenAtWd(wTok, cmdExecWd, isCmdExecutable, strippedSeg[0]?.value ?? '');
       if (wordHit) return wordHit;
+    }
+    for (const rTok of [...segInputRedirs, ...segRedirTargets]) {
+      const rHit = checkWordTokenAtWd(rTok, cmdExecWd, false, strippedSeg[0]?.value ?? '');
+      if (rHit) return rHit;
+    }
+
+    if (cBase) {
+      const mutHit = checkMutatingCommandWriteScope(cBase, strippedSeg, cmdExecWd);
+      if (mutHit) return mutHit;
     }
 
     if ((cBase === 'cd' || cBase === 'pushd') && strippedSeg.length > 1) {
@@ -1409,7 +2689,7 @@ function inputFsExists(absPath, fsImpl, realOf) {
  * 0 Auto LLM calls) or capable of affecting outside the Sandbox (`confined: false` -> independent Auto review). Pure.
  */
 export function classifySandboxBoundary(input, config) {
-  const { tool, args, cwd } = input;
+  const { tool, args, cwd, actor } = input;
   const platform = input.platform ?? process.platform;
   const workspace = resolvePath(cwd, undefined, platform);
   if (workspace === null) return { confined: false, reason: 'missing workspace' };
@@ -1428,21 +2708,25 @@ export function classifySandboxBoundary(input, config) {
   if (tool === 'job_kill') {
     return { confined: true, reason: 'session-scoped sandbox background job termination' };
   }
+  if (tool === 'web_search' || tool === 'web_fetch') {
+    // evaluateHardRules already enforced user network-prohibition checks and public http(s) SSRF safety.
+    return { confined: true, reason: `read-only public ${tool} verified by deterministic URL/task rules` };
+  }
   if (config.gate.shellTools.includes(tool)) {
-    const res = inspectShellSandboxConfinement(args, workspace, realWorkspace, config, platform, realOf, tool, fsImpl);
+    const res = inspectShellSandboxConfinement(args, workspace, realWorkspace, config, platform, realOf, tool, fsImpl, actor);
     if (res.confined && typeof args?.command === 'string' && hasUnconfinedInlineInterpreter(args, workspace, realWorkspace, platform, tool, realOf)) {
       return { confined: false, reason: 'shell command runs inline script interpreter or find -exec requiring safety gate review' };
     }
-    return res;
+    return { confined: res.confined, reason: res.reason };
   }
   return { confined: false, reason: `external or plugin tool "${tool}" requires safety gate review` };
 }
 
 const DIRECT_EXEC_INDIRECT_BYPASS_RE = /\b(?:Start-Process|Start-Job|sajb|wscript|cscript|mshta|rundll32|ssh|scp|sftp|ncat|netcat|socat|nohup|disown|setsid|daemonize|start-stop-daemon)\b|\bcmd(?:\.exe)?\s+\/[ck]\s+start\b|\b(?:powershell|pwsh)(?:\.exe)?\s+-(?:EncodedCommand|enc|WindowStyle\s+Hidden)\b|\b(?:http|https|net|tls)\.createServer\s*\(/i;
 
-const SECRET_FILE_BASENAME_RE = /(?:^|\/)(?:\.env(?:\.[A-Za-z0-9._-]+)?|id_(?:rsa|dsa|ecdsa|ed25519)(?:\.pub)?|\.npmrc|\.pypirc|\.netrc|.*credentials.*\.json|.*\.(?:pem|key|pfx|p12))$/i;
+export const SECRET_FILE_BASENAME_RE = /(?:^|\/)(?:\.env(?:\.[A-Za-z0-9._-]+)?|id_(?:rsa|dsa|ecdsa|ed25519)(?:\.pub)?|\.npmrc|\.pypirc|\.netrc|.*credentials.*\.json|.*\.(?:pem|key|pfx|p12))$/i;
 
-const DIRECT_EXEC_AMBIGUOUS_SHELL_RE = /\b(?:child_process|spawnSync|execSync|execFileSync|eval\s*\(|new\s+Function\s*\()\b|\b(?:python3?|node|nodejs|deno|bun|perl|ruby|php|lua)\b[^;|&]*?\s(?:-[A-Za-z]*[ceErpi]\b|--(?:eval|print|require|import|loader)(?:=|\b))|\bfind\b[^;|&]*?\s-(?:exec|execdir|ok|delete)\b/i;
+const DIRECT_EXEC_AMBIGUOUS_SHELL_RE = /\b(?:child_process|spawnSync|execSync|execFileSync|eval\s*\(|new\s+Function\s*\()\b|\b(?:python3?|node|nodejs|deno|bun|perl|ruby|php|lua)\b[^;|&]*?\s(?:-[A-Za-z]*[ceErpi]\b|--(?:eval|print|require|import|loader)(?:=|\b))|\bfind\b[^;|&]*?\s-(?:exec|execdir|ok|delete)\b|\b(?:gawk|mawk|nawk|awk)\b[^;|&]*?(?:\bsystem\s*\(|\bgetline\b|@[ \t]*(?:include|load)\b|\s-(?:f|l)\b|\s--(?:file|load)(?:=|\b))/i;
 
 const CROSS_BOUNDARY_HARD_PROHIBITED_RE = /\b(?:Format-Volume|Clear-Disk|Initialize-Disk|bcdedit|vssadmin\s+delete|cipher\s+\/w|mimikatz|sekurlsa|mkfs(?:\.[A-Za-z0-9_+-]+)?|wipefs|pkexec)\b|-Verb\s+RunAs\b|\breg(?:\.exe)?\s+(?:add|delete)\s+HKLM\b|\bgit\s+push\s+(?:--force|-f)\b|\brm\s+(?:-[A-Za-z]*[rf][A-Za-z]*\s+|--no-preserve-root\s+)+\/(?:\*|\s|$)|\bdd\b[^;|&]*\bof=\/dev\/(?:sd[a-z]|nvme\d|vd[a-z]|xvd[a-z]|mmcblk\d)/i;
 
@@ -1453,7 +2737,7 @@ const CROSS_BOUNDARY_HARD_PROHIBITED_RE = /\b(?:Format-Volume|Clear-Disk|Initial
  *      ONLY when an in-Sandbox script uses ambiguous dynamic execution (`decision: 'needs-model'`). Pure.
  */
 export function evaluateDirectExecSafetyGate(input, config) {
-  const { tool, args, cwd } = input;
+  const { tool, args, cwd, actor } = input;
   const platform = input.platform ?? process.platform;
   const workspace = resolvePath(cwd, undefined, platform);
   if (workspace === null) return { decision: 'deny', by: 'rule:no-workspace', risk: 'high', reason: 'missing workspace' };
@@ -1462,6 +2746,10 @@ export function evaluateDirectExecSafetyGate(input, config) {
   const realWorkspace = realOf(workspace);
   const protectedDirs = config.paths.protectedDirs.map(d => resolvePath(d, workspace, platform)).filter(Boolean);
   const realProtectedDirs = protectedDirs.map(realOf);
+  const protectedEntries = (config.paths.protectedDirs ?? []).map(d => {
+    try { return normalizeGlob(d, platform); } catch { return null; }
+  }).filter(Boolean);
+  const directWriteScope = Array.isArray(actor?.writeScope) ? actor.writeScope : [];
 
   const checkSecretOrProtectedRead = raw => {
     if (typeof raw !== 'string' || !raw.trim()) return null;
@@ -1497,7 +2785,7 @@ export function evaluateDirectExecSafetyGate(input, config) {
   }
   if (config.gate.shellTools.includes(tool)) {
     const command = typeof args?.command === 'string' ? args.command : '';
-    if (/\b(?:powershell|pwsh|cmd(?:\.exe)?|bash|sh|zsh|dash|ksh|wsl)\b\s+(?:-\w+\s+)*(?:-c|-Command|-EncodedCommand|\/c|<<)\b|\b(?:bash|sh|zsh|dash|ksh)\b\s*<</i.test(command)) {
+    if (/\b(?:powershell|pwsh|cmd(?:\.exe)?|bash|sh|zsh|dash|ksh|fish|csh|tcsh|wsl)\b\s+(?:-\w+\s+)*(?:-c|-Command|-EncodedCommand|\/c|<<)\b|\b(?:bash|sh|zsh|dash|ksh|fish|csh|tcsh)\b\s*<</i.test(command)) {
       return { decision: 'deny', by: 'rule:direct-exec-no-indirect-bypass', risk: 'high', reason: 'safety gate blocked direct-exec indirect sub-shell wrapper (§3.2)' };
     }
     if (DIRECT_EXEC_INDIRECT_BYPASS_RE.test(command)) {
@@ -1506,6 +2794,9 @@ export function evaluateDirectExecSafetyGate(input, config) {
     const scannedDirect = scanPosixShell(command, { treatBacktickAsSubstitution: tool === 'bash' || platform !== 'win32' });
     if (scannedDirect.tokens.some(t => t.type === 'bg')) {
       return { decision: 'deny', by: 'rule:direct-exec-no-indirect-bypass', risk: 'high', reason: 'safety gate blocked direct-exec persistent background daemon via "&"' };
+    }
+    if (scannedDirect.substitutions.some(s => s.kind === 'proc_sub')) {
+      return { decision: 'deny', by: 'rule:direct-exec-sandbox-lock', risk: 'high', reason: `safety gate blocked direct-exec process substitution${DIRECT_EXEC_EPISTEMIC_NOTE}` };
     }
     const globals = (config.paths.globalRefRoots ?? []).map(r => resolvePath(r, undefined, platform)).filter(Boolean);
     const realGlobals = globals.map(realOf);
@@ -1517,6 +2808,8 @@ export function evaluateDirectExecSafetyGate(input, config) {
       effectiveWorkdir: effectiveWd,
       protectedDirs,
       realProtectedDirs,
+      protectedEntries,
+      writeScope: directWriteScope,
       globals,
       realGlobals,
       platform,
@@ -1525,11 +2818,21 @@ export function evaluateDirectExecSafetyGate(input, config) {
       isDirectExec: true,
     });
     if (directEscape) {
-      return { decision: 'deny', by: 'rule:direct-exec-sandbox-lock', risk: 'high', reason: directEscape.reason };
+      return { decision: 'deny', by: 'rule:direct-exec-sandbox-lock', risk: 'high', reason: `${directEscape.reason}${DIRECT_EXEC_EPISTEMIC_NOTE}` };
     }
-    const directConfinement = inspectShellSandboxConfinement(args, workspace, realWorkspace, config, platform, realOf, tool, fsImpl);
-    if (!directConfinement.confined && !DIRECT_EXEC_AMBIGUOUS_SHELL_RE.test(command) && scannedDirect.substitutions.length === 0) {
-      return { decision: 'deny', by: 'rule:direct-exec-sandbox-lock', risk: 'high', reason: directConfinement.reason };
+    const directConfinement = inspectShellSandboxConfinement(
+      args,
+      workspace,
+      realWorkspace,
+      config,
+      platform,
+      realOf,
+      tool,
+      fsImpl,
+      actor ?? { role: 'direct_exec', writeScope: directWriteScope },
+    );
+    if (!directConfinement.confined && (directConfinement.hardDenyInDirectExec || (!DIRECT_EXEC_AMBIGUOUS_SHELL_RE.test(command) && scannedDirect.substitutions.length === 0))) {
+      return { decision: 'deny', by: 'rule:direct-exec-sandbox-lock', risk: 'high', reason: `${directConfinement.reason}${DIRECT_EXEC_EPISTEMIC_NOTE}` };
     }
     if (SECRET_FILE_BASENAME_RE.test(command.replace(/\\/g, '/'))) {
       return { decision: 'deny', by: 'rule:direct-exec-secret-file', risk: 'high', reason: 'safety gate blocked direct-exec shell access to sensitive credential/key file' };
@@ -1592,6 +2895,20 @@ export function evaluateHardRules(input, config) {
   if (actor.role === 'direct_exec' && !DIRECT_EXEC_ALLOWED_TOOLS.includes(tool)) {
     return { rule: 'direct-exec-tool-forbidden', reason: `direct execution model has minimum permissions and cannot invoke "${tool}"` };
   }
+  if (actor.role === 'leader') {
+    if (
+      actor.executionMode !== 'single'
+      && ['write', 'edit', ...(config.gate?.shellTools ?? []), 'job_list', 'job_output', 'job_kill'].includes(tool)
+    ) {
+      return { rule: 'tool-not-in-profile', reason: `tool "${tool}" is not granted to leader in Team mode` };
+    }
+    if (
+      actor.executionMode === 'single'
+      && (tool.startsWith('team_') || ['send_message', 'interrupt_agent', 'list_agents', 'subagent', 'fork_agent'].includes(tool))
+    ) {
+      return { rule: 'single-mode-no-team-tools', reason: `team tool "${tool}" is disabled in Single mode` };
+    }
+  }
   if (!Array.isArray(actor.allowedTools) || !actor.allowedTools.includes(tool)) return { rule: 'tool-not-in-profile', reason: `tool "${tool}" is not granted to ${actor.role} ${actor.name ?? ''}`.trim() };
   if (Array.isArray(actor.loadedTools) && !actor.loadedTools.includes(tool)) return { rule: 'tool-not-loaded', reason: `load the authorized tool "${tool}" with team_tools before using it in a later step` };
   const workspace = resolvePath(cwd, undefined, platform);
@@ -1609,6 +2926,9 @@ export function evaluateHardRules(input, config) {
     ...protectedDirs.map(realOf),
     ...config.paths.protectedDirs.map(d => resolvePath(d, realWorkspace, platform)).filter(Boolean),
   ])];
+  const protectedEntries = (config.paths.protectedDirs ?? []).map(d => {
+    try { return normalizeGlob(d, platform); } catch { return null; }
+  }).filter(Boolean);
   if (actor.role === 'leader' && tool === 'team_direct_exec') {
     if (typeof args?.task !== 'string' || !args.task.trim()) {
       return { rule: 'direct-exec-task-missing', reason: 'team_direct_exec requires a non-empty task string' };
@@ -1617,14 +2937,11 @@ export function evaluateHardRules(input, config) {
       if (!Array.isArray(args.write_scope) || args.write_scope.some(g => typeof g !== 'string' || !g.trim())) {
         return { rule: 'direct-exec-scope-invalid', reason: 'team_direct_exec write_scope must be an array of workspace-relative globs' };
       }
-      const protectedEntries = (config.paths.protectedDirs ?? []).map(normalizeGlob).filter(Boolean);
       for (const rawGlob of args.write_scope) {
         let norm;
-        try { norm = normalizeGlob(rawGlob); } catch (e) { return { rule: 'direct-exec-scope-invalid', reason: e.message }; }
-        if (!hasGlobWildcard(norm.split('/')[0])) {
-          const hit = protectedEntries.find(d => anyGlobOverlaps([norm], [d, `${d}/**`], platform));
-          if (hit) return { rule: 'path-protected', reason: `team_direct_exec write_scope "${rawGlob}" cannot target protected path "${hit}"` };
-        }
+        try { norm = normalizeGlob(rawGlob, platform); } catch (e) { return { rule: 'direct-exec-scope-invalid', reason: e.message }; }
+        const hit = findProtectedWriteScopeOverlap(norm, config.paths.protectedDirs ?? [], platform);
+        if (hit) return { rule: 'path-protected', reason: `team_direct_exec write_scope "${rawGlob}" cannot target protected path "${hit}"` };
       }
     }
     return undefined;
@@ -1643,7 +2960,7 @@ export function evaluateHardRules(input, config) {
     const realTarget = realOf(target);
     if (actor.role === 'direct_exec') {
       if (!isInside(target, workspace, platform) || !isInside(realTarget, realWorkspace, platform)) {
-        return { rule: 'direct-exec-sandbox-lock', reason: `direct execution model is strictly forbidden from leaving the workspace sandbox: ${target}` };
+        return { rule: 'direct-exec-sandbox-lock', reason: `direct execution model is strictly forbidden from leaving the workspace sandbox: ${target}${DIRECT_EXEC_EPISTEMIC_NOTE}` };
       }
     }
     if (globals.some(g => isInside(target, g, platform)) || realGlobals.some(g => isInside(realTarget, g, platform))) return { rule: 'path-in-global-refs', reason: `global references are read-only: ${target}` };
@@ -1677,13 +2994,19 @@ export function evaluateHardRules(input, config) {
       const realTarget = realOf(target);
       if (actor.role === 'direct_exec') {
         if (!isInside(target, workspace, platform) || !isInside(realTarget, realWorkspace, platform)) {
-          return { rule: 'direct-exec-sandbox-lock', reason: `direct execution model is strictly forbidden from reading or searching outside the workspace sandbox: ${target}` };
+          return { rule: 'direct-exec-sandbox-lock', reason: `direct execution model is strictly forbidden from reading or searching outside the workspace sandbox: ${target}${DIRECT_EXEC_EPISTEMIC_NOTE}` };
         }
       } else {
-        const lexOk = isInside(target, workspace, platform) || globals.some(g => isInside(target, g, platform));
+        const assignedRefs = Array.isArray(actor.refs) ? actor.refs.map(r => resolvePath(r, workspace, platform)).filter(Boolean) : [];
+        const realAssignedRefs = assignedRefs.map(realOf);
+        const isAssignedRef = (tool === 'read' || tool === 'read_image')
+          && realAssignedRefs.some(r => pathKey(realTarget, platform) === pathKey(r, platform))
+          && (assignedRefs.some(r => pathKey(target, platform) === pathKey(r, platform))
+            || realAssignedRefs.some(r => pathKey(target, platform) === pathKey(r, platform)));
+        const lexOk = isInside(target, workspace, platform) || globals.some(g => isInside(target, g, platform)) || realGlobals.some(g => isInside(target, g, platform));
         const realOk = isInside(realTarget, realWorkspace, platform) || realGlobals.some(g => isInside(realTarget, g, platform));
         const spillOk = tool === 'read' && isOwnSessionSpillFile(target, realTarget, input, platform, realOf);
-        if ((!lexOk || !realOk) && !spillOk) {
+        if ((!lexOk || !realOk) && !spillOk && !isAssignedRef) {
           if (actor.role === 'member') return { rule: 'path-outside-workspace', reason: `member ${tool} path must stay inside the workspace or global reference roots: ${target}` };
           // Leader only: standing read-only roots from the configuration, then grants from the user's own messages (read lazily).
           const within = roots => roots.some(r => isInside(target, r, platform)) && roots.some(r => isInside(realTarget, realOf(r), platform));
@@ -1751,6 +3074,8 @@ export function evaluateHardRules(input, config) {
         effectiveWorkdir: effectiveShellWorkdir,
         protectedDirs,
         realProtectedDirs,
+        protectedEntries,
+        writeScope: (actor.role === 'member' || actor.role === 'direct_exec') && Array.isArray(actor.writeScope) ? actor.writeScope : [],
         globals,
         realGlobals,
         platform,
@@ -1761,12 +3086,28 @@ export function evaluateHardRules(input, config) {
       if (posixEscapeHit) return posixEscapeHit;
     }
     if (actor.role === 'direct_exec') {
-      const confinement = inspectShellSandboxConfinement(args, workspace, realWorkspace, config, platform, realOf, tool);
+      const confinement = inspectShellSandboxConfinement(args, workspace, realWorkspace, config, platform, realOf, tool, fsImpl, actor);
       if (!confinement.confined) {
-        return { rule: 'direct-exec-sandbox-lock', reason: `direct execution model is strictly forbidden from leaving the workspace sandbox (${confinement.reason})` };
+        return { rule: 'direct-exec-sandbox-lock', reason: `direct execution model is strictly forbidden from leaving the workspace sandbox (${confinement.reason})${DIRECT_EXEC_EPISTEMIC_NOTE}` };
       }
       if (DIRECT_EXEC_INDIRECT_BYPASS_RE.test(command)) {
-        return { rule: 'direct-exec-sandbox-lock', reason: 'direct execution model cannot spawn detached processes, subshells, network listeners, or indirect bypass channels' };
+        return { rule: 'direct-exec-sandbox-lock', reason: `direct execution model cannot spawn detached processes, subshells, network listeners, or indirect bypass channels${DIRECT_EXEC_EPISTEMIC_NOTE}` };
+      }
+    }
+  }
+  if (tool === 'web_search' || tool === 'web_fetch') {
+    const texts = typeof input.userTexts === 'function' ? input.userTexts() : input.userTexts;
+    if (isNetworkForbiddenByUser(texts)) {
+      return { rule: 'network-forbidden-by-user', reason: `user task explicitly forbids network/web access (${tool})` };
+    }
+    if (tool === 'web_search') {
+      if (typeof args?.query !== 'string' || !args.query.trim()) {
+        return { rule: 'web-search-query-missing', reason: 'web_search requires a non-empty query string' };
+      }
+    } else {
+      const urlSafety = inspectWebFetchUrlSafety(args?.url);
+      if (!urlSafety.safe) {
+        return { rule: 'web-fetch-url-blocked', reason: urlSafety.reason };
       }
     }
   }
@@ -1804,7 +3145,11 @@ export function buildGateRequest(input, config) {
     },
     scope: {
       workspace_root: workspace,
-      write_scope: (actor.role === 'member' || actor.role === 'direct_exec') ? (actor.writeScope ?? []) : ['(leader has no file-write tools; team_note writes only under the project references directory)'],
+      write_scope: (actor.role === 'member' || actor.role === 'direct_exec')
+        ? (actor.writeScope ?? [])
+        : (actor.role === 'leader' && actor.executionMode === 'single')
+          ? ['**/* (Single Mode: leader direct workspace write access, excluding protected_dirs and read_only_roots)']
+          : ['(leader has no file-write tools; team_note writes only under the project references directory)'],
       read_only_roots: [...config.paths.globalRefRoots],
       project_refs_dir: config.paths.projectRefsDir,
       protected_dirs: [...config.paths.protectedDirs],

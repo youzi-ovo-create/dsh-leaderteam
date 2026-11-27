@@ -42,8 +42,9 @@ import { frontierState } from '../core/frontier.mjs';
 import { roleRouteChain } from '../core/role-routes.mjs';
 import { readQuotaStateFile } from '../core/quota.mjs';
 import { quotaGate } from '../core/models.mjs';
-import { resolvePath, isInside, relativeInside, matchesAnyGlob, anyGlobOverlaps } from '../core/paths.mjs';
-import { truncate } from '../core/redact.mjs';
+import { resolvePath, isInside, relativeInside, matchesAnyGlob, anyGlobOverlaps, realpathBestEffort, normalizeGlob } from '../core/paths.mjs';
+import { truncate, redactInlineSecrets } from '../core/redact.mjs';
+import { SECRET_FILE_BASENAME_RE } from '../core/gate-policy.mjs';
 import { baseRuntime, recordUsage } from './runtime.mjs';
 
 const ACTIVE_EXECUTION_STATUSES = new Set(['starting', 'started', 'running']);
@@ -237,9 +238,30 @@ function computeSupervisionSubmissionDigest({
   });
 }
 
-function loadBoundedWorkspaceExcerpts(cwd, relFiles = [], maxTotalChars = 32000, platform = process.platform) {
+const MAX_EXCERPT_READ_BYTES = 32768;
+
+export function loadBoundedWorkspaceExcerpts(
+  cwd,
+  relFiles = [],
+  maxTotalChars = 32000,
+  protectedDirs = ['.leaderteam', '.git', '.agents', 'AGENTS.md'],
+  platform = process.platform,
+) {
   const ws = resolvePath(cwd, undefined, platform);
   if (!ws) return [];
+  const realWs = realpathBestEffort(ws, platform, fs);
+  const effProtected = Array.isArray(protectedDirs) && protectedDirs.length > 0
+    ? protectedDirs
+    : ['.leaderteam', '.git', '.agents', 'AGENTS.md'];
+  const resolvedProtected = effProtected.map(d => resolvePath(d, ws, platform)).filter(Boolean);
+  const realProtected = [...new Set([
+    ...resolvedProtected.map(d => realpathBestEffort(d, platform, fs)),
+    ...effProtected.map(d => resolvePath(d, realWs, platform)).filter(Boolean),
+  ])];
+  const protectedGlobs = effProtected.map(d => {
+    try { return normalizeGlob(d, platform); } catch { return null; }
+  }).filter(Boolean);
+
   const excerpts = [];
   let used = 0;
   for (const raw of Array.isArray(relFiles) ? relFiles : []) {
@@ -247,13 +269,53 @@ function loadBoundedWorkspaceExcerpts(cwd, relFiles = [], maxTotalChars = 32000,
     const target = resolvePath(raw.trim(), ws, platform);
     if (!target || !isInside(target, ws, platform)) continue;
     try {
-      const st = fs.statSync(target);
-      if (!st.isFile()) continue;
-      const text = fs.readFileSync(target, 'utf8');
+      const lst = fs.lstatSync(target);
+      if (lst.isSymbolicLink() || !lst.isFile()) continue;
+      const realTarget = realpathBestEffort(target, platform, fs);
+      if (!realTarget || !isInside(realTarget, realWs, platform)) continue;
+      const rel = relativeInside(ws, target, platform);
+      const realRel = relativeInside(realWs, realTarget, platform);
+      if (!rel || !realRel) continue;
+      const normRelPosix = rel.replace(/\\/g, '/');
+      const normRealRelPosix = realRel.replace(/\\/g, '/');
+      if (SECRET_FILE_BASENAME_RE.test(normRelPosix) || SECRET_FILE_BASENAME_RE.test(normRealRelPosix)) continue;
+      if (resolvedProtected.some(d => isInside(target, d, platform)) || realProtected.some(d => isInside(realTarget, d, platform))) continue;
+      if (protectedGlobs.length > 0 && (matchesAnyGlob(rel, protectedGlobs, platform) || matchesAnyGlob(realRel, protectedGlobs, platform))) continue;
+
+      const readLen = Math.min(MAX_EXCERPT_READ_BYTES, Math.max(0, lst.size));
+      let rawText = '';
+      if (readLen > 0) {
+        const buf = Buffer.allocUnsafe(readLen);
+        const openFlags = typeof fs.constants?.O_NOFOLLOW === 'number' && platform !== 'win32'
+          ? (fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW)
+          : 'r';
+        const fd = fs.openSync(target, openFlags);
+        let bytesRead = 0;
+        try {
+          bytesRead = fs.readSync(fd, buf, 0, readLen, 0);
+        } finally {
+          try { fs.closeSync(fd); } catch {}
+        }
+        let validEnd = bytesRead;
+        if (bytesRead === MAX_EXCERPT_READ_BYTES && lst.size > MAX_EXCERPT_READ_BYTES) {
+          let cont = 0;
+          while (cont < 3 && validEnd - 1 - cont >= 0 && (buf[validEnd - 1 - cont] & 0xc0) === 0x80) cont++;
+          const leadIdx = validEnd - 1 - cont;
+          if (leadIdx >= 0 && buf[leadIdx] >= 0x80) {
+            const b = buf[leadIdx];
+            const expectedLen = (b & 0xe0) === 0xc0 ? 2 : ((b & 0xf0) === 0xe0 ? 3 : ((b & 0xf8) === 0xf0 ? 4 : 1));
+            if (cont + 1 < expectedLen) validEnd = leadIdx;
+          }
+        }
+        rawText = buf.subarray(0, validEnd).toString('utf8');
+      }
+      const scrubbed = redactInlineSecrets(rawText);
       const budget = Math.min(8000, maxTotalChars - used);
-      const slice = truncate(text, budget);
+      const slice = lst.size > MAX_EXCERPT_READ_BYTES && scrubbed.length <= budget
+        ? `${scrubbed}…`
+        : truncate(scrubbed, budget);
       used += slice.length;
-      excerpts.push({ file: relativeInside(ws, target, platform) ?? raw, content: slice });
+      excerpts.push({ file: rel, content: slice });
     } catch {}
   }
   return excerpts;
@@ -417,8 +479,7 @@ export async function awaitExecutionModelsCheckpointPause({
     }
 
     await new Promise(resolve => {
-      const t = setTimeout(resolve, 30);
-      t.unref?.();
+      setTimeout(resolve, 30);
     });
   }
 
@@ -635,7 +696,7 @@ export async function verifyActiveArbiterDirectives({
 
       const dirTargets = normalizeDisputeTargets(dir.targets);
       const targetHashes = collectTargetFileHashes(actor.cwd, dirTargets, rt.config?.paths?.protectedDirs);
-      const excerpts = loadBoundedWorkspaceExcerpts(actor.cwd, Object.keys(targetHashes).slice(0, 8), 24000);
+      const excerpts = loadBoundedWorkspaceExcerpts(actor.cwd, Object.keys(targetHashes).slice(0, 8), 24000, rt.config?.paths?.protectedDirs);
 
       if (!rt?.llm) {
         if (rem.hasPassedStageVerification) {
@@ -829,7 +890,7 @@ async function runThreePartyCaucus({
   });
 
   const targetHashes = collectTargetFileHashes(actor.cwd, strikeInfo.targets, rt.config.paths?.protectedDirs);
-  const targetExcerpts = loadBoundedWorkspaceExcerpts(actor.cwd, Object.keys(targetHashes).slice(0, 6), 18000);
+  const targetExcerpts = loadBoundedWorkspaceExcerpts(actor.cwd, Object.keys(targetHashes).slice(0, 6), 18000, rt.config.paths?.protectedDirs);
   const membersSummary = [...store.members().values()]
     .filter(m => (m.taskSeq ?? 1) === taskSeq)
     .map(m => ({ name: m.name, actorRole: m.actorRole ?? 'member', stageId: m.stageId, status: m.status, writeScope: m.writeScope }));
@@ -1191,7 +1252,7 @@ export async function respondInFormalConference({
     throw new Error(`active conference is "${conf.conferenceId}", not "${conferenceId}"`);
   }
 
-  const evidenceExcerpts = loadBoundedWorkspaceExcerpts(actor.cwd, newEvidenceFiles, 24000);
+  const evidenceExcerpts = loadBoundedWorkspaceExcerpts(actor.cwd, newEvidenceFiles, 24000, rt?.config?.paths?.protectedDirs);
   const leaderTurn = {
     speaker: 'leader',
     text: truncate(String(explanation ?? '').trim(), 6000),
@@ -1965,11 +2026,14 @@ export async function awaitTeamGovernanceJobs(rt, teamId, timeoutMs = 60000) {
   const jobs = [...(base.governanceJobs?.values() ?? [])].filter(j => j.teamId === teamId && j.promise);
   if (jobs.length === 0) return;
   let timer;
-  await Promise.race([
-    Promise.allSettled(jobs.map(j => j.promise)),
-    new Promise(resolve => { timer = setTimeout(resolve, timeoutMs); timer.unref?.(); }),
-  ]);
-  if (timer) clearTimeout(timer);
+  try {
+    await Promise.race([
+      Promise.allSettled(jobs.map(j => j.promise)),
+      new Promise(resolve => { timer = setTimeout(resolve, timeoutMs); }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 /** Resolve an active Strike 3 Human Escalation when the User replies in the Leader session (§5 & §6.3). */
@@ -2013,15 +2077,23 @@ export async function resolveHumanEscalationOnUserTurn({ ctx, rt, store, leaderA
   return true;
 }
 
-/** Concise governance snapshot injected into Leader's live runtime context. */
+/** Concise governance snapshot injected into Leader's live runtime context (empty when quiescent in normal phase). */
 export function formatLeaderGovernanceContext(store, taskSeq) {
   const gov = replayGovernanceState(store.governanceEvents(), taskSeq);
+  const isQuiescent = gov.phase === 'normal'
+    && !gov.pausingConference
+    && !gov.activeConference
+    && !gov.activeHumanEscalation
+    && gov.activeDirectives.length === 0
+    && (!gov.pendingSupervisions || gov.pendingSupervisions.length === 0)
+    && gov.advisoryNotes.length === 0;
+  if (isQuiescent) return '';
   const lines = [`LeaderTeam autonomous governance state: phase=${gov.phase}`];
   if (gov.pausingConference) {
     lines.push(`- PAUSING FOR CONFERENCE "${gov.pausingConference.conferenceId}" (dispute=${gov.pausingConference.disputeId}): Waiting for active execution models to checkpoint and pause before Stage 3 opens; dispatches and team_direct_exec are suspended.`);
   }
   if (gov.activeConference) {
-    lines.push(`- ACTIVE FORMAL CONFERENCE "${gov.activeConference.conferenceId}" (dispute=${gov.activeConference.disputeId}, strike=#${gov.activeConference.strike}): All execution dispatches and team_direct_exec are suspended. Respond via team_conference(action="respond", conference_id="${gov.activeConference.conferenceId}", ...).`);
+    lines.push(`- ACTIVE FORMAL CONFERENCE "${gov.activeConference.conferenceId}" (dispute=${gov.activeConference.disputeId}, strike=#${gov.activeConference.strike}): All execution dispatches, send_message, and team_direct_exec are suspended. Respond promptly via team_conference(action="respond", conference_id="${gov.activeConference.conferenceId}", explanation, new_evidence_files, proposed_alternative) with concrete workspace facts or a better alternative.`);
   }
   if (gov.activeHumanEscalation) {
     lines.push(`- HUMAN ESCALATION PENDING "${gov.activeHumanEscalation.escalationId}" (dispute=${gov.activeHumanEscalation.disputeId}, 3rd strike): All execution dispatches and team_direct_exec are paused. Declare team_status(stop_state="waiting_user") and present the dispute dossier to the user.`);

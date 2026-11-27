@@ -1,11 +1,18 @@
 // Dynamic upstream model discovery & multi-provider route resolution for DeepSeek Harness.
 // Queries live DSH `ctx.llm` adapters and `/v1/models` endpoints so LeaderTeam automatically
 // obtains real `contextWindow` and `maxTokens` capacities without hardcoded caps.
+import fs from 'node:fs';
+import path from 'node:path';
 import { EFFORT_ID_RE, MODEL_ROUTE_RE, DSH_EFFORTS } from './constants.mjs';
 import { deepFreeze } from './canonical.mjs';
+import { writeFileAtomic } from './store.mjs';
 
 const LEGACY_HARDCODED_CONTEXT_WINDOW = 131072;
 const LEGACY_HARDCODED_MAX_TOKENS = 16384;
+const VALID_PI_AI_EFFORT_KEYS = new Set(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
+const THINKING_EFFORT_KEYS = new Set(['minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
+export const RESERVED_DSH_BUILTIN_PROVIDER_IDS = new Set(['deepseek-official', 'deepseek-account']);
+const BUILTIN_OPENAI_MODEL_PREFIX_RE = /^(?:gpt-3\.5|gpt-4|gpt-5|o1|o3|o4|codex|chatgpt)/i;
 
 function positiveInt(...candidates) {
   for (const c of candidates) {
@@ -574,60 +581,101 @@ export function mergeUpstreamModelsIntoConfig(baseConfig, catalog) {
   return deepFreeze(cloned);
 }
 
-/**
- * Live-register or update upstream models into DSH's `settings` service (`llm-pi-ai`).
- * Never injects hardcoded `131072` / `16384` limits: passes real `contextWindow` and `maxTokens`
- * when known, omits them otherwise (letting DSH `llm-pi-ai` use its native unthrottled defaults),
- * and cleans up stale hardcoded `131072`/`16384` entries on existing models.
- */
-export async function syncUpstreamModelsToDshSettings(ctx, modelsToEnsure = [], defaultProvider = 'magpie', options = {}) {
-  const providerTemplates = options?.providerTemplates ?? null;
-  const settings = ctx?.get?.('settings');
-  if (!settings || typeof settings.describe !== 'function' || typeof settings.update !== 'function') {
-    return { synced: false, reason: 'settings-service-unavailable', updatedProviders: [] };
-  }
-  let desc;
-  try { desc = settings.describe({ redactSecrets: false }); } catch {
-    try { desc = settings.describe({ redactSecrets: true }); } catch {
-      return { synced: false, reason: 'settings-describe-failed', updatedProviders: [] };
-    }
-  }
-  const llmNs = (desc?.namespaces ?? []).find(n => n?.ns === 'llm-pi-ai' || (n?.data && typeof n.data === 'object' && 'providers' in n.data));
-  if (!llmNs?.ns || !llmNs.data || typeof llmNs.data !== 'object') {
-    return { synced: false, reason: 'llm-namespace-not-found', updatedProviders: [] };
-  }
-  const nextData = structuredClone(llmNs.data);
-  nextData.providers ??= {};
+function applyModelsToProvidersMap(curProviders = {}, modelsToEnsure = [], defaultProvider = 'magpie', providerTemplates = null) {
+  const nextProviders = structuredClone(curProviders && typeof curProviders === 'object' ? curProviders : {});
   const updatedProviders = [];
 
   for (const item of modelsToEnsure) {
+    if (!item || typeof item !== 'object') continue;
     const prov = item.provider ?? defaultProvider;
     const modelId = item.upstreamModel ?? item.route;
+    if (!prov || !modelId) continue;
+    // Never write reserved DSH builtin adapter IDs (`deepseek-official`, `deepseek-account`) into `llm-pi-ai`
+    if (RESERVED_DSH_BUILTIN_PROVIDER_IDS.has(prov)) continue;
     const tpl = providerTemplates?.[prov] ?? null;
-    let provObj = nextData.providers[prov];
+    let provObj = nextProviders[prov];
     if ((!provObj || typeof provObj !== 'object') && tpl) {
-      const { modelMetadata: _meta, ...profileFields } = tpl;
+      const { modelMetadata: _meta, clearApiKeyEnv: _clearKey, ...profileFields } = tpl;
+      if (_clearKey === true) delete profileFields.apiKeyEnv;
       provObj = { ...profileFields, models: [] };
-      nextData.providers[prov] = provObj;
+      nextProviders[prov] = provObj;
       if (!updatedProviders.includes(prov)) updatedProviders.push(prov);
+    } else if (provObj && typeof provObj === 'object' && tpl && typeof tpl === 'object') {
+      let provChanged = false;
+      const isAuthoritativeTpl =
+        !tpl.modelMetadata || Boolean(tpl.clearApiKeyEnv || tpl.headers || tpl.forceBaseURL === true);
+      if (tpl.baseURL && (isAuthoritativeTpl ? provObj.baseURL !== tpl.baseURL : !provObj.baseURL)) {
+        provObj.baseURL = tpl.baseURL;
+        provChanged = true;
+      }
+      if (tpl.api && !provObj.api) {
+        provObj.api = tpl.api;
+        provChanged = true;
+      }
+      if (tpl.apiKeyEnv && !provObj.apiKeyEnv && tpl.clearApiKeyEnv !== true) {
+        provObj.apiKeyEnv = tpl.apiKeyEnv;
+        provChanged = true;
+      }
+      if (tpl.displayName && !provObj.displayName) {
+        provObj.displayName = tpl.displayName;
+        provChanged = true;
+      }
+      if (tpl.headers && typeof tpl.headers === 'object' && !Array.isArray(tpl.headers)) {
+        const curHeaders = (provObj.headers && typeof provObj.headers === 'object' && !Array.isArray(provObj.headers))
+          ? provObj.headers
+          : {};
+        if (Object.keys(tpl.headers).some(k => curHeaders[k] !== tpl.headers[k])) {
+          provObj.headers = { ...curHeaders, ...tpl.headers };
+          provChanged = true;
+        }
+      }
+      if (tpl.clearApiKeyEnv === true && 'apiKeyEnv' in provObj) {
+        delete provObj.apiKeyEnv;
+        provChanged = true;
+      }
+      if (provChanged && !updatedProviders.includes(prov)) {
+        updatedProviders.push(prov);
+      }
     }
     if (!provObj || typeof provObj !== 'object') continue;
     provObj.models = Array.isArray(provObj.models) ? provObj.models : [];
-    const rawEfforts = item.efforts ?? [];
-    const realEfforts = rawEfforts.filter(e => e && e !== 'none');
-    const hasNoneWithThinking = realEfforts.length > 0 && rawEfforts.includes('none') && !realEfforts.includes('off');
-    const existingIdx = provObj.models.findIndex(m => (typeof m === 'string' ? m : m?.id) === modelId);
-    const explicitWireMap = (item.reasoningEfforts && typeof item.reasoningEfforts === 'object' && !Array.isArray(item.reasoningEfforts))
+
+    // Guard against PiAiCatalogError when custom baseURL is set on builtin `openai` provider
+    if (
+      prov === 'openai' &&
+      !provObj.api &&
+      typeof provObj.baseURL === 'string' &&
+      provObj.baseURL.trim() &&
+      provObj.baseURL.trim().replace(/\/+$/, '') !== 'https://api.openai.com/v1'
+    ) {
+      provObj.api = 'openai-completions';
+      if (!updatedProviders.includes(prov)) updatedProviders.push(prov);
+    }
+
+    const rawEfforts = Array.isArray(item.efforts) ? item.efforts : [];
+    const rawWireMap = (item.reasoningEfforts && typeof item.reasoningEfforts === 'object' && !Array.isArray(item.reasoningEfforts))
       ? item.reasoningEfforts
       : null;
+    const explicitWireMap = rawWireMap
+      ? Object.fromEntries(
+          Object.entries(rawWireMap).filter(([k, v]) => VALID_PI_AI_EFFORT_KEYS.has(k) && typeof v === 'string' && v.trim()),
+        )
+      : null;
+    const hasThinkingCapability =
+      rawEfforts.some(e => typeof e === 'string' && THINKING_EFFORT_KEYS.has(e)) ||
+      Boolean(explicitWireMap && Object.keys(explicitWireMap).some(k => THINKING_EFFORT_KEYS.has(k)));
+    // Non-reasoning models MUST NOT emit `{ off: 'none' }`
+    const realEfforts = hasThinkingCapability
+      ? rawEfforts.filter(e => typeof e === 'string' && e !== 'none' && VALID_PI_AI_EFFORT_KEYS.has(e))
+      : [];
+    const hasNoneWithThinking = realEfforts.length > 0 && rawEfforts.includes('none') && !realEfforts.includes('off');
+    const existingIdx = provObj.models.findIndex(m => (typeof m === 'string' ? m : m?.id) === modelId);
     const reasoningEfforts = realEfforts.length > 0
       ? {
-          ...(hasNoneWithThinking ? { off: explicitWireMap && typeof explicitWireMap.off === 'string' ? explicitWireMap.off : 'none' } : {}),
+          ...(hasNoneWithThinking ? { off: explicitWireMap?.off ?? 'none' } : {}),
           ...Object.fromEntries(realEfforts.map(e => [
             e,
-            explicitWireMap && typeof explicitWireMap[e] === 'string'
-              ? explicitWireMap[e]
-              : (e === 'off' ? 'none' : e),
+            explicitWireMap?.[e] ?? (e === 'off' ? 'none' : e),
           ])),
         }
       : undefined;
@@ -635,10 +683,15 @@ export async function syncUpstreamModelsToDshSettings(ctx, modelsToEnsure = [], 
     const desiredCtx = positiveInt(item.contextWindow, tplModelMeta?.contextWindow);
     const desiredMax = positiveInt(item.maxTokens, item.defaultMaxTokens ?? tplModelMeta?.maxTokens);
     const desiredCompat = item.compat ?? tplModelMeta?.compat ?? undefined;
+    const needsCustomModelApi =
+      !provObj.api &&
+      prov === 'openai' &&
+      !BUILTIN_OPENAI_MODEL_PREFIX_RE.test(modelId);
 
     if (existingIdx < 0) {
       provObj.models.push({
         id: modelId,
+        ...(needsCustomModelApi ? { api: 'openai-completions' } : {}),
         ...(desiredCtx !== undefined ? { contextWindow: desiredCtx } : {}),
         ...(desiredMax !== undefined ? { maxTokens: desiredMax } : {}),
         input: item.vision ? ['text', 'image'] : ['text'],
@@ -649,14 +702,31 @@ export async function syncUpstreamModelsToDshSettings(ctx, modelsToEnsure = [], 
     } else if (typeof provObj.models[existingIdx] === 'object' && provObj.models[existingIdx] !== null) {
       const cur = { ...provObj.models[existingIdx] };
       let entryChanged = false;
+      if (needsCustomModelApi && !cur.api) {
+        cur.api = 'openai-completions';
+        entryChanged = true;
+      }
       if (reasoningEfforts) {
-        const curEff = (cur.reasoningEfforts && typeof cur.reasoningEfforts === 'object') ? cur.reasoningEfforts : {};
+        const curEff = (cur.reasoningEfforts && typeof cur.reasoningEfforts === 'object')
+          ? Object.fromEntries(Object.entries(cur.reasoningEfforts).filter(([k]) => VALID_PI_AI_EFFORT_KEYS.has(k)))
+          : {};
         const nextEff = { ...reasoningEfforts, ...curEff, ...(explicitWireMap ?? {}) };
-        if (Object.keys(nextEff).some(k => curEff[k] !== nextEff[k])) {
-          // Preserve existing user/gateway wire values while applying newly discovered keys and explicit LT wire overrides
+        if (
+          typeof cur.reasoningEfforts !== 'object' ||
+          cur.reasoningEfforts === null ||
+          Object.keys(nextEff).some(k => curEff[k] !== nextEff[k]) ||
+          Object.keys(cur.reasoningEfforts).some(k => !VALID_PI_AI_EFFORT_KEYS.has(k))
+        ) {
           cur.reasoningEfforts = nextEff;
           entryChanged = true;
         }
+      } else if (
+        cur.reasoningEfforts &&
+        typeof cur.reasoningEfforts === 'object' &&
+        !Object.keys(cur.reasoningEfforts).some(k => THINKING_EFFORT_KEYS.has(k))
+      ) {
+        delete cur.reasoningEfforts;
+        entryChanged = true;
       }
       if (desiredCtx !== undefined && cur.contextWindow !== desiredCtx) {
         cur.contextWindow = desiredCtx;
@@ -677,15 +747,681 @@ export async function syncUpstreamModelsToDshSettings(ctx, modelsToEnsure = [], 
         if (!updatedProviders.includes(prov)) updatedProviders.push(prov);
       }
     }
+
+    // DSH PiAiCatalogError forbids setting both `models` and `modelOverrides` on the same provider
+    if (provObj.models.length > 0 && 'modelOverrides' in provObj) {
+      delete provObj.modelOverrides;
+      if (!updatedProviders.includes(prov)) updatedProviders.push(prov);
+    }
   }
 
+  return { providers: nextProviders, updatedProviders };
+}
+
+/**
+ * Live-register or update upstream models into DSH's `settings` service (`llm-pi-ai`).
+ * Never injects hardcoded `131072` / `16384` limits: passes real `contextWindow` and `maxTokens`
+ * when known, omits them otherwise (letting DSH `llm-pi-ai` use its native unthrottled defaults),
+ * and cleans up stale hardcoded `131072`/`16384` entries on existing models.
+ */
+export async function syncUpstreamModelsToDshSettings(ctx, modelsToEnsure = [], defaultProvider = 'magpie', options = {}) {
+  const providerTemplates = options?.providerTemplates ?? null;
+  const defaultSelection = options?.defaultSelection ?? null;
+  const syncDefaultModel = Boolean(options?.syncDefaultModel);
+  const onlyIfNoAvailableDefault = Boolean(options?.onlyIfNoAvailableDefault);
+  const settings =
+    (typeof ctx?.get === 'function' ? ctx.get('settings') : null) ??
+    ctx?.settings ??
+    (typeof ctx?.root?.get === 'function' ? ctx.root.get('settings') : null) ??
+    null;
+  if (!settings || typeof settings.describe !== 'function' || typeof settings.update !== 'function') {
+    return { synced: false, reason: 'settings-service-unavailable', updatedProviders: [] };
+  }
+  let desc;
+  try { desc = settings.describe({ redactSecrets: false }); } catch {
+    try { desc = settings.describe({ redactSecrets: true }); } catch {
+      return { synced: false, reason: 'settings-describe-failed', updatedProviders: [] };
+    }
+  }
+  const nsList = Array.isArray(desc) ? desc : (Array.isArray(desc?.namespaces) ? desc.namespaces : []);
+  const resolveNsPayload = entry => {
+    if (entry?.value && typeof entry.value === 'object') return entry.value;
+    if (entry?.data && typeof entry.data === 'object') return entry.data;
+    return null;
+  };
+  const llmNs = nsList.find(n => {
+    const payload = resolveNsPayload(n);
+    if (!payload) return false;
+    return n?.ns === 'llm-pi-ai' || n?.namespace === 'llm-pi-ai' || ('providers' in payload);
+  });
+  const targetNs = llmNs?.ns ?? llmNs?.namespace;
+  const curPayload = resolveNsPayload(llmNs);
+  if (!targetNs || !curPayload) {
+    return { synced: false, reason: 'llm-namespace-not-found', updatedProviders: [] };
+  }
+
+  const nextData = structuredClone(curPayload);
+  const { providers: mergedProviders, updatedProviders } = applyModelsToProvidersMap(
+    nextData.providers ?? {},
+    modelsToEnsure,
+    defaultProvider,
+    providerTemplates,
+  );
+  nextData.providers = mergedProviders;
+
+  let defaultModelSynced = false;
+  const syncLiveDefaultSelection = async () => {
+    if (!syncDefaultModel || !defaultSelection?.provider || !defaultSelection?.model) return;
+    if (RESERVED_DSH_BUILTIN_PROVIDER_IDS.has(String(defaultSelection.provider))) return;
+    const admSvc =
+      (typeof ctx?.get === 'function' ? ctx.get('agentDefaultModel') : null) ??
+      ctx?.agentDefaultModel ??
+      (typeof ctx?.root?.get === 'function' ? ctx.root.get('agentDefaultModel') : null) ??
+      null;
+    const defNs = nsList.find(n => (n?.ns ?? n?.namespace) === 'agent-default-model');
+    if (onlyIfNoAvailableDefault) {
+      let curSel = null;
+      try {
+        curSel =
+          (typeof admSvc?.getSelection === 'function' ? await admSvc.getSelection() : null) ??
+          (typeof admSvc?.current === 'function' ? await admSvc.current() : null) ??
+          admSvc?.selection ??
+          resolveNsPayload(defNs) ??
+          null;
+      } catch {}
+      if (curSel?.provider && curSel?.model) {
+        const llmSvc =
+          (typeof ctx?.get === 'function' ? ctx.get('llm') : null) ??
+          ctx?.llm ??
+          (typeof ctx?.root?.get === 'function' ? ctx.root.get('llm') : null) ??
+          null;
+        if (llmSvc && typeof llmSvc.listModels === 'function') {
+          try {
+            const avail = (await llmSvc.listModels(curSel.provider)) ?? [];
+            if (Array.isArray(avail) && avail.some(m => (typeof m === 'string' ? m : m?.id) === curSel.model)) {
+              return;
+            }
+          } catch {}
+        }
+      }
+    }
+    const cleanSel = {
+      provider: String(defaultSelection.provider),
+      model: String(defaultSelection.model),
+      ...(defaultSelection.reasoningEffort ? { reasoningEffort: String(defaultSelection.reasoningEffort) } : {}),
+    };
+    if (admSvc && typeof admSvc.saveSelection === 'function') {
+      try {
+        await admSvc.saveSelection(cleanSel);
+        defaultModelSynced = true;
+        return;
+      } catch {}
+    }
+    if (defNs) {
+      try {
+        await settings.update(defNs.ns ?? defNs.namespace, cleanSel);
+        defaultModelSynced = true;
+      } catch {}
+    }
+  };
+
   if (updatedProviders.length === 0) {
-    return { synced: true, changed: false, updatedProviders: [] };
+    await syncLiveDefaultSelection();
+    return { synced: true, changed: defaultModelSynced, defaultModelSynced, updatedProviders: [] };
   }
   try {
-    await settings.update(llmNs.ns, nextData);
-    return { synced: true, changed: true, updatedProviders };
+    await settings.update(targetNs, nextData);
+    await syncLiveDefaultSelection();
+    return { synced: true, changed: true, defaultModelSynced, updatedProviders };
   } catch (e) {
     return { synced: false, reason: e instanceof Error ? e.message : String(e), updatedProviders: [] };
   }
+}
+
+function writeAtomicWithFs(filePath, content, fsImpl = fs, mode = null) {
+  if (fsImpl === fs) {
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    writeFileAtomic(filePath, content);
+    if (mode !== null && process.platform !== 'win32') {
+      try { fs.chmodSync(filePath, mode); } catch {}
+    }
+    return;
+  }
+  fsImpl.mkdirSync(path.dirname(filePath), { recursive: true });
+  const tmp = `${filePath}.tmp-${process.pid}-${Date.now()}`;
+  fsImpl.writeFileSync(tmp, content, 'utf8');
+  if (mode !== null && process.platform !== 'win32' && typeof fsImpl.chmodSync === 'function') {
+    try { fsImpl.chmodSync(tmp, mode); } catch {}
+  }
+  fsImpl.renameSync(tmp, filePath);
+}
+
+/**
+ * Write or update an API key inside `$DSH_HOME/.credentials.yaml` (`version: 1`, `refs:`)
+ * matching `@deepseek-ai/dsh-credentials-local`'s exact live-watched schema while preserving
+ * existing `refs` and `records`.
+ */
+export function writeDshCredentialsYamlEntry({
+  dshHome,
+  envVarName,
+  apiKey,
+  onlyIfMissing = false,
+  fsImpl = fs,
+} = {}) {
+  const cleanVar = String(envVarName ?? '').trim();
+  const cleanKey = String(apiKey ?? '').trim();
+  if (!dshHome || !/^[A-Z_][A-Z0-9_]*$/.test(cleanVar) || !cleanKey || /[\r\n\0]/.test(cleanKey)) {
+    return { updated: false, credFile: dshHome ? path.join(dshHome, '.credentials.yaml') : null };
+  }
+  const credFile = path.join(dshHome, '.credentials.yaml');
+  const serializedValue = JSON.stringify(cleanKey);
+  const existed = fsImpl.existsSync(credFile);
+  const rawPrev = existed ? String(fsImpl.readFileSync(credFile, 'utf8') ?? '').replace(/\r\n/g, '\n') : '';
+
+  if (!rawPrev.trim()) {
+    const fresh = `version: 1\nrefs:\n  ${cleanVar}: ${serializedValue}\n`;
+    writeAtomicWithFs(credFile, fresh, fsImpl, 0o600);
+    return { updated: true, credFile };
+  }
+
+  const lines = rawPrev.split('\n');
+  while (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
+
+  const hasVersion = lines.some(l => /^version\s*:\s*\d+/.test(l.trim()));
+  if (!hasVersion) {
+    lines.unshift('version: 1');
+  }
+
+  let refsIdx = lines.findIndex(l => /^refs\s*:(?:\s*\{\s*\})?\s*(?:#.*)?$/.test(l));
+  if (refsIdx < 0) {
+    const verIdx = lines.findIndex(l => /^version\s*:/.test(l));
+    const insertAt = verIdx >= 0 ? verIdx + 1 : lines.length;
+    lines.splice(insertAt, 0, 'refs:', `  ${cleanVar}: ${serializedValue}`);
+    writeAtomicWithFs(credFile, `${lines.join('\n')}\n`, fsImpl, 0o600);
+    return { updated: true, credFile };
+  }
+
+  // Normalize `refs: {}` into block `refs:`
+  lines[refsIdx] = 'refs:';
+  let blockEnd = refsIdx + 1;
+  while (blockEnd < lines.length) {
+    const l = lines[blockEnd];
+    if (l.trim() === '' || /^\s+#/.test(l) || /^[ \t]+/.test(l)) {
+      blockEnd++;
+    } else {
+      break;
+    }
+  }
+
+  const keyLineRe = new RegExp(`^[ \\t]+${cleanVar}\\s*:\\s*(.*)$`);
+  let matchedIdx = -1;
+  for (let i = refsIdx + 1; i < blockEnd; i++) {
+    const m = keyLineRe.exec(lines[i]);
+    if (m) {
+      matchedIdx = i;
+      const existingVal = m[1].trim();
+      if (onlyIfMissing && existingVal && existingVal !== '""' && existingVal !== "''" && existingVal !== 'null') {
+        return { updated: false, credFile };
+      }
+      break;
+    }
+  }
+
+  if (matchedIdx >= 0) {
+    const nextLine = `  ${cleanVar}: ${serializedValue}`;
+    if (lines[matchedIdx] === nextLine) {
+      return { updated: false, credFile };
+    }
+    lines[matchedIdx] = nextLine;
+  } else {
+    let insertPos = blockEnd;
+    while (insertPos > refsIdx + 1 && lines[insertPos - 1].trim() === '') {
+      insertPos--;
+    }
+    lines.splice(insertPos, 0, `  ${cleanVar}: ${serializedValue}`);
+  }
+
+  const nextContent = `${lines.join('\n')}\n`;
+  writeAtomicWithFs(credFile, nextContent, fsImpl, 0o600);
+  return { updated: true, credFile };
+}
+
+/**
+ * Read ambient provider credentials from `$DSH_HOME/.env` + `env` so standalone/panel saves can
+ * mirror active `apiKeyEnv` secrets into `$DSH_HOME/.credentials.yaml` (`dsh-credentials-local` live store).
+ */
+export function readDshEnvCredentialsMap({ dshHome = null, env = process.env, fsImpl = fs } = {}) {
+  const out = {};
+  if (dshHome) {
+    const envFile = path.join(dshHome, '.env');
+    if (fsImpl.existsSync(envFile)) {
+      try {
+        const txt = fsImpl.readFileSync(envFile, 'utf8');
+        for (const rawLine of txt.split(/\r?\n/)) {
+          const trimmed = rawLine.trim();
+          if (!trimmed || trimmed.startsWith('#')) continue;
+          const m = /^(?:export\s+)?([A-Z_][A-Z0-9_]*)\s*=\s*(.*)$/.exec(trimmed);
+          if (!m) continue;
+          const k = m[1];
+          let v = m[2].trim();
+          if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) {
+            if (v.startsWith('"')) {
+              try { v = JSON.parse(v); } catch { v = v.slice(1, -1); }
+            } else {
+              v = v.slice(1, -1);
+            }
+          }
+          if (typeof v === 'string' && v.trim()) out[k] = v.trim();
+        }
+      } catch {}
+    }
+  }
+  if (env && typeof env === 'object') {
+    for (const [k, v] of Object.entries(env)) {
+      if (/^[A-Z_][A-Z0-9_]*$/.test(k) && typeof v === 'string' && v.trim() && !/[\r\n\0]/.test(v)) {
+        out[k] = v.trim();
+      }
+    }
+  }
+  return out;
+}
+
+function parseYamlScalarValue(raw) {
+  const s = String(raw ?? '').trim();
+  if (!s) return '';
+  if (s === 'true') return true;
+  if (s === 'false') return false;
+  if (s === 'null' || s === '~') return null;
+  if (/^-?\d+(?:\.\d+)?$/.test(s)) return Number(s);
+  if (s.startsWith('"') && s.endsWith('"')) {
+    try { return JSON.parse(s); } catch { return s.slice(1, -1); }
+  }
+  if (s.startsWith("'") && s.endsWith("'")) {
+    return s.slice(1, -1).replace(/''/g, "'");
+  }
+  if (s.startsWith('[') && s.endsWith(']')) {
+    const inner = s.slice(1, -1).trim();
+    if (!inner) return [];
+    return inner.split(',').map(part => parseYamlScalarValue(part));
+  }
+  if (s.startsWith('{') && s.endsWith('}')) {
+    try { return JSON.parse(s); } catch {}
+    const inner = s.slice(1, -1).trim();
+    if (!inner) return {};
+    const obj = {};
+    for (const pair of inner.split(',')) {
+      const idx = pair.indexOf(':');
+      if (idx > 0) {
+        const k = parseYamlScalarValue(pair.slice(0, idx));
+        obj[String(k)] = parseYamlScalarValue(pair.slice(idx + 1));
+      }
+    }
+    return obj;
+  }
+  return s;
+}
+
+function parseSimpleIndentedYaml(lines, startIdx = 0, minIndent = 0) {
+  let idx = startIdx;
+  const skipIgnorable = () => {
+    while (idx < lines.length && (lines[idx].trim() === '' || /^\s*#/.test(lines[idx]))) idx++;
+  };
+  skipIgnorable();
+  if (idx >= lines.length) return { value: undefined, nextIdx: idx };
+  const firstIndent = /^([ \t]*)/.exec(lines[idx])[1].length;
+  if (firstIndent < minIndent) return { value: undefined, nextIdx: idx };
+
+  const trimmedFirst = lines[idx].trim();
+  if (trimmedFirst.startsWith('- ') || trimmedFirst === '-') {
+    const arr = [];
+    while (idx < lines.length) {
+      skipIgnorable();
+      if (idx >= lines.length) break;
+      const ind = /^([ \t]*)/.exec(lines[idx])[1].length;
+      if (ind < firstIndent) break;
+      const t = lines[idx].trim();
+      if (!(t.startsWith('- ') || t === '-')) break;
+      const rest = t === '-' ? '' : t.slice(2).trim();
+      idx++;
+      if (!rest) {
+        const sub = parseSimpleIndentedYaml(lines, idx, ind + 1);
+        arr.push(sub.value);
+        idx = sub.nextIdx;
+      } else if (/^[^'"[{][^:]*:(?:\s+.*)?$/.test(rest) || /^['"][^'"]+['"]\s*:(?:\s+.*)?$/.test(rest)) {
+        const virtualLines = [`${' '.repeat(ind + 2)}${rest}`];
+        while (idx < lines.length) {
+          const l = lines[idx];
+          if (l.trim() === '' || /^\s*#/.test(l)) { idx++; continue; }
+          const subInd = /^([ \t]*)/.exec(l)[1].length;
+          if (subInd <= ind) break;
+          virtualLines.push(l);
+          idx++;
+        }
+        const sub = parseSimpleIndentedYaml(virtualLines, 0, ind + 2);
+        arr.push(sub.value);
+      } else {
+        arr.push(parseYamlScalarValue(rest));
+      }
+    }
+    return { value: arr, nextIdx: idx };
+  }
+
+  const obj = {};
+  while (idx < lines.length) {
+    skipIgnorable();
+    if (idx >= lines.length) break;
+    const ind = /^([ \t]*)/.exec(lines[idx])[1].length;
+    if (ind < firstIndent) break;
+    const t = lines[idx].trim();
+    if (t.startsWith('- ') || t === '-') break;
+    const kvMatch = /^(?:"([^"]+)"|'([^']+)'|([^:#]+?))\s*:\s*(.*?)(?:\s+#.*)?$/.exec(t);
+    if (!kvMatch) { idx++; continue; }
+    const key = (kvMatch[1] ?? kvMatch[2] ?? kvMatch[3]).trim();
+    const valRest = kvMatch[4].trim();
+    idx++;
+    if (valRest === '') {
+      const sub = parseSimpleIndentedYaml(lines, idx, ind + 1);
+      obj[key] = sub.value ?? {};
+      idx = sub.nextIdx;
+    } else {
+      obj[key] = parseYamlScalarValue(valRest);
+    }
+  }
+  return { value: obj, nextIdx: idx };
+}
+
+function formatYamlKey(key) {
+  return /^[A-Za-z0-9_-]+$/.test(key) ? key : JSON.stringify(String(key));
+}
+
+function formatYamlScalar(val) {
+  if (typeof val === 'boolean' || typeof val === 'number') return String(val);
+  if (val === null) return 'null';
+  return JSON.stringify(String(val));
+}
+
+function serializeYamlValueLines(val, indent = 2) {
+  const pad = ' '.repeat(indent);
+  if (Array.isArray(val)) {
+    if (val.length === 0) return [`${pad}[]`];
+    if (val.every(x => typeof x === 'string' || typeof x === 'number' || typeof x === 'boolean')) {
+      return [`${pad}[${val.map(formatYamlScalar).join(', ')}]`];
+    }
+    const out = [];
+    for (const item of val) {
+      if (item && typeof item === 'object' && !Array.isArray(item)) {
+        const entries = Object.entries(item).filter(([, v]) => v !== undefined);
+        if (entries.length === 0) {
+          out.push(`${pad}- {}`);
+          continue;
+        }
+        const [firstK, firstV] = entries[0];
+        if (firstV !== null && typeof firstV === 'object') {
+          out.push(`${pad}- ${formatYamlKey(firstK)}:`);
+          out.push(...serializeYamlValueLines(firstV, indent + 4));
+        } else {
+          out.push(`${pad}- ${formatYamlKey(firstK)}: ${formatYamlScalar(firstV)}`);
+        }
+        for (let i = 1; i < entries.length; i++) {
+          const [k, v] = entries[i];
+          if (v !== null && typeof v === 'object') {
+            if (Array.isArray(v) && v.every(x => typeof x === 'string' || typeof x === 'number' || typeof x === 'boolean')) {
+              out.push(`${' '.repeat(indent + 2)}${formatYamlKey(k)}: [${v.map(formatYamlScalar).join(', ')}]`);
+            } else if (!Array.isArray(v) && Object.keys(v).length === 0) {
+              out.push(`${' '.repeat(indent + 2)}${formatYamlKey(k)}: {}`);
+            } else {
+              out.push(`${' '.repeat(indent + 2)}${formatYamlKey(k)}:`);
+              out.push(...serializeYamlValueLines(v, indent + 4));
+            }
+          } else {
+            out.push(`${' '.repeat(indent + 2)}${formatYamlKey(k)}: ${formatYamlScalar(v)}`);
+          }
+        }
+      } else {
+        out.push(`${pad}- ${formatYamlScalar(item)}`);
+      }
+    }
+    return out;
+  }
+  if (val && typeof val === 'object') {
+    const entries = Object.entries(val).filter(([, v]) => v !== undefined);
+    if (entries.length === 0) return [`${pad}{}`];
+    const out = [];
+    for (const [k, v] of entries) {
+      if (v !== null && typeof v === 'object') {
+        if (Array.isArray(v) && v.every(x => typeof x === 'string' || typeof x === 'number' || typeof x === 'boolean')) {
+          out.push(`${pad}${formatYamlKey(k)}: [${v.map(formatYamlScalar).join(', ')}]`);
+        } else if (Array.isArray(v) && v.length === 0) {
+          out.push(`${pad}${formatYamlKey(k)}: []`);
+        } else if (!Array.isArray(v) && Object.keys(v).length === 0) {
+          out.push(`${pad}${formatYamlKey(k)}: {}`);
+        } else {
+          out.push(`${pad}${formatYamlKey(k)}:`);
+          out.push(...serializeYamlValueLines(v, indent + 2));
+        }
+      } else {
+        out.push(`${pad}${formatYamlKey(k)}: ${formatYamlScalar(v)}`);
+      }
+    }
+    return out;
+  }
+  return [`${pad}${formatYamlScalar(val)}`];
+}
+
+function partitionCordisPatchBlocks(rawText) {
+  const normalized = String(rawText ?? '').replace(/\r\n/g, '\n');
+  const lines = normalized.split('\n');
+  const headerLines = [];
+  const blocks = [];
+  let pendingComments = [];
+  let curLines = null;
+  let seenFirst = false;
+
+  const flush = () => {
+    if (curLines) {
+      while (curLines.length > 1 && curLines[curLines.length - 1].trim() === '') curLines.pop();
+      blocks.push({ comments: pendingComments, lines: curLines });
+      pendingComments = [];
+      curLines = null;
+    }
+  };
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (/^\[\]\s*(?:#.*)?$/.test(trimmed) && !line.startsWith(' ')) continue;
+    if (/^-\s/.test(line)) {
+      flush();
+      seenFirst = true;
+      curLines = [line];
+    } else if (!seenFirst) {
+      headerLines.push(line);
+    } else if (/^#/.test(line)) {
+      flush();
+      pendingComments.push(line);
+    } else if (curLines) {
+      curLines.push(line);
+    } else if (trimmed !== '') {
+      pendingComments.push(line);
+    }
+  }
+  flush();
+  return { headerLines, blocks };
+}
+
+function extractBlockIdAndName(lines) {
+  let id = null;
+  let name = null;
+  if (!Array.isArray(lines) || lines.length === 0) return { id, name };
+  const m0 = /^\s*-\s*id\s*:\s*['"]?([^'"#\r\n]+?)['"]?\s*(?:#.*)?$/.exec(lines[0]);
+  if (m0) id = m0[1].trim();
+  for (let i = 1; i < lines.length; i++) {
+    if (!id) {
+      const mi = /^  id\s*:\s*['"]?([^'"#\r\n]+?)['"]?\s*(?:#.*)?$/.exec(lines[i]);
+      if (mi) id = mi[1].trim();
+    }
+    if (!name) {
+      const mn = /^  name\s*:\s*['"]?([^'"#\r\n]+?)['"]?\s*(?:#.*)?$/.exec(lines[i]);
+      if (mn) name = mn[1].trim();
+    }
+  }
+  return { id, name };
+}
+
+/**
+ * Directly synchronize provider & model definitions (and optional `agent-default-model`) into
+ * `$DSH_HOME/profiles/<profile>/cordis.patch.yml` on disk so standalone `lt-ui` / `lt-installer`
+ * (`ctx === null`) and DSH Desktop / `dsh web` stay 100% in sync without wiping other profile patches.
+ */
+export function syncModelsToDshDiskProfiles({
+  dshHome,
+  modelsToEnsure = [],
+  defaultProvider = 'magpie',
+  providerTemplates = null,
+  defaultSelection = null,
+  syncDefaultModel = false,
+  targetProfiles = null,
+  createDefaultProfilesIfNone = false,
+  fsImpl = fs,
+} = {}) {
+  if (!dshHome) {
+    return { synced: false, changed: false, reason: 'no-dsh-home', updatedProviders: [], updatedProfiles: [] };
+  }
+  const profilesRoot = path.join(dshHome, 'profiles');
+  let profileNames = [];
+  if (Array.isArray(targetProfiles) && targetProfiles.length > 0) {
+    profileNames = [...new Set(targetProfiles.map(String).filter(Boolean))];
+  } else if (fsImpl.existsSync(profilesRoot)) {
+    try {
+      profileNames = fsImpl
+        .readdirSync(profilesRoot, { withFileTypes: true })
+        .filter(d => d.isDirectory())
+        .map(d => d.name);
+    } catch {}
+  }
+  if (profileNames.length === 0 && createDefaultProfilesIfNone) {
+    profileNames = ['desktop', 'web'];
+  }
+  if (profileNames.length === 0) {
+    return { synced: false, changed: false, reason: 'no-initialized-profiles', updatedProviders: [], updatedProfiles: [] };
+  }
+
+  const allUpdatedProviders = new Set();
+  const updatedProfiles = [];
+  let anyChanged = false;
+
+  for (const profName of profileNames) {
+    const profDir = path.join(profilesRoot, profName);
+    if (profName === 'desktop' && createDefaultProfilesIfNone) {
+      const desktopPkgFile = path.join(profDir, 'package.json');
+      if (!fsImpl.existsSync(desktopPkgFile)) {
+        writeAtomicWithFs(
+          desktopPkgFile,
+          '{"name":"dsh-profile-desktop","private":true,"dsh":{"profile":{"bundles":["@deepseek-ai/dsh-base","@deepseek-ai/dsh-web-app"]}}}\n',
+          fsImpl,
+        );
+      }
+    }
+    const patchFile = path.join(profDir, 'cordis.patch.yml');
+    const existed = fsImpl.existsSync(patchFile);
+    const prevRaw = existed ? String(fsImpl.readFileSync(patchFile, 'utf8') ?? '') : '';
+    const { headerLines, blocks } = partitionCordisPatchBlocks(prevRaw);
+
+    let existingProviders = {};
+    let llmBlockIdx = -1;
+    let llmPluginName = null;
+    let defaultModelIdx = -1;
+    let defaultModelPluginName = null;
+    let existingDefaultModelCfg = null;
+
+    for (let i = 0; i < blocks.length; i++) {
+      const { id, name } = extractBlockIdAndName(blocks[i].lines);
+      if (id === 'llm-pi-ai') {
+        llmBlockIdx = i;
+        llmPluginName = name;
+        const parsedItem = parseSimpleIndentedYaml(blocks[i].lines, 0, 0).value;
+        const itemObj = Array.isArray(parsedItem) ? parsedItem[0] : parsedItem;
+        if (itemObj?.config?.providers && typeof itemObj.config.providers === 'object') {
+          existingProviders = itemObj.config.providers;
+        }
+      } else if (id === 'agent-default-model') {
+        defaultModelIdx = i;
+        defaultModelPluginName = name;
+        const parsedItem = parseSimpleIndentedYaml(blocks[i].lines, 0, 0).value;
+        const itemObj = Array.isArray(parsedItem) ? parsedItem[0] : parsedItem;
+        if (itemObj?.config && typeof itemObj.config === 'object') {
+          existingDefaultModelCfg = itemObj.config;
+        }
+      }
+    }
+
+    const { providers: mergedProviders, updatedProviders } = applyModelsToProvidersMap(
+      existingProviders,
+      modelsToEnsure,
+      defaultProvider,
+      providerTemplates,
+    );
+    for (const p of updatedProviders) allUpdatedProviders.add(p);
+
+    const hasProvidersToWrite = Object.keys(mergedProviders).length > 0;
+    if (hasProvidersToWrite && (updatedProviders.length > 0 || llmBlockIdx < 0)) {
+      const llmLines = ['- id: llm-pi-ai'];
+      if (llmPluginName) llmLines.push(`  name: ${JSON.stringify(llmPluginName)}`);
+      llmLines.push('  config:');
+      llmLines.push('    providers:');
+      llmLines.push(...serializeYamlValueLines(mergedProviders, 6));
+      if (llmBlockIdx >= 0) {
+        blocks[llmBlockIdx] = { comments: blocks[llmBlockIdx].comments, lines: llmLines };
+      } else {
+        blocks.push({ comments: [], lines: llmLines });
+      }
+    }
+
+    const shouldWriteDefaultModel =
+      Boolean(defaultSelection?.provider && defaultSelection?.model) &&
+      (syncDefaultModel || defaultModelIdx < 0 || !existingDefaultModelCfg?.provider || !existingDefaultModelCfg?.model);
+
+    if (shouldWriteDefaultModel) {
+      const cleanSel = {
+        provider: String(defaultSelection.provider),
+        model: String(defaultSelection.model),
+        ...(defaultSelection.reasoningEffort ? { reasoningEffort: String(defaultSelection.reasoningEffort) } : {}),
+      };
+      const dmLines = ['- id: agent-default-model'];
+      if (defaultModelPluginName) dmLines.push(`  name: ${JSON.stringify(defaultModelPluginName)}`);
+      dmLines.push('  config:');
+      dmLines.push(...serializeYamlValueLines(cleanSel, 4));
+      if (defaultModelIdx >= 0) {
+        blocks[defaultModelIdx] = { comments: blocks[defaultModelIdx].comments, lines: dmLines };
+      } else {
+        blocks.push({ comments: [], lines: dmLines });
+      }
+    }
+
+    const cleanHeader = [...headerLines];
+    while (cleanHeader.length > 0 && cleanHeader[cleanHeader.length - 1].trim() === '') cleanHeader.pop();
+    const outLines = [];
+    if (cleanHeader.length > 0) {
+      outLines.push(...cleanHeader);
+    } else if (!existed) {
+      outLines.push('# Your patch layer for this dsh profile, applied after every bundle layer:');
+    }
+    for (const b of blocks) {
+      if (b.comments.length > 0) outLines.push(...b.comments);
+      outLines.push(...b.lines);
+    }
+    const nextText = blocks.length > 0 ? `${outLines.join('\n').trimEnd()}\n` : `${outLines.join('\n').trimEnd()}\n[]\n`;
+    const normPrev = `${prevRaw.replace(/\r\n/g, '\n').trimEnd()}\n`;
+    if (!existed || nextText !== normPrev) {
+      writeAtomicWithFs(patchFile, nextText, fsImpl);
+      anyChanged = true;
+      updatedProfiles.push(profName);
+    }
+  }
+
+  return {
+    synced: true,
+    changed: anyChanged,
+    updatedProviders: [...allUpdatedProviders],
+    updatedProfiles,
+  };
 }

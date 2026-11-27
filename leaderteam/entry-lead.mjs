@@ -21,14 +21,15 @@ export function apply(ctx) {
   const scopeRef = Symbol('leaderteam-lead-scope');
 
   if (ctx.subagents) {
-    rt[SUBAGENTS_REFS_SYM] ??= new Set();
-    rt[SUBAGENTS_REFS_SYM].add(scopeRef);
+    if (!(rt[SUBAGENTS_REFS_SYM] instanceof Map)) {
+      rt[SUBAGENTS_REFS_SYM] = new Map();
+    }
+    const refs = rt[SUBAGENTS_REFS_SYM];
+    refs.set(scopeRef, ctx.subagents);
     rt.subagents = ctx.subagents;
     ctx.effect(() => () => {
-      rt[SUBAGENTS_REFS_SYM]?.delete(scopeRef);
-      if ((rt[SUBAGENTS_REFS_SYM]?.size ?? 0) === 0 && rt.subagents === ctx.subagents) {
-        rt.subagents = null;
-      }
+      refs.delete(scopeRef);
+      rt.subagents = refs.size > 0 ? [...refs.values()].at(-1) : null;
     }, { label: 'leaderteam-lead subagents-ref' });
   }
 

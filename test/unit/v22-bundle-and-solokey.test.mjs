@@ -58,14 +58,18 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
 
 test('root package.json and cordis.patch.yml conform to official DSH bundle rules', () => {
   const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
+  const innerPkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'leaderteam/package.json'), 'utf8'));
+  const webPkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'packages/lt-web/package.json'), 'utf8'));
   assert.equal(pkg.name, 'dsh-leaderteam');
-  assert.equal(pkg.version, '2.2.1');
+  assert.equal(pkg.version, '2.2.3');
+  assert.equal(innerPkg.version, pkg.version);
+  assert.equal(webPkg.version, pkg.version);
   assert.equal(pkg.license, 'Apache-2.0');
   assert.equal(pkg.dsh?.bundle?.patch, './cordis.patch.yml');
   assert.equal(pkg.dsh?.client?.platform, 'web');
   // Review check #3: never emit non-standard dsh.compatibility.dshReleases; use bounded engines.dsh
   assert.equal(pkg.dsh?.compatibility, undefined);
-  assert.equal(pkg.engines?.dsh, '0.2.2-rc.1 || 0.2.2-rc.5');
+  assert.equal(pkg.engines?.dsh, '>=0.2.2-alpha.2 <1.0.0');
 
   // Every exported subpath target and bundle patch file must exist on disk
   for (const [subpath, target] of Object.entries(pkg.exports)) {
@@ -95,7 +99,7 @@ test('Solo-Key starter presets produce strictly valid frozen configs with active
     const validated = validateConfig(raw);
     assert.equal(validated.magpie.provider, preset.provider);
     assert.equal(validated.roles.leader.route, preset.reasoningRoute);
-    assert.equal(validated.team.leaderModelPolicy, 'warn');
+    assert.equal(validated.team.leaderModelPolicy, 'follow');
     assert.equal(validated.governance.mode, 'autonomous');
     assert.equal(validated.powerMonitor.enabled, true);
     assert.equal(validated.powerMonitor.pollIntervalMs, 720000);

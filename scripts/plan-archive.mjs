@@ -17,7 +17,7 @@ import { resolveDefaultDshHome } from '../leaderteam/core/model-config-writer.mj
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
-function parseArgs(argv) {
+export function parseArgs(argv) {
   const out = { json: false, dryRun: true, confirm: false, all: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -37,7 +37,13 @@ function parseArgs(argv) {
     else if (a === '--project') out.projectKey = argv[++i];
     else if (a === '--category') out.category = argv[++i];
     else if (a === '--state') out.lifecycleState = argv[++i];
-    else if (a === '--older-than-days') out.olderThanDays = Number(argv[++i]);
+    else if (a === '--older-than-days' || a.startsWith('--older-than-days=')) {
+      const rawDays = a.startsWith('--older-than-days=') ? a.slice('--older-than-days='.length) : argv[++i];
+      const trimmedDays = typeof rawDays === 'string' ? rawDays.trim() : '';
+      out.olderThanDays = (trimmedDays !== '' && /^-?(?:\d+(?:\.\d+)?|\.\d+)$/.test(trimmedDays))
+        ? Number(trimmedDays)
+        : Number.NaN;
+    }
     else if (a === '--limit') out.limit = Number(argv[++i]);
     else if (a === '--notes') out.notes = argv[++i];
     else if (a === '--help' || a === '-h') out.cmd = 'help';
@@ -85,11 +91,12 @@ function resolveArchiveCliConfigFile(opts) {
   return path.join(ROOT, 'config', 'leaderteam.config.json');
 }
 
-try {
-  const opts = parseArgs(process.argv.slice(2));
+export function runPlanArchiveCli(argv = process.argv.slice(2), { writeStdout = true } = {}) {
+  const opts = parseArgs(argv);
   if (!opts.cmd || opts.cmd === 'help') {
-    console.log('Usage: node scripts/plan-archive.mjs (--status | --list | --show <id> | --retrospect <id> | --clean) [options]');
-    process.exit(0);
+    const helpMsg = 'Usage: node scripts/plan-archive.mjs (--status | --list | --show <id> | --retrospect <id> | --clean) [options]';
+    if (writeStdout) console.log(helpMsg);
+    return { help: true, message: helpMsg };
   }
   const configFile = resolveArchiveCliConfigFile(opts);
   const cfg = loadConfig(configFile);
@@ -101,13 +108,16 @@ try {
 
   if (opts.cmd === 'status') {
     const stats = store.getStats();
-    if (opts.json) emit(opts, stats);
-    else {
-      console.log(`Archive Root (fixed external): ${stats.root}`);
-      console.log(`Total Plans: ${stats.totalPlans} | Projects: ${stats.projectCount}`);
-      console.log(`By Category: ${JSON.stringify(stats.byCategory)}`);
-      console.log(`By Lifecycle: ${JSON.stringify(stats.byLifecycleState)}`);
+    if (writeStdout) {
+      if (opts.json) emit(opts, stats);
+      else {
+        console.log(`Archive Root (fixed external): ${stats.root}`);
+        console.log(`Total Plans: ${stats.totalPlans} | Projects: ${stats.projectCount}`);
+        console.log(`By Category: ${JSON.stringify(stats.byCategory)}`);
+        console.log(`By Lifecycle: ${JSON.stringify(stats.byLifecycleState)}`);
+      }
     }
+    return stats;
   } else if (opts.cmd === 'list') {
     const plans = store.listPlans({
       workspace: opts.workspace ?? null,
@@ -116,18 +126,23 @@ try {
       lifecycleState: opts.lifecycleState ?? null,
       limit: Number.isInteger(opts.limit) ? opts.limit : 50,
     });
-    if (opts.json) emit(opts, { root: store.root, count: plans.length, plans });
-    else {
-      console.log(`Archive Root: ${store.root} (${plans.length} plan(s))`);
-      for (const p of plans) {
-        console.log(`- ${p.planId} [${p.category}] (${p.lifecycleState}) ${p.topic} | project=${p.projectLabel || p.projectKey}`);
+    const out = { root: store.root, count: plans.length, plans };
+    if (writeStdout) {
+      if (opts.json) emit(opts, out);
+      else {
+        console.log(`Archive Root: ${store.root} (${plans.length} plan(s))`);
+        for (const p of plans) {
+          console.log(`- ${p.planId} [${p.category}] (${p.lifecycleState}) ${p.topic} | project=${p.projectLabel || p.projectKey}`);
+        }
       }
     }
+    return out;
   } else if (opts.cmd === 'show') {
     if (!opts.planId) throw new Error('--show requires <planId>');
     const plan = store.resolvePlan(opts.planId);
     if (!plan) throw new Error(`Archived plan not found: ${opts.planId}`);
-    emit(opts, plan);
+    if (writeStdout) emit(opts, plan);
+    return plan;
   } else if (opts.cmd === 'retrospect') {
     if (!opts.planId) throw new Error('--retrospect requires <planId>');
     const plan = store.resolvePlan(opts.planId);
@@ -139,20 +154,43 @@ try {
       teamStoreInstance,
       notes: opts.notes ?? '',
     });
-    emit(opts, retro);
+    if (writeStdout) emit(opts, retro);
+    return retro;
   } else if (opts.cmd === 'clean') {
     const res = store.cleanPlans({
       workspace: opts.workspace ?? null,
       projectKey: opts.projectKey ?? null,
       category: opts.category ?? null,
-      olderThanDays: typeof opts.olderThanDays === 'number' && !Number.isNaN(opts.olderThanDays) ? opts.olderThanDays : null,
+      olderThanDays: opts.olderThanDays !== undefined ? opts.olderThanDays : null,
       all: opts.all,
       dryRun: opts.dryRun,
       confirm: opts.confirm,
     });
-    emit(opts, res);
+    if (writeStdout) emit(opts, res);
+    return res;
   }
-} catch (e) {
-  console.error(`ERROR: ${e instanceof Error ? e.message : String(e)}`);
-  process.exit(1);
+  return null;
+}
+
+function isMainCliModule(metaUrl, argv1 = process.argv[1]) {
+  if (!argv1) return false;
+  const selfPath = fileURLToPath(metaUrl);
+  const resolvedArgv = path.resolve(argv1);
+  if (resolvedArgv === selfPath) return true;
+  try {
+    return fs.realpathSync(resolvedArgv) === fs.realpathSync(selfPath);
+  } catch {
+    return false;
+  }
+}
+
+if (isMainCliModule(import.meta.url)) {
+  try {
+    runPlanArchiveCli(process.argv.slice(2), { writeStdout: true });
+    process.exit(0);
+  } catch (e) {
+    const codeTag = typeof e?.code === 'string' ? `[${e.code}] ` : '';
+    console.error(`ERROR: ${codeTag}${e instanceof Error ? e.message : String(e)}`);
+    process.exit(1);
+  }
 }

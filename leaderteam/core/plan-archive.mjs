@@ -844,7 +844,23 @@ export class PlanArchiveStore {
       ? 'issues-identified'
       : (members.length > 0 ? 'clean-execution' : 'not-executed');
 
-    const retroId = `retro-${refreshed.planId}-${String(nowMs).slice(-6)}`;
+    fs.mkdirSync(this.retrospectivesDir, { recursive: true });
+    refreshed.execution ??= { members: [], deliveryAgreements: [], retrospectiveIds: [] };
+    const existingRetroIds = new Set(refreshed.execution.retrospectiveIds ?? []);
+    let retroId = '';
+    for (let attempt = 0; attempt < 16; attempt++) {
+      const nonce = crypto.randomBytes(4).toString('hex');
+      const candidate = `retro-${refreshed.planId}-${nowMs}-${nonce}`;
+      const jsonPath = path.join(this.retrospectivesDir, `${safeId(candidate)}.json`);
+      const mdPath = path.join(this.retrospectivesDir, `${safeId(candidate)}.md`);
+      if (!existingRetroIds.has(candidate) && !fs.existsSync(jsonPath) && !fs.existsSync(mdPath)) {
+        retroId = candidate;
+        break;
+      }
+    }
+    if (!retroId) {
+      retroId = `retro-${refreshed.planId}-${nowMs}-${crypto.randomUUID().slice(0, 12)}`;
+    }
     const nowIso = new Date(nowMs).toISOString();
     const retro = {
       v: 1,
@@ -937,13 +953,22 @@ export class PlanArchiveStore {
     olderThanDays = null,
     all = false,
     dryRun = true,
+    confirm = undefined,
     nowMs = resolveNowMs(),
   } = {}) {
+    if (olderThanDays !== null && olderThanDays !== undefined) {
+      if (typeof olderThanDays !== 'number' || !Number.isFinite(olderThanDays) || olderThanDays < 0) {
+        throw new LtError('PLAN_ARCHIVE_CLEAN', 'olderThanDays must be a finite non-negative number');
+      }
+    }
+    if (!dryRun && confirm === false) {
+      throw new LtError('PLAN_ARCHIVE_CLEAN', 'Destructive plan archive clean requires confirm: true');
+    }
     if (!all && !projectKey && !workspace && !teamId && !category && (olderThanDays === null || olderThanDays === undefined)) {
       throw new LtError('PLAN_ARCHIVE_CLEAN', 'clean requires an explicit filter (projectKey, workspace, teamId, category, olderThanDays) or all=true');
     }
     const wantProj = projectKey ?? (workspace ? computeProjectKey(workspace, this.platform) : null);
-    const cutoffMs = (typeof olderThanDays === 'number' && Number.isFinite(olderThanDays) && olderThanDays >= 0)
+    const cutoffMs = (olderThanDays !== null && olderThanDays !== undefined)
       ? nowMs - olderThanDays * 86400 * 1000
       : null;
 

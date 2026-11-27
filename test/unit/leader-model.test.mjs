@@ -6,14 +6,15 @@ import { configWith, defaultConfig } from './helpers.mjs';
 
 const SOL = { provider: 'magpie', model: 'codex/gpt-6.1-sol', reasoningEffort: 'high' };
 
-test('leader model policy defaults to enforce and is validated', () => {
-  assert.equal(defaultConfig().team.leaderModelPolicy, 'enforce');
+test('leader model policy defaults to follow (session auto-sync) and validates explicit enforce/warn/off', () => {
+  assert.equal(defaultConfig().team.leaderModelPolicy, 'follow');
+  assert.equal(configWith({ team: { leaderModelPolicy: 'enforce' } }).team.leaderModelPolicy, 'enforce');
   assert.equal(configWith({ team: { leaderModelPolicy: 'warn' } }).team.leaderModelPolicy, 'warn');
-  assert.throws(() => configWith({ team: { leaderModelPolicy: 'strict' } }), /team\.leaderModelPolicy must be "enforce", "warn" or "off"/);
+  assert.throws(() => configWith({ team: { leaderModelPolicy: 'strict' } }), /team\.leaderModelPolicy must be "follow", "enforce", "warn" or "off"/);
 });
 
-test('enforce: exact route+effort passes; wrong route, wrong effort or unknown effort blocks', () => {
-  const cfg = defaultConfig();
+test('enforce (opt-in): exact route+effort passes; wrong route, wrong effort or unknown effort blocks', () => {
+  const cfg = configWith({ team: { leaderModelPolicy: 'enforce' } });
   const ok = checkLeaderModel(cfg, SOL);
   assert.equal(ok.status, 'match'); assert.equal(ok.blocked, false); assert.equal(ok.message, undefined);
   const effort = checkLeaderModel(cfg, { ...SOL, reasoningEffort: 'medium' });
@@ -42,7 +43,7 @@ test('warn reports route and effort mismatches without blocking; off skips; role
   assert.equal(checkLeaderModel(warn, undefined).blocked, false);
   const off = configWith({ team: { leaderModelPolicy: 'off' } });
   assert.deepEqual([checkLeaderModel(off, undefined).status, checkLeaderModel(off, undefined).blocked], ['unchecked', false]);
-  const glm = configWith({ roles: { leader: { route: 'zcode/GLM-5.3', effort: 'high' } } });
+  const glm = configWith({ roles: { leader: { route: 'zcode/GLM-5.3', effort: 'high' } }, team: { leaderModelPolicy: 'enforce' } });
   assert.equal(checkLeaderModel(glm, { provider: 'magpie', model: 'zcode/GLM-5.3', reasoningEffort: 'high' }).status, 'match');
   assert.equal(checkLeaderModel(glm, SOL).blocked, true);
 });

@@ -33,12 +33,13 @@ export function queueExecutionReview(rt, store, taskSeq, agent, stage, args, run
   rt.executionReviewJobs ??= new Map();
   if (rt.executionReviewJobs.has(key)) return { status: 'reviewing', review_id: reviewId, stage_id: stage.id, instruction: 'Keep planning the next stage. Approval is required only before dispatch.' };
   if (!prior) store.appendWorkflowEvent({ type: 'execution-review-queued', taskSeq, reviewId, stageId: stage.id, stageHash: stage.hash, stage, args, resumeId: args.resume_id ?? null, revises: args.revises ?? null });
-  const controller = new AbortController(), work = { teamId: store.teamId, controller, promise: null };
+  const logicalTeamId = store.rawTeamId ?? store.teamId;
+  const controller = new AbortController(), work = { teamId: logicalTeamId, controller, promise: null };
   rt.executionReviewJobs.set(key, work);
   work.promise = Promise.resolve().then(() => run(controller.signal)).then(value => {
     if (controller.signal.aborted) return; // interrupted work remains recoverable; it cannot publish a late approval
     store.appendWorkflowEvent({ type: 'execution-review-result', taskSeq, reviewId, stageId: stage.id, stageHash: stage.hash, result: value });
-    wake(rt, agent, `[LeaderTeam execution review ${reviewId}] Stage ${stage.id} version ${stage.revision}: ${JSON.stringify(value)}. Dispatch only this approved version; continue planning future work concurrently.`, store.teamId, taskSeq);
+    wake(rt, agent, `[LeaderTeam execution review ${reviewId}] Stage ${stage.id} version ${stage.revision}: ${JSON.stringify(value)}. Dispatch only this approved version; continue planning future work concurrently.`, logicalTeamId, taskSeq);
   }).catch(e => {
     if (controller.signal.aborted) return;
     store.appendWorkflowEvent({ type: 'execution-review-result', taskSeq, reviewId, stageId: stage.id, stageHash: stage.hash, result: { status: 'error', error: e.message } });
@@ -59,9 +60,11 @@ export function formatFrontierContext(store, taskSeq, cfg = null) {
   });
   const remaining = { missing_stage_ids: v.overview.future_work.filter(id => !v.stages.some(s => s.stage_id === id)), provisional_stage_ids: v.stages.filter(s => !s.ready).map(s => s.stage_id) };
   if (autonomous) {
-    const next = frontierNeedsPlanning(store, taskSeq)
-      ? 'Autonomous execution mode: dispatch ready stages (`ready_to_dispatch`) immediately with `team_dispatch` WITHOUT waiting for `plan_id` or Dual Reviewers; Dual Reviewers supervise asynchronously in the background. Keep planning useful future stages as needed.'
-      : 'Autonomous execution mode: dispatch any unblocked `ready_to_dispatch` stage immediately with `team_dispatch` (or use `team_direct_exec` for local checks/fixes). If dependencies, write scopes or capacity block remaining dispatches, declare `team_status(stop_state="waiting_members")` once and END THIS TURN.';
+    const next = v.stages.length === 0
+      ? 'Autonomous progressive planning: define ONLY the first executable stage(s) (`ready=true` for their own boundary; leave downstream stages in `future_work` or `ready=false`) and call `team_dispatch` immediately — do NOT wait to design every future stage up front.'
+      : frontierNeedsPlanning(store, taskSeq)
+        ? 'Autonomous execution mode: dispatch ready stages (`ready_to_dispatch`) immediately with `team_dispatch` WITHOUT waiting for `plan_id` or Dual Reviewers; Dual Reviewers supervise asynchronously in the background. Elaborate remaining future stages incrementally while members run.'
+        : 'Autonomous execution mode: dispatch any unblocked `ready_to_dispatch` stage immediately with `team_dispatch` (or use `team_direct_exec` for workspace-confined checks/fixes). If dependencies, write scopes or capacity block remaining dispatches, declare `team_status(stop_state="waiting_members")` once and END THIS TURN.';
     const stages = v.stages.map(({ verification, ...stage }) => ({ ...stage, ...(verification && { verification_state: verification.status }) }));
     return `LeaderTeam rolling planning revision ${v.revision}:\n` + JSON.stringify({ stages, remaining_planning: remaining, ...(feedback.length ? { recent_feedback: feedback } : {}) }) + '\n' + next + ' `member_done` records member completion; verify actual behavior before final delivery.';
   }

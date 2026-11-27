@@ -35,8 +35,8 @@ async function runScenario(name, scenario) {
   const cfg = JSON.parse(fs.readFileSync(path.join(ROOT, 'config/leaderteam.config.json'), 'utf8'));
   merge(cfg, { storage: { root: store }, quota: { stateFile: path.join(workDir, 'quota.json') }, paths: { globalRefRoots: [globalRefs] } });
   merge(cfg, { planArchive: { root: path.join(os.tmpdir(), 'leaderteam-integration-plan-archives', path.basename(workDir)) } });
-  // Preserve old protocol coverage; rolling / sandbox-direct / autonomous scenarios explicitly enable the new protocol.
-  merge(cfg, { team: { rollingPlanning: false }, gate: { sandboxDirectAllow: false }, governance: { mode: 'approval' } });
+  // Preserve old protocol coverage; rolling / sandbox-direct / autonomous / follow scenarios explicitly enable the new protocol.
+  merge(cfg, { team: { rollingPlanning: false, leaderModelPolicy: 'enforce' }, gate: { sandboxDirectAllow: false }, governance: { mode: 'approval' } });
   merge(cfg, scenario.config);
   const cfgFile = path.join(workDir, 'leaderteam.config.json');
   fs.writeFileSync(cfgFile, JSON.stringify(cfg, null, 1));
@@ -145,7 +145,19 @@ async function runScenario(name, scenario) {
 }
 
 const dir = path.join(path.dirname(fileURLToPath(import.meta.url)), 'scenarios');
-const wanted = process.argv.slice(2);
+const rawArgs = process.argv.slice(2);
+const wanted = [];
+for (let i = 0; i < rawArgs.length; i++) {
+  const arg = rawArgs[i];
+  if (arg === '--filter') {
+    if (rawArgs[i + 1]) wanted.push(rawArgs[++i]);
+  } else if (arg.startsWith('--filter=')) {
+    const val = arg.slice('--filter='.length);
+    if (val) wanted.push(val);
+  } else if (!arg.startsWith('--')) {
+    wanted.push(arg);
+  }
+}
 const names = fs.readdirSync(dir).filter(f => f.endsWith('.mjs')).map(f => f.slice(0, -4)).filter(n => wanted.length === 0 || wanted.some(w => n.startsWith(w))).sort();
 let failed = 0, ran = 0;
 for (const n of names) {

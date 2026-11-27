@@ -32,6 +32,63 @@ export function deepMergePlain(base, over) {
   return out;
 }
 
+/** Prune `team.executionFallbacks` entries so every primary and fallback route is an enabled route in `pool`. Pure. */
+export function pruneExecutionFallbacksMap(fallbacksObj, pool, models, disabledModels = [], disabledFamilies = []) {
+  if (!fallbacksObj || typeof fallbacksObj !== 'object' || Array.isArray(fallbacksObj)) {
+    return { next: undefined, pruned: [] };
+  }
+  const poolSet = new Set(Array.isArray(pool) ? pool : []);
+  const disRoutes = new Set(Array.isArray(disabledModels) ? disabledModels : []);
+  const disFams = new Set(Array.isArray(disabledFamilies) ? disabledFamilies : []);
+  const isEnabled = r => typeof r === 'string' && poolSet.has(r) && Boolean(models && Object.hasOwn(models, r)) && !disRoutes.has(r) && !disFams.has(models[r]?.family);
+  const next = {};
+  const pruned = [];
+  for (const [primary, list] of Object.entries(fallbacksObj)) {
+    if (!isEnabled(primary) || !Array.isArray(list)) {
+      pruned.push(`${primary} -> [${Array.isArray(list) ? list.join(', ') : ''}]`);
+      continue;
+    }
+    const kept = [];
+    for (const cand of list) {
+      if (cand !== primary && isEnabled(cand) && !kept.includes(cand)) kept.push(cand);
+      else pruned.push(`${primary} -> ${String(cand)}`);
+    }
+    if (kept.length > 0) next[primary] = kept;
+  }
+  return { next: Object.keys(next).length > 0 ? next : undefined, pruned };
+}
+
+export function mergeConfigLayers(base, over) {
+  const merged = deepMergePlain(base, over);
+  if (
+    merged && typeof merged === 'object' && !Array.isArray(merged)
+    && over && typeof over === 'object' && !Array.isArray(over)
+    && merged.team && typeof merged.team === 'object' && !Array.isArray(merged.team)
+    && over.team && typeof over.team === 'object' && !Array.isArray(over.team)
+  ) {
+    if (over.team.executionFallbacks !== undefined && over.team.executionFallbacks !== null && typeof over.team.executionFallbacks === 'object' && !Array.isArray(over.team.executionFallbacks)) {
+      merged.team.executionFallbacks = structuredClone(over.team.executionFallbacks);
+    } else if (
+      over.team.executionFallbacks === undefined
+      && (over.team.executionPool !== undefined || over.team.disabledModels !== undefined || over.team.disabledFamilies !== undefined)
+      && merged.team.executionFallbacks
+      && typeof merged.team.executionFallbacks === 'object'
+      && !Array.isArray(merged.team.executionFallbacks)
+    ) {
+      const { next } = pruneExecutionFallbacksMap(
+        merged.team.executionFallbacks,
+        merged.team.executionPool,
+        merged.models,
+        merged.team.disabledModels,
+        merged.team.disabledFamilies,
+      );
+      if (next) merged.team.executionFallbacks = next;
+      else delete merged.team.executionFallbacks;
+    }
+  }
+  return merged;
+}
+
 export function loadConfig(file, options = {}) {
   return validateConfig(loadRawConfig(file, options));
 }
@@ -45,7 +102,7 @@ export function loadRawConfig(file, options = {}) {
       if (localRaw === null || typeof localRaw !== 'object' || Array.isArray(localRaw)) {
         throw new LtError('BAD_CONFIG', `local config override ${localFile} must be a JSON object`);
       }
-      raw = deepMergePlain(raw, localRaw);
+      raw = mergeConfigLayers(raw, localRaw);
     }
   }
   return raw;
@@ -173,7 +230,10 @@ export function validateConfig(raw) {
   }
 
   const g = isObj(raw.gate) ? raw.gate : (p.push('gate must be an object'), {});
-  onlyKeys(g, ['scope', 'sandboxDirectAllow', 'enablePatternCache', 'uncontrolledTools', 'shellTools', 'mutatingTools', 'pathArgs', 'requireReadBeforeWrite', 'maxArgChars', 'maxAuthorizationChars', 'dedupeDeniedCalls', 'maxReviewsPerMember', 'maxDenialsPerMember', 'maxReviewsPerTask', 'ruleOnlyTools', 'maxConsecutiveGateErrors', 'gateErrorCooldownMs'], 'gate');
+  onlyKeys(g, ['scope', 'sandboxDirectAllow', 'enablePatternCache', 'uncontrolledTools', 'shellTools', 'mutatingTools', 'pathArgs', 'requireReadBeforeWrite', 'maxArgChars', 'maxAuthorizationChars', 'dedupeDeniedCalls', 'maxReviewsPerMember', 'maxDenialsPerMember', 'maxReviewsPerTask', 'ruleOnlyTools', 'maxConsecutiveGateErrors', 'gateErrorCooldownMs', 'hostCompatibilityPolicy'], 'gate');
+  if (g.hostCompatibilityPolicy !== undefined && g.hostCompatibilityPolicy !== 'adaptive' && g.hostCompatibilityPolicy !== 'strict-verified') {
+    p.push('gate.hostCompatibilityPolicy must be "adaptive" or "strict-verified"');
+  }
   if (g.sandboxDirectAllow !== undefined) bool(g.sandboxDirectAllow, 'gate.sandboxDirectAllow');
   if (g.enablePatternCache !== undefined) bool(g.enablePatternCache, 'gate.enablePatternCache');
   // "all" was never a working mode: it left ordinary sessions without any tool. Only team sessions are governed.
@@ -214,7 +274,7 @@ export function validateConfig(raw) {
   if (pa.leaderReadRoots !== undefined) strArr(pa.leaderReadRoots, 'paths.leaderReadRoots'); // optional: extra read-only roots for the leader
 
   const t = isObj(raw.team) ? raw.team : (p.push('team must be an object'), {});
-  onlyKeys(t, ['executionPool', 'maxMembersPerTeam', 'maxActiveMembers', 'requirePlanAgreement', 'planExemptProfiles', 'maxPlanAgreements', 'maxDiscussionsPerTask', 'maxRefsPerMember', 'leaderModelPolicy', 'leaderModelAsLastResort', 'autoIncludeUpstreamModels', 'disabledModels', 'disabledFamilies', 'rollingPlanning'], 'team');
+  onlyKeys(t, ['executionPool', 'executionFallbacks', 'maxMembersPerTeam', 'maxActiveMembers', 'requirePlanAgreement', 'planExemptProfiles', 'maxPlanAgreements', 'maxDiscussionsPerTask', 'maxRefsPerMember', 'leaderModelPolicy', 'leaderModelAsLastResort', 'autoIncludeUpstreamModels', 'disabledModels', 'disabledFamilies', 'rollingPlanning'], 'team');
   if (t.rollingPlanning !== undefined) bool(t.rollingPlanning, 'team.rollingPlanning');
   if (strArr(t.executionPool, 'team.executionPool', { nonEmpty: true })) for (const r of t.executionPool) if (!models[r]) p.push(`team.executionPool: "${r}" is not in models`);
   int(t.maxMembersPerTeam, 'team.maxMembersPerTeam', 1, 10000); bool(t.requirePlanAgreement, 'team.requirePlanAgreement');
@@ -223,11 +283,29 @@ export function validateConfig(raw) {
   if (strArr(t.planExemptProfiles, 'team.planExemptProfiles')) for (const x of t.planExemptProfiles) if (!memberProfiles.includes(x)) p.push(`team.planExemptProfiles: unknown profile "${x}"`);
   int(t.maxPlanAgreements, 'team.maxPlanAgreements', 1, 50); int(t.maxRefsPerMember, 'team.maxRefsPerMember', 0, 100);
   if (t.maxDiscussionsPerTask !== undefined && t.maxDiscussionsPerTask !== null) int(t.maxDiscussionsPerTask, 'team.maxDiscussionsPerTask', 1, 10000);
-  if (t.leaderModelPolicy !== undefined && !['enforce', 'warn', 'off'].includes(t.leaderModelPolicy)) p.push('team.leaderModelPolicy must be "enforce", "warn" or "off"');
+  if (t.leaderModelPolicy !== undefined && !['follow', 'enforce', 'warn', 'off'].includes(t.leaderModelPolicy)) p.push('team.leaderModelPolicy must be "follow", "enforce", "warn" or "off"');
   if (t.autoIncludeUpstreamModels !== undefined) bool(t.autoIncludeUpstreamModels, 'team.autoIncludeUpstreamModels');
   if (t.disabledModels !== undefined) strArr(t.disabledModels, 'team.disabledModels');
   if (t.disabledFamilies !== undefined && strArr(t.disabledFamilies, 'team.disabledFamilies')) {
     for (const f of t.disabledFamilies) if (!FAMILIES.includes(f)) p.push(`team.disabledFamilies: unknown family "${f}"`);
+  }
+  if (t.executionFallbacks !== undefined) {
+    if (!isObj(t.executionFallbacks)) p.push('team.executionFallbacks must be an object');
+    else {
+      const pool = Array.isArray(t.executionPool) ? t.executionPool : [];
+      const disabledRoutes = new Set(Array.isArray(t.disabledModels) ? t.disabledModels : []);
+      const disabledFamilies = new Set(Array.isArray(t.disabledFamilies) ? t.disabledFamilies : []);
+      for (const [primary, fallbacks] of Object.entries(t.executionFallbacks)) {
+        const at = `team.executionFallbacks[${JSON.stringify(primary)}]`;
+        if (!strArr(fallbacks, at)) continue;
+        for (const route of [primary, ...fallbacks]) {
+          if (!pool.includes(route) || !Object.hasOwn(models, route) || disabledRoutes.has(route) || disabledFamilies.has(models[route]?.family)) {
+            p.push(`${at}: "${route}" must be an enabled execution pool route`);
+          }
+        }
+        if (fallbacks.includes(primary)) p.push(`${at}: fallback repeats the primary route`);
+      }
+    }
   }
 
   const a = isObj(raw.agreement) ? raw.agreement : (p.push('agreement must be an object'), {});
@@ -377,6 +455,7 @@ export function validateConfig(raw) {
       if (cb.investigatorRole !== undefined && !['arbiter', 'discussA', 'discussB', 'gate'].includes(cb.investigatorRole)) {
         p.push('circuitBreaker.investigatorRole must be one of arbiter, discussA, discussB, gate');
       }
+      const cbFieldOk = {};
       for (const k of [
         'zeroProgressTruncationSoft', 'zeroProgressTruncationHard',
         'repeatedFailureSoft', 'repeatedFailureHard',
@@ -385,9 +464,21 @@ export function validateConfig(raw) {
         'runtimeErrorSoft', 'runtimeErrorHard',
         'maxConsolidationsPerAgent',
       ]) {
-        if (cb[k] !== undefined) int(cb[k], `circuitBreaker.${k}`, 1, 10000);
+        cbFieldOk[k] = cb[k] === undefined || int(cb[k], `circuitBreaker.${k}`, 1, 10000);
       }
       if (cb.cooldownMs !== undefined) int(cb.cooldownMs, 'circuitBreaker.cooldownMs', 0, 3600000);
+      const effCb = { ...DEFAULT_CIRCUIT_BREAKER_CONFIG, ...cb };
+      for (const [softKey, hardKey] of [
+        ['zeroProgressTruncationSoft', 'zeroProgressTruncationHard'],
+        ['repeatedFailureSoft', 'repeatedFailureHard'],
+        ['identicalSignatureSoft', 'identicalSignatureHard'],
+        ['stagnantSpinSoft', 'stagnantSpinHard'],
+        ['runtimeErrorSoft', 'runtimeErrorHard'],
+      ]) {
+        if (cbFieldOk[softKey] && cbFieldOk[hardKey] && effCb[softKey] > effCb[hardKey]) {
+          p.push(`circuitBreaker.${softKey} must be <= circuitBreaker.${hardKey}`);
+        }
+      }
     }
   }
 
@@ -404,8 +495,12 @@ export function validateConfig(raw) {
       if (gv.mode !== undefined && !['autonomous', 'approval'].includes(gv.mode)) {
         p.push('governance.mode must be "autonomous" or "approval"');
       }
-      if (gv.caucusQuorumNumerator !== undefined) int(gv.caucusQuorumNumerator, 'governance.caucusQuorumNumerator', 1, 10);
-      if (gv.caucusQuorumDenominator !== undefined) int(gv.caucusQuorumDenominator, 'governance.caucusQuorumDenominator', 1, 10);
+      const numOk = gv.caucusQuorumNumerator === undefined || int(gv.caucusQuorumNumerator, 'governance.caucusQuorumNumerator', 1, 10);
+      const denOk = gv.caucusQuorumDenominator === undefined || int(gv.caucusQuorumDenominator, 'governance.caucusQuorumDenominator', 1, 10);
+      const effGv = { ...DEFAULT_GOVERNANCE_CONFIG, ...gv };
+      if (numOk && denOk && effGv.caucusQuorumNumerator > effGv.caucusQuorumDenominator) {
+        p.push('governance.caucusQuorumNumerator must be <= governance.caucusQuorumDenominator');
+      }
       if (gv.maxInternalArbitrationRounds !== undefined) int(gv.maxInternalArbitrationRounds, 'governance.maxInternalArbitrationRounds', 1, 5);
       if (gv.maxConferenceDialogueTurns !== undefined) int(gv.maxConferenceDialogueTurns, 'governance.maxConferenceDialogueTurns', 0, 5);
       if (gv.autoSuperviseStages !== undefined) bool(gv.autoSuperviseStages, 'governance.autoSuperviseStages');
@@ -422,9 +517,10 @@ export function validateConfig(raw) {
       onlyKeys(pm, ['enabled', 'pollIntervalMs', 'lowBatteryPct', 'resetBatteryPct'], 'powerMonitor');
       if (pm.enabled !== undefined) bool(pm.enabled, 'powerMonitor.enabled');
       if (pm.pollIntervalMs !== undefined) int(pm.pollIntervalMs, 'powerMonitor.pollIntervalMs', 600000, 900000);
-      if (pm.lowBatteryPct !== undefined) int(pm.lowBatteryPct, 'powerMonitor.lowBatteryPct', 5, 50);
-      if (pm.resetBatteryPct !== undefined) int(pm.resetBatteryPct, 'powerMonitor.resetBatteryPct', 10, 90);
-      if (Number.isInteger(pm.lowBatteryPct) && Number.isInteger(pm.resetBatteryPct) && pm.resetBatteryPct <= pm.lowBatteryPct) {
+      const lowOk = pm.lowBatteryPct === undefined || int(pm.lowBatteryPct, 'powerMonitor.lowBatteryPct', 5, 50);
+      const resetOk = pm.resetBatteryPct === undefined || int(pm.resetBatteryPct, 'powerMonitor.resetBatteryPct', 10, 90);
+      const effPm = { ...DEFAULT_POWER_MONITOR_CONFIG, ...pm };
+      if (lowOk && resetOk && effPm.resetBatteryPct <= effPm.lowBatteryPct) {
         p.push('powerMonitor.resetBatteryPct must be greater than powerMonitor.lowBatteryPct');
       }
     }
@@ -437,8 +533,12 @@ export function validateConfig(raw) {
       onlyKeys(rw, ['enabled', 'windowMs', 'softThrottlePct', 'hardPausePct', 'windowsByProvider'], 'requestWindow');
       if (rw.enabled !== undefined) bool(rw.enabled, 'requestWindow.enabled');
       if (rw.windowMs !== undefined) int(rw.windowMs, 'requestWindow.windowMs', 60000, 86400000);
-      if (rw.softThrottlePct !== undefined) num(rw.softThrottlePct, 'requestWindow.softThrottlePct', 1, 80);
-      if (rw.hardPausePct !== undefined) num(rw.hardPausePct, 'requestWindow.hardPausePct', 0, 50);
+      const softOk = rw.softThrottlePct === undefined || num(rw.softThrottlePct, 'requestWindow.softThrottlePct', 1, 80);
+      const hardOk = rw.hardPausePct === undefined || num(rw.hardPausePct, 'requestWindow.hardPausePct', 0, 50);
+      const effRw = { ...DEFAULT_REQUEST_WINDOW_CONFIG, ...rw };
+      if (softOk && hardOk && effRw.hardPausePct > effRw.softThrottlePct) {
+        p.push('requestWindow.hardPausePct must be <= requestWindow.softThrottlePct');
+      }
       if (rw.windowsByProvider !== undefined) {
         if (!isObj(rw.windowsByProvider)) p.push('requestWindow.windowsByProvider must be an object');
         else {
@@ -509,7 +609,7 @@ export function validateConfig(raw) {
       ...(raw.scheduler?.memberMemoryMib ?? {}),
     },
   };
-  if (cfg.team.leaderModelPolicy === undefined) cfg.team.leaderModelPolicy = 'enforce';
+  if (cfg.team.leaderModelPolicy === undefined) cfg.team.leaderModelPolicy = 'follow';
   if (cfg.team.maxActiveMembers === undefined) cfg.team.maxActiveMembers = Math.min(cfg.team.maxMembersPerTeam, 8);
   if (cfg.team.maxDiscussionsPerTask === undefined) cfg.team.maxDiscussionsPerTask = null;
   if (cfg.team.autoIncludeUpstreamModels === undefined) cfg.team.autoIncludeUpstreamModels = false;
