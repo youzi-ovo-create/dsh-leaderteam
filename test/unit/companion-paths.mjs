@@ -8,11 +8,16 @@ const THIS_DIR = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(THIS_DIR, '..', '..');
 
 export function resolveCompanionDir(name) {
+  const envOverride = name === 'lt-shared-contracts'
+    ? process.env.LT_SHARED_CONTRACTS_DIR
+    : (name === 'lt-usage-plugin' ? process.env.LT_USAGE_PLUGIN_DIR : null);
   const candidates = [
+    envOverride ? path.resolve(envOverride) : null,
     path.resolve(REPO_ROOT, '..', name),
     path.resolve(REPO_ROOT, '..', '..', 'deliverables', 'v2.2.3', 'companion', name),
     path.resolve(REPO_ROOT, '..', '..', 'v2.2.3-r3', 'leaderteam-v2.2.3-r3', name),
-  ];
+    name === 'lt-shared-contracts' ? path.resolve(REPO_ROOT, 'test', 'fixtures', 'lt-shared-contracts') : null,
+  ].filter(Boolean);
   for (const cand of candidates) {
     if (fs.existsSync(cand)) return cand;
   }

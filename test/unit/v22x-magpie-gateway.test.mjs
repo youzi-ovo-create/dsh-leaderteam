@@ -280,6 +280,6 @@ test('Real Magpie binary lifecycle: isolated install, start, health, crash recov
     assert.equal(stopped.state, 'stopped');
   } finally {
     await mgr.stop().catch(() => {});
-    fs.rmSync(tmpDir, { recursive: true, force: true });
+    try { fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 150 }); } catch {}
   }
 });

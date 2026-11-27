@@ -1,0 +1,317 @@
+{
+  "contract": "lt.public.v1",
+  "contractVersion": "1.1.0",
+  "capabilities": {
+    "backendLine": "v2.2.x-oss",
+    "backendVersion": "2.2.3",
+    "hostKind": "dsh-web",
+    "frontendSwitch": {
+      "available": true,
+      "currentSurface": "lt-native",
+      "dshFrontendUrl": "../",
+      "ltFrontendUrl": "./",
+      "sharesRuntimeAndSessions": true
+    },
+    "features": {
+      "liveSessionRpc": true,
+      "magpieGateway": true,
+      "magpieManagedLifecycle": true,
+      "magpieProviderAdmin": true,
+      "magpieOAuthPassthrough": true,
+      "directProviders": true,
+      "externalGateways": true,
+      "modelPoolWrite": true,
+      "roleConfigWrite": true,
+      "roleFallbacks": true,
+      "teamObservability": true,
+      "rollingFrontier": true,
+      "governanceConferences": true,
+      "schedulerTelemetry": true,
+      "planArchive": true,
+      "usageAnalytics": true,
+      "usageOfflineImport": true,
+      "themePersistence": true,
+      "inSessionDualMode": true
+    },
+    "supportedRoles": [
+      { "roleId": "leader", "label": "主导代理 (Leader)", "description": "规划、分派与交付汇总结算", "supportsFallbacks": false, "maxFallbacks": 0, "required": true },
+      { "roleId": "gate", "label": "安全门禁 (Safety Gate)", "description": "高风险命令与边界审查", "supportsFallbacks": true, "maxFallbacks": 4, "required": true },
+      { "roleId": "discussA", "label": "对称评审 A (Discuss A)", "description": "方案评审与异步双监督", "supportsFallbacks": true, "maxFallbacks": 4, "required": true },
+      { "roleId": "discussB", "label": "对称评审 B (Discuss B)", "description": "方案评审与异步双监督", "supportsFallbacks": true, "maxFallbacks": 4, "required": true },
+      { "roleId": "arbiter", "label": "仲裁者 (Arbiter)", "description": "争议裁决与正式治理会议", "supportsFallbacks": true, "maxFallbacks": 4, "required": true },
+      { "roleId": "serialReviewer", "label": "串行质询 (Serial Reviewer)", "description": "串行依赖必要性审查", "supportsFallbacks": true, "maxFallbacks": 4, "required": false },
+      { "roleId": "directExec", "label": "直接执行 (Direct Exec)", "description": "轻量单步受控执行", "supportsFallbacks": true, "maxFallbacks": 4, "required": false }
+    ]
+  },
+  "gateway": {
+    "mode": "managed",
+    "state": "running",
+    "gatewayUrl": "http://127.0.0.1:13425",
+    "webAdminUrl": "http://127.0.0.1:13430",
+    "managementAuthenticated": true,
+    "autoRecover": true,
+    "recoveryCount": 0,
+    "version": {
+      "current": "0.1.4731",
+      "pinned": "0.1.4731",
+      "testedRange": "0.1.4731 - 0.1.4797",
+      "compatible": true,
+      "rollbackAvailable": false,
+      "previousVersion": null,
+      "license": "MIT"
+    },
+    "health": {
+      "ok": true,
+      "latencyMs": 3,
+      "checkedAt": "2026-11-25T14:30:00.000Z",
+      "pid": 24180,
+      "modelCount": 2
+    },
+    "lastError": null
+  },
+  "providers": [
+    {
+      "providerId": "magpie:deepseek",
+      "sourceKind": "magpie",
+      "vendorId": "deepseek",
+      "displayName": "DeepSeek (Magpie)",
+      "protocol": "openai-chat",
+      "endpointUrl": "https://api.deepseek.com/v1",
+      "status": "ready",
+      "keyRotation": "round-robin",
+      "sessionAffinity": true,
+      "credentials": [
+        { "credentialId": "key:a1b2c3d4e5", "kind": "api_key", "label": "Primary", "maskedPreview": "sk-****d4e5", "enabled": true, "primary": true, "weight": 2 },
+        { "credentialId": "key:f6e7d8c9b0", "kind": "api_key", "label": "Backup", "maskedPreview": "sk-****c9b0", "enabled": true, "primary": false, "weight": 1 }
+      ],
+      "discoveredModelCount": 2,
+      "enabledModelCount": 2
+    },
+    {
+      "providerId": "direct:deepseek",
+      "sourceKind": "direct",
+      "vendorId": "deepseek",
+      "displayName": "DeepSeek (Direct Solo-Key)",
+      "protocol": "openai-chat",
+      "endpointUrl": "https://api.deepseek.com/v1",
+      "status": "ready",
+      "keyRotation": "single",
+      "sessionAffinity": false,
+      "credentials": [
+        { "credentialId": "env:DEEPSEEK_API_KEY", "kind": "env_ref", "label": "DEEPSEEK_API_KEY", "maskedPreview": "env:DEEPSEEK_API_KEY", "enabled": true, "primary": true, "weight": 1 }
+      ],
+      "discoveredModelCount": 1,
+      "enabledModelCount": 1
+    }
+  ],
+  "models": [
+    {
+      "entryId": "magpie:magpie:deepseek:deepseek-chat",
+      "routeId": "deepseek/deepseek-chat",
+      "upstreamModelId": "deepseek-chat",
+      "providerId": "magpie:deepseek",
+      "providerDisplayName": "DeepSeek (Magpie)",
+      "credentialScope": "provider-pool",
+      "sourceKind": "magpie",
+      "displayName": "DeepSeek Chat (Magpie)",
+      "family": "deepseek",
+      "capabilities": { "vision": false, "pdf": false, "toolCall": true, "reasoning": false },
+      "efforts": { "supported": ["none"], "defaultEffort": "none" },
+      "limits": { "contextWindow": 128000, "maxOutputTokens": 8192 },
+      "tier": "balanced",
+      "inModelPool": true,
+      "inExecutionPool": true,
+      "disabled": false
+    },
+    {
+      "entryId": "direct:direct:deepseek:deepseek-chat",
+      "routeId": "deepseek/deepseek-chat@direct",
+      "upstreamModelId": "deepseek-chat",
+      "providerId": "direct:deepseek",
+      "providerDisplayName": "DeepSeek (Direct Solo-Key)",
+      "credentialScope": "env:DEEPSEEK_API_KEY",
+      "sourceKind": "direct",
+      "displayName": "DeepSeek Chat (Direct)",
+      "family": "deepseek",
+      "capabilities": { "vision": false, "pdf": false, "toolCall": true, "reasoning": false },
+      "efforts": { "supported": ["none"], "defaultEffort": "none" },
+      "limits": { "contextWindow": 128000, "maxOutputTokens": 8192 },
+      "tier": "balanced",
+      "inModelPool": true,
+      "inExecutionPool": false,
+      "disabled": false
+    },
+    {
+      "entryId": "magpie:magpie:deepseek:deepseek-reasoner",
+      "routeId": "deepseek/deepseek-reasoner",
+      "upstreamModelId": "deepseek-reasoner",
+      "providerId": "magpie:deepseek",
+      "providerDisplayName": "DeepSeek (Magpie)",
+      "credentialScope": "provider-pool",
+      "sourceKind": "magpie",
+      "displayName": "DeepSeek Reasoner",
+      "family": "deepseek",
+      "capabilities": { "vision": false, "pdf": false, "toolCall": true, "reasoning": true },
+      "efforts": { "supported": ["off", "medium", "high"], "defaultEffort": "high", "wireEffortMap": { "off": "none", "medium": "medium", "high": "high" } },
+      "limits": { "contextWindow": 128000, "maxOutputTokens": 32768 },
+      "tier": "reasoning",
+      "inModelPool": true,
+      "inExecutionPool": true,
+      "disabled": false
+    }
+  ],
+  "runtime": {
+    "modelPool": {
+      "configuredRoutes": ["deepseek/deepseek-chat", "deepseek/deepseek-chat@direct", "deepseek/deepseek-reasoner"],
+      "executionPool": ["deepseek/deepseek-reasoner", "deepseek/deepseek-chat"],
+      "disabledRoutes": []
+    },
+    "roleAssignments": {
+      "leader": { "route": "deepseek/deepseek-reasoner", "effort": "high", "fallback": [] },
+      "gate": { "route": "deepseek/deepseek-chat", "effort": "none", "timeoutMs": 60000, "retries": 1, "fallback": [{ "route": "deepseek/deepseek-chat@direct", "effort": "none" }] },
+      "discussA": { "route": "deepseek/deepseek-reasoner", "effort": "medium", "timeoutMs": 120000, "retries": 1, "fallback": [] },
+      "discussB": { "route": "deepseek/deepseek-chat", "effort": "none", "timeoutMs": 120000, "retries": 1, "fallback": [] },
+      "arbiter": { "route": "deepseek/deepseek-reasoner", "effort": "high", "timeoutMs": 180000, "retries": 1, "fallback": [] }
+    },
+    "syncState": {
+      "dshSettingsSynced": true,
+      "patchSynced": true,
+      "governanceHash": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+    },
+    "scheduler": {
+      "maxActiveMembers": 6,
+      "effectiveCap": 4,
+      "activeExecutionMembers": 2,
+      "pressureBand": "normal"
+    },
+    "power": {
+      "enabled": true,
+      "onBattery": false,
+      "batteryPct": null,
+      "latched": false
+    },
+    "requestWindows": [
+      { "provider": "deepseek", "used5h": 18, "limit5h": 300, "tier": "normal" }
+    ],
+    "teams": [
+      {
+        "teamId": "session-mock-team-01",
+        "sessionId": "session-mock-team-01",
+        "title": "网关与前端联调验收",
+        "status": "active",
+        "taskSeq": 2,
+        "frozenGovernanceHash": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+        "pendingGovernanceUpdate": false,
+        "timers": {
+          "projectWallMs": 184000,
+          "projectActiveMs": 142000,
+          "taskWallMs": 62000,
+          "planningStagnationMs": 0,
+          "timePressure": "normal",
+          "unapprovedPlanAttempts": 0
+        },
+        "frontierOverview": "分两阶段并行验证适配器与衡账非阻塞流水",
+        "frontierStages": [
+          { "stageId": "stage-1", "title": "网关适配器验证", "ready": true, "executionState": "verified", "dependsOn": [], "writeScope": ["leaderteam/gateway/**"] },
+          { "stageId": "stage-2", "title": "前端工作台联调", "ready": true, "executionState": "running", "dependsOn": ["stage-1"], "writeScope": ["packages/lt-web/**"] }
+        ],
+        "members": [
+          { "memberId": "child-01", "name": "impl-web", "actorRole": "member", "configuredModel": "deepseek/deepseek-reasoner", "effort": "high", "status": "running", "stageId": "stage-2", "taskSummary": "构建河洛序主题切换器", "writeScope": ["packages/lt-web/**"], "hasCheckpoint": false }
+        ],
+        "governanceEvents": [
+          { "eventId": "agr-01", "kind": "agreement", "status": "approved", "summary": "双审一轮通过规划契约", "at": "2026-11-25T14:28:00.000Z" }
+        ],
+        "roleReceipts": {
+          "leader": { "configuredRoute": "deepseek/deepseek-reasoner", "actualRoutes": ["deepseek/deepseek-reasoner"], "calls": 3, "degradedCalls": 0, "totalTokens": 28400 }
+        },
+        "gateSummary": { "reviews": 4, "allow": 4, "deny": 0, "degraded": 0 }
+      }
+    ]
+  },
+  "usageRecords": [
+    {
+      "logicalRequestId": "req-001",
+      "timestampMs": 1764080880000,
+      "status": "ok",
+      "requestedRoute": "group/auto-coding",
+      "actualProvider": "deepseek",
+      "actualModel": "deepseek-reasoner",
+      "sourceKind": "magpie",
+      "physicalAttemptCount": 2,
+      "attempts": [
+        { "attemptIndex": 1, "upstreamProvider": "deepseek", "upstreamModel": "deepseek-reasoner", "status": 429, "latencyMs": 210, "ttftMs": null },
+        { "attemptIndex": 2, "upstreamProvider": "deepseek", "upstreamModel": "deepseek-reasoner", "status": 200, "latencyMs": 1840, "ttftMs": 420 }
+      ],
+      "latencyMs": 2050,
+      "ttftMs": 630,
+      "metered": true,
+      "tokens": {
+        "uncachedInputTokens": 2400,
+        "cacheReadTokens": 12000,
+        "cacheWriteTokens": 0,
+        "outputTokens": 950,
+        "reasoningTokens": 600,
+        "totalTokens": 15350
+      },
+      "cost": {
+        "known": true,
+        "currency": "CNY",
+        "actualCny": 0.0284,
+        "peakCny": 0.0392,
+        "offPeakCny": 0.0284,
+        "actualUsd": 0.0042,
+        "priceSource": "catalog"
+      },
+      "attribution": {
+        "sessionId": "session-mock-team-01",
+        "teamId": "session-mock-team-01",
+        "taskSeq": 2,
+        "stageId": "stage-2",
+        "group": "execution",
+        "role": "member",
+        "actorName": "impl-web",
+        "degraded": false
+      }
+    },
+    {
+      "logicalRequestId": "req-002-unpriced",
+      "timestampMs": 1764080910000,
+      "status": "ok",
+      "requestedRoute": "custom-relay/mystery-model-v1",
+      "actualProvider": "unknown",
+      "actualModel": "mystery-model-v1",
+      "sourceKind": "dsh-session",
+      "physicalAttemptCount": null,
+      "latencyMs": null,
+      "ttftMs": null,
+      "metered": true,
+      "tokens": {
+        "uncachedInputTokens": 1000,
+        "cacheReadTokens": 0,
+        "cacheWriteTokens": 0,
+        "outputTokens": 200,
+        "reasoningTokens": null,
+        "totalTokens": 1200
+      },
+      "cost": {
+        "known": false,
+        "currency": null,
+        "actualCny": null,
+        "peakCny": null,
+        "offPeakCny": null,
+        "actualUsd": null,
+        "priceSource": "unknown"
+      },
+      "attribution": {
+        "sessionId": "session-mock-team-01",
+        "teamId": "session-mock-team-01",
+        "taskSeq": 2,
+        "stageId": null,
+        "group": "leader",
+        "role": "leader",
+        "actorName": "leader",
+        "degraded": false
+      }
+    }
+  ]
+}

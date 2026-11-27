@@ -695,7 +695,7 @@ test('Live Magpie 0.1.4731 binary verification: GW-01..06 & HZ-01 (providerJSON 
     assert.match(scrubbedStatus.lastError.message, /&k=\[REDACTED\]/);
 
     const schemaJson = JSON.parse(
-      fs.readFileSync(path.resolve(repoRoot, '..', 'lt-shared-contracts', 'schemas', 'lt-public-v1.schema.json'), 'utf8'),
+      fs.readFileSync(path.join(SHARED_CONTRACTS_ROOT, 'schemas', 'lt-public-v1.schema.json'), 'utf8'),
     );
     assert.ok(Array.isArray(schemaJson.oneOf) && schemaJson.oneOf.length === 2);
     for (const defName of ['Capabilities', 'Gateway', 'ProviderDescriptor', 'ModelCatalogEntry', 'RuntimeSnapshot', 'LogicalUsageRecord', 'FlatBundleSnapshot', 'LiveBundleEnvelope']) {
