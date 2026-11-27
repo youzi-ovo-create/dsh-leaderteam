@@ -36,6 +36,7 @@ import {
   computeActualBehaviorDigest,
   resolveDisputeStrike,
 } from '../core/dispute-tracker.mjs';
+import { hashJson } from '../core/canonical.mjs';
 import { readJsonl } from '../core/store.mjs';
 import { frontierState } from '../core/frontier.mjs';
 import { roleRouteChain } from '../core/role-routes.mjs';
@@ -161,6 +162,80 @@ export function collectTargetFileHashes(cwd, targets = [], protectedDirs = ['.le
 
   walk(ws);
   return hashes;
+}
+
+function collectExplicitFileHashes(cwd, relFiles = [], platform = process.platform) {
+  const ws = resolvePath(cwd, undefined, platform);
+  if (!ws || !fs.existsSync(ws)) return {};
+  const hashes = {};
+  for (const raw of Array.isArray(relFiles) ? relFiles : []) {
+    if (typeof raw !== 'string' || !raw.trim()) continue;
+    const target = resolvePath(raw.trim(), ws, platform);
+    if (!target || !isInside(target, ws, platform)) continue;
+    const rel = relativeInside(ws, target, platform) ?? raw.trim().replace(/\\/g, '/').replace(/^\.\//, '');
+    try {
+      const stat = fs.statSync(target);
+      if (!stat.isFile()) continue;
+      hashes[rel] = stat.size <= 2 * 1024 * 1024
+        ? createHash('sha256').update(fs.readFileSync(target)).digest('hex')
+        : `size:${stat.size}`;
+    } catch {
+      hashes[rel] = 'missing';
+    }
+  }
+  return Object.fromEntries(Object.entries(hashes).sort(([a], [b]) => a.localeCompare(b)));
+}
+
+function normalizeSubmissionText(raw, maxLen) {
+  return truncate(String(raw ?? '').replace(/\r\n/g, '\n').trim(), maxLen);
+}
+
+function normalizeEvidenceFileList(relFiles = []) {
+  return [...new Set(
+    (Array.isArray(relFiles) ? relFiles : [])
+      .filter(f => typeof f === 'string' && f.trim())
+      .map(f => f.trim().replace(/\\/g, '/').replace(/^\.\//, '')),
+  )].sort();
+}
+
+function computeSupervisionSubmissionDigest({
+  phaseKind = 'execution',
+  stageId = null,
+  stageHash = null,
+  targets = [],
+  profile = null,
+  tools = [],
+  interfaces = [],
+  goal = '',
+  method = '',
+  summary = '',
+  proposal = '',
+  evidence = '',
+  evidenceFiles = [],
+  evidenceFileHashes = {},
+  targetFileHashes = {},
+  postConferencePacket = null,
+} = {}) {
+  const sortedTools = [...new Set((Array.isArray(tools) ? tools : []).filter(t => typeof t === 'string'))].sort();
+  const sortedInterfaces = [...new Set((Array.isArray(interfaces) ? interfaces : []).filter(s => typeof s === 'string').map(s => s.trim()).filter(Boolean))].sort();
+  return hashJson({
+    phaseKind: phaseKind === 'delivery' ? 'delivery' : (phaseKind === 'architecture' ? 'architecture' : 'execution'),
+    stageId: stageId ?? null,
+    stageHash: stageHash ?? null,
+    targets,
+    profile: profile ?? null,
+    tools: sortedTools,
+    interfaces: sortedInterfaces,
+    goal: normalizeSubmissionText(goal, 1200),
+    method: normalizeSubmissionText(method, 2400),
+    summary: normalizeSubmissionText(summary, 800),
+    proposal: normalizeSubmissionText(proposal, 12000),
+    evidence: normalizeSubmissionText(evidence, 8000),
+    evidenceFiles: normalizeEvidenceFileList(evidenceFiles),
+    evidenceFileHashes,
+    targetFileHashes,
+    postConferencePacket: postConferencePacket ?? null,
+  });
 }
 
 const MAX_EXCERPT_READ_BYTES = 32768;
@@ -1451,9 +1526,10 @@ export function queueAsyncSupervision({
     parentDisputeId,
     postConferencePacket,
   });
+  let curGov = null;
   let slotPending = [];
   try {
-    const curGov = replayGovernanceState(store.governanceEvents(), taskSeq);
+    curGov = replayGovernanceState(store.governanceEvents(), taskSeq);
     slotPending = (curGov.pendingSupervisions ?? []).filter(p =>
       (p.logicalSlotKey && p.logicalSlotKey === logicalSlotKey)
       || supersedesDedupeKeys.includes(p.dedupeKey)
@@ -1470,6 +1546,7 @@ export function queueAsyncSupervision({
   ])];
 
   const targetFileHashes = collectTargetFileHashes(actor.cwd, normTargets, rt.config.paths?.protectedDirs);
+  const evidenceFileHashes = collectExplicitFileHashes(actor.cwd, evidenceFiles);
   const snapshotDigest = computeActualBehaviorDigest({
     phaseKind,
     targets: normTargets,
@@ -1481,13 +1558,65 @@ export function queueAsyncSupervision({
     proposal,
     targetFileHashes,
   });
+  const normSummary = normalizeSubmissionText(summary, 800);
+  const normProposal = normalizeSubmissionText(proposal, 12000);
+  const normEvidence = normalizeSubmissionText(evidence, 8000);
+  const normEvidenceFiles = normalizeEvidenceFileList(evidenceFiles);
+  const submissionDigest = computeSupervisionSubmissionDigest({
+    phaseKind,
+    stageId,
+    stageHash,
+    targets: normTargets,
+    profile,
+    tools,
+    interfaces,
+    goal,
+    method,
+    summary,
+    proposal,
+    evidence,
+    evidenceFiles,
+    evidenceFileHashes,
+    targetFileHashes,
+    postConferencePacket,
+  });
 
-  const dedupeIdentity = (stageId && stageHash && !postConferencePacket)
+  const confKey = postConferencePacket?.conference_id ?? 'initial';
+  const dedupeIdentity = (stageId && stageHash && !postConferencePacket && !normEvidence)
+    ? `stage:${stageId}:${stageHash}:${JSON.stringify(targetFileHashes)}`
+    : `sub:${submissionDigest}`;
+  const dedupeKey = `${store.teamId}:${taskSeq}:${phaseKind}:${dedupeIdentity}:${confKey}`;
+  const legacyDedupeIdentity = (stageId && stageHash && !postConferencePacket)
     ? `stage:${stageId}:${stageHash}:${JSON.stringify(targetFileHashes)}`
     : snapshotDigest;
-  const dedupeKey = `${store.teamId}:${taskSeq}:${phaseKind}:${dedupeIdentity}:${postConferencePacket?.conference_id ?? 'initial'}`;
+  const legacyDedupeKey = `${store.teamId}:${taskSeq}:${phaseKind}:${legacyDedupeIdentity}:${confKey}`;
+  const matchesSubmittedMaterials = spec => Boolean(
+    spec
+    && normalizeSubmissionText(spec.summary, 800) === normSummary
+    && normalizeSubmissionText(spec.proposal, 12000) === normProposal
+    && normalizeSubmissionText(spec.evidence, 8000) === normEvidence
+    && JSON.stringify(normalizeEvidenceFileList(spec.evidenceFiles)) === JSON.stringify(normEvidenceFiles),
+  );
   if (base.supervisedDigests.has(dedupeKey) && slotPending.length === 0 && effectiveSupersedesKeys.length === 0) {
-    return { queued: false, deduplicated: true, status: 'already_completed', behaviorDigest: snapshotDigest };
+    return { queued: false, deduplicated: true, status: 'already_completed', behaviorDigest: snapshotDigest, submissionDigest };
+  }
+  const refusedSameSnapshot = (curGov?.pendingSupervisions ?? []).find(p =>
+    p.policyRefused && (
+      p.dedupeKey === dedupeKey
+      || (p.dedupeKey === legacyDedupeKey && matchesSubmittedMaterials(p.submittedSpec))
+    ),
+  );
+  if (refusedSameSnapshot) {
+    return {
+      queued: false,
+      deduplicated: true,
+      status: 'policy_refused',
+      completed: false,
+      policyRefused: true,
+      supervisionId: refusedSameSnapshot.supervisionId ?? null,
+      behaviorDigest: snapshotDigest,
+      submissionDigest,
+    };
   }
   if (base.inFlightSupervisionKeys.has(dedupeKey)) {
     const existingJob = [...base.governanceJobs.values()].find(j => j.dedupeKey === dedupeKey);
@@ -1590,6 +1719,10 @@ export function queueAsyncSupervision({
       const opinionA = resA?.ok ? resA.opinion : null;
       const opinionB = resB?.ok ? resB.opinion : null;
       if (!opinionA || !opinionB) {
+        const policyRefused = Boolean(
+          (!opinionA && resA?.error?.kind === 'policy')
+          || (!opinionB && resB?.error?.kind === 'policy'),
+        );
         if (opinionA || opinionB) {
           base.partialSupervisionOpinions.set(dedupeKey, { opinionA, opinionB });
         }
@@ -1613,11 +1746,19 @@ export function queueAsyncSupervision({
           ...(opinionB ? { opinionB } : {}),
           errorA,
           errorB,
-          retrySpec,
+          submittedSpec: {
+            summary: normSummary,
+            proposal: normProposal,
+            evidence: normEvidence,
+            evidenceFiles: normEvidenceFiles,
+          },
+          ...(policyRefused ? { policyRefused: true } : {}),
+          retrySpec: policyRefused ? null : retrySpec,
         });
         return {
           status: 'deferred',
           completed: false,
+          policyRefused,
           supervisionId,
           dedupeKey,
           logicalSlotKey,
@@ -1850,7 +1991,7 @@ export function retryDeferredSupervisions({
 
   const groupedBySlot = new Map();
   for (const pending of gov.pendingSupervisions) {
-    if (!pending.retrySpec) continue;
+    if (pending.policyRefused || !pending.retrySpec) continue;
     if (excludePhaseKind && pending.phaseKind === excludePhaseKind && !pending.isStage4ReReview) continue;
     const slotKey = pending.logicalSlotKey ?? pending.dedupeKey ?? pending.supervisionId;
     const prev = groupedBySlot.get(slotKey);
@@ -1934,15 +2075,23 @@ export async function resolveHumanEscalationOnUserTurn({ ctx, rt, store, leaderA
   return true;
 }
 
-/** Concise governance snapshot injected into Leader's live runtime context. */
+/** Concise governance snapshot injected into Leader's live runtime context (empty when quiescent in normal phase). */
 export function formatLeaderGovernanceContext(store, taskSeq) {
   const gov = replayGovernanceState(store.governanceEvents(), taskSeq);
+  const isQuiescent = gov.phase === 'normal'
+    && !gov.pausingConference
+    && !gov.activeConference
+    && !gov.activeHumanEscalation
+    && gov.activeDirectives.length === 0
+    && (!gov.pendingSupervisions || gov.pendingSupervisions.length === 0)
+    && gov.advisoryNotes.length === 0;
+  if (isQuiescent) return '';
   const lines = [`LeaderTeam autonomous governance state: phase=${gov.phase}`];
   if (gov.pausingConference) {
     lines.push(`- PAUSING FOR CONFERENCE "${gov.pausingConference.conferenceId}" (dispute=${gov.pausingConference.disputeId}): Waiting for active execution models to checkpoint and pause before Stage 3 opens; dispatches and team_direct_exec are suspended.`);
   }
   if (gov.activeConference) {
-    lines.push(`- ACTIVE FORMAL CONFERENCE "${gov.activeConference.conferenceId}" (dispute=${gov.activeConference.disputeId}, strike=#${gov.activeConference.strike}): All execution dispatches and team_direct_exec are suspended. Respond via team_conference(action="respond", conference_id="${gov.activeConference.conferenceId}", ...).`);
+    lines.push(`- ACTIVE FORMAL CONFERENCE "${gov.activeConference.conferenceId}" (dispute=${gov.activeConference.disputeId}, strike=#${gov.activeConference.strike}): All execution dispatches, send_message, and team_direct_exec are suspended. Respond promptly via team_conference(action="respond", conference_id="${gov.activeConference.conferenceId}", explanation, new_evidence_files, proposed_alternative) with concrete workspace facts or a better alternative.`);
   }
   if (gov.activeHumanEscalation) {
     lines.push(`- HUMAN ESCALATION PENDING "${gov.activeHumanEscalation.escalationId}" (dispute=${gov.activeHumanEscalation.disputeId}, 3rd strike): All execution dispatches and team_direct_exec are paused. Declare team_status(stop_state="waiting_user") and present the dispute dossier to the user.`);

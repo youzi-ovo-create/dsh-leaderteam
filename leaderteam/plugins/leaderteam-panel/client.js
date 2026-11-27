@@ -462,6 +462,32 @@
         }
       };
 
+      const onAlignLeaderSession = async (sessionId, mode) => {
+        const modeEpoch = modeMutationEpochRef.current;
+        setLoading(true);
+        setError(null);
+        setNotice(null);
+        try {
+          const res = await postApi(ROUTES.APPLY, {
+            target: saveTarget,
+            changes: {
+              alignLeaderSession: { sessionId, mode },
+            },
+          });
+          hydrateFromState(res.state, {
+            preserveDirty: false,
+            epochStale: modeEpoch !== modeMutationEpochRef.current,
+          });
+          setNotice(mode === 'session-to-config'
+            ? ('已将会话 ' + sessionId + ' 的领队模型切换为配置模型。')
+            : ('已将配置领队更新为会话 ' + sessionId + ' 当前所选模型。'));
+        } catch (e) {
+          setError(e && e.message ? e.message : String(e));
+        } finally {
+          setLoading(false);
+        }
+      };
+
       const onSetSessionLeaderOverride = async (sid, nextRoute) => {
         if (!sid) return;
         setLoading(true);
@@ -897,6 +923,32 @@
           );
         })(),
         notice ? h('div', { style: { padding: '8px 10px', borderRadius: '6px', background: tok.successBg, color: tok.success, marginBottom: '10px', fontSize: '12px' } }, notice) : null,
+        (data && Array.isArray(data.leaderSessionChecks) ? data.leaderSessionChecks.filter(s => s && s.status !== 'match' && s.status !== 'synced' && s.status !== 'follow-default' && s.policy !== 'off' && s.policy !== 'follow') : []).map(s =>
+          h('div', {
+            key: s.sessionId,
+            style: {
+              padding: '10px 12px',
+              borderRadius: '8px',
+              border: '1px solid ' + tok.warning,
+              background: tok.warningBg,
+              color: tok.fgPrimary,
+              marginBottom: '10px',
+              fontSize: '12px',
+            },
+          },
+          h('div', { style: { fontWeight: 700, marginBottom: '4px' } },
+            (s.blocked ? '⚠️ 领队模型不一致（enforce 校验拦截中）：' : '提示（领队模型不一致）：') + s.sessionId
+          ),
+          h('div', { style: { marginBottom: '6px', opacity: 0.9 } },
+            '当前会话运行：' + (s.actual ? (s.actual.provider + '/' + s.actual.model + ' (' + (s.actual.effort || 'auto') + ')') : '未知') +
+            ' ｜ 配置领队：' + (s.configured ? (s.configured.provider + '/' + s.configured.model + ' (' + s.configured.effort + ')') : '未知') +
+            (s.workspace ? (' ｜ 工作区：' + s.workspace) : '')
+          ),
+          h('div', { style: { display: 'flex', gap: '6px', flexWrap: 'wrap' } },
+            h('button', { style: btnStyle(true), onClick: () => onAlignLeaderSession(s.sessionId, 'session-to-config'), disabled: loading }, '一键切换该会话模型以匹配配置'),
+            !s.started ? h('button', { style: btnStyle(false), onClick: () => onAlignLeaderSession(s.sessionId, 'config-to-session'), disabled: loading }, '将当前会话模型设为配置领队') : null
+          ))
+        ),
         // Navigation Tabs
         h(
           'div',

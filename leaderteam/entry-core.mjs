@@ -6,8 +6,8 @@ import { fileURLToPath } from 'node:url';
 import { loadConfig } from './core/config.mjs';
 import { writeFileAtomic } from './core/store.mjs';
 import { resolveOrBootstrapConfigPath, buildSoloProviderSettingsTemplates } from './core/solo-key.mjs';
-import { buildAutoAdoptedLocalOverrideFromDshModels } from './core/session-config.mjs';
-import { isPluginActive, runtimeForTeam, runtime, bindRuntimeConfigFile, syncRuntimeConfig, refreshUpstreamCatalog, effectiveRuntimeConfig, syncSessionLeaderSelectionFromHost, flushPendingSessionConfigAtSafeBoundary, rebindAllIdleSessionsOnGlobalUserSave } from './host/runtime.mjs';
+import { buildAutoAdoptedLocalOverrideFromDshModels, readSessionConfigRecord, hasActiveSessionOverride } from './core/session-config.mjs';
+import { isPluginActive, runtimeForTeam, runtime, bindRuntimeConfigFile, syncRuntimeConfig, refreshUpstreamCatalog, effectiveRuntimeConfig, syncSessionLeaderSelectionFromHost, flushPendingSessionConfigAtSafeBoundary, rebindAllIdleSessionsOnGlobalUserSave, isTeamExecutionStarted, rebindUnstartedTeamGovernance } from './host/runtime.mjs';
 import { syncUpstreamModelsToDshSettings, resolveModelTarget } from './core/upstream-models.mjs';
 import { onAgentCreated, onAgentPresetSelected, onAgentDisposed, onAgentStatus, onAgentError, onSessionEvent, onToolResult, shouldApplyDefaultLeaderModel } from './host/roles.mjs';
 import { bindHostImports } from './host/host-imports.mjs';
@@ -81,23 +81,23 @@ export function apply(ctx, config) {
   if (!rt.cordisCompositionMode && rt.config.plugins?.timerArchive !== false) {
     hostTimerArchive.ensurePlanArchive(rt, null);
   }
-  rt.formatLeaderContext = teamId => {
-    const sections = [];
+  rt.formatLeaderGovernanceSlot = teamId => {
     const teamRt = runtimeForTeam(teamId);
-    if (isAutonomousGovernance(teamRt.config)) {
-      const g = formatLeaderGovernanceContext(teamStore(teamId), currentTaskSeq(ctx, teamId));
-      if (g) sections.push(g);
-    }
-    if (isPluginActive(teamRt, 'scheduler')) {
-      const c = hostConcurrency.formatLeaderConcurrencyContext(ctx, teamId);
-      if (c) sections.push(c);
-    }
-    if (isPluginActive(teamRt, 'timerArchive')) {
-      const t = hostTimerArchive.formatLeaderTimerContext(ctx, teamId, null, teamRt);
-      if (t) sections.push(t);
-    }
-    return sections.join('\n\n');
+    return isAutonomousGovernance(teamRt.config) ? formatLeaderGovernanceContext(teamStore(teamId), currentTaskSeq(ctx, teamId)) : '';
   };
+  rt.formatLeaderConcurrencySlot = teamId => {
+    const teamRt = runtimeForTeam(teamId);
+    return isPluginActive(teamRt, 'scheduler') ? hostConcurrency.formatLeaderConcurrencyContext(ctx, teamId) : '';
+  };
+  rt.formatLeaderTimerSlot = teamId => {
+    const teamRt = runtimeForTeam(teamId);
+    return isPluginActive(teamRt, 'timerArchive') ? hostTimerArchive.formatLeaderTimerContext(ctx, teamId, null, teamRt) : '';
+  };
+  rt.formatLeaderContext = teamId => [
+    rt.formatLeaderGovernanceSlot(teamId),
+    rt.formatLeaderConcurrencySlot(teamId),
+    rt.formatLeaderTimerSlot(teamId),
+  ].filter(Boolean).join('\n\n');
   rt.onLeaderSessionReady = (hookCtx, teamId, cwd) => {
     if ((!rt.cordisCompositionMode || rt.plugins.timerArchive) && rt.config.plugins?.timerArchive !== false) {
       hostTimerArchive.ensureTeamTimerState(hookCtx, teamId, cwd, runtimeForTeam(teamId));
@@ -111,7 +111,24 @@ export function apply(ctx, config) {
     try { flushPendingSessionConfigAtSafeBoundary(ctx, rt, teamId); } catch {}
   };
   rt.onLeaderUserMessage = (hookCtx, teamId) => {
+    syncRuntimeConfig(rt);
     const preActor = rt.actors.get(teamId);
+    if (rt.surface === 'desktop' && !isTeamExecutionStarted(teamStore(teamId)) && !hasActiveSessionOverride(readSessionConfigRecord(rt.storageRoot, teamId))) {
+      const reb = rebindUnstartedTeamGovernance(rt, teamId);
+      if (reb.rebound && reb.changed && preActor?.agent?.model?.select) {
+        try {
+          const curSel = preActor.agent.model.current?.();
+          const heldPrevDefault = reb.prevLeaderTarget
+            && curSel
+            && curSel.provider === reb.prevLeaderTarget.provider
+            && curSel.model === reb.prevLeaderTarget.model;
+          if (!curSel || heldPrevDefault) {
+            const nextCfg = runtimeForTeam(teamId).config;
+            preActor.agent.model.select(resolveModelTarget(nextCfg, nextCfg.roles.leader.route, nextCfg.roles.leader.effort));
+          }
+        } catch {}
+      }
+    }
     if (preActor?.agent) {
       try { syncSessionLeaderSelectionFromHost(hookCtx, rt, preActor.agent, { atUserTurnStart: true }); } catch {}
     }

@@ -20,21 +20,34 @@ export function roleRouteChain(config, roleKey, leaderModel = null) {
     });
   }
   if (config.team?.leaderModelAsLastResort !== false && leaderModel && typeof leaderModel.model === 'string') {
-    let leaderRoute = Object.hasOwn(config.models ?? {}, leaderModel.model) ? leaderModel.model : null;
-    if (!leaderRoute) {
-      for (const [rKey, spec] of Object.entries(config.models ?? {})) {
-        const specProv = spec?.provider ?? provider;
-        const specModel = spec?.upstreamModel ?? rKey;
-        if ((leaderModel.provider === undefined || leaderModel.provider === specProv) && specModel === leaderModel.model) {
+    const models = config.models ?? {};
+    const leaderDefault = config.roles?.leader;
+    const matchesLeaderPair = (rKey, spec) => {
+      if (!spec || typeof spec !== 'object') return false;
+      const specProv = spec.provider ?? provider;
+      const specModel = spec.upstreamModel ?? rKey;
+      return (leaderModel.provider === undefined || leaderModel.provider === specProv) && specModel === leaderModel.model;
+    };
+    let leaderRoute = null;
+    if (leaderDefault?.route && Object.hasOwn(models, leaderDefault.route) && matchesLeaderPair(leaderDefault.route, models[leaderDefault.route])) {
+      leaderRoute = leaderDefault.route;
+    } else if (Object.hasOwn(models, leaderModel.model) && matchesLeaderPair(leaderModel.model, models[leaderModel.model])) {
+      leaderRoute = leaderModel.model;
+    } else {
+      for (const [rKey, spec] of Object.entries(models)) {
+        if (matchesLeaderPair(rKey, spec)) {
           leaderRoute = rKey;
           break;
         }
       }
+      if (!leaderRoute && leaderModel.provider === undefined && Object.hasOwn(models, leaderModel.model)) {
+        leaderRoute = leaderModel.model;
+      }
     }
-    const m = leaderRoute ? config.models?.[leaderRoute] : null;
+    const m = leaderRoute ? models[leaderRoute] : null;
     const mProv = m?.provider ?? provider;
-    // Only a model this configuration knows can stand in: its efforts are validated and its quota is tracked.
-    if (m && (leaderModel.provider === undefined || leaderModel.provider === mProv || leaderModel.provider === provider)) {
+    // Only a model this configuration knows on the matching provider can stand in: its efforts are validated and its quota is tracked.
+    if (m && (leaderModel.provider === undefined || leaderModel.provider === mProv)) {
       const effort = Array.isArray(m.efforts) && m.efforts.includes(leaderModel.reasoningEffort) ? leaderModel.reasoningEffort : m.defaultEffort;
       if (typeof effort === 'string') chain.push({ provider: mProv, route: leaderRoute, effort, ...limits, via: 'leader', degraded: true });
     }
