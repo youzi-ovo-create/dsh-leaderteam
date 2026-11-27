@@ -19,7 +19,13 @@ import { computeTimerSnapshot, resolveNowMs } from '../../core/timer.mjs';
 import { resolvePlanArchiveRoot, PlanArchiveStore } from '../../core/plan-archive.mjs';
 import { inspectModelConfiguration, applyModelConfigChanges, resolveDefaultDshHome } from '../../core/model-config-writer.mjs';
 import { buildSoloProviderSettingsTemplates, resolveOrBootstrapConfigPath } from '../../core/solo-key.mjs';
-import { resolveModelTarget, syncUpstreamModelsToDshSettings } from '../../core/upstream-models.mjs';
+import {
+  resolveModelTarget,
+  syncModelsToDshDiskProfiles,
+  syncUpstreamModelsToDshSettings,
+  writeDshCredentialsYamlEntry,
+  readDshEnvCredentialsMap,
+} from '../../core/upstream-models.mjs';
 import { hashJson } from '../../core/canonical.mjs';
 import { loadConfig } from '../../core/config.mjs';
 import {
@@ -1583,11 +1589,26 @@ export function enrichChangesWithDiscoveredProviders(changes, rtConfig, discover
   };
 }
 
-export async function syncActiveModelsToDshHost(ctx, rt, effective, discoveredModels = [], gwStatus = null, extraUpserts = []) {
-  if (!ctx) return { synced: false, reason: 'no-host-context', updatedProviders: [] };
+export async function syncActiveModelsToDshHost(
+  ctx,
+  rt,
+  effective,
+  discoveredModels = [],
+  gwStatus = null,
+  extraUpserts = [],
+  options = {},
+) {
+  const resolvedDshHome =
+    (typeof options?.dshHome === 'string' && options.dshHome.trim() ? path.resolve(options.dshHome.trim()) : null) ??
+    resolveDshHomeFromCtx(ctx, rt) ??
+    null;
+  if (!ctx && !resolvedDshHome) {
+    return { synced: false, reason: 'no-host-context', updatedProviders: [] };
+  }
   const magpieProv = resolveMagpieGatewayHostProvider(effective ?? rt?.config);
   const configuredDefaultProv = effective?.magpie?.provider ?? rt?.config?.magpie?.provider ?? magpieProv;
-  const templates = buildSoloProviderSettingsTemplates(process.env);
+  const ambientCreds = readDshEnvCredentialsMap({ dshHome: resolvedDshHome, env: process.env });
+  const templates = buildSoloProviderSettingsTemplates({ ...ambientCreds, ...process.env });
   const rawGwUrl = gwStatus?.gatewayUrl ?? (rt?.storageRoot ? getOrCreateGatewayManager(rt.storageRoot).getActiveEndpoints()?.gatewayUrl : null);
   if (rawGwUrl) {
     const magpieHeaders = { Authorization: 'Bearer magpie-leaderteam' };
@@ -1632,16 +1653,71 @@ export async function syncActiveModelsToDshHost(ctx, rt, effective, discoveredMo
       maxTokens: spec.maxTokens ?? dm?.upstreamMaxTokens ?? dm?.maxTokens ?? dm?.defaultMaxTokens,
     });
   }
-  return syncUpstreamModelsToDshSettings(
-    ctx,
-    [...byRouteToSync.values()],
-    magpieProv,
-    { providerTemplates: templates },
-  ).catch(err => ({
-    synced: false,
-    reason: err instanceof Error ? err.message : String(err),
-    updatedProviders: [],
-  }));
+
+  const modelsList = [...byRouteToSync.values()];
+  const defaultLeaderSelection = effective?.roles?.leader?.route
+    ? resolveModelTarget(effective, effective.roles.leader.route, effective.roles.leader.effort)
+    : null;
+
+  // Mirror any active provider credentials from `.env` / `process.env` into `.credentials.yaml` (`version: 1`)
+  // so `PiAiAdapter.listModels()` never returns `[]` due to `MISSING_CREDENTIAL` on live DSH!
+  if (resolvedDshHome) {
+    const activeProvs = new Set(modelsList.map(m => m.provider ?? magpieProv));
+    for (const provId of activeProvs) {
+      const apiKeyEnv = templates[provId]?.apiKeyEnv;
+      if (apiKeyEnv && ambientCreds[apiKeyEnv]) {
+        try {
+          writeDshCredentialsYamlEntry({
+            dshHome: resolvedDshHome,
+            envVarName: apiKeyEnv,
+            apiKey: ambientCreds[apiKeyEnv],
+            onlyIfMissing: true,
+          });
+        } catch {}
+      }
+    }
+  }
+
+  let liveRes = null;
+  if (ctx) {
+    liveRes = await syncUpstreamModelsToDshSettings(
+      ctx,
+      modelsList,
+      magpieProv,
+      {
+        providerTemplates: templates,
+        defaultSelection: defaultLeaderSelection,
+        syncDefaultModel: Boolean(options?.syncDefaultModel),
+      },
+    ).catch(err => ({
+      synced: false,
+      reason: err instanceof Error ? err.message : String(err),
+      updatedProviders: [],
+    }));
+  }
+
+  if (resolvedDshHome && (!ctx || !liveRes?.synced)) {
+    const diskRes = syncModelsToDshDiskProfiles({
+      dshHome: resolvedDshHome,
+      modelsToEnsure: modelsList,
+      defaultProvider: magpieProv,
+      providerTemplates: templates,
+      defaultSelection: defaultLeaderSelection,
+      syncDefaultModel: Boolean(options?.syncDefaultModel),
+      createDefaultProfilesIfNone: true,
+    });
+    if (!ctx || diskRes.synced) {
+      return {
+        synced: diskRes.synced,
+        changed: diskRes.changed,
+        mode: 'disk-profiles',
+        updatedProviders: diskRes.updatedProviders,
+        updatedProfiles: diskRes.updatedProfiles,
+      };
+    }
+  }
+
+  return liveRes ?? { synced: false, reason: 'no-host-context', updatedProviders: [] };
 }
 
 function resolveAuthorizedUsageHome(bridge, rawHome) {
@@ -2256,6 +2332,7 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
           discoveredModels,
           gwStatus,
           upserts,
+          { dshHome: getDshHome() },
         );
         const warnings = [...(applyResult.warnings ?? [])];
         if (
@@ -2319,21 +2396,25 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
           idleRebind = rebindAllIdleSessionsOnGlobalUserSave(rt, {
             principal: { kind: 'user', source: 'lt-public-v1' },
           });
-          if (ctx) {
-            dshSettingsSync = await syncActiveModelsToDshHost(
-              ctx,
-              rt,
-              applyResult.effective,
-              discoveredModels,
-              gwStatus,
-            );
-            if (
-              !dshSettingsSync.synced &&
-              dshSettingsSync.reason &&
-              !['settings-service-unavailable', 'no-host-context'].includes(dshSettingsSync.reason)
-            ) {
-              warnings.push(`DSH settings live-sync warning: ${dshSettingsSync.reason}`);
-            }
+          dshSettingsSync = await syncActiveModelsToDshHost(
+            ctx,
+            rt,
+            applyResult.effective,
+            discoveredModels,
+            gwStatus,
+            [],
+            {
+              dshHome: getDshHome(),
+              syncDefaultModel: Array.isArray(changes.setRoles) && changes.setRoles.some(r => r?.role === 'leader'),
+            },
+          );
+          if (
+            ctx &&
+            !dshSettingsSync.synced &&
+            dshSettingsSync.reason &&
+            !['settings-service-unavailable', 'no-host-context'].includes(dshSettingsSync.reason)
+          ) {
+            warnings.push(`DSH settings live-sync warning: ${dshSettingsSync.reason}`);
           }
         }
         return okEnvelope({
@@ -2946,9 +3027,10 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
           );
           syncRuntimeConfig(rt);
           const idleRebind = rebindAllIdleSessionsOnGlobalUserSave(rt, { principal });
-          if (ctx) {
-            await syncActiveModelsToDshHost(ctx, rt, rt.config, discoveredModels, gwStatus).catch(() => null);
-          }
+          await syncActiveModelsToDshHost(ctx, rt, rt.config, discoveredModels, gwStatus, [], {
+            dshHome: getDshHome(),
+            syncDefaultModel: true,
+          }).catch(() => null);
           return okEnvelope({
             scope: 'global',
             idleRebind,
@@ -2983,9 +3065,9 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
           });
           if (mut.appliedImmediately) {
             rebindTeamGovernanceSnapshot(rt, sessionId, { principal, forceAtSafeBoundary: true });
-            if (ctx) {
-              await syncActiveModelsToDshHost(ctx, rt, mut.effectiveConfig, discoveredModels, gwStatus).catch(() => null);
-            }
+            await syncActiveModelsToDshHost(ctx, rt, mut.effectiveConfig, discoveredModels, gwStatus, [], {
+              dshHome: getDshHome(),
+            }).catch(() => null);
             const baseRt = baseRuntime(rt);
             const liveAgent = baseRt?.actors?.get?.(sessionId)?.agent ?? baseRt?.hostAgents?.get?.(sessionId) ?? null;
             if (liveAgent && typeof liveAgent.model?.select === 'function' && patch.roles?.leader) {
@@ -3044,6 +3126,10 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
           );
           syncRuntimeConfig(rt);
           const idleRebind = rebindAllIdleSessionsOnGlobalUserSave(rt, { principal });
+          await syncActiveModelsToDshHost(ctx, rt, rt.config, discoveredModels, gwStatus, [], {
+            dshHome: getDshHome(),
+            syncDefaultModel: true,
+          }).catch(() => null);
           if (!snap.isBusy) {
             mutateSessionConfig({
               storageRoot,
@@ -3341,6 +3427,7 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
             pluginRoot,
             storageRoot,
             track: body.track || null,
+            targetVersion: body.targetVersion || body.version || null,
             includePrerelease: Boolean(body.includePrerelease),
             force: body.force !== false,
             currentHostVersion: hostVersion,
@@ -3367,6 +3454,7 @@ export function createPublicContractHandlers(ctx, rt = runtime(), options = {}) 
             sha256SumsUrl: body.sha256SumsUrl || null,
             expectedSha256: body.expectedSha256 || null,
             targetTrack: body.targetTrack || null,
+            targetVersion: body.targetVersion || body.version || null,
             confirmTrackSwitch: body.confirmTrackSwitch || null,
             currentHostVersion: hostVersion,
             fetchImpl: options.fetchImpl ?? globalThis.fetch,

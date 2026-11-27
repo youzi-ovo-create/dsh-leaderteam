@@ -408,11 +408,89 @@ export function listSavedBackups(storageRoot, fsImpl = fs) {
   return out.sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
 }
 
+export function normalizeUpdaterPlatform(rawPlatform = process.platform) {
+  const s = String(rawPlatform ?? '').trim().toLowerCase();
+  if (s === 'win32' || s === 'windows') return 'win32';
+  if (s === 'linux') return 'linux';
+  if (s === 'darwin' || s === 'macos') return 'darwin';
+  return s || process.platform;
+}
+
+/**
+ * Parse a GitHub Release tag under the cross-platform independent release governance spec:
+ * - `windows-vX.Y.Z` -> `{ platformScope: 'win32', prefix: 'windows', version: 'X.Y.Z', tagName }`
+ * - `linux-vX.Y.Z`   -> `{ platformScope: 'linux', prefix: 'linux', version: 'X.Y.Z', tagName }`
+ * - `vX.Y.Z`         -> `{ platformScope: 'universal', prefix: null, version: 'X.Y.Z', tagName }`
+ * Non-release tags (e.g. `vps-freeze/v2.2.3-r3`) return `null`.
+ */
+export function parseReleaseTagForPlatform(rawTag) {
+  const tag = String(rawTag ?? '').trim();
+  if (!tag) return null;
+  const prefMatch = /^(windows|linux)-v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$/i.exec(tag);
+  if (prefMatch) {
+    const prefix = prefMatch[1].toLowerCase();
+    const version = prefMatch[2];
+    if (!parseDshSemver(version)) return null;
+    return {
+      tagName: tag,
+      version,
+      prefix,
+      platformScope: prefix === 'windows' ? 'win32' : 'linux',
+    };
+  }
+  const legacyMatch = /^v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$/i.exec(tag);
+  if (legacyMatch && !tag.includes('/')) {
+    const version = legacyMatch[1];
+    if (!parseDshSemver(version)) return null;
+    return {
+      tagName: tag,
+      version,
+      prefix: null,
+      platformScope: 'universal',
+    };
+  }
+  return null;
+}
+
+export function assertTargetReleaseTagMatchesPlatform(targetVersion, platform = process.platform) {
+  if (targetVersion === null || targetVersion === undefined || String(targetVersion).trim() === '') {
+    return null;
+  }
+  const normPlat = normalizeUpdaterPlatform(platform);
+  const parsed = parseReleaseTagForPlatform(targetVersion);
+  if (!parsed) {
+    const err = new Error(`无效的目标版本或标签格式：${targetVersion}`);
+    err.code = 'INVALID_RELEASE_VERSION_TAG';
+    err.statusCode = 400;
+    throw err;
+  }
+  if (
+    parsed.platformScope !== 'universal' &&
+    (normPlat === 'win32' || normPlat === 'linux' || normPlat === 'darwin') &&
+    parsed.platformScope !== normPlat
+  ) {
+    const expectedPrefix = normPlat === 'win32' ? 'windows-v' : `${normPlat}-v`;
+    const err = new Error(
+      `跨平台发行标签不匹配（PLATFORM_RELEASE_TAG_MISMATCH）：当前运行平台为 ${normPlat}，拒绝安装目标标签 "${parsed.tagName}"（请使用 ${expectedPrefix}${parsed.version}）。`,
+    );
+    err.code = 'PLATFORM_RELEASE_TAG_MISMATCH';
+    err.statusCode = 400;
+    err.details = {
+      currentPlatform: normPlat,
+      requestedTag: parsed.tagName,
+      targetPlatformScope: parsed.platformScope,
+    };
+    throw err;
+  }
+  return parsed;
+}
+
 function normalizeReleaseEntry(rel, track) {
   if (!rel || typeof rel !== 'object' || rel.draft) return null;
   const rawTag = String(rel.tag_name ?? '').trim();
-  const cleanVersion = rawTag.replace(/^v/i, '');
-  if (!parseDshSemver(cleanVersion)) return null;
+  const parsedTag = parseReleaseTagForPlatform(rawTag);
+  if (!parsedTag) return null;
+  const cleanVersion = parsedTag.version;
   const assets = Array.isArray(rel.assets) ? rel.assets : [];
   const tgzAsset =
     assets.find(a => typeof a?.name === 'string' && /^dsh-leaderteam-.*\.tgz$/i.test(a.name)) ??
@@ -432,6 +510,8 @@ function normalizeReleaseEntry(rel, track) {
     track,
     tagName: rawTag,
     version: cleanVersion,
+    platformScope: parsedTag.platformScope,
+    platformPrefix: parsedTag.prefix,
     name: String(rel.name || rawTag),
     prerelease: Boolean(rel.prerelease),
     publishedAt: rel.published_at || rel.created_at || null,
@@ -450,13 +530,67 @@ function normalizeReleaseEntry(rel, track) {
 }
 
 /**
+ * Filter `/releases` strictly for the current platform (`win32` vs `linux`):
+ * - NEVER matches the opposite platform's prefixed tags (`linux-v*` on `win32` or `windows-v*` on `linux`).
+ * - Prefers same-platform prefixed releases (`windows-v*` on `win32`, `linux-v*` on `linux`),
+ *   falling back to historical unprefixed `vX.Y.Z` ONLY when zero same-platform prefixed releases exist.
+ * - Throws `PLATFORM_RELEASE_TAG_MISMATCH` if `targetVersion` explicitly names another platform's prefix.
+ */
+export function selectReleasesForPlatform(rawList, {
+  track = 'open-source',
+  platform = process.platform,
+  includePrerelease = false,
+  targetVersion = null,
+} = {}) {
+  const normPlat = normalizeUpdaterPlatform(platform);
+  const parsedTarget = assertTargetReleaseTagMatchesPlatform(targetVersion, normPlat);
+
+  const normalized = (Array.isArray(rawList) ? rawList : [rawList])
+    .map(r => normalizeReleaseEntry(r, track))
+    .filter(r => r !== null && (includePrerelease || !r.prerelease || (parsedTarget && r.version === parsedTarget.version)));
+
+  const allowedForPlat = normalized.filter(r => {
+    if (normPlat === 'win32') return r.platformScope === 'win32' || r.platformScope === 'universal';
+    if (normPlat === 'linux') return r.platformScope === 'linux' || r.platformScope === 'universal';
+    return r.platformScope !== 'win32';
+  });
+
+  if (parsedTarget) {
+    const exactMatches = allowedForPlat
+      .filter(r => {
+        if (parsedTarget.platformScope !== 'universal') {
+          return r.platformScope === parsedTarget.platformScope && r.version === parsedTarget.version;
+        }
+        return r.version === parsedTarget.version;
+      })
+      .sort((a, b) => {
+        const aPref = a.platformScope === normPlat ? 1 : 0;
+        const bPref = b.platformScope === normPlat ? 1 : 0;
+        if (aPref !== bPref) return bPref - aPref;
+        return compareDshSemver(b.version, a.version) ?? 0;
+      });
+    return exactMatches;
+  }
+
+  const samePlatPrefixed = allowedForPlat.filter(r => r.platformScope === normPlat);
+  const candidatePool = samePlatPrefixed.length > 0
+    ? samePlatPrefixed
+    : allowedForPlat.filter(r => r.platformScope === 'universal');
+
+  return candidatePool.sort((a, b) => compareDshSemver(b.version, a.version) ?? 0);
+}
+
+/**
  * Check GitHub Releases (or custom mirror) for updates on the specified distribution track.
  * Never crosses tracks unless explicitly requested for preview; `apply` enforces confirmation token.
+ * Never blindly queries `/releases/latest`: always filters `/releases` by current OS platform (`windows-v*` vs `linux-v*`).
  */
 export async function checkForUpdates({
   pluginRoot = DEFAULT_PLUGIN_ROOT,
   storageRoot = null,
   track = null,
+  platform = process.platform,
+  targetVersion = null,
   includePrerelease = false,
   force = false,
   currentHostVersion = null,
@@ -464,26 +598,34 @@ export async function checkForUpdates({
   fetchImpl = globalThis.fetch,
   cacheTtlMs = DEFAULT_CHECK_CACHE_TTL_MS,
 } = {}) {
+  const normPlat = normalizeUpdaterPlatform(platform);
+  assertTargetReleaseTagMatchesPlatform(targetVersion, normPlat);
   const installed = readInstalledVersionInfo(pluginRoot);
   const queryTrack = track && UPDATE_TRACKS[track] ? track : installed.track;
   const trackMeta = UPDATE_TRACKS[queryTrack];
   const isCrossTrackPreview = queryTrack !== installed.track;
 
-  const cacheFile = storageRoot
-    ? path.join(resolveUpdaterDir(storageRoot), `check-cache-${queryTrack}.json`)
+  const cacheFile = storageRoot && !targetVersion
+    ? path.join(resolveUpdaterDir(storageRoot), `check-cache-${queryTrack}-${normPlat}.json`)
     : null;
 
-  if (!force && !apiUrlOverride && cacheFile && fs.existsSync(cacheFile)) {
+  if (!force && !targetVersion && !apiUrlOverride && cacheFile && fs.existsSync(cacheFile)) {
     try {
       const cached = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
       const age = Date.now() - Date.parse(cached.checkedAt || '');
-      if (Number.isFinite(age) && age >= 0 && age < cacheTtlMs && cached.installedVersion === installed.version) {
+      if (
+        Number.isFinite(age) &&
+        age >= 0 &&
+        age < cacheTtlMs &&
+        cached.installedVersion === installed.version &&
+        cached.platform === normPlat
+      ) {
         return { ...cached, fromCache: true };
       }
     } catch {}
   }
 
-  const targetUrl = apiUrlOverride || `${trackMeta.releasesApiUrl}?per_page=20`;
+  const targetUrl = apiUrlOverride || `${trackMeta.releasesApiUrl}?per_page=30`;
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), 12000);
   timer.unref?.();
@@ -507,20 +649,29 @@ export async function checkForUpdates({
     clearTimeout(timer);
   }
 
-  const releases = rawList
-    .map(r => normalizeReleaseEntry(r, queryTrack))
-    .filter(r => r !== null && (includePrerelease || !r.prerelease))
-    .sort((a, b) => compareDshSemver(b.version, a.version) ?? 0);
+  const releases = selectReleasesForPlatform(rawList, {
+    track: queryTrack,
+    platform: normPlat,
+    includePrerelease,
+    targetVersion,
+  });
 
   const latest = releases.find(r => r.asset?.downloadUrl) ?? releases[0] ?? null;
   const hasUpdate = latest
-    ? (isCrossTrackPreview ? latest.version !== installed.version || queryTrack !== installed.track : compareDshSemver(latest.version, installed.version) > 0)
+    ? (
+        targetVersion
+          ? latest.version !== installed.version || queryTrack !== installed.track
+          : (isCrossTrackPreview
+              ? latest.version !== installed.version || queryTrack !== installed.track
+              : compareDshSemver(latest.version, installed.version) > 0)
+      )
     : false;
 
   const checkedAt = new Date().toISOString();
   const result = {
     checkedAt,
     fromCache: false,
+    platform: normPlat,
     installedVersion: installed.version,
     installedTrack: installed.track,
     installedTrackInfo: installed.trackInfo,
@@ -540,7 +691,7 @@ export async function checkForUpdates({
       writeFileAtomic(cacheFile, `${JSON.stringify(result, null, 2)}\n`);
     } catch {}
   }
-  if (storageRoot && !isCrossTrackPreview) {
+  if (storageRoot && !isCrossTrackPreview && !targetVersion) {
     writeUpdaterState(storageRoot, {
       lastCheckedAt: checkedAt,
       lastError: null,
@@ -768,6 +919,8 @@ export async function performOneClickUpgrade({
   storageRoot,
   dshHome = null,
   profile = null,
+  platform = process.platform,
+  targetVersion = null,
   localTgzPath = null,
   downloadUrl = null,
   sha256SumsUrl = null,
@@ -781,6 +934,7 @@ export async function performOneClickUpgrade({
   allowBusy = false,
 } = {}) {
   if (!storageRoot) throw new Error('storageRoot is required for performOneClickUpgrade');
+  assertTargetReleaseTagMatchesPlatform(targetVersion, platform);
 
   if (!allowBusy) {
     const idleCheck = isRuntimeIdleForUpgrade(rt);
@@ -844,6 +998,8 @@ export async function performOneClickUpgrade({
         pluginRoot,
         storageRoot,
         track: resolvedTargetTrack,
+        platform,
+        targetVersion,
         force: true,
         currentHostVersion,
         fetchImpl,

@@ -647,6 +647,7 @@ export async function startInstallerGuiServer({
         const data = await checkForUpdates({
           pluginRoot: repoRoot,
           track: body.track || 'open-source',
+          targetVersion: body.targetVersion || body.version || null,
           force: true,
         });
         sendJson(200, { ok: true, data });
@@ -657,10 +658,12 @@ export async function startInstallerGuiServer({
         const out = await runOneClickInstallation({
           repoRoot,
           dshHome,
+          customDshPath: body.customDshPath || null,
           targetId: body.targetId || null,
           sourceKind: body.sourceKind || 'auto',
           localTgzPath: body.localTgzPath || null,
           track: body.track || 'open-source',
+          targetVersion: body.targetVersion || body.version || null,
           providerId: body.providerId || '',
           apiKey: body.apiKey || '',
         });
@@ -725,8 +728,10 @@ function parseArgs(argv) {
     noOpen: false,
     port: 0,
     dshHome: null,
+    customDshPath: null,
     targetId: null,
     tgz: null,
+    version: null,
     track: 'open-source',
     provider: '',
     launch: false,
@@ -741,8 +746,10 @@ function parseArgs(argv) {
     else if (a === '--launch') opts.launch = true;
     else if (a === '--port' && argv[i + 1]) opts.port = Number(argv[++i]) || 0;
     else if (a === '--dsh-home' && argv[i + 1]) opts.dshHome = argv[++i];
+    else if (a === '--custom-path' && argv[i + 1]) opts.customDshPath = argv[++i];
     else if (a === '--target' && argv[i + 1]) opts.targetId = argv[++i];
     else if (a === '--tgz' && argv[i + 1]) opts.tgz = argv[++i];
+    else if ((a === '--version' || a === '--tag') && argv[i + 1]) opts.version = argv[++i];
     else if (a === '--track' && argv[i + 1]) opts.track = argv[++i];
     else if (a === '--provider' && argv[i + 1]) opts.provider = argv[++i];
     else if (a === '--help' || a === '-h') opts.help = true;
@@ -760,7 +767,9 @@ function printHelp() {
     '  --no-open               Do not auto-open browser in --gui mode',
     '  --cli                   Run automated non-interactive installation',
     '  --inspect               Scan local DSH installations and print summary',
+    '  --custom-path <dir>     Specify custom DSH installation folder',
     '  --tgz <file>            Install a specific local .tgz bundle',
+    '  --version <tag>         Target platform release tag (e.g. windows-v2.2.3 or linux-v2.2.3)',
     '  --track <id>            Track when downloading: open-source | closed-free',
     '  --dsh-home <dir>        Override DSH_HOME directory',
     '  --launch                Launch DSH client immediately after --cli install',
@@ -786,7 +795,10 @@ if (isMain(import.meta.url)) {
       process.exit(0);
     }
     if (opts.inspectOnly) {
-      const snap = inspectInstallerEnvironment({ dshHome: opts.dshHome });
+      const snap = inspectInstallerEnvironment({
+        dshHome: opts.dshHome,
+        customDshPath: opts.customDshPath,
+      });
       if (opts.json) console.log(JSON.stringify(snap, null, 2));
       else {
         console.log(`Detected ${snap.targets.length} DeepSeek Harness environment(s):`);
@@ -800,10 +812,12 @@ if (isMain(import.meta.url)) {
       try {
         const res = await runOneClickInstallation({
           dshHome: opts.dshHome,
+          customDshPath: opts.customDshPath,
           targetId: opts.targetId,
-          sourceKind: opts.tgz ? 'local-tgz' : 'auto',
+          sourceKind: opts.tgz ? 'local-tgz' : (opts.version ? 'download-release' : 'auto'),
           localTgzPath: opts.tgz,
           track: opts.track,
+          targetVersion: opts.version,
           providerId: opts.provider,
         });
         let launchRes = null;

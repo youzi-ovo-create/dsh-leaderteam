@@ -23,6 +23,7 @@ function parseArgs(argv) {
   const opts = {
     action: 'check', // 'check' | 'apply' | 'rollback' | 'backups'
     track: null,
+    version: null,
     confirmTrackSwitch: null,
     tgz: null,
     sha256: null,
@@ -39,6 +40,7 @@ function parseArgs(argv) {
     else if (a === '--rollback') opts.action = 'rollback';
     else if (a === '--backups') opts.action = 'backups';
     else if (a === '--track' && argv[i + 1]) opts.track = argv[++i];
+    else if ((a === '--version' || a === '--tag') && argv[i + 1]) opts.version = argv[++i];
     else if (a === '--confirm-track-switch' && argv[i + 1]) opts.confirmTrackSwitch = argv[++i];
     else if (a === '--tgz' && argv[i + 1]) opts.tgz = argv[++i];
     else if (a === '--sha256' && argv[i + 1]) opts.sha256 = argv[++i];
@@ -57,12 +59,13 @@ function printHelp() {
     'Usage: lt-update [options]',
     '',
     'Actions:',
-    '  --check                          Check current track for new releases (default)',
+    '  --check                          Check current track & platform for new releases (default)',
     '  --apply                          Download, verify SHA-256, check host compat, backup & upgrade',
     '  --rollback                       Roll back to the most recent (or --backup-id) snapshot',
     '  --backups                        List saved local rollback snapshots',
     '',
     'Options:',
+    '  --version <tag>                  Target platform release tag (e.g. windows-v2.2.3 or linux-v2.2.3)',
     '  --tgz <file>                     Upgrade from a local .tgz bundle instead of GitHub Release',
     '  --sha256 <hex>                   Expected SHA-256 digest for verification',
     '  --track <open-source|closed-free> Explicit release track',
@@ -111,17 +114,18 @@ if (isMain(import.meta.url)) {
         pluginRoot: PLUGIN_ROOT,
         storageRoot,
         track: opts.track,
+        targetVersion: opts.version,
         force: true,
         currentHostVersion: hostCheck.toolsVersion,
       });
       if (opts.json) console.log(JSON.stringify({ ok: true, ...res }, null, 2));
       else {
-        console.log(`当前版本：v${res.installedVersion} [${res.installedTrackInfo.label}]`);
+        console.log(`当前版本：v${res.installedVersion} [${res.installedTrackInfo.label} · ${res.platform}]`);
         if (res.hasUpdate && res.latestRelease) {
-          console.log(`发现新版本：v${res.latestRelease.version} (${res.latestRelease.publishedAt || ''})`);
+          console.log(`发现新版本：${res.latestRelease.tagName} (v${res.latestRelease.version} · ${res.latestRelease.publishedAt || ''})`);
           console.log(`更新说明：\n${res.latestRelease.body || '（无详细说明）'}`);
         } else {
-          console.log('当前已是该发行分支最新版本。');
+          console.log('当前已是该平台发行分支最新版本。');
         }
       }
       process.exit(0);
@@ -136,6 +140,7 @@ if (isMain(import.meta.url)) {
         localTgzPath: opts.tgz,
         expectedSha256: opts.sha256,
         targetTrack: opts.track,
+        targetVersion: opts.version,
         confirmTrackSwitch: opts.confirmTrackSwitch,
         currentHostVersion: hostCheck.toolsVersion,
       });

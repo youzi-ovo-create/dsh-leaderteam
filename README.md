@@ -31,19 +31,17 @@ LeaderTeam 是运行在 **DeepSeek Harness（Linux & Windows）** 上的长周�
 
 - **方式 B：标准 `dsh plugin` 命令行安装**：
 
-> **安装源说明**：当前稳定版通过 [GitHub Releases](https://github.com/youzi-ovo-create/dsh-leaderteam/releases/tag/v2.2.0) 分发离线 `.tgz` 插件包（公共 npm registry 尚未上架，请直接安装 `.tgz` 包或本地克隆目录）：
+> **安装源与跨平台独立 Release 标签说明**：当前稳定版通过 [GitHub Releases](https://github.com/youzi-ovo-create/dsh-leaderteam/releases) 按平台独立分发离线 `.tgz` 插件包——Linux 发行标签为 **`linux-vX.Y.Z`**（如 `linux-v2.2.3`），Windows 发行标签为 **`windows-vX.Y.Z`**（如 `windows-v2.2.3`）；内置安装器与自动更新器会自动按当前系统匹配对应平台 Release（详见《[跨平台独立发行与长期工程治理规范](docs/13-跨平台独立发行与长期工程规范.md)》）：
 
 ```bash
-# 1. 从 GitHub Release 下载 v2.2.0 标准插件包
-curl -fLO https://github.com/youzi-ovo-create/dsh-leaderteam/releases/download/v2.2.0/dsh-leaderteam-2.2.0.tgz
+# 1A. Linux / WSL2：从 linux-v2.2.3 Release 下载并安装到 web profile
+curl -fLO https://github.com/youzi-ovo-create/dsh-leaderteam/releases/download/linux-v2.2.3/dsh-leaderteam-2.2.3.tgz
+dsh plugin --profile web add ./dsh-leaderteam-2.2.3.tgz
 
-# 2A. Linux / Web CLI Profile 安装
-dsh plugin --profile web add ./dsh-leaderteam-2.2.0.tgz
-
-# 2B. 官方 Windows Desktop Profile 安装
-# （若此前用 V2.1 install-desktop.ps1 注入过旧补丁，先在克隆仓内运行一次清理，会自动备份原文件：
-#   node bin/lt-doctor.mjs --clean-legacy-patch ）
-dsh plugin --profile desktop add ./dsh-leaderteam-2.2.0.tgz
+# 1B. 官方 Windows Desktop：从 windows-v2.2.3 Release 下载并安装到 desktop profile
+# （推荐直接双击随附的 Install-LeaderTeam.cmd 图形向导自动识别默认/自定义安装目录；若用命令行安装：）
+curl.exe -fLO https://github.com/youzi-ovo-create/dsh-leaderteam/releases/download/windows-v2.2.3/dsh-leaderteam-2.2.3.tgz
+dsh plugin --profile desktop add ./dsh-leaderteam-2.2.3.tgz
 ```
 
 > 若已 `git clone` 本仓库，也可在仓库根目录直接执行 `dsh plugin --profile web add .`；Windows 旧版脚本备份恢复流程见《[官方 Desktop 部署与恢复](docs/官方Desktop部署与恢复.md)》。
@@ -123,5 +121,5 @@ node bin/lt-bugreport.mjs --out lt-bugreport.md
 
 - **实跑基准与横向对照**：[V2.1 双项复杂工程实跑测评报告（自举编译器 & 存量生态账本插件，含耗时/成本客观劣势披露）](docs/benchmarks/LeaderTeam_V2.1_双项工程实跑测评报告.md)
 - **核心设计与接口契约**：[架构总览与设计决定](docs/00-总览.md) · [配置与接口参考](docs/01-配置与接口.md) · [按需工具与技能](docs/07-按需工具与技能.md) · [可视化与用量账本](docs/08-可视化与用量.md)
-- **日常操作与客户端维护**：[使用指南](docs/使用指南.md) · [官方 Desktop 部署与恢复](docs/官方Desktop部署与恢复.md) · [官方客户端更新复验](docs/官方Desktop更新复验.md) · [CHANGELOG.md](CHANGELOG.md)
+- **日常操作与客户端维护**：[一键安装、新手引导与自动更新指南](docs/11-一键安装新手引导与自动更新指南.md) · [历代设计原则与反退化台账](docs/12-历代设计原则与反退化台账.md) · [跨平台独立发行与长期工程治理规范](docs/13-跨平台独立发行与长期工程规范.md) · [使用指南](docs/使用指南.md) · [官方 Desktop 部署与恢复](docs/官方Desktop部署与恢复.md) · [CHANGELOG.md](CHANGELOG.md)
 - **开源许可**：本项目采用 [Apache License 2.0](LICENSE) 许可发布，第三方组件声明见 [leaderteam/NOTICE](leaderteam/NOTICE)。
