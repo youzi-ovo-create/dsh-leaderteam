@@ -1405,7 +1405,7 @@ export async function performOneClickUpgrade({
         windowsHide: true,
         shell: dshCli.shell,
         timeout: 180000,
-        env: { ...process.env, ...(dshHome ? { DSH_HOME: dshHome } : {}) },
+        env: { ...process.env, ...(dshCli.extraEnv ?? {}), ...(dshHome ? { DSH_HOME: dshHome } : {}) },
       },
     );
     if (proc.status !== 0) {
@@ -1540,7 +1540,7 @@ export async function rollbackToSavedBackup({
         windowsHide: true,
         shell: dshCli.shell,
         timeout: 180000,
-        env: { ...process.env, ...(dshHome ? { DSH_HOME: dshHome } : {}) },
+        env: { ...process.env, ...(dshCli.extraEnv ?? {}), ...(dshHome ? { DSH_HOME: dshHome } : {}) },
       },
     );
     if (proc.status !== 0) {
