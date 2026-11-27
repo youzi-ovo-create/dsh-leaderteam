@@ -843,6 +843,13 @@ test('O9 & Issue #4 Recheck [P1]: abnormal restart flushes pending config before
   // --- Part A: O9 crash recovery on first turn (Team & Single) ---
   for (const mode of ['single', 'team']) {
     const sid = `sess-o9-${mode}`;
+    fs.mkdirSync(path.join(dshHome, 'sessions', sid), { recursive: true });
+    fs.writeFileSync(
+      path.join(dshHome, 'sessions', sid, 'session.v4.jsonl.zstd'),
+      zlib.zstdCompressSync(
+        Buffer.from(`${JSON.stringify({ type: 'session', id: sid, createdAt: 100, cwd: '/tmp/ws', agentPreset: 'leaderteam' })}\n`),
+      ),
+    );
     if (mode === 'team') {
       const st = teamStore(sid);
       st.ensure({ workspace: '/tmp/ws', surface: 'desktop' });
