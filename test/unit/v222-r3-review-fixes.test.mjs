@@ -82,8 +82,18 @@ const {
 const { resolveStorageRoot } = await import('../../packages/lt-usage/index.mjs');
 
 function makeTempDir(t, suffix = '') {
+  const originCwd = process.cwd();
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), `lt-v222-r3-${suffix}`));
-  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  t.after(() => {
+    try {
+      if (process.cwd().toLowerCase().startsWith(dir.toLowerCase())) {
+        process.chdir(originCwd);
+      }
+    } catch {}
+    try {
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    } catch {}
+  });
   return dir;
 }
 
@@ -121,6 +131,7 @@ test('V222-R3-01 [P1]: relative storage.root stays invariant across entry-core i
     for (const fn of cleanups.reverse()) {
       try { fn(); } catch {}
     }
+    try { rt.configWatch?.close?.(); } catch {}
     process.chdir(prevCwd);
     if (prevDshHome === undefined) delete process.env.DSH_HOME;
     else process.env.DSH_HOME = prevDshHome;

@@ -396,6 +396,7 @@ test('V2.2.1 [R04 & R07]: upsertModels label-only edit preserves reasoningEffort
       fs.mkdirSync(roDir);
       const roPatch = path.join(roDir, 'magpie-models.patch.yml');
       fs.copyFileSync(patchFile, roPatch);
+      fs.chmodSync(roPatch, 0o444);
       fs.chmodSync(roDir, 0o555);
       try {
         assert.throws(
@@ -406,6 +407,7 @@ test('V2.2.1 [R04 & R07]: upsertModels label-only edit preserves reasoningEffort
         );
       } finally {
         fs.chmodSync(roDir, 0o755);
+        fs.chmodSync(roPatch, 0o644);
       }
       assert.equal(JSON.parse(fs.readFileSync(cfgFile, 'utf8')).models[route].label, 'Renamed for display');
     }

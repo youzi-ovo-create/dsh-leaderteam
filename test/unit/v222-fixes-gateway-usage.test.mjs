@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import http from 'node:http';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import zlib from 'node:zlib';
 import { execFileSync, spawn } from 'node:child_process';
@@ -16,6 +17,7 @@ import {
   normalizeMagpieUsageRow,
   sanitizeMaskedPreview,
   discoverSystemMagpieBinary,
+  compareMagpieVersions,
 } from '../../leaderteam/gateway/index.mjs';
 import {
   HengzhangUsageBridge,
@@ -39,7 +41,7 @@ function computeSha256File(file) {
 }
 
 function mkStage2Sandbox(suffix) {
-  return fs.mkdtempSync(path.join('/tmp', `lt-s2-gw-${suffix}-`));
+  return fs.mkdtempSync(path.join(os.tmpdir(), `lt-s2-gw-${suffix}-`));
 }
 
 function isPidAlive(pid) {
@@ -451,7 +453,9 @@ test('Live Magpie 0.1.4731 binary verification: GW-01..06 & HZ-01 (providerJSON 
   let foreignHelper = null;
 
   try {
-    await mgr.install({ sourceBinaryPath: sysMagpie });
+    const instRes = await mgr.install({ sourceBinaryPath: sysMagpie });
+    const initialMagpieVer = instRes.version;
+    const supportsCursorFeed = compareMagpieVersions(initialMagpieVer, '0.1.4731') >= 0;
     const started = await mgr.start({ allocateDynamicPortsIfBusy: true });
     assert.equal(started.state, 'running');
     const client = mgr.createClient();
@@ -536,45 +540,47 @@ test('Live Magpie 0.1.4731 binary verification: GW-01..06 & HZ-01 (providerJSON 
     }
     assert.equal(liveSync1.synced, true);
     assert.ok(liveSync1.totalCached >= 1);
-    assert.notEqual(bridge.nextCursor, 'start');
+    if (supportsCursorFeed) {
+      assert.notEqual(bridge.nextCursor, 'start');
 
-    // Locate and remove `usage-feed.jsonl` inside sandbox to trigger real Go `410 cursor_reset`
-    const findFeedFiles = dir => {
-      const found = [];
-      for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
-        const full = path.join(dir, ent.name);
-        if (ent.isDirectory()) found.push(...findFeedFiles(full));
-        else if (ent.name.includes('usage-feed')) found.push(full);
+      // Locate and remove `usage-feed.jsonl` inside sandbox to trigger real Go `410 cursor_reset`
+      const findFeedFiles = dir => {
+        const found = [];
+        for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
+          const full = path.join(dir, ent.name);
+          if (ent.isDirectory()) found.push(...findFeedFiles(full));
+          else if (ent.name.includes('usage-feed')) found.push(full);
+        }
+        return found;
+      };
+      for (const f of findFeedFiles(mgr.runtimeSandboxDir)) {
+        fs.rmSync(f, { force: true });
       }
-      return found;
-    };
-    for (const f of findFeedFiles(mgr.runtimeSandboxDir)) {
-      fs.rmSync(f, { force: true });
-    }
-    // Emit a new loopback call so a fresh `usage-feed.jsonl` with a new feed header is created
-    const chatRes2 = await fetch(`${ep.gatewayUrl}/v1/chat/completions`, {
-      method: 'POST',
-      headers: {
-        Authorization: 'Bearer magpie-leaderteam',
-        'Content-Type': 'application/json',
-        'X-Magpie-Session': 'sess-live-02',
-      },
-      body: JSON.stringify({
-        model: 'localrelay/alpha-model',
-        messages: [{ role: 'user', content: 'loopback ping 2' }],
-      }),
-    });
-    assert.equal(chatRes2.status, 200);
-    await chatRes2.text();
+      // Emit a new loopback call so a fresh `usage-feed.jsonl` with a new feed header is created
+      const chatRes2 = await fetch(`${ep.gatewayUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer magpie-leaderteam',
+          'Content-Type': 'application/json',
+          'X-Magpie-Session': 'sess-live-02',
+        },
+        body: JSON.stringify({
+          model: 'localrelay/alpha-model',
+          messages: [{ role: 'user', content: 'loopback ping 2' }],
+        }),
+      });
+      assert.equal(chatRes2.status, 200);
+      await chatRes2.text();
 
-    let liveSync2 = await bridge.triggerBackgroundMagpieSync();
-    for (let wait = 0; wait < 25 && !bridge.gatewayRecords.some(r => r.sessionId === 'sess-live-02'); wait++) {
-      await new Promise(r => setTimeout(r, 25));
-      liveSync2 = await bridge.triggerBackgroundMagpieSync();
+      let liveSync2 = await bridge.triggerBackgroundMagpieSync();
+      for (let wait = 0; wait < 25 && !bridge.gatewayRecords.some(r => r.sessionId === 'sess-live-02'); wait++) {
+        await new Promise(r => setTimeout(r, 25));
+        liveSync2 = await bridge.triggerBackgroundMagpieSync();
+      }
+      assert.equal(liveSync2.synced, true, `Expected 410 auto-recovery, got: ${JSON.stringify(liveSync2)}`);
+      assert.equal(bridge.lastSyncError, null);
+      assert.ok(bridge.gatewayRecords.some(r => r.sessionId === 'sess-live-02'));
     }
-    assert.equal(liveSync2.synced, true, `Expected 410 auto-recovery, got: ${JSON.stringify(liveSync2)}`);
-    assert.equal(bridge.lastSyncError, null);
-    assert.ok(bridge.gatewayRecords.some(r => r.sessionId === 'sess-live-02'));
 
     // 4. GW-04 (Live): Sandboxed OAuth sign-in auto-unlocks discovery inside `sandboxHome` & normalizes `gemini-cli`
     await client.updateSettings({ proxy: 'http://127.0.0.1:9' });
@@ -670,7 +676,7 @@ test('Live Magpie 0.1.4731 binary verification: GW-01..06 & HZ-01 (providerJSON 
     });
     assert.equal(cliInst2.version, '0.1.4797');
     const cliRbRes = runCliJson(['rollback']);
-    assert.equal(cliRbRes.rolledBackTo, '0.1.4731');
+    assert.equal(cliRbRes.rolledBackTo, initialMagpieVer);
     const cliStatusAfterRb = runCliJson(['status']);
     assert.equal(cliStatusAfterRb.state, 'running');
     assert.notEqual(cliStatusAfterRb.health.pid, rbPidBefore);
@@ -703,13 +709,13 @@ test('Live Magpie 0.1.4731 binary verification: GW-01..06 & HZ-01 (providerJSON 
     const cliCleanupMgr = new MagpieGatewayManager({ storageRoot: cliStorageRoot });
     await cliCleanupMgr.stop().catch(() => {});
     await relay.close().catch(() => {});
-    fs.rmSync(tmpDir, { recursive: true, force: true });
+    try { fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 150 }); } catch {}
   }
 });
 
 test('Stage 4 Re-Audit Fixes (S3-UIGW-01, S3-UIGW-02, S3-UIGW-03, S3-UIGW-06): live Magpie 0.1.4731 test-provider latency + scanNoSecretLeakage on providersMutate + mutate-key protocol/plan/refs + REPORT_CACHE in-place upsert invalidation + sync configure/start _stoppingPids drain', async t => {
   const sysMagpie = discoverSystemMagpieBinary();
-  const tmpDir = fs.mkdtempSync(path.join('/tmp', 'lt-s4-uigw-gw-'));
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lt-s4-uigw-gw-'));
   const relay = await startLocalDummyUpstreamRelay();
   const mockSrv = await startMockMagpieServer({
     initialUsageRows: [
@@ -948,6 +954,6 @@ test('Stage 4 Re-Audit Fixes (S3-UIGW-01, S3-UIGW-02, S3-UIGW-03, S3-UIGW-06): l
     if (liveMgr) await liveMgr.stop().catch(() => {});
     await mockSrv.close().catch(() => {});
     await relay.close().catch(() => {});
-    fs.rmSync(tmpDir, { recursive: true, force: true });
+    try { fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 150 }); } catch {}
   }
 });

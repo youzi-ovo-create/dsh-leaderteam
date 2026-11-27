@@ -2983,10 +2983,16 @@ export function evaluateHardRules(input, config) {
           return { rule: 'direct-exec-sandbox-lock', reason: `direct execution model is strictly forbidden from reading or searching outside the workspace sandbox: ${target}${DIRECT_EXEC_EPISTEMIC_NOTE}` };
         }
       } else {
-        const lexOk = isInside(target, workspace, platform) || globals.some(g => isInside(target, g, platform));
+        const assignedRefs = Array.isArray(actor.refs) ? actor.refs.map(r => resolvePath(r, workspace, platform)).filter(Boolean) : [];
+        const realAssignedRefs = assignedRefs.map(realOf);
+        const isAssignedRef = (tool === 'read' || tool === 'read_image')
+          && realAssignedRefs.some(r => pathKey(realTarget, platform) === pathKey(r, platform))
+          && (assignedRefs.some(r => pathKey(target, platform) === pathKey(r, platform))
+            || realAssignedRefs.some(r => pathKey(target, platform) === pathKey(r, platform)));
+        const lexOk = isInside(target, workspace, platform) || globals.some(g => isInside(target, g, platform)) || realGlobals.some(g => isInside(target, g, platform));
         const realOk = isInside(realTarget, realWorkspace, platform) || realGlobals.some(g => isInside(realTarget, g, platform));
         const spillOk = tool === 'read' && isOwnSessionSpillFile(target, realTarget, input, platform, realOf);
-        if ((!lexOk || !realOk) && !spillOk) {
+        if ((!lexOk || !realOk) && !spillOk && !isAssignedRef) {
           if (actor.role === 'member') return { rule: 'path-outside-workspace', reason: `member ${tool} path must stay inside the workspace or global reference roots: ${target}` };
           // Leader only: standing read-only roots from the configuration, then grants from the user's own messages (read lazily).
           const within = roots => roots.some(r => isInside(target, r, platform)) && roots.some(r => isInside(realTarget, realOf(r), platform));

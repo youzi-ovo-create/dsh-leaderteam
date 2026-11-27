@@ -119,24 +119,56 @@ export async function isPortInUse(port, host = '127.0.0.1') {
 }
 
 export function detectBinaryVersion(binaryPath) {
+  const probeRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'lt-magpie-ver-'));
   try {
-    const out = execFileSync(binaryPath, ['--version'], {
-      encoding: 'utf8',
-      timeout: 4000,
-      windowsHide: true,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    const m = String(out || '').trim().match(/magpie\s+v?(\d+\.\d+\.\d+[^\s]*)/i);
-    return m ? m[1] : String(out || '').trim().split(/\s+/)[0] || null;
-  } catch {
+    const probeEnv = {
+      ...process.env,
+      MAGPIE_NO_STATS: '1',
+      MAGPIE_NO_INSTALL: '1',
+      MAGPIE_NO_HANDOVER: '1',
+      MAGPIE_NO_SHORTCUT: '1',
+      XDG_CONFIG_HOME: path.join(probeRoot, 'cfg'),
+      XDG_CACHE_HOME: path.join(probeRoot, 'cache'),
+      XDG_STATE_HOME: path.join(probeRoot, 'state'),
+      APPDATA: path.join(probeRoot, 'cfg'),
+      LOCALAPPDATA: path.join(probeRoot, 'local'),
+      HOME: probeRoot,
+      USERPROFILE: probeRoot,
+      DSH_HOME: path.join(probeRoot, 'dsh'),
+    };
+    for (const arg of ['version', '--version', '-v']) {
+      try {
+        const out = execFileSync(binaryPath, [arg], {
+          encoding: 'utf8',
+          timeout: 4000,
+          windowsHide: true,
+          env: probeEnv,
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        const m = String(out || '').trim().match(/magpie\s+v?(\d+\.\d+\.\d+[^\s]*)/i);
+        if (m) return m[1];
+        const firstToken = String(out || '').trim().split(/\s+/)[0] || '';
+        if (/^v?\d+\.\d+\.\d+/.test(firstToken)) return firstToken.replace(/^v/i, '');
+      } catch {}
+    }
     return null;
+  } finally {
+    try { fs.rmSync(probeRoot, { recursive: true, force: true }); } catch {}
   }
 }
 
-export function discoverSystemMagpieBinary() {
-  const candidates = IS_WIN
+export function discoverSystemMagpieBinary(env = process.env, platform = process.platform, fsImpl = fs) {
+  const candidates = platform === 'win32'
     ? [
-      process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Programs', 'magpie', 'magpie.exe') : null,
+      // Prioritize 50.6MB headless CLI server `magpie-cli.exe` BEFORE 114MB GUI shell `magpie.exe` on Windows!
+      env?.LOCALAPPDATA ? path.join(env.LOCALAPPDATA, 'Programs', 'Magpie', 'magpie-cli.exe') : null,
+      env?.LOCALAPPDATA ? path.join(env.LOCALAPPDATA, 'Programs', 'magpie', 'magpie-cli.exe') : null,
+      env?.LOCALAPPDATA ? path.join(env.LOCALAPPDATA, 'Magpie', 'magpie-cli.exe') : null,
+      (env?.PROGRAMFILES || env?.ProgramFiles) ? path.join(env.PROGRAMFILES || env.ProgramFiles, 'Magpie', 'magpie-cli.exe') : null,
+      env?.USERPROFILE ? path.join(env.USERPROFILE, '.local', 'bin', 'magpie-cli.exe') : null,
+      os.homedir() ? path.join(os.homedir(), '.local', 'bin', 'magpie-cli.exe') : null,
+      env?.LOCALAPPDATA ? path.join(env.LOCALAPPDATA, 'Programs', 'Magpie', 'magpie.exe') : null,
+      env?.LOCALAPPDATA ? path.join(env.LOCALAPPDATA, 'Programs', 'magpie', 'magpie.exe') : null,
     ].filter(Boolean)
     : [
       '/opt/magpie/current/magpie',
@@ -147,7 +179,7 @@ export function discoverSystemMagpieBinary() {
 
   for (const cand of candidates) {
     try {
-      if (fs.existsSync(cand) && fs.statSync(cand).isFile()) {
+      if (fsImpl.existsSync(cand) && fsImpl.statSync(cand).isFile()) {
         return cand;
       }
     } catch {}
@@ -308,12 +340,36 @@ export class MagpieGatewayManager {
     if (typeof syncVerdict === 'boolean') return syncVerdict;
     if (!saved?.gatewayPort) return false;
     try {
+      const creds = readJsonSafe(this.credentialsFile, null);
       const probeClient = new MagpieClient({
         gatewayUrl: `http://127.0.0.1:${saved.gatewayPort}`,
+        webAdminUrl: saved.webPort ? `http://127.0.0.1:${saved.webPort}` : null,
+        webKey: creds?.managedWebKey ?? null,
         fetchImpl: this.fetchImpl,
       });
       const h = await probeClient.probeHealth({ timeoutMs: 1000 });
-      return Boolean(h.ok && h.pid === saved.pid);
+      if (!h.ok) return false;
+      if (Number.isInteger(h.pid)) return h.pid === saved.pid;
+      // Fallback for Magpie < 0.1.4731 on Windows (where `/` omits `pid` and `/proc` is absent):
+      // Verify Windows process image name matches `magpie` AND Web Admin authenticates with our secret managedWebKey.
+      if (IS_WIN) {
+        try {
+          const tl = execFileSync('tasklist', ['/FI', `PID eq ${saved.pid}`, '/FO', 'CSV', '/NH'], {
+            encoding: 'utf8',
+            windowsHide: true,
+            stdio: ['ignore', 'pipe', 'ignore'],
+            timeout: 2000,
+          });
+          if (!/magpie/i.test(String(tl || ''))) return false;
+        } catch {
+          return false;
+        }
+      }
+      if (saved.webPort && creds?.managedWebKey) {
+        await probeClient.getSettings();
+        return true;
+      }
+      return false;
     } catch {
       return false;
     }
@@ -337,6 +393,15 @@ export class MagpieGatewayManager {
     while (Date.now() < sigkillDeadline) {
       if (!isPidAlive(pid)) return;
       await new Promise(r => setTimeout(r, 40));
+    }
+    if (IS_WIN && isPidAlive(pid)) {
+      try {
+        execFileSync('taskkill', ['/PID', String(pid), '/T', '/F'], {
+          windowsHide: true,
+          stdio: 'ignore',
+          timeout: 3000,
+        });
+      } catch {}
     }
     try {
       process.kill(pid, 'SIGKILL');
@@ -711,6 +776,7 @@ export class MagpieGatewayManager {
       });
     }
     const saved = this._readManagedPidRecord();
+    let preserveCrossProcessPidRecord = false;
     if (saved && saved.pid !== proc?.pid) {
       const owned = this._verifyOwnedPidSync(saved);
       if (owned === true) {
@@ -729,9 +795,15 @@ export class MagpieGatewayManager {
           }
         }, 2000);
         fallback.unref?.();
+      } else if (owned === null) {
+        // On Windows (`/proc` absent), `_verifyOwnedPidSync` returns `null` when a cross-process PID inside `releasesDir` is still alive.
+        // Preserve `managed-pid.json` so subsequent async `stop()` / `start()` can verify ownership via HTTP PID probe and terminate it cleanly!
+        preserveCrossProcessPidRecord = true;
       }
     }
-    this._removeManagedPidRecord();
+    if (!preserveCrossProcessPidRecord) {
+      this._removeManagedPidRecord();
+    }
   }
 
   _prepareRuntimeSandbox(cfg) {
@@ -764,6 +836,7 @@ export class MagpieGatewayManager {
 
   async start({ allocateDynamicPortsIfBusy = false, keepAliveOnParentExit } = {}) {
     if (this.startingPromise) return this.startingPromise;
+    this._lastAllocateDynamicPorts = Boolean(allocateDynamicPortsIfBusy);
     const myEpoch = ++this._lifecycleEpoch;
     this.stopping = false;
     const effectiveKeepAlive = typeof keepAliveOnParentExit === 'boolean'
@@ -890,7 +963,7 @@ export class MagpieGatewayManager {
 
     let gwPort = cfg.gatewayPort || this.defaultGatewayPort;
     let webPort = cfg.webPort || this.defaultWebPort;
-    const maxBindAttempts = allocateDynamicPortsIfBusy ? 3 : 1;
+    const maxBindAttempts = allocateDynamicPortsIfBusy ? 5 : 1;
 
     for (let bindAttempt = 0; bindAttempt < maxBindAttempts; bindAttempt++) {
       ensureNotAborted();
@@ -952,6 +1025,7 @@ export class MagpieGatewayManager {
         XDG_CONFIG_HOME: dirs.configHome,
         XDG_CACHE_HOME: dirs.cacheHome,
         XDG_STATE_HOME: dirs.stateHome,
+        APPDATA: dirs.configHome,
         LOCALAPPDATA: dirs.localAppData,
         // CRITICAL: prevents Magpie's KeepDshWired loop from overwriting the user's real ~/.dsh!
         DSH_HOME: dirs.sandboxDsh,
@@ -1070,12 +1144,33 @@ export class MagpieGatewayManager {
               }
               throw new Error(`Managed Magpie gateway port 127.0.0.1:${gwPort} was bound by another Magpie process (pid=${h.pid})`);
             }
-            startupCompleted = true;
-            this.lastError = null;
-            if (keepAliveOnParentExit) {
-              child.unref?.();
+            // Also verify Web Admin port is ready and authenticated with this instance's unique managedWebKey
+            // (prevents cross-instance port spoofing when Magpie < 0.1.4731 omits `pid` on `/`).
+            let webReady = true;
+            if (client.hasWebAdminAuth()) {
+              webReady = false;
+              try {
+                await client.getSettings();
+                webReady = true;
+              } catch (webErr) {
+                if (webErr?.code === 'MAGPIE_AUTH_FAILED' || webErr?.status === 401 || webErr?.status === 403) {
+                  await this._killChildRef(child);
+                  if (allocateDynamicPortsIfBusy && bindAttempt + 1 < maxBindAttempts) {
+                    retryPortConflict = true;
+                    break;
+                  }
+                  throw new Error(`Managed Magpie web port 127.0.0.1:${webPort} was bound by another Magpie process`);
+                }
+              }
             }
-            return this.getStatus();
+            if (webReady && this.child === child && child.exitCode === null) {
+              startupCompleted = true;
+              this.lastError = null;
+              if (keepAliveOnParentExit) {
+                child.unref?.();
+              }
+              return this.getStatus();
+            }
           }
         } catch (probeErr) {
           if (String(probeErr?.message || '').includes('bound by another Magpie process')) {
@@ -1157,7 +1252,7 @@ export class MagpieGatewayManager {
     this.recoveryTimer = setTimeout(() => {
       this.recoveryTimer = null;
       if (this.stopping) return;
-      this.start().catch(err => {
+      this.start({ allocateDynamicPortsIfBusy: Boolean(this._lastAllocateDynamicPorts) }).catch(err => {
         const creds = readJsonSafe(this.credentialsFile, null);
         this.lastError = {
           code: 'MAGPIE_RECOVERY_FAILED',
@@ -1180,9 +1275,11 @@ export class MagpieGatewayManager {
       await this.startingPromise.catch(() => {});
     }
 
+    let killedAny = false;
     const proc = this.child;
     if (proc) {
       await this._killChildRef(proc);
+      killedAny = true;
     }
 
     // Cross-process stop via `managed-pid.json` with strict ownership verification (`GW-03`)
@@ -1191,8 +1288,14 @@ export class MagpieGatewayManager {
       const owned = await this._verifyOwnedPid(saved);
       if (owned) {
         await this._terminateOwnedPid(saved.pid);
+        killedAny = true;
       }
       this._removeManagedPidRecord(saved.pid);
+    }
+
+    if (IS_WIN && killedAny) {
+      // Allow Windows kernel image section handle on magpie.exe to release before immediate directory cleanup
+      await new Promise(r => setTimeout(r, 120));
     }
 
     this._removeParentExitCleanup();
@@ -1314,7 +1417,11 @@ export class MagpieGatewayManager {
         ok: Boolean(healthProbe?.ok),
         latencyMs: healthProbe?.latencyMs ?? null,
         checkedAt,
-        pid: healthProbe?.pid ?? (this.child?.pid ?? null),
+        pid: healthProbe?.pid ?? this.child?.pid ?? (() => {
+          if (!healthProbe?.ok || !webAuthed) return null;
+          const rec = this._readManagedPidRecord();
+          return rec && isPidAlive(rec.pid) ? rec.pid : null;
+        })(),
         modelCount: healthProbe?.modelCount ?? 0,
       },
       lastError: safeLastError,

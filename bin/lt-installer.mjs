@@ -115,7 +115,7 @@ function openSystemBrowser(url) {
   } catch {}
 }
 
-function renderInstallerHtml() {
+export function renderInstallerHtml() {
   return `<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -258,7 +258,7 @@ function renderInstallerHtml() {
 <div class="wrap">
   <div class="hero">
     <h1>LeaderTeam 图形化一键安装器</h1>
-    <p>自动识别 DeepSeek Harness 安装环境、校验宿主版本兼容性、一键完成插件安装与初始模型配置——全程无需命令行。</p>
+    <p>自动识别 DeepSeek Harness 默认与自定义安装目录（如 D:\\Apps\\DeepSeek-Harness）、校验宿主版本兼容性、一键完成插件安装与初始模型配置——全程无需命令行。</p>
   </div>
 
   <div class="steps-bar">
@@ -275,13 +275,11 @@ function renderInstallerHtml() {
     </h2>
     <div id="targetsBox">正在扫描本机环境…</div>
     <div class="field">
-      <details>
-        <summary>未自动找到客户端？手动填写 DSH 安装目录重新识别</summary>
-        <div class="row" style="margin-top:8px">
-          <input id="customDshInput" type="text" placeholder="例如 D:\\Programs\\DeepSeek Harness" style="flex:1" />
-          <button class="secondary" id="btnProbeCustom" type="button">检测此目录</button>
-        </div>
-      </details>
+      <label for="customDshInput">手动指定 DeepSeek Harness 安装目录（可选）</label>
+      <div class="row" style="margin-top:4px">
+        <input id="customDshInput" type="text" placeholder="例如 D:\\Apps\\DeepSeek-Harness（留空则自动扫描全盘与注册表）" style="flex:1" />
+        <button class="secondary" id="btnProbeCustom" type="button">重新扫描此目录</button>
+      </div>
     </div>
     <div id="legacyBox"></div>
     <div style="margin-top:12px">
@@ -301,6 +299,10 @@ function renderInstallerHtml() {
     <div class="field" id="uploadRow" style="display:none">
       <label for="tgzFileInput">选择本地已下载的 <code>dsh-leaderteam-*.tgz</code> 安装包</label>
       <input id="tgzFileInput" type="file" accept=".tgz,application/gzip" />
+    </div>
+    <div class="field" id="localPathRow" style="display:none">
+      <label for="localTgzPathInput">填写本地 <code>.tgz</code> 安装包完整路径</label>
+      <input id="localTgzPathInput" type="text" placeholder="例如 D:\\Downloads\\dsh-leaderteam-2.2.2.tgz" />
     </div>
     <div class="field">
       <label for="providerSelect">首次使用免命令行接入模型（可留空，安装后在控制台向导中配置）</label>
@@ -358,10 +360,11 @@ function renderInstallerHtml() {
   }
 
   function renderEnv(envData) {
+    const prevSrc = document.getElementById('sourceSelect').value;
     state = envData;
     const box = document.getElementById('targetsBox');
     if (!envData.targets || envData.targets.length === 0) {
-      box.innerHTML = '<div class="alert warn"><strong>未自动检测到已安装的 DeepSeek Harness</strong><br>请先安装官方 DeepSeek Harness 客户端（版本 &gt;= 0.2.2-rc.1），或展开下方输入框指定您的客户端目录。</div>';
+      box.innerHTML = '<div class="alert warn"><strong>未自动检测到已安装的 DeepSeek Harness</strong><br>请先安装官方 DeepSeek Harness 客户端（版本 &gt;= 0.2.2-rc.1），或在下方输入框指定您的客户端目录。</div>';
     } else {
       if (!selectedTargetId || !envData.targets.some(t => t.id === selectedTargetId)) {
         const rec = envData.targets.find(t => t.recommended) || envData.targets[0];
@@ -375,7 +378,7 @@ function renderInstallerHtml() {
           : (compat.productionAllowed ? '结构契约兼容 (' + (t.dshVersion || '') + ')' : '版本不兼容 (' + (t.dshVersion || '未知') + ')');
         const installedTag = t.installedLtVersion ? ' · 当前已装 LT v' + esc(t.installedLtVersion) : ' · 尚未安装 LT';
         const warnRunning = (t.kind === 'official-desktop' && t.desktopRunning)
-          ? '<div class="alert warn" style="margin-top:8px">检测到 DeepSeek Harness 桌面端正在运行，请先退出客户端后再点击安装。</div>'
+          ? '<div class="alert warn" style="margin-top:8px">检测到 DeepSeek Harness 桌面端正在运行，请先完全退出客户端（含右下角系统托盘图标）后再点击安装。</div>'
           : '';
         return '<div class="target-item ' + (t.id === selectedTargetId ? 'selected' : '') + '" data-tid="' + esc(t.id) + '">' +
           '<div class="target-head"><span>' + esc(t.label) + '</span><span class="badge ' + badgeCls + '">' + esc(badgeText) + '</span></div>' +
@@ -416,10 +419,14 @@ function renderInstallerHtml() {
     opts.push({ val: 'download:open-source', label: '在线下载最新「开源维护版 (Apache-2.0)」官方发布包' });
     opts.push({ val: 'download:closed-free', label: '在线下载最新「闭源免费公开发行版」官方发布包' });
     opts.push({ val: 'upload-tgz', label: '手动选择电脑上的 .tgz 安装包文件…' });
+    opts.push({ val: 'path-tgz', label: '手动输入本地 .tgz 安装包完整路径…' });
     srcSel.innerHTML = opts.map(o => '<option value="' + esc(o.val) + '">' + esc(o.label) + '</option>').join('');
+    if (prevSrc && opts.some(o => o.val === prevSrc)) srcSel.value = prevSrc;
     srcSel.onchange = () => {
       document.getElementById('uploadRow').style.display = srcSel.value === 'upload-tgz' ? 'block' : 'none';
+      document.getElementById('localPathRow').style.display = srcSel.value === 'path-tgz' ? 'block' : 'none';
     };
+    srcSel.onchange();
 
     // Providers
     const pSel = document.getElementById('providerSelect');
@@ -435,20 +442,26 @@ function renderInstallerHtml() {
 
   async function scan(customPath) {
     try {
-      const data = await api('/api/installer/inspect', { customDshPath: customPath || null });
+      const effectiveCustom = customPath != null ? customPath : document.getElementById('customDshInput').value.trim();
+      const data = await api('/api/installer/inspect', { customDshPath: effectiveCustom || null });
+      if (effectiveCustom && data.targets && data.targets.length > 0) selectedTargetId = data.targets[0].id;
       renderEnv(data);
     } catch (e) {
       document.getElementById('targetsBox').innerHTML = '<div class="alert err">环境扫描失败：' + esc(e.message) + '</div>';
     }
   }
 
-  document.getElementById('btnRescan').onclick = () => scan(null);
+  document.getElementById('btnRescan').onclick = () => scan();
   document.getElementById('btnProbeCustom').onclick = () => scan(document.getElementById('customDshInput').value.trim());
+  document.getElementById('customDshInput').addEventListener('keydown', ev => {
+    if (ev.key === 'Enter') { ev.preventDefault(); scan(); }
+  });
 
   document.getElementById('btnInstall').onclick = async () => {
     const btn = document.getElementById('btnInstall');
     const prog = document.getElementById('progressBox');
     const resBox = document.getElementById('resultBox');
+    const customPath = document.getElementById('customDshInput').value.trim();
     btn.disabled = true;
     resBox.innerHTML = '';
     prog.style.display = 'block';
@@ -460,6 +473,7 @@ function renderInstallerHtml() {
       const srcVal = document.getElementById('sourceSelect').value;
       let payload = {
         targetId: selectedTargetId,
+        customDshPath: customPath || null,
         providerId: document.getElementById('providerSelect').value,
         apiKey: document.getElementById('apiKeyInput').value.trim(),
       };
@@ -471,6 +485,11 @@ function renderInstallerHtml() {
       } else if (srcVal.startsWith('download:')) {
         payload.sourceKind = 'download-release';
         payload.track = srcVal.slice('download:'.length);
+      } else if (srcVal === 'path-tgz') {
+        const p = document.getElementById('localTgzPathInput').value.trim();
+        if (!p) throw new Error('请先输入本地 .tgz 安装包的完整路径');
+        payload.sourceKind = 'local-tgz';
+        payload.localTgzPath = p;
       } else if (srcVal === 'upload-tgz') {
         const fileInput = document.getElementById('tgzFileInput');
         const file = fileInput.files && fileInput.files[0];
@@ -497,7 +516,7 @@ function renderInstallerHtml() {
       document.getElementById('sp4').className = 'step-pill active';
       document.getElementById('nextHintText').textContent = out.nextStepHint;
       document.getElementById('launchCard').style.display = 'block';
-      await scan(null);
+      await scan();
     } catch (e) {
       const f = e.friendly || { title: '安装未完成', friendlyMessage: e.message, suggestion: '请根据提示检查后重试。', rawDetail: e.message };
       prog.textContent += '✖ ' + f.title + '\\n';
@@ -511,9 +530,10 @@ function renderInstallerHtml() {
 
   document.getElementById('btnLaunch').onclick = async () => {
     const statusEl = document.getElementById('launchStatus');
+    const customPath = document.getElementById('customDshInput').value.trim();
     statusEl.innerHTML = '<div class="alert ok">正在为您启动客户端…</div>';
     try {
-      const res = await api('/api/installer/launch', { targetId: selectedTargetId });
+      const res = await api('/api/installer/launch', { targetId: selectedTargetId, customDshPath: customPath || null });
       statusEl.innerHTML = '<div class="alert ok">' + esc(res.message) + '</div>';
       if (res.url) {
         setTimeout(() => { window.location.href = res.url; }, 800);
@@ -658,6 +678,7 @@ export async function startInstallerGuiServer({
         const out = await runOneClickInstallation({
           repoRoot,
           dshHome,
+          customDshPath: body.customDshPath || null,
           targetId: body.targetId || null,
           sourceKind: body.sourceKind || 'auto',
           localTgzPath: body.localTgzPath || null,
@@ -674,6 +695,7 @@ export async function startInstallerGuiServer({
         const out = await launchInstalledClient({
           repoRoot,
           dshHome,
+          customDshPath: body.customDshPath || null,
           targetId: body.targetId || null,
           webPort: Number(body.webPort) || 4096,
         });
@@ -727,6 +749,7 @@ function parseArgs(argv) {
     noOpen: false,
     port: 0,
     dshHome: null,
+    customDshPath: null,
     targetId: null,
     tgz: null,
     track: 'open-source',
@@ -744,6 +767,8 @@ function parseArgs(argv) {
     else if (a === '--launch') opts.launch = true;
     else if (a === '--port' && argv[i + 1]) opts.port = Number(argv[++i]) || 0;
     else if (a === '--dsh-home' && argv[i + 1]) opts.dshHome = argv[++i];
+    else if ((a === '--custom-path' || a === '--dsh-dir' || a === '--dsh-app') && argv[i + 1]) opts.customDshPath = argv[++i];
+    else if (a === '--profile' && argv[i + 1]) opts.profile = argv[++i];
     else if (a === '--target' && argv[i + 1]) opts.targetId = argv[++i];
     else if (a === '--tgz' && argv[i + 1]) opts.tgz = argv[++i];
     else if (a === '--track' && argv[i + 1]) opts.track = argv[++i];
@@ -764,6 +789,7 @@ function printHelp() {
     '  --no-open               Do not auto-open browser in --gui mode',
     '  --cli                   Run automated non-interactive installation',
     '  --inspect               Scan local DSH installations and print summary',
+    '  --custom-path <dir>     Explicit DeepSeek Harness installation directory (e.g. D:\\Apps\\DeepSeek-Harness)',
     '  --tgz <file>            Install a specific local .tgz bundle',
     '  --track <id>            Track when downloading: open-source | closed-free',
     '  --tag <tag>             Explicit release tag (e.g. windows-v2.2.2)',
@@ -791,7 +817,7 @@ if (isMain(import.meta.url)) {
       process.exit(0);
     }
     if (opts.inspectOnly) {
-      const snap = inspectInstallerEnvironment({ dshHome: opts.dshHome });
+      const snap = inspectInstallerEnvironment({ dshHome: opts.dshHome, customDshPath: opts.customDshPath });
       if (opts.json) console.log(JSON.stringify(snap, null, 2));
       else {
         console.log(`Detected ${snap.targets.length} DeepSeek Harness environment(s):`);
@@ -805,6 +831,8 @@ if (isMain(import.meta.url)) {
       try {
         const res = await runOneClickInstallation({
           dshHome: opts.dshHome,
+          customDshPath: opts.customDshPath,
+          profile: opts.profile || null,
           targetId: opts.targetId,
           sourceKind: opts.tgz ? 'local-tgz' : (opts.releaseTag ? 'download-release' : 'auto'),
           localTgzPath: opts.tgz,
@@ -814,7 +842,7 @@ if (isMain(import.meta.url)) {
         });
         let launchRes = null;
         if (opts.launch) {
-          launchRes = await launchInstalledClient({ dshHome: opts.dshHome, targetId: res.target.id });
+          launchRes = await launchInstalledClient({ dshHome: opts.dshHome, customDshPath: opts.customDshPath, targetId: res.target.id });
         }
         if (opts.json) console.log(JSON.stringify({ ok: true, install: res, launch: launchRes }, null, 2));
         else console.log(`✔ LeaderTeam v${res.installedVersion} installed into ${res.target.label}.\n${res.nextStepHint}`);
