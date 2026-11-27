@@ -103,28 +103,51 @@ function readBoundedBody(req, maxBytes = MAX_BODY_BYTES) {
 }
 
 function sendPayloadTooLargeAndDestroy(req, res, maxBytes = MAX_BODY_BYTES) {
-  const timer = setTimeout(() => {
-    try { req.destroy(); } catch {}
-  }, 500);
+  // Drain bounded request bytes (up to 16 MiB / 1000ms) BEFORE ending `res` with Connection: close
+  // so Winsock never sees unread inbound bytes on socket close and never emits TCP RST (ECONNRESET).
+  let finished = false;
+  let drained = 0;
+  const maxDrain = maxBytes * 8;
+  const send413 = forceDestroy => {
+    if (finished) return;
+    finished = true;
+    clearTimeout(timer);
+    req.removeListener('data', onDrainData);
+    req.removeListener('end', onEnd);
+    if (!res.headersSent) {
+      res.writeHead(413, {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Cache-Control': 'no-store',
+        Connection: 'close',
+      });
+    }
+    res.end(
+      JSON.stringify({
+        ok: false,
+        error: { code: 'PAYLOAD_TOO_LARGE', message: `Request body exceeds ${maxBytes} bytes` },
+      }),
+      () => {
+        if (forceDestroy) {
+          const g = setTimeout(() => { try { req.destroy(); } catch {} }, 100);
+          g.unref?.();
+        }
+      },
+    );
+  };
+  const onDrainData = chunk => {
+    drained += chunk.length;
+    if (drained > maxDrain) send413(true);
+  };
+  const onEnd = () => send413(false);
+  const timer = setTimeout(() => send413(true), 1000);
   timer.unref?.();
-  res.writeHead(413, {
-    'Content-Type': 'application/json; charset=utf-8',
-    'Cache-Control': 'no-store',
-    Connection: 'close',
-  });
-  res.end(
-    JSON.stringify({
-      ok: false,
-      error: { code: 'PAYLOAD_TOO_LARGE', message: `Request body exceeds ${maxBytes} bytes` },
-    }),
-    () => {
-      clearTimeout(timer);
-      const grace = setTimeout(() => {
-        try { req.destroy(); } catch {}
-      }, 150);
-      grace.unref?.();
-    },
-  );
+  if (req.readableEnded) {
+    send413(false);
+    return;
+  }
+  req.on('data', onDrainData);
+  req.once('end', onEnd);
+  req.resume();
 }
 
 export async function startStandaloneLtUiServer({

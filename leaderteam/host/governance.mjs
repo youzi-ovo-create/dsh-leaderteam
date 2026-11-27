@@ -483,8 +483,7 @@ export async function awaitExecutionModelsCheckpointPause({
     }
 
     await new Promise(resolve => {
-      const t = setTimeout(resolve, 30);
-      t.unref?.();
+      setTimeout(resolve, 30);
     });
   }
 
@@ -2031,11 +2030,14 @@ export async function awaitTeamGovernanceJobs(rt, teamId, timeoutMs = 60000) {
   const jobs = [...(base.governanceJobs?.values() ?? [])].filter(j => j.teamId === teamId && j.promise);
   if (jobs.length === 0) return;
   let timer;
-  await Promise.race([
-    Promise.allSettled(jobs.map(j => j.promise)),
-    new Promise(resolve => { timer = setTimeout(resolve, timeoutMs); timer.unref?.(); }),
-  ]);
-  if (timer) clearTimeout(timer);
+  try {
+    await Promise.race([
+      Promise.allSettled(jobs.map(j => j.promise)),
+      new Promise(resolve => { timer = setTimeout(resolve, timeoutMs); }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 /** Resolve an active Strike 3 Human Escalation when the User replies in the Leader session (§5 & §6.3). */

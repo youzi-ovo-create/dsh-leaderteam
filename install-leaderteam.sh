@@ -2,10 +2,17 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-INSTALLER_JS="${SCRIPT_DIR}/bin/lt-installer.mjs"
+INSTALLER_JS=""
+if [[ -f "${SCRIPT_DIR}/bin/lt-installer.mjs" && -f "${SCRIPT_DIR}/leaderteam/core/installer.mjs" ]]; then
+  INSTALLER_JS="${SCRIPT_DIR}/bin/lt-installer.mjs"
+elif [[ -f "${SCRIPT_DIR}/installer/lt-installer-standalone.mjs" ]]; then
+  INSTALLER_JS="${SCRIPT_DIR}/installer/lt-installer-standalone.mjs"
+elif [[ -f "${SCRIPT_DIR}/bin/lt-installer.mjs" ]]; then
+  INSTALLER_JS="${SCRIPT_DIR}/bin/lt-installer.mjs"
+fi
 
-if [[ ! -f "${INSTALLER_JS}" ]]; then
-  echo "[LeaderTeam] 未找到 ${INSTALLER_JS}，请先完整解压安装包目录。" >&2
+if [[ -z "${INSTALLER_JS}" ]]; then
+  echo "[LeaderTeam] 未找到安装器脚本（bin/lt-installer.mjs 或 installer/lt-installer-standalone.mjs），请先完整解压安装包目录。" >&2
   exit 1
 fi
 

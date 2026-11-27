@@ -52,6 +52,8 @@
     "scripts/dev/set-max-members.mjs",
     "tools/dsh-sandbox-acl/**",
     "examples/smoke-bugfix/**",
+    "installer/**",
+    "Install-LeaderTeam.cmd",
     "install-leaderteam.sh",
     "README.md",
     "CHANGELOG.md",

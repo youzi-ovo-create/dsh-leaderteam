@@ -28,6 +28,7 @@ import { disposePlanning } from './host/planning.mjs';
 import { frontierNeedsPlanning } from './core/frontier.mjs';
 import { isAutonomousGovernance } from './core/governance-protocol.mjs';
 import { isReadGrantOnlyMessage } from './core/gate-policy.mjs';
+import { resetShellCircuitBreakerForTeam } from './core/shell-circuit-breaker.mjs';
 import { formatLeaderGovernanceContext, resolveHumanEscalationOnUserTurn, retryDeferredSupervisions } from './host/governance.mjs';
 import { teamStore } from './host/runtime.mjs';
 import { currentTaskSeq, userMessageTexts } from './host/roles.mjs';
@@ -147,6 +148,7 @@ export function apply(ctx, config) {
     }
     const teamRt = runtimeForTeam(teamId);
     const latestMsg = userMessageTexts(hookCtx, teamId).at(-1) ?? '';
+    if (!isReadGrantOnlyMessage(latestMsg)) resetShellCircuitBreakerForTeam(rt, teamId);
     if (latestMsg && !isReadGrantOnlyMessage(latestMsg)) {
       hostConcurrency?.clearPowerPauseForTeamOnUserMessage?.(rt, teamId);
     }

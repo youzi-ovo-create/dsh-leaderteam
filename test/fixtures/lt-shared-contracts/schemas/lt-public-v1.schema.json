@@ -1,0 +1,370 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://heluoxu.org/schemas/lt-public-v1.schema.json",
+  "title": "LeaderTeamPublicContractBundleV1",
+  "oneOf": [
+    { "$ref": "#/$defs/FlatBundleSnapshot" },
+    { "$ref": "#/$defs/LiveBundleEnvelope" }
+  ],
+  "$defs": {
+    "Capabilities": {
+      "type": "object",
+      "required": ["backendLine", "backendVersion", "hostKind", "frontendSwitch", "features", "supportedRoles"],
+      "properties": {
+        "backendLine": { "type": "string", "minLength": 1 },
+        "backendVersion": { "type": "string", "minLength": 1 },
+        "hostKind": { "enum": ["dsh-web", "dsh-desktop", "standalone"] },
+        "frontendSwitch": {
+          "type": "object",
+          "required": ["available", "currentSurface", "dshFrontendUrl", "ltFrontendUrl", "sharesRuntimeAndSessions"],
+          "properties": {
+            "available": { "type": "boolean" },
+            "currentSurface": { "enum": ["lt-native", "dsh-native"] },
+            "dshFrontendUrl": { "type": ["string", "null"] },
+            "ltFrontendUrl": { "type": "string" },
+            "sharesRuntimeAndSessions": { "type": "boolean" }
+          }
+        },
+        "features": { "type": "object", "additionalProperties": { "type": "boolean" } },
+        "supportedRoles": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["roleId", "label", "description", "supportsFallbacks", "maxFallbacks", "required"],
+            "properties": {
+              "roleId": { "type": "string", "minLength": 1 },
+              "label": { "type": "string" },
+              "description": { "type": "string" },
+              "supportsFallbacks": { "type": "boolean" },
+              "maxFallbacks": { "type": "integer", "minimum": 0 },
+              "required": { "type": "boolean" }
+            }
+          }
+        }
+      }
+    },
+    "Gateway": {
+      "type": "object",
+      "required": ["mode", "state", "managementAuthenticated", "version", "health", "lastError"],
+      "properties": {
+        "mode": { "enum": ["managed", "external", "disabled"] },
+        "state": { "enum": ["running", "starting", "draining", "stopped", "degraded", "error", "not_installed"] },
+        "gatewayUrl": { "type": ["string", "null"] },
+        "webAdminUrl": { "type": ["string", "null"] },
+        "managementAuthenticated": { "type": "boolean" },
+        "autoRecover": { "type": "boolean" },
+        "recoveryCount": { "type": "integer", "minimum": 0 },
+        "version": {
+          "type": "object",
+          "required": ["current", "pinned", "testedRange", "compatible", "rollbackAvailable", "previousVersion", "license"],
+          "properties": {
+            "current": { "type": ["string", "null"] },
+            "pinned": { "type": "string", "minLength": 1 },
+            "testedRange": { "type": "string", "minLength": 1 },
+            "compatible": { "type": "boolean" },
+            "rollbackAvailable": { "type": "boolean" },
+            "previousVersion": { "type": ["string", "null"] },
+            "license": { "const": "MIT" }
+          }
+        },
+        "health": {
+          "type": "object",
+          "required": ["ok", "latencyMs", "checkedAt", "pid", "modelCount"],
+          "properties": {
+            "ok": { "type": "boolean" },
+            "latencyMs": { "type": ["number", "null"] },
+            "checkedAt": { "type": ["string", "null"] },
+            "pid": { "type": ["integer", "null"] },
+            "modelCount": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "lastError": {
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "required": ["code", "message", "at"],
+              "properties": {
+                "code": { "type": "string", "minLength": 1 },
+                "message": { "type": "string" },
+                "at": { "type": "string" }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "ProviderDescriptor": {
+      "type": "object",
+      "required": ["providerId", "sourceKind", "vendorId", "displayName", "protocol", "endpointUrl", "status", "credentials"],
+      "properties": {
+        "providerId": { "type": "string", "minLength": 1 },
+        "sourceKind": { "enum": ["magpie", "direct", "external-gateway"] },
+        "vendorId": { "type": "string", "minLength": 1 },
+        "displayName": { "type": "string", "minLength": 1 },
+        "protocol": { "enum": ["openai-chat", "openai-responses", "anthropic-messages", "google-gemini", "multi"] },
+        "endpointUrl": { "type": "string" },
+        "status": { "enum": ["ready", "degraded", "unconfigured", "disabled", "auth_required"] },
+        "keyRotation": { "enum": ["fill-first", "round-robin", "least-used", "single"] },
+        "sessionAffinity": { "type": "boolean" },
+        "discoveredModelCount": { "type": "integer", "minimum": 0 },
+        "enabledModelCount": { "type": "integer", "minimum": 0 },
+        "credentials": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["credentialId", "kind", "label", "maskedPreview", "enabled", "primary", "weight"],
+            "additionalProperties": false,
+            "properties": {
+              "credentialId": { "type": "string", "minLength": 1 },
+              "kind": { "enum": ["api_key", "oauth", "env_ref"] },
+              "label": { "type": "string" },
+              "maskedPreview": { "type": "string" },
+              "enabled": { "type": "boolean" },
+              "primary": { "type": "boolean" },
+              "weight": { "type": "number" },
+              "accountPlan": { "type": ["string", "null"] }
+            }
+          }
+        }
+      }
+    },
+    "ModelCatalogEntry": {
+      "type": "object",
+      "required": ["entryId", "routeId", "upstreamModelId", "providerId", "sourceKind", "displayName", "family", "capabilities", "efforts", "limits", "tier"],
+      "properties": {
+        "entryId": { "type": "string", "minLength": 1 },
+        "routeId": { "type": "string", "minLength": 1 },
+        "upstreamModelId": { "type": "string", "minLength": 1 },
+        "magpieModelId": { "type": "string" },
+        "providerId": { "type": "string", "minLength": 1 },
+        "providerDisplayName": { "type": "string" },
+        "credentialScope": { "type": "string" },
+        "sourceKind": { "enum": ["magpie", "direct", "external-gateway", "host-settings"] },
+        "displayName": { "type": "string", "minLength": 1 },
+        "family": { "enum": ["gpt", "claude", "gemini", "deepseek", "qwen", "glm", "other"] },
+        "capabilities": {
+          "type": "object",
+          "required": ["vision", "pdf", "toolCall", "reasoning"],
+          "properties": {
+            "vision": { "type": "boolean" },
+            "pdf": { "type": "boolean" },
+            "toolCall": { "type": "boolean" },
+            "reasoning": { "type": "boolean" }
+          }
+        },
+        "efforts": {
+          "type": "object",
+          "required": ["supported", "defaultEffort"],
+          "properties": {
+            "supported": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+            "defaultEffort": { "type": "string", "minLength": 1 },
+            "wireEffortMap": { "type": "object", "additionalProperties": { "type": "string" } }
+          }
+        },
+        "limits": {
+          "type": "object",
+          "required": ["contextWindow", "maxOutputTokens"],
+          "properties": {
+            "contextWindow": { "type": ["integer", "null"] },
+            "maxOutputTokens": { "type": ["integer", "null"] }
+          }
+        },
+        "tier": { "enum": ["flagship", "balanced", "fast", "reasoning", "unspecified"] },
+        "inModelPool": { "type": "boolean" },
+        "inExecutionPool": { "type": "boolean" },
+        "disabled": { "type": "boolean" }
+      }
+    },
+    "RuntimeSnapshot": {
+      "type": "object",
+      "required": ["modelPool", "roleAssignments", "syncState", "scheduler", "power", "requestWindows", "teams"],
+      "properties": {
+        "modelPool": {
+          "type": "object",
+          "required": ["configuredRoutes", "executionPool", "disabledRoutes"],
+          "properties": {
+            "configuredRoutes": { "type": "array", "items": { "type": "string" } },
+            "executionPool": { "type": "array", "items": { "type": "string" } },
+            "disabledRoutes": { "type": "array", "items": { "type": "string" } }
+          }
+        },
+        "roleAssignments": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "required": ["route", "effort", "fallback"],
+            "properties": {
+              "route": { "type": "string" },
+              "effort": { "type": "string" },
+              "maxTokens": { "type": ["integer", "null"] },
+              "timeoutMs": { "type": ["integer", "null"] },
+              "retries": { "type": ["integer", "null"] },
+              "fallback": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": ["route", "effort"],
+                  "properties": {
+                    "route": { "type": "string" },
+                    "effort": { "type": "string" },
+                    "maxTokens": { "type": ["integer", "null"] },
+                    "timeoutMs": { "type": ["integer", "null"] },
+                    "retries": { "type": ["integer", "null"] }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "syncState": {
+          "type": "object",
+          "required": ["dshSettingsSynced", "patchSynced", "governanceHash"],
+          "properties": {
+            "dshSettingsSynced": { "type": "boolean" },
+            "patchSynced": { "type": "boolean" },
+            "governanceHash": { "type": ["string", "null"] }
+          }
+        },
+        "scheduler": {
+          "type": "object",
+          "required": ["maxActiveMembers", "effectiveCap", "activeExecutionMembers", "pressureBand"],
+          "properties": {
+            "maxActiveMembers": { "type": "integer" },
+            "effectiveCap": { "type": ["integer", "null"] },
+            "activeExecutionMembers": { "type": "integer" },
+            "pressureBand": { "type": "string" }
+          }
+        },
+        "power": {
+          "type": "object",
+          "required": ["enabled", "onBattery", "batteryPct", "latched"],
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "onBattery": { "type": ["boolean", "null"] },
+            "batteryPct": { "type": ["number", "null"] },
+            "latched": { "type": "boolean" }
+          }
+        },
+        "requestWindows": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["provider", "used5h", "limit5h", "tier"],
+            "properties": {
+              "provider": { "type": "string" },
+              "used5h": { "type": "number" },
+              "limit5h": { "type": ["number", "null"] },
+              "tier": { "type": "string" }
+            }
+          }
+        },
+        "teams": { "type": "array", "items": { "type": "object" } }
+      }
+    },
+    "LogicalUsageRecord": {
+      "type": "object",
+      "required": ["logicalRequestId", "timestampMs", "status", "requestedRoute", "actualProvider", "actualModel", "sourceKind", "metered", "tokens", "cost", "attribution"],
+      "properties": {
+        "logicalRequestId": { "type": "string", "minLength": 1 },
+        "timestampMs": { "type": "number" },
+        "status": { "enum": ["ok", "error", "aborted", "unknown"] },
+        "requestedRoute": { "type": "string", "minLength": 1 },
+        "actualProvider": { "type": "string", "minLength": 1 },
+        "actualModel": { "type": "string", "minLength": 1 },
+        "sourceKind": { "enum": ["magpie", "direct", "dsh-session", "lt-governance", "unknown"] },
+        "physicalAttemptCount": { "type": ["integer", "null"] },
+        "latencyMs": { "type": ["number", "null"] },
+        "ttftMs": { "type": ["number", "null"] },
+        "metered": { "type": "boolean" },
+        "tokens": {
+          "type": "object",
+          "required": ["uncachedInputTokens", "cacheReadTokens", "cacheWriteTokens", "outputTokens", "reasoningTokens", "totalTokens"],
+          "properties": {
+            "uncachedInputTokens": { "type": ["integer", "null"] },
+            "cacheReadTokens": { "type": ["integer", "null"] },
+            "cacheWriteTokens": { "type": ["integer", "null"] },
+            "outputTokens": { "type": ["integer", "null"] },
+            "reasoningTokens": { "type": ["integer", "null"] },
+            "totalTokens": { "type": ["integer", "null"] }
+          }
+        },
+        "cost": {
+          "type": "object",
+          "required": ["known", "currency", "actualCny", "peakCny", "offPeakCny", "actualUsd", "priceSource"],
+          "properties": {
+            "known": { "type": "boolean" },
+            "currency": { "enum": ["CNY", "USD", null] },
+            "actualCny": { "type": ["number", "null"] },
+            "peakCny": { "type": ["number", "null"] },
+            "offPeakCny": { "type": ["number", "null"] },
+            "actualUsd": { "type": ["number", "null"] },
+            "priceSource": { "enum": ["gateway", "catalog", "custom", "unknown"] }
+          }
+        },
+        "attribution": {
+          "type": "object",
+          "required": ["sessionId", "teamId", "taskSeq", "stageId", "group", "role", "actorName", "degraded"],
+          "properties": {
+            "sessionId": { "type": ["string", "null"] },
+            "teamId": { "type": ["string", "null"] },
+            "taskSeq": { "type": ["integer", "null"] },
+            "stageId": { "type": ["string", "null"] },
+            "group": { "enum": ["leader", "execution", "governance", "main", "subagents", "unknown"] },
+            "role": { "type": ["string", "null"] },
+            "actorName": { "type": ["string", "null"] },
+            "degraded": { "type": "boolean" }
+          }
+        }
+      }
+    },
+    "FlatBundleSnapshot": {
+      "type": "object",
+      "required": [
+        "contract",
+        "contractVersion",
+        "capabilities",
+        "gateway",
+        "providers",
+        "models",
+        "runtime",
+        "usageRecords"
+      ],
+      "properties": {
+        "contract": { "const": "lt.public.v1" },
+        "contractVersion": { "enum": ["1.0.0", "1.0.1"] },
+        "capabilities": { "$ref": "#/$defs/Capabilities" },
+        "gateway": { "$ref": "#/$defs/Gateway" },
+        "providers": { "type": "array", "items": { "$ref": "#/$defs/ProviderDescriptor" } },
+        "models": { "type": "array", "items": { "$ref": "#/$defs/ModelCatalogEntry" } },
+        "runtime": { "$ref": "#/$defs/RuntimeSnapshot" },
+        "usageRecords": { "type": "array", "items": { "$ref": "#/$defs/LogicalUsageRecord" } }
+      }
+    },
+    "LiveBundleEnvelope": {
+      "type": "object",
+      "required": ["ok", "contract", "contractVersion", "generatedAt", "data"],
+      "properties": {
+        "ok": { "const": true },
+        "contract": { "const": "lt.public.v1" },
+        "contractVersion": { "enum": ["1.0.0", "1.0.1"] },
+        "generatedAt": { "type": "string", "minLength": 1 },
+        "data": {
+          "type": "object",
+          "required": ["capabilities", "gateway", "providers", "models", "runtime", "usageStatus"],
+          "properties": {
+            "capabilities": { "$ref": "#/$defs/Capabilities" },
+            "gateway": { "$ref": "#/$defs/Gateway" },
+            "providers": { "type": "array", "items": { "$ref": "#/$defs/ProviderDescriptor" } },
+            "providerPresets": { "type": "array" },
+            "models": { "type": "array", "items": { "$ref": "#/$defs/ModelCatalogEntry" } },
+            "runtime": { "$ref": "#/$defs/RuntimeSnapshot" },
+            "uiPreferences": { "type": "object" },
+            "usageStatus": { "type": "object" },
+            "usageRecords": { "type": "array", "items": { "$ref": "#/$defs/LogicalUsageRecord" } }
+          }
+        }
+      }
+    }
+  }
+}

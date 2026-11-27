@@ -6,6 +6,8 @@ home-headless/
 backups/
 scratch/
 reports/
+scripts/acceptance/work/
+scripts/acceptance/*-report.json
 __pycache__/
 *.tmp
 .DS_Store

@@ -173,10 +173,14 @@ function isMainCliModule() {
 
 if (isMainCliModule()) {
   runLtMagpieCli().then(
-    code => process.exit(code),
+    code => {
+      process.exitCode = code;
+      setTimeout(() => process.exit(code), 50).unref();
+    },
     err => {
       console.error(`lt-magpie error: ${err instanceof Error ? err.message : String(err)}`);
-      process.exit(1);
+      process.exitCode = 1;
+      setTimeout(() => process.exit(1), 50).unref();
     },
   );
 }
