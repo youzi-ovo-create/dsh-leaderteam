@@ -456,6 +456,11 @@ export function createPanelHandlers(ctx, rt = runtime(), options = {}) {
               applyResult.effective,
               discoveredModels,
               gwStatus,
+              [],
+              {
+                dshHome: explicitDshHome,
+                syncDefaultModel: Array.isArray(changes.setRoles) && changes.setRoles.some(r => r?.role === 'leader'),
+              },
             );
             if (
               !dshSettingsSync.synced &&
@@ -657,7 +662,10 @@ export function createPanelHandlers(ctx, rt = runtime(), options = {}) {
           );
           syncRuntimeConfig(rt);
           const idleRebind = rebindAllIdleSessionsOnGlobalUserSave(rt, { principal });
-          await syncActiveModelsToDshHost(ctx, rt, rt.config, discoveredModels, gwStatus).catch(() => null);
+          await syncActiveModelsToDshHost(ctx, rt, rt.config, discoveredModels, gwStatus, [], {
+            dshHome: explicitDshHome,
+            syncDefaultModel: true,
+          }).catch(() => null);
           return okReply({ idleRebind, state: await buildPanelStateSnapshot(ctx, rt) });
         }
 
@@ -762,6 +770,7 @@ export function createPanelHandlers(ctx, rt = runtime(), options = {}) {
             pluginRoot,
             storageRoot: rt.storageRoot,
             track: body.track || null,
+            targetVersion: body.targetVersion || body.version || null,
             force: body.force !== false,
             currentHostVersion: hostVersion,
           });
@@ -775,6 +784,7 @@ export function createPanelHandlers(ctx, rt = runtime(), options = {}) {
             storageRoot: rt.storageRoot,
             dshHome: explicitDshHome,
             targetTrack: body.targetTrack || null,
+            targetVersion: body.targetVersion || body.version || null,
             confirmTrackSwitch: body.confirmTrackSwitch || null,
             localTgzPath: body.localTgzPath || null,
             currentHostVersion: hostVersion,
@@ -813,7 +823,9 @@ export function createPanelHandlers(ctx, rt = runtime(), options = {}) {
             bundledDefaultConfigPath: path.join(pluginRoot, 'config', 'leaderteam.config.json'),
             providerId: body.providerId || 'deepseek',
             apiKey: body.apiKey || '',
+            customBaseURL: body.customBaseURL || '',
             collabPresetId: body.collabPresetId || 'balanced-team',
+            verifyConnectivity: Boolean(body.verifyConnectivity),
           });
           return okReply(applied);
         }

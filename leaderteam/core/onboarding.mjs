@@ -8,7 +8,17 @@ import { SOLO_PROVIDER_PRESETS, buildSoloKeyStarterConfig, buildSoloProviderSett
 import { writeFileAtomic } from './store.mjs';
 import { loadConfig } from './config.mjs';
 import { applyModelConfigChanges } from './model-config-writer.mjs';
-import { syncUpstreamModelsToDshSettings } from './upstream-models.mjs';
+import {
+  canonicalRouteFor,
+  inferEffortsFromMetadata,
+  inferModelFamily,
+  parseUpstreamModelsPayload,
+  resolveModelTarget,
+  syncModelsToDshDiskProfiles,
+  syncUpstreamModelsToDshSettings,
+  writeDshCredentialsYamlEntry,
+  readDshEnvCredentialsMap,
+} from './upstream-models.mjs';
 
 export const ONBOARDING_STATE_FILENAME = 'onboarding.json';
 
@@ -237,6 +247,16 @@ export async function persistProviderApiKey({
       try { fsImpl.chmodSync(envFile, 0o600); } catch {}
     }
     storedInDshEnvFile = true;
+    // Also mirror into `$DSH_HOME/.credentials.yaml` (`version: 1`, `refs:`) so `@deepseek-ai/dsh-credentials-local`
+    // (`fs.watch` live store) resolves `PiAiAdapter.listModels()` immediately even when configured from standalone UI/CLI!
+    try {
+      writeDshCredentialsYamlEntry({
+        dshHome,
+        envVarName: cleanVar,
+        apiKey: cleanKey,
+        fsImpl,
+      });
+    } catch {}
   }
 
   // 3. Keep current process env in sync for immediate Solo-Key template discovery
@@ -249,12 +269,42 @@ export async function persistProviderApiKey({
     maskedPreview: maskKeyPreview(cleanKey),
     storedInHostCredentials,
     storedInDshEnvFile,
+    storedInCredentialsYaml: Boolean(dshHome),
   };
+}
+
+function selectDiscoveredStarterPair(discoveredModels = [], providerId = '') {
+  if (!Array.isArray(discoveredModels) || discoveredModels.length === 0) return null;
+  const scoreReasoning = id => {
+    const l = String(id).toLowerCase();
+    if (/deepseek-v4-pro|deepseek-reasoner|deepseek-r1/.test(l)) return 100;
+    if (/qwen3-max|qwen-max|qwq/.test(l)) return 95;
+    if (/glm-5|glm-4\.5(?!-air)/.test(l)) return 92;
+    if (/gpt-5|gpt-4\.1(?!-mini|-nano)|o3|o4|claude-opus|claude-sonnet/.test(l)) return 90;
+    if (/reasoner|thinking|pro|max|opus/.test(l)) return 80;
+    return 10;
+  };
+  const scoreChat = id => {
+    const l = String(id).toLowerCase();
+    if (/deepseek-flash|deepseek-chat|deepseek-v3/.test(l)) return 100;
+    if (/qwen-plus|qwen-turbo|qwen2\.5-coder/.test(l)) return 95;
+    if (/glm-4\.5-air|glm-4-flash|glm-4-plus/.test(l)) return 92;
+    if (/gpt-4\.1-mini|gpt-4o-mini|o4-mini|claude-haiku/.test(l)) return 90;
+    if (/flash|chat|plus|mini|air|turbo|coder/.test(l)) return 80;
+    return 10;
+  };
+  const sortedReasoning = [...discoveredModels].sort((a, b) => scoreReasoning(b.id) - scoreReasoning(a.id));
+  const reasoningModel = sortedReasoning[0];
+  const sortedChat = [...discoveredModels].sort((a, b) => scoreChat(b.id) - scoreChat(a.id));
+  const chatModel = sortedChat.find(m => m.id !== reasoningModel.id && scoreChat(m.id) >= 50)
+    ?? sortedChat.find(m => m.id !== reasoningModel.id)
+    ?? reasoningModel;
+  return { reasoningModel, chatModel, providerId };
 }
 
 /**
  * Optional lightweight connectivity check against an OpenAI-compatible `/models` endpoint
- * with friendly Chinese diagnostics for beginners.
+ * with friendly Chinese diagnostics for beginners and real `/v1/models` list extraction.
  */
 export async function probeProviderKeyConnectivity({
   baseURL,
@@ -263,33 +313,46 @@ export async function probeProviderKeyConnectivity({
   timeoutMs = 8000,
 } = {}) {
   if (typeof fetchImpl !== 'function') {
-    return { ok: true, skipped: true, message: '当前环境不支持在线连通性预检，已跳过验证直接保存。' };
+    return { ok: true, skipped: true, models: [], message: '当前环境不支持在线连通性预检，已跳过验证直接保存。' };
   }
   const cleanBase = String(baseURL || '').trim().replace(/\/+$/, '');
   if (!cleanBase) {
-    return { ok: false, code: 'INVALID_BASE_URL', message: '接口地址（Base URL）不能为空。' };
+    return { ok: false, code: 'INVALID_BASE_URL', models: [], message: '接口地址（Base URL）不能为空。' };
   }
-  const modelsUrl = cleanBase.endsWith('/v1') || cleanBase.endsWith('/v4')
+  const primaryModelsUrl = /\/v\d+$/i.test(cleanBase)
     ? `${cleanBase}/models`
     : `${cleanBase}/v1/models`;
+  const fallbackModelsUrl = !/\/v\d+$/i.test(cleanBase) && !cleanBase.endsWith('/models')
+    ? `${cleanBase}/models`
+    : null;
 
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), timeoutMs);
   timer.unref?.();
   try {
-    const res = await fetchImpl(modelsUrl, {
+    const reqHeaders = {
+      Authorization: `Bearer ${String(apiKey || '').trim()}`,
+      Accept: 'application/json',
+    };
+    let res = await fetchImpl(primaryModelsUrl, {
       method: 'GET',
-      headers: {
-        Authorization: `Bearer ${String(apiKey || '').trim()}`,
-        Accept: 'application/json',
-      },
+      headers: reqHeaders,
       signal: ac.signal,
     });
+    if (res.status === 404 && fallbackModelsUrl) {
+      const fallbackRes = await fetchImpl(fallbackModelsUrl, {
+        method: 'GET',
+        headers: reqHeaders,
+        signal: ac.signal,
+      }).catch(() => null);
+      if (fallbackRes) res = fallbackRes;
+    }
     if (res.status === 401 || res.status === 403) {
       return {
         ok: false,
         code: 'AUTH_FAILED',
         status: res.status,
+        models: [],
         message: 'API Key 验证未通过（HTTP ' + res.status + '）：请检查是否完整复制了有效的密钥，且没有多余空格。',
       };
     }
@@ -298,6 +361,7 @@ export async function probeProviderKeyConnectivity({
         ok: false,
         code: 'INSUFFICIENT_BALANCE',
         status: 402,
+        models: [],
         message: '该 API Key 账户余额或免费额度不足（HTTP 402），请前往厂商控制台充值或检查额度。',
       };
     }
@@ -306,12 +370,21 @@ export async function probeProviderKeyConnectivity({
         ok: false,
         code: 'UPSTREAM_ERROR',
         status: res.status,
+        models: [],
         message: `上游模型服务暂时繁忙（HTTP ${res.status}），您可以稍后重试或直接保存配置。`,
       };
+    }
+    let discoveredModels = [];
+    if (res.ok) {
+      try {
+        const bodyJson = await res.json();
+        discoveredModels = parseUpstreamModelsPayload(bodyJson);
+      } catch {}
     }
     return {
       ok: true,
       status: res.status,
+      models: discoveredModels,
       message: 'API Key 连通性校验通过！',
     };
   } catch (err) {
@@ -319,6 +392,7 @@ export async function probeProviderKeyConnectivity({
     return {
       ok: false,
       code: isAbort ? 'TIMEOUT' : 'NETWORK_ERROR',
+      models: [],
       message: isAbort
         ? '连接模型接口超时：请检查本机网络或代理设置，或勾选“跳过连通性测试直接保存”。'
         : `无法连接到模型接口（${cleanBase}）：请检查网络连接或接口地址是否正确。`,
@@ -423,8 +497,10 @@ export async function applyQuickOnboardingSetup({
   const preset = SOLO_PROVIDER_PRESETS.find(p => p.id === providerId || p.provider === providerId) ?? SOLO_PROVIDER_PRESETS[0];
   const collab = TEAM_COLLAB_PRESETS.find(c => c.id === collabPresetId) ?? TEAM_COLLAB_PRESETS[0];
   const cleanKey = String(apiKey ?? '').trim();
+  const hasExplicitCustomBaseURL = Boolean(String(customBaseURL ?? '').trim());
   const effectiveBaseURL = String(customBaseURL ?? '').trim() || preset.defaultBaseURL;
 
+  let endpointDiscoveredModels = [];
   if (verifyConnectivity && cleanKey) {
     const probe = await probeProviderKeyConnectivity({
       baseURL: effectiveBaseURL,
@@ -435,6 +511,9 @@ export async function applyQuickOnboardingSetup({
       const err = new Error(probe.message);
       err.code = probe.code || 'CONNECTIVITY_CHECK_FAILED';
       throw err;
+    }
+    if (Array.isArray(probe.models) && probe.models.length > 0) {
+      endpointDiscoveredModels = probe.models;
     }
   }
 
@@ -447,13 +526,112 @@ export async function applyQuickOnboardingSetup({
       apiKey: cleanKey,
       env,
     });
+  } else if (dshHome) {
+    // If key was already present in process.env or `$DSH_HOME/.env`, ensure `.credentials.yaml` also has it
+    const ambientMap = readDshEnvCredentialsMap({ dshHome, env });
+    const existingEnvVar = preset.envVars.find(v => ambientMap[v]);
+    if (existingEnvVar) {
+      try {
+        writeDshCredentialsYamlEntry({
+          dshHome,
+          envVarName: existingEnvVar,
+          apiKey: ambientMap[existingEnvVar],
+          onlyIfMissing: true,
+        });
+      } catch {}
+    }
   }
 
   const baseRaw = JSON.parse(fs.readFileSync(bundledDefaultConfigPath, 'utf8'));
-  const customizedPreset = effectiveBaseURL !== preset.defaultBaseURL
+  let effectivePreset = hasExplicitCustomBaseURL
     ? { ...preset, defaultBaseURL: effectiveBaseURL }
     : preset;
-  const starterCfg = buildSoloKeyStarterConfig(baseRaw, { preset: customizedPreset });
+
+  // When live `/v1/models` returned real model IDs and the static preset's models aren't served by this endpoint
+  // (e.g. `deepseek-reasoner` + `deepseek-chat` or custom OpenAI-compatible gateway models), adapt starter routes automatically!
+  if (endpointDiscoveredModels.length > 0) {
+    const discoveredIdSet = new Set(endpointDiscoveredModels.map(m => m.id));
+    const staticReasoningUpstream = preset.models?.[preset.reasoningRoute]?.upstreamModel ?? preset.reasoningRoute;
+    const staticChatUpstream = preset.models?.[preset.chatRoute]?.upstreamModel ?? preset.chatRoute;
+    const pair = selectDiscoveredStarterPair(endpointDiscoveredModels, preset.provider);
+    if (pair && (!discoveredIdSet.has(staticReasoningUpstream) || !discoveredIdSet.has(staticChatUpstream))) {
+      const adaptedModels = {};
+      let adaptedReasoningRoute = null;
+      let adaptedChatRoute = null;
+      for (const dm of endpointDiscoveredModels.slice(0, 25)) {
+        const route = canonicalRouteFor(preset.provider, dm.id, {
+          defaultProvider: preset.provider,
+          existingModels: adaptedModels,
+        });
+        if (!route) continue;
+        const family = inferModelFamily(dm.id, preset.provider);
+        const effMeta = inferEffortsFromMetadata({
+          family,
+          modelId: dm.id,
+          resolvedInfo: dm,
+          fromEndpointOnly: true,
+        });
+        adaptedModels[route] = {
+          provider: preset.provider,
+          upstreamModel: dm.id,
+          family,
+          label: dm.name || dm.id,
+          efforts: effMeta.efforts,
+          defaultEffort: effMeta.defaultEffort,
+          strengths: `Discovered from ${preset.displayName} (/v1/models)`,
+          ...(typeof dm.vision === 'boolean' ? { vision: dm.vision } : {}),
+          ...(dm.contextWindow ? { contextWindow: dm.contextWindow } : {}),
+          ...(dm.maxTokens ? { maxTokens: dm.maxTokens } : {}),
+        };
+        if (dm.id === pair.reasoningModel.id) adaptedReasoningRoute = route;
+        if (dm.id === pair.chatModel.id) adaptedChatRoute = route;
+      }
+      if (adaptedReasoningRoute && adaptedChatRoute) {
+        effectivePreset = {
+          ...effectivePreset,
+          reasoningRoute: adaptedReasoningRoute,
+          reasoningLabel: adaptedModels[adaptedReasoningRoute].label,
+          reasoningEffort: adaptedModels[adaptedReasoningRoute].defaultEffort || 'none',
+          chatRoute: adaptedChatRoute,
+          chatLabel: adaptedModels[adaptedChatRoute].label,
+          chatEffort: adaptedModels[adaptedChatRoute].defaultEffort || 'none',
+          models: adaptedModels,
+        };
+      }
+    }
+  }
+
+  const starterCfg = buildSoloKeyStarterConfig(baseRaw, { preset: effectivePreset });
+
+  // Also include any additional models discovered from `/v1/models` so all endpoint models appear in DSH & LT selectors
+  if (endpointDiscoveredModels.length > 0) {
+    for (const dm of endpointDiscoveredModels.slice(0, 25)) {
+      const route = canonicalRouteFor(preset.provider, dm.id, {
+        defaultProvider: preset.provider,
+        existingModels: starterCfg.models,
+      });
+      if (!route || starterCfg.models[route]) continue;
+      const family = inferModelFamily(dm.id, preset.provider);
+      const effMeta = inferEffortsFromMetadata({
+        family,
+        modelId: dm.id,
+        resolvedInfo: dm,
+        fromEndpointOnly: true,
+      });
+      starterCfg.models[route] = {
+        provider: preset.provider,
+        upstreamModel: dm.id,
+        family,
+        label: dm.name || dm.id,
+        efforts: effMeta.efforts,
+        defaultEffort: effMeta.defaultEffort,
+        strengths: `Discovered from ${preset.displayName} (/v1/models)`,
+        ...(typeof dm.vision === 'boolean' ? { vision: dm.vision } : {}),
+        ...(dm.contextWindow ? { contextWindow: dm.contextWindow } : {}),
+        ...(dm.maxTokens ? { maxTokens: dm.maxTokens } : {}),
+      };
+    }
+  }
 
   const upsertModels = Object.entries(starterCfg.models).map(([route, spec]) => ({
     route,
@@ -463,6 +641,11 @@ export async function applyQuickOnboardingSetup({
     role,
     ...roleSpec,
   }));
+
+  if (configPath && !fs.existsSync(configPath)) {
+    fs.mkdirSync(path.dirname(configPath), { recursive: true });
+    writeFileAtomic(configPath, `${JSON.stringify(starterCfg, null, 2)}\n`);
+  }
 
   applyModelConfigChanges(
     {
@@ -491,26 +674,54 @@ export async function applyQuickOnboardingSetup({
     } catch {}
   }
 
-  // Sync provider template & models to live DSH settings when ctx is available
-  const effectiveEnv = { ...env };
+  // Sync provider template, models & default leader model to BOTH live DSH `ctx` AND `$DSH_HOME/profiles/*/cordis.patch.yml`!
+  const effectiveEnv = { ...readDshEnvCredentialsMap({ dshHome, env }), ...env };
   if (cleanKey) effectiveEnv[preset.envVars[0]] = cleanKey;
   const providerTemplates = buildSoloProviderSettingsTemplates(effectiveEnv);
-  if (effectiveBaseURL && providerTemplates[preset.provider] && !preset.catalogRoute) {
-    providerTemplates[preset.provider].baseURL = effectiveBaseURL;
+  if (effectiveBaseURL && providerTemplates[preset.provider]) {
+    if (hasExplicitCustomBaseURL || !preset.catalogRoute) {
+      providerTemplates[preset.provider].baseURL = effectiveBaseURL;
+    }
+    if (hasExplicitCustomBaseURL) {
+      providerTemplates[preset.provider].forceBaseURL = true;
+      providerTemplates[preset.provider].api = providerTemplates[preset.provider].api || preset.api || 'openai-completions';
+    }
   }
+
   const effCfg = loadConfig(configPath);
+  const modelsToSync = Object.entries(effCfg.models ?? {}).map(([route, spec]) => ({
+    route,
+    provider: spec.provider ?? preset.provider,
+    upstreamModel: spec.upstreamModel ?? route,
+    efforts: spec.efforts,
+    ...(spec.reasoningEfforts ? { reasoningEfforts: spec.reasoningEfforts } : {}),
+    vision: spec.vision,
+    contextWindow: spec.contextWindow,
+    maxTokens: spec.maxTokens,
+  }));
+  const defaultLeaderSelection = effCfg.roles?.leader?.route
+    ? resolveModelTarget(effCfg, effCfg.roles.leader.route, effCfg.roles.leader.effort)
+    : null;
+
+  let dshSettingsSync = { synced: false, reason: 'not-run', updatedProviders: [] };
   if (ctx) {
-    const modelsToSync = Object.entries(effCfg.models ?? {}).map(([route, spec]) => ({
-      route,
-      provider: spec.provider ?? preset.provider,
-      upstreamModel: spec.upstreamModel ?? route,
-      efforts: spec.efforts,
-      ...(spec.reasoningEfforts ? { reasoningEfforts: spec.reasoningEfforts } : {}),
-      vision: spec.vision,
-      contextWindow: spec.contextWindow,
-      maxTokens: spec.maxTokens,
-    }));
-    await syncUpstreamModelsToDshSettings(ctx, modelsToSync, preset.provider, { providerTemplates }).catch(() => null);
+    dshSettingsSync = await syncUpstreamModelsToDshSettings(ctx, modelsToSync, preset.provider, {
+      providerTemplates,
+      defaultSelection: defaultLeaderSelection,
+      syncDefaultModel: true,
+    }).catch(err => ({ synced: false, reason: err instanceof Error ? err.message : String(err), updatedProviders: [] }));
+  }
+  let diskProfileSync = null;
+  if (dshHome) {
+    diskProfileSync = syncModelsToDshDiskProfiles({
+      dshHome,
+      modelsToEnsure: modelsToSync,
+      defaultProvider: preset.provider,
+      providerTemplates,
+      defaultSelection: defaultLeaderSelection,
+      syncDefaultModel: true,
+      createDefaultProfilesIfNone: true,
+    });
   }
 
   if (rt) {
@@ -532,10 +743,31 @@ export async function applyQuickOnboardingSetup({
       displayName: preset.displayName,
       envVar: preset.envVars[0],
       maskedKey: keyResult?.maskedPreview ?? record.keyPreview ?? null,
-      reasoningRoute: preset.reasoningRoute,
-      chatRoute: preset.chatRoute,
+      reasoningRoute: effectivePreset.reasoningRoute,
+      chatRoute: effectivePreset.chatRoute,
+    },
+    dshSync: {
+      liveHostSynced: Boolean(dshSettingsSync?.synced),
+      diskProfilesSynced: Boolean(diskProfileSync?.synced),
+      updatedProfiles: diskProfileSync?.updatedProfiles ?? [],
     },
     collabPreset: collab,
     onboarding: record,
   };
+}
+
+export function recordOnboardingFirstTask({ storageRoot, sessionId, completed = true }) {
+  return writePersistedOnboardingRecord(storageRoot, {
+    completed: Boolean(completed),
+    dismissed: false,
+    completedAt: completed ? new Date().toISOString() : null,
+    ...(sessionId ? { firstSessionId: String(sessionId) } : {}),
+  });
+}
+
+export function dismissOnboardingWizard({ storageRoot }) {
+  return writePersistedOnboardingRecord(storageRoot, {
+    dismissed: true,
+    dismissedAt: new Date().toISOString(),
+  });
 }

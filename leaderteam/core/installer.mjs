@@ -204,8 +204,12 @@ export function inspectInstallerEnvironment({
     const unixCli = path.join(dir, 'resources', 'runtime', 'cli', 'bin', 'dsh');
     const exeWin = path.join(dir, 'DeepSeek Harness.exe');
     const exeLinux = path.join(dir, 'deepseek-harness');
-    const isDesktopLayout = fsImpl.existsSync(winCli) || fsImpl.existsSync(unixCli) || fsImpl.existsSync(exeWin) || fsImpl.existsSync(exeLinux);
-    if (!isDesktopLayout && dir !== customDshPath) continue;
+    const hasAsar = fsImpl.existsSync(path.join(dir, 'resources', 'app.asar'));
+    const isDesktopLayout = fsImpl.existsSync(winCli) || fsImpl.existsSync(unixCli) || fsImpl.existsSync(exeWin) || fsImpl.existsSync(exeLinux) || hasAsar;
+    const hasCliBinJs =
+      fsImpl.existsSync(path.join(dir, 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js')) ||
+      fsImpl.existsSync(path.join(dir, 'lib', 'bin.js'));
+    if (!isDesktopLayout && (dir !== customDshPath || hasCliBinJs)) continue;
 
     const compat = checkDshHostCompatibility({ checkHost: dir, platform, env, fsImpl });
     const desktopProfileDir = path.join(resolvedHome, 'profiles', 'desktop');
@@ -232,7 +236,7 @@ export function inspectInstallerEnvironment({
         summary: compat.summary,
       },
       profileInitialized,
-      desktopRunning: isOfficialDesktopProcessRunning(platform),
+      desktopRunning: isDesktopLayout ? isOfficialDesktopProcessRunning(platform) : false,
       installedLtVersion,
       recommended: platform === 'win32',
     });
@@ -240,6 +244,9 @@ export function inspectInstallerEnvironment({
 
   // 2. Check Web / CLI runtime candidates
   const cliDirs = [];
+  if (customDshPath && fsImpl.existsSync(customDshPath)) {
+    cliDirs.push(customDshPath);
+  }
   const homeDir = os.homedir();
   if (homeDir) {
     const dshRuntimeCur = path.join(homeDir, '.local', 'share', 'dsh-runtime', 'current');
@@ -374,6 +381,9 @@ export async function runOneClickInstallation({
   cleanLegacyPatches = true,
   providerId = '',
   apiKey = '',
+  customDshPath = null,
+  targetVersion = null,
+  platform = process.platform,
   fetchImpl = globalThis.fetch,
   installerRunner = null,
   onProgress = null,
@@ -384,7 +394,14 @@ export async function runOneClickInstallation({
     }
   };
 
-  const envSnap = inspectInstallerEnvironment({ repoRoot, dshHome });
+  const inferredCustomDshPath =
+    customDshPath || (/^(?:desktop|web):(.+)$/.exec(String(targetId ?? ''))?.[1] ?? null);
+  const envSnap = inspectInstallerEnvironment({
+    repoRoot,
+    dshHome,
+    customDshPath: inferredCustomDshPath,
+    platform,
+  });
   const resolvedHome = envSnap.dshHome;
   const storageRoot = path.join(resolvedHome, 'leaderteam');
   fs.mkdirSync(storageRoot, { recursive: true });
@@ -483,6 +500,8 @@ export async function runOneClickInstallation({
       pluginRoot: repoRoot,
       storageRoot,
       track,
+      platform,
+      targetVersion,
       force: true,
       fetchImpl,
     });
@@ -604,11 +623,18 @@ export async function runOneClickInstallation({
 export async function launchInstalledClient({
   repoRoot = DEFAULT_REPO_ROOT,
   dshHome = null,
+  customDshPath = null,
   targetId = null,
   webPort = 4096,
   spawner = spawn,
 } = {}) {
-  const envSnap = inspectInstallerEnvironment({ repoRoot, dshHome });
+  const inferredCustomDshPath =
+    customDshPath || (/^(?:desktop|web):(.+)$/.exec(String(targetId ?? ''))?.[1] ?? null);
+  const envSnap = inspectInstallerEnvironment({
+    repoRoot,
+    dshHome,
+    customDshPath: inferredCustomDshPath,
+  });
   const selectedTarget =
     (targetId ? envSnap.targets.find(t => t.id === targetId) : null) ??
     envSnap.targets.find(t => t.recommended) ??
