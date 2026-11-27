@@ -116,6 +116,9 @@ node bin/lt-bugreport.mjs --out lt-bugreport.md
 ### 架构文档与工程治理索引
 
 - **安装、兼容与跨平台发行规范**：[一键安装、新手引导与自动更新指南](docs/11-一键安装新手引导与自动更新指南.md) · [DSH 宿主兼容性列表](docs/10-DSH宿主兼容性列表.md) · [跨平台独立发行与长期工程规范](docs/13-跨平台独立发行与长期工程规范.md) · [历代设计原则与反退化台账](docs/12-历代设计原则与反退化台账.md)
-- **实跑基准与横向对照**：[V2.1 双项复杂工程实跑测评报告](docs/benchmarks/LeaderTeam_V2.1_双项工程实跑测评报告.md) · [V2.2 Linux 跨语言自举工程实证报告](docs/benchmarks/LeaderTeam_V2.2_Linux跨语言自举工程实证报告.md)
+- **实跑基准与演进分析**：
+  - [V2.2 工程实证报告：49 分钟完成 Linux 跨语言核心模块自举与宿主集成](docs/benchmarks/LeaderTeam_V2.2_Linux跨语言自举工程实证报告.md)（附 [脱敏验收回执与账本核算脚本](docs/benchmarks/evidence/v2.2-linux-selfhost/README.md)）
+  - [V1.1–V2.2：基于五项真实工程实测的架构演进与发展潜力分析](docs/benchmarks/LeaderTeam_V1.1至V2.2_架构演进与发展潜力分析.md)
+  - [V2.1 双项复杂工程实跑测评报告](docs/benchmarks/LeaderTeam_V2.1_双项工程实跑测评报告.md)
 - **核心设计与日常维护**：[架构总览与设计决定](docs/00-总览.md) · [配置与接口参考](docs/01-配置与接口.md) · [可视化与用量账本](docs/08-可视化与用量.md) · [使用指南](docs/使用指南.md) · [官方 Desktop 部署与恢复](docs/官方Desktop部署与恢复.md) · [CHANGELOG.md](CHANGELOG.md)
 - **开源许可**：本项目采用 [Apache License 2.0](LICENSE) 许可发布，第三方组件声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) 与 [leaderteam/NOTICE](leaderteam/NOTICE)。
