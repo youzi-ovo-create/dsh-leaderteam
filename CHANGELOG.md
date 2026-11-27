@@ -2,15 +2,28 @@
 
 本项目的所有重要版本变更均记录于此文件，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
-## [2.2.2] - 2026-11-27
+## [2.2.2] - 2026-11-27 (`windows-v2.2.2` / `v2.2.2`)
 
-历代设计原则反退化修复、冷启动效率恢复与桌面端开箱体验升级版（纯 Node.js ESM，Apache-2.0）：
+V2.2 产品化团队协作正式版：集成历代设计原则反退化（`DP-01`..`DP-06`）、河洛原生工作台（`lt.public.v1` `1.0.1`，严格保持纯正团队治理边界 `inSessionDualMode: false`）、一键图形化安装与自动升级、会话级模型跟随，以及 Windows 全链路真机适配（纯 Node.js ESM，Apache-2.0）：
+
+### Added
+- **河洛原生工作台（`/lt/`）与三步新手引导（Issues `#1`–`#3`）**：
+  - 内置零命令行图形化安装器（`bin/lt-installer.mjs`、`installer/lt-installer-standalone.mjs`、`Install-LeaderTeam.cmd`、`install-leaderteam.sh`）、首次使用三步配置向导（`leaderteam/core/onboarding.mjs`）以及带 `SHA-256` 校验、宿主兼容预检与离线快照自动回滚的双轨更新器（`leaderteam/core/updater.mjs`、`bin/lt-update.mjs`）；
+  - 升级自适应结构契约宿主兼容引擎（`leaderteam/core/host-compat.mjs`，支持 `>=0.2.2-alpha.2 <1.0.0`，实机认证 `0.2.2-rc.1`、`0.2.2-rc.5`、`0.2.3-alpha.2`），配套《[DSH 宿主兼容性列表](docs/10-DSH宿主兼容性列表.md)》与《[一键安装、新手引导与自动更新指南](docs/11-一键安装新手引导与自动更新指南.md)》；
+  - 补齐根级第三方开源组件声明 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+- **会话级独立配置、手动切换模型自动跟随与 User/Agent 权限分离（Issue `#4`）**：
+  - 默认 `leaderModelPolicy: "follow"`：用户在 DSH 原生聊天界面手动切换模型或推理档位时仅同步当前会话（落盘于 `<DSH_HOME>/leaderteam/session-configs/`），不污染全局配置或其他会话；空闲会话配置保存立即生效，执行中会话在安全边界无损切换；
+  - 严格隔离 User 与 Agent 身份：API 层（`403 AGENT_CONFIG_MUTATION_FORBIDDEN`）与安全门硬规则（`protected-lt-config`，覆盖 `write`/`edit` 及 `bash`/`pwsh` 写文件命令）双重阻断模型篡改配置。
+- **跨平台独立发行标签治理（`windows-vX.Y.Z` / `linux-vX.Y.Z`）**：
+  - 更新器与安装器原生支持平台前缀 Release 标签，严禁盲取 `/releases/latest`，按运行平台过滤 `/releases` 列表并向后兼容历史 `vX.Y.Z` 标签，显式跨平台标签硬拦截（`PLATFORM_RELEASE_TAG_MISMATCH`）；新增《[跨平台独立发行与长期工程规范](docs/13-跨平台独立发行与长期工程规范.md)》。
+- **Windows 平台专项工程适配（`windows-v2.2.2`）**：
+  - **自定义路径自动发现与零状态桌面初始化**：支持自动扫描 `D:\Apps\DeepSeek-Harness` 等全盘自定义目录、Windows 注册表 `Uninstall` 二阶段展开、运行进程路径及 `--dsh-dir` / `--profile web` 参数；在全新 `$DSH_HOME` 执行 `--profile desktop` 安装前自动幂等初始化 `profiles/desktop/package.json` 与 `cordis.patch.yml`，安装后自动净化历史手工补丁并开启 `tool-web`；独立 `lt-update` 支持自动复用自定义目录 `DeepSeek Harness.exe` 内嵌 CLI；
+  - **官方桌面端 `dsh-app://app/` 协议与宿主模型选择闭环**：适配官方 Windows 客户端 `dsh-app:` 窗口内 `/lt/` 与 `/` 互跳（不触发 `_blank` 拦截）；修复 DSH `0.2.2-rc.1+` 顶层数组 `settings.describe()` 解析、同步写入 `.credentials.yaml`（`version: 1`）与 `ctx.credentials.set`、探测 `/v1/models` 动态采纳真实模型 ID、保留自定义网关 `/v1` 路径并严守非推理模型 Schema；
+  - **Windows `0xC0000142` Shell 通道熔断、NTFS Junction 归并与 Magpie 生命周期加固**：新增宿主级 Shell 初始化故障（`STATUS_DLL_INIT_FAILED`）双振熔断器（`shell-circuit-breaker.mjs`）；修复 NTFS Junction / 软链接下成员参考资料读取追踪与越界判定（`realpathBestEffort` + `isAssignedRef`）；Windows 下优先发现 `magpie-cli.exe` 服务程序（早于 `magpie.exe` GUI 壳），并在同步停机时保留跨进程 `managed-pid.json` 配合 `taskkill /T /F` 杜绝孤儿进程。
 
 ### Fixed
-- **正交恢复 V1.9 渐进式局部就绪规划 + V2.1 自主直接派发**：修复自治领队提示词与动态规划上下文遗漏“禁止开局私下预设计全工程、阶段仅需对自身边界就绪即刻派发”纪律的问题，并对前置正式会商规程做减法（平时简洁说明，仅会商激活时动态注入完整参数）。
-- **静默态零增量上下文与前缀缓存保护**：常规区间（`tier=normal`）抑制每步递增的 `local_estimated` 计数字符串，治理正常无会商/无待审时静默返回空上下文，并将治理、并发、计时拆分为独立上下文槽位，消除无意义的 `<system-reminder>` 追加与 KV 缓存失效。
-- **环境事实锚定、原生公开联网调查与策略拒绝语义分离**：注入零子进程隐私安全宿主事实（`host-facts.mjs`），在 `leader` / `readonly` / `shell` 预设恢复 `@deepseek-ai/dsh-tool-web`（`web_search` / `web_fetch`，受用户禁网指令与确定性 SSRF 规则约束），并在 `direct-exec-sandbox-lock` 回执中显式标注“仅代表权限边界而非宿主缺失该能力”。
-- **桌面端空会话冻结修复、`enforce` 阻塞上报与控制台协同修剪**：修复未开工空会话复用导致的旧治理快照冻结；维持 `leaderModelPolicy: "enforce"` 默认值同时放行 `team_status(stop_state="blocked"|"waiting_user")` 故障上报，新增控制台领队不一致横幅与一键双向对齐；补齐 `mergeConfigLayers` 与 `executionFallbacks` 自动修剪；新增 `bin/lt-setup-desktop.mjs` 一键桌面安装器与《[历代设计原则与反退化台账](docs/12-历代设计原则与反退化台账.md)》。
+- **正交恢复 V1.9 渐进式局部就绪规划 + V2.1 自主直接派发（`DP-01`..`DP-06`）**：修复自治领队提示词与动态规划上下文遗漏“禁止开局私下预设计全工程、阶段仅需对自身边界就绪即刻派发”纪律的问题；常规区间（`tier=normal`）抑制每步递增计数字符串以保护 KV 缓存前缀；注入隐私安全宿主事实（`host-facts.mjs`）并在预设恢复 `@deepseek-ai/dsh-tool-web`；修复空会话治理快照冻结、允许 `enforce` 模式下通过 `team_status` 上报阻塞，并自动修剪 `executionFallbacks`（详见《[历代设计原则与反退化台账](docs/12-历代设计原则与反退化台账.md)》）。
+- **多供应商成对回退、策略拒绝即停与双审材料绑定**：修正领队兜底路由成对核对 `(provider, upstreamModel)`；遇到 `CONTENT_REFUSED` 立即停止重试与异步重发；5 小时窗口纳入重试次数与中途切换归属；双审去重键绑定送审材料摘要；衡账与会话目录统一支持 `~XXXX` 安全编码解码与超长 ID 压缩。
 
 ## [2.2.1] - 2026-11-26
 
